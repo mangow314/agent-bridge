@@ -113,11 +113,15 @@ write_message() {
 }
 
 # notify_pane <pane_id> <one-line-cmd>：先驗證 pane 存活再 send-keys；失敗回非零
+# Enter 與文字拆成兩次送並隔一小段延遲：agent REPL（claude/codex 等 TUI）
+# 會把同批抵達的文字+Enter 當成貼上，Enter 被吞掉導致指令留在輸入框不送出
 notify_pane() {
   local pane="$1" cmd="$2"
   command -v tmux >/dev/null 2>&1 || return 1
   tmux list-panes -a -F '#{pane_id}' 2>/dev/null | grep -Fx "$pane" >/dev/null || return 1
-  tmux send-keys -t "$pane" "$cmd" Enter 2>/dev/null
+  tmux send-keys -t "$pane" "$cmd" 2>/dev/null || return 1
+  sleep "${AGENT_BRIDGE_NOTIFY_DELAY:-0.3}"
+  tmux send-keys -t "$pane" Enter 2>/dev/null
 }
 
 check_task_id() {

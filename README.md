@@ -26,7 +26,9 @@ context 保持短而乾淨。
    - `logs/`：保留目錄（本輪未使用）
 3. **tmux send-keys 短通知**：send / reply 寫完檔案後，只向對方 pane 送一行
    `agent-bridge receive <task-id>`（或 `read <task-id>`）加 Enter。訊息內容
-   永遠走檔案，絕不進 send-keys。
+   永遠走檔案，絕不進 send-keys。文字與 Enter 拆成兩次 send-keys、中間隔
+   0.3 秒（可用 `AGENT_BRIDGE_NOTIFY_DELAY` 調整）：agent REPL 這類 TUI 會把
+   同批抵達的文字+Enter 當成貼上而吞掉 Enter，導致指令留在輸入框不送出。
 
 狀態機（core）：
 
