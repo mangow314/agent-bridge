@@ -133,3 +133,11 @@ tests/run-tests.sh
   `workspace-write` sandbox 預設擋 workspace 外寫入，需在 `config.toml` 的
   `[sandbox_workspace_write] writable_roots` 加入該路徑，否則 receive 會因
   無法建立鎖而失敗（status 唯讀不受影響）。
+- **sandbox 擋 socket 連線時，該 agent 發不出通知**：發通知要連 tmux server
+  的 unix socket（`/tmp/tmux-<uid>/default`）。codex `workspace-write` 預設
+  `network_access = false`，以 seccomp 擋 `connect()`（含 unix socket，
+  `writable_roots` 救不了），實測錯誤為
+  `error connecting to /tmp/tmux-1000/default (Operation not permitted)`。
+  該 agent 收任務、reply 都正常，只有通知走優雅降級（notify-failed 警告＋
+  手動補救指令）；要全自動需設 `network_access = true`，代價是 sandbox 內
+  指令可對外連網，請自行取捨。
