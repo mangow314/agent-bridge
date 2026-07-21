@@ -1,0 +1,363 @@
+#!/usr/bin/env bash
+# agent-bridge — 跨 tmux pane 的 agent 任務委派橋（core MVP）
+#
+# 機制：檔案系統 mailbox（AGENT_BRIDGE_DATA）＋ tmux send-keys 短通知。
+# 通知只送一行短指令（agent-bridge receive/read <task-id>），
+# 絕不把訊息內容放進 send-keys。
+set -euo pipefail
+
+DATA_DIR="${AGENT_BRIDGE_DATA:-$HOME/.local/share/agent-bridge}"
+AGENTS_DIR="$DATA_DIR/agents"
+TASKS_DIR="$DATA_DIR/tasks"
+LOCKS_DIR="$DATA_DIR/locks"
+LOGS_DIR="$DATA_DIR/logs"
+
+NAME_RE='^[A-Za-z0-9_-]+$'
+TASK_ID_RE='^[A-Za-z0-9._-]+$'
+
+err()  { printf 'agent-bridge: %s\n' "$*" >&2; }
+die()  { err "$*"; exit 1; }
+info() { printf '%s\n' "$*" >&2; }
+
+usage() {
+  cat >&2 <<'EOF'
+用法：
+  agent-bridge register <agent> <tmux-target>   註冊 agent 與其 tmux pane
+  agent-bridge list                             列出已註冊 agent（name<TAB>pane_id）
+  agent-bridge send <agent> --from <sender> (--message <text> | --message-file <path>)
+                                                委派任務；stdout 只印 task-id
+  agent-bridge receive <task-id>                取出任務（標頭走 stderr、request 原文走 stdout）
+  agent-bridge reply <task-id> (--message <text> | --message-file <path>)
+                                                回覆任務（僅 delivered 可回）
+  agent-bridge status <task-id>                 印裸狀態字（queued/delivered/completed）
+  agent-bridge read <task-id>                   讀回覆（標頭走 stderr、response 原文走 stdout）
+
+--message-file 用 `-` 表示讀 stdin。
+資料目錄預設 ~/.local/share/agent-bridge/，可用 AGENT_BRIDGE_DATA 覆蓋。
+EOF
+}
+
+now_iso() { date -u +%Y-%m-%dT%H:%M:%SZ; }
+
+rand_suffix() { head -c 2 /dev/urandom | od -An -tx1 | tr -d ' \n'; }
+
+ensure_dirs() { mkdir -p "$AGENTS_DIR" "$TASKS_DIR" "$LOCKS_DIR" "$LOGS_DIR"; }
+
+require_jq() {
+  command -v jq >/dev/null 2>&1 \
+    || die "缺少硬依賴 jq，請先安裝（例如 pacman -S jq）"
+}
+
+# atomic_write <dest>：內容從 stdin，同檔案系統 mktemp + mv 保證原子性
+atomic_write() {
+  local dest="$1" tmp
+  tmp="$(mktemp "$(dirname "$dest")/.tmp.XXXXXX")"
+  cat > "$tmp"
+  mv "$tmp" "$dest"
+}
+
+# ---- 鎖：mkdir lock，短暫重試後報錯 ----
+LOCK_DIR=""
+
+release_lock() {
+  if [[ -n "$LOCK_DIR" && -d "$LOCK_DIR" ]]; then
+    rmdir "$LOCK_DIR" 2>/dev/null || true
+  fi
+  LOCK_DIR=""
+}
+
+acquire_lock() {
+  local id="$1" tries=0 lock
+  lock="$LOCKS_DIR/$id.lock"
+  until mkdir "$lock" 2>/dev/null; do
+    tries=$((tries + 1))
+    if (( tries >= 25 )); then
+      die "無法取得 task 鎖（locks/$id.lock 佔用中或殘留），請稍後重試"
+    fi
+    sleep 0.2
+  done
+  LOCK_DIR="$lock"
+  trap release_lock EXIT
+}
+
+# log_event <task-id> <event> [detail]：append-only events.log
+log_event() {
+  local id="$1" ev="$2" detail="${3:-}" line
+  line="$(now_iso) $ev"
+  if [[ -n "$detail" ]]; then
+    line="$line $detail"
+  fi
+  printf '%s\n' "$line" >> "$TASKS_DIR/$id/events.log"
+}
+
+# update_meta_status <task-dir> <new-status>：同步更新 metadata.json 與 status 檔
+update_meta_status() {
+  local dir="$1" new="$2" ts updated
+  ts="$(now_iso)"
+  updated="$(jq --arg s "$new" --arg t "$ts" '.status = $s | .updated_at = $t' "$dir/metadata.json")"
+  printf '%s\n' "$updated" | atomic_write "$dir/metadata.json"
+  printf '%s\n' "$new" | atomic_write "$dir/status"
+}
+
+# write_message <dest> <mode:text|file> <value>；file 模式的 `-` 讀 stdin
+write_message() {
+  local dest="$1" mode="$2" val="$3"
+  if [[ "$mode" == "text" ]]; then
+    printf '%s\n' "$val" | atomic_write "$dest"
+  elif [[ "$val" == "-" ]]; then
+    atomic_write "$dest"
+  else
+    [[ -f "$val" ]] || die "找不到訊息檔：$val"
+    atomic_write "$dest" < "$val"
+  fi
+}
+
+# notify_pane <pane_id> <one-line-cmd>：先驗證 pane 存活再 send-keys；失敗回非零
+notify_pane() {
+  local pane="$1" cmd="$2"
+  command -v tmux >/dev/null 2>&1 || return 1
+  tmux list-panes -a -F '#{pane_id}' 2>/dev/null | grep -Fx "$pane" >/dev/null || return 1
+  tmux send-keys -t "$pane" "$cmd" Enter 2>/dev/null
+}
+
+check_task_id() {
+  local id="$1"
+  [[ "$id" =~ $TASK_ID_RE ]] || die "task-id 不合法：$id"
+}
+
+# ---- 指令 ----
+
+cmd_register() {
+  (( $# == 2 )) || die "用法：agent-bridge register <agent> <tmux-target>"
+  local name="$1" target="$2" pane ts doc
+  [[ "$name" =~ $NAME_RE ]] || die "agent 名稱不合法（僅允許 [A-Za-z0-9_-]+）：$name"
+  command -v tmux >/dev/null 2>&1 || die "找不到 tmux，register 需要 tmux"
+  if ! pane="$(tmux display -pt "$target" '#{pane_id}' 2>/dev/null)" || [[ -z "$pane" ]]; then
+    die "無法解析 tmux target：$target"
+  fi
+  ts="$(now_iso)"
+  doc="$(jq -n --arg name "$name" --arg pane "$pane" --arg ts "$ts" \
+    '{name: $name, pane_id: $pane, registered_at: $ts}')"
+  printf '%s\n' "$doc" | atomic_write "$AGENTS_DIR/$name.json"
+  info "已註冊 agent '$name' → pane $pane"
+}
+
+cmd_list() {
+  local f name pane
+  shopt -s nullglob
+  for f in "$AGENTS_DIR"/*.json; do
+    name="$(jq -r '.name' "$f")"
+    pane="$(jq -r '.pane_id' "$f")"
+    printf '%s\t%s\n' "$name" "$pane"
+  done
+}
+
+cmd_send() {
+  (( $# >= 1 )) || die "用法：agent-bridge send <agent> --from <sender> (--message <text> | --message-file <path>)"
+  local to="$1"; shift
+  local from="" mode="" val=""
+  while (( $# > 0 )); do
+    case "$1" in
+      --from)
+        shift; (( $# > 0 )) || die "--from 需要參數"
+        from="$1" ;;
+      --message)
+        shift; (( $# > 0 )) || die "--message 需要參數"
+        [[ -z "$mode" ]] || die "--message 與 --message-file 只能擇一"
+        mode="text"; val="$1" ;;
+      --message-file)
+        shift; (( $# > 0 )) || die "--message-file 需要參數"
+        [[ -z "$mode" ]] || die "--message 與 --message-file 只能擇一"
+        mode="file"; val="$1" ;;
+      *) die "未知參數：$1" ;;
+    esac
+    shift
+  done
+  [[ -n "$from" ]] || die "send 需要 --from <sender>"
+  [[ -n "$mode" ]] || die "send 需要 --message 或 --message-file"
+  [[ "$to" =~ $NAME_RE ]]   || die "agent 名稱不合法（僅允許 [A-Za-z0-9_-]+）：$to"
+  [[ "$from" =~ $NAME_RE ]] || die "sender 名稱不合法（僅允許 [A-Za-z0-9_-]+）：$from"
+
+  local agent_file="$AGENTS_DIR/$to.json"
+  [[ -f "$agent_file" ]] || die "未註冊的 agent：$to（先用 agent-bridge register）"
+  local pane; pane="$(jq -r '.pane_id' "$agent_file")"
+
+  local task_id dir tries=0
+  while :; do
+    task_id="$(date -u +%Y%m%dT%H%M%SZ)-$(rand_suffix)"
+    dir="$TASKS_DIR/$task_id"
+    if mkdir "$dir" 2>/dev/null; then
+      break
+    fi
+    tries=$((tries + 1))
+    (( tries < 5 )) || die "無法建立 task 目錄（task-id 連續碰撞）"
+  done
+
+  write_message "$dir/request.md" "$mode" "$val"
+
+  local ts wd doc
+  ts="$(now_iso)"
+  wd="$(pwd)"
+  doc="$(jq -n --arg id "$task_id" --arg from "$from" --arg to "$to" \
+              --arg ts "$ts" --arg wd "$wd" \
+    '{version: 1, task_id: $id, from: $from, to: $to,
+      created_at: $ts, updated_at: $ts,
+      working_directory: $wd, status: "queued"}')"
+  printf '%s\n' "$doc" | atomic_write "$dir/metadata.json"
+  printf 'queued\n' | atomic_write "$dir/status"
+  log_event "$task_id" created "from=$from to=$to"
+
+  if notify_pane "$pane" "agent-bridge receive $task_id"; then
+    log_event "$task_id" notified "pane=$pane cmd=receive"
+  else
+    log_event "$task_id" notify-failed "pane=$pane cmd=receive"
+    err "警告：無法通知 $to（pane $pane）；請手動在對方 session 執行：agent-bridge receive $task_id"
+  fi
+
+  printf '%s\n' "$task_id"
+}
+
+cmd_receive() {
+  (( $# == 1 )) || die "用法：agent-bridge receive <task-id>"
+  local id="$1"
+  check_task_id "$id"
+  local dir="$TASKS_DIR/$id"
+  [[ -d "$dir" ]] || die "找不到 task：$id"
+
+  acquire_lock "$id"
+  local st; st="$(<"$dir/status")"
+  case "$st" in
+    queued)
+      update_meta_status "$dir" delivered
+      log_event "$id" delivered
+      ;;
+    delivered)
+      log_event "$id" re-receive
+      ;;
+    *)
+      die "task 狀態為 $st，無法 receive（僅 queued/delivered 可）"
+      ;;
+  esac
+  release_lock
+
+  local from wd
+  from="$(jq -r '.from' "$dir/metadata.json")"
+  wd="$(jq -r '.working_directory' "$dir/metadata.json")"
+  {
+    printf 'task-id: %s\n' "$id"
+    printf 'from: %s\n' "$from"
+    printf 'working_directory: %s\n' "$wd"
+  } >&2
+  cat "$dir/request.md"
+}
+
+cmd_reply() {
+  (( $# >= 1 )) || die "用法：agent-bridge reply <task-id> (--message <text> | --message-file <path>)"
+  local id="$1"; shift
+  check_task_id "$id"
+  local mode="" val=""
+  while (( $# > 0 )); do
+    case "$1" in
+      --message)
+        shift; (( $# > 0 )) || die "--message 需要參數"
+        [[ -z "$mode" ]] || die "--message 與 --message-file 只能擇一"
+        mode="text"; val="$1" ;;
+      --message-file)
+        shift; (( $# > 0 )) || die "--message-file 需要參數"
+        [[ -z "$mode" ]] || die "--message 與 --message-file 只能擇一"
+        mode="file"; val="$1" ;;
+      *) die "未知參數：$1" ;;
+    esac
+    shift
+  done
+  [[ -n "$mode" ]] || die "reply 需要 --message 或 --message-file"
+
+  local dir="$TASKS_DIR/$id"
+  [[ -d "$dir" ]] || die "找不到 task：$id"
+
+  acquire_lock "$id"
+  local st; st="$(<"$dir/status")"
+  if [[ "$st" != "delivered" ]]; then
+    die "task 狀態為 $st，僅 delivered 可 reply（queued 請先 receive；completed 不可重複 reply）"
+  fi
+  write_message "$dir/response.md" "$mode" "$val"
+  update_meta_status "$dir" completed
+  log_event "$id" replied
+  release_lock
+
+  local from; from="$(jq -r '.from' "$dir/metadata.json")"
+  if [[ -f "$AGENTS_DIR/$from.json" ]]; then
+    local pane; pane="$(jq -r '.pane_id' "$AGENTS_DIR/$from.json")"
+    if notify_pane "$pane" "agent-bridge read $id"; then
+      log_event "$id" notified "pane=$pane cmd=read"
+    else
+      log_event "$id" notify-failed "pane=$pane cmd=read"
+      err "警告：無法通知 $from（pane $pane）；請手動在對方 session 執行：agent-bridge read $id"
+    fi
+  fi
+  info "已回覆 task $id（completed）"
+}
+
+cmd_status() {
+  (( $# == 1 )) || die "用法：agent-bridge status <task-id>"
+  local id="$1"
+  check_task_id "$id"
+  local dir="$TASKS_DIR/$id"
+  [[ -d "$dir" ]] || die "找不到 task：$id"
+  printf '%s\n' "$(<"$dir/status")"
+}
+
+cmd_read() {
+  (( $# == 1 )) || die "用法：agent-bridge read <task-id>"
+  local id="$1"
+  check_task_id "$id"
+  local dir="$TASKS_DIR/$id"
+  [[ -d "$dir" ]] || die "找不到 task：$id"
+
+  local st; st="$(<"$dir/status")"
+  if [[ "$st" != "completed" ]]; then
+    die "task $id 尚未回覆（狀態：$st）；查詢進度請用 agent-bridge status $id"
+  fi
+
+  local from to
+  from="$(jq -r '.from' "$dir/metadata.json")"
+  to="$(jq -r '.to' "$dir/metadata.json")"
+  {
+    printf 'task-id: %s\n' "$id"
+    printf 'from: %s\n' "$from"
+    printf 'to: %s\n' "$to"
+  } >&2
+  log_event "$id" read
+  cat "$dir/response.md"
+}
+
+main() {
+  if (( $# == 0 )); then
+    usage
+    exit 1
+  fi
+  local cmd="$1"; shift
+  case "$cmd" in
+    -h|--help|help)
+      usage
+      return 0
+      ;;
+  esac
+  require_jq
+  ensure_dirs
+  case "$cmd" in
+    register) cmd_register "$@" ;;
+    list)     cmd_list "$@" ;;
+    send)     cmd_send "$@" ;;
+    receive)  cmd_receive "$@" ;;
+    reply)    cmd_reply "$@" ;;
+    status)   cmd_status "$@" ;;
+    read)     cmd_read "$@" ;;
+    *)
+      usage
+      die "未知指令：$cmd"
+      ;;
+  esac
+}
+
+main "$@"
