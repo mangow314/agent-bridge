@@ -67,9 +67,18 @@ release_lock() {
 }
 
 acquire_lock() {
-  local id="$1" tries=0 lock
+  local id="$1" tries=0 lock err
   lock="$LOCKS_DIR/$id.lock"
   until mkdir "$lock" 2>/dev/null; do
+    # mkdir 失敗但鎖目錄不存在＝不是佔用，是權限/sandbox/檔案系統問題；
+    # 重試無意義，帶出 mkdir 的真正錯誤原因（例：codex sandbox 擋
+    # workspace 外寫入時，誤報「佔用中」會把人引去查錯方向）
+    if [[ ! -d "$lock" ]]; then
+      if err="$(mkdir "$lock" 2>&1)"; then
+        break
+      fi
+      die "無法建立鎖目錄（非鎖佔用，疑似權限或 sandbox 寫入限制）：$err"
+    fi
     tries=$((tries + 1))
     if (( tries >= 25 )); then
       die "無法取得 task 鎖（locks/$id.lock 佔用中或殘留），請稍後重試"

@@ -225,6 +225,23 @@ assert "通知失敗：stderr 有含 task-id 的警告" \
 assert "通知失敗：events.log 記 notify-failed" \
   grep -q ' notify-failed ' "$D5/tasks/$id5/events.log"
 
+# ---- 8b. 鎖失敗路徑：權限失敗 vs 真正鎖佔用 ----
+D6="$TESTROOT/d6"
+ab "$D6" register bob "$PANE_B" 2>/dev/null
+id6="$(ab "$D6" send bob --from alice --message hi 2>/dev/null)"
+chmod 555 "$D6/locks"
+ab "$D6" receive "$id6" >/dev/null 2>"$TESTROOT/d6-recv.err"; rc=$?
+chmod 755 "$D6/locks"
+assert "鎖目錄不可寫：非零退出" test "$rc" -ne 0
+assert "鎖目錄不可寫：報權限問題而非鎖佔用" \
+  grep -q '非鎖佔用' "$TESTROOT/d6-recv.err"
+assert "鎖目錄不可寫：狀態不變（仍 queued）" st_is "$D6" "$id6" queued
+mkdir "$D6/locks/$id6.lock"
+ab "$D6" receive "$id6" >/dev/null 2>"$TESTROOT/d6-lock.err"; rc=$?
+rmdir "$D6/locks/$id6.lock"
+assert "鎖被佔用：重試後非零退出" test "$rc" -ne 0
+assert "鎖被佔用：報佔用中" grep -q '佔用中' "$TESTROOT/d6-lock.err"
+
 # ---- 9. tmux 整合：完整 round-trip ----
 ab "$DATA_IT" register agent-a "$PANE_A" 2>/dev/null
 ab "$DATA_IT" register agent-b "$PANE_B" 2>/dev/null

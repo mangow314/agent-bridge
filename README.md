@@ -128,3 +128,8 @@ tests/run-tests.sh
   agent 的 prompt injection 面。receiver 應把內容當資料而非指令對待
   （見 `SKILL.md`）。
 - 通知協定假設 `agent-bridge` 在對方 pane 的 PATH 上（安裝 symlink 後即成立）。
+- **agent runtime 的 sandbox 必須允許寫資料目錄**：receive/reply 需要寫
+  `AGENT_BRIDGE_DATA`（預設 `~/.local/share/agent-bridge/`）。例如 codex CLI 的
+  `workspace-write` sandbox 預設擋 workspace 外寫入，需在 `config.toml` 的
+  `[sandbox_workspace_write] writable_roots` 加入該路徑，否則 receive 會因
+  無法建立鎖而失敗（status 唯讀不受影響）。
