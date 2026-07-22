@@ -16,6 +16,9 @@ fi
 
 TESTROOT="$(mktemp -d "${TMPDIR:-/tmp}/agent-bridge-tests.XXXXXX")"
 
+# await 測試走短輪詢間隔，避免整體測試時間被預設 1s 拖長
+export AGENT_BRIDGE_POLL_INTERVAL=0.2
+
 tmx() { "$REAL_TMUX" -L "$SOCK" -f /dev/null "$@"; }
 
 # shellcheck disable=SC2329  # 經 trap EXIT 間接呼叫
@@ -242,7 +245,113 @@ rmdir "$D6/locks/$id6.lock"
 assert "鎖被佔用：重試後非零退出" test "$rc" -ne 0
 assert "鎖被佔用：報佔用中" grep -q '佔用中' "$TESTROOT/d6-lock.err"
 
-# ---- 9. tmux 整合：完整 round-trip ----
+# ---- 9. unregister ----
+D7="$TESTROOT/d7"
+ab "$D7" register dave "$PANE_A" 2>/dev/null
+ab "$D7" unregister dave 2>/dev/null; rc=$?
+assert "unregister：exit 0" test "$rc" -eq 0
+assert "unregister 後 list 為空" test -z "$(ab "$D7" list)"
+assert "unregister 後 agents 檔已刪" test ! -e "$D7/agents/dave.json"
+assert_fails "unregister 未註冊 agent 報錯" ab "$D7" unregister nobody
+assert_fails "unregister：不合法名稱被拒" ab "$D7" unregister "bad name"
+assert_fails "unregister 後 send 該 agent 報錯" \
+  ab "$D7" send dave --from alice --message hi
+
+# ---- 10. start：delivered → running ----
+D8="$TESTROOT/d8"
+ab "$D8" register bob "$PANE_B" 2>/dev/null
+id8="$(ab "$D8" send bob --from alice --message "work" 2>/dev/null)"
+assert_fails "start 於 queued（未 receive）報錯" ab "$D8" start "$id8"
+assert "start 於 queued：狀態不變" st_is "$D8" "$id8" queued
+ab "$D8" receive "$id8" >/dev/null 2>&1
+ab "$D8" start "$id8" 2>/dev/null; rc=$?
+assert "start 於 delivered：exit 0" test "$rc" -eq 0
+assert "start 後狀態 running" st_is "$D8" "$id8" running
+assert "events.log 記 started" grep -q ' started' "$D8/tasks/$id8/events.log"
+assert_fails "重複 start（running）報錯" ab "$D8" start "$id8"
+ab "$D8" receive "$id8" > "$TESTROOT/got8.out" 2>/dev/null
+assert "receive 於 running 冪等：內容一致" \
+  bash -c "diff <(printf 'work\n') '$TESTROOT/got8.out'"
+assert "receive 於 running：狀態仍 running" st_is "$D8" "$id8" running
+ab "$D8" reply "$id8" --message "done from running" 2>/dev/null
+assert "running 可 reply → completed" st_is "$D8" "$id8" completed
+
+# ---- 11. fail：delivered/running → failed，read 可讀失敗原因 ----
+D9="$TESTROOT/d9"
+ab "$D9" register bob "$PANE_B" 2>/dev/null
+id9="$(ab "$D9" send bob --from alice --message "doomed" 2>/dev/null)"
+assert_fails "fail 於 queued 報錯" ab "$D9" fail "$id9" --message "nope"
+assert "fail 於 queued：不產生 response.md" test ! -e "$D9/tasks/$id9/response.md"
+ab "$D9" receive "$id9" >/dev/null 2>&1
+assert_fails "fail 缺訊息參數報錯" ab "$D9" fail "$id9"
+FAILMSG="$TESTROOT/failmsg.txt"
+printf '失敗原因："權限不足"\n第二行\n' > "$FAILMSG"
+ab "$D9" fail "$id9" --message-file "$FAILMSG" 2>/dev/null; rc=$?
+assert "fail 於 delivered：exit 0" test "$rc" -eq 0
+assert "fail 後狀態 failed" st_is "$D9" "$id9" failed
+assert "events.log 記 failed" grep -q ' failed' "$D9/tasks/$id9/events.log"
+ab "$D9" read "$id9" > "$TESTROOT/rgot9.out" 2> "$TESTROOT/rgot9.hdr"; rc=$?
+assert "read 於 failed：exit 0" test "$rc" -eq 0
+assert "read 於 failed：內容與失敗原因 diff 為空" diff -q "$FAILMSG" "$TESTROOT/rgot9.out"
+assert "read 於 failed：stderr 標頭含 task-id" grep -q "task-id: $id9" "$TESTROOT/rgot9.hdr"
+assert_fails "fail 後 reply 報錯（終態）" ab "$D9" reply "$id9" --message late
+assert_fails "重複 fail 報錯（終態）" ab "$D9" fail "$id9" --message again
+assert "終態後狀態仍 failed" st_is "$D9" "$id9" failed
+
+# ---- 12. cancel：queued/delivered/running → cancelled ----
+D10="$TESTROOT/d10"
+ab "$D10" register bob "$PANE_B" 2>/dev/null
+idc1="$(ab "$D10" send bob --from alice --message "c1" 2>/dev/null)"
+ab "$D10" cancel "$idc1" 2>/dev/null; rc=$?
+assert "cancel 於 queued：exit 0" test "$rc" -eq 0
+assert "cancel 後狀態 cancelled" st_is "$D10" "$idc1" cancelled
+assert "events.log 記 cancelled" grep -q ' cancelled' "$D10/tasks/$idc1/events.log"
+assert "cancel 通知 worker（events 記 cmd=status）" \
+  grep -q 'cmd=status' "$D10/tasks/$idc1/events.log"
+assert_fails "cancelled 後 receive 報錯" ab "$D10" receive "$idc1"
+assert_fails "cancelled 後 reply 報錯" ab "$D10" reply "$idc1" --message x
+ab "$D10" read "$idc1" >/dev/null 2>"$TESTROOT/rc1.err"; rc=$?
+assert "cancelled 後 read 非零退出" test "$rc" -ne 0
+assert "cancelled 後 read 提示已取消" grep -q '已取消' "$TESTROOT/rc1.err"
+assert_fails "重複 cancel 報錯" ab "$D10" cancel "$idc1"
+idc2="$(ab "$D10" send bob --from alice --message "c2" 2>/dev/null)"
+ab "$D10" receive "$idc2" >/dev/null 2>&1
+ab "$D10" start "$idc2" 2>/dev/null
+ab "$D10" cancel "$idc2" 2>/dev/null
+assert "cancel 於 running → cancelled" st_is "$D10" "$idc2" cancelled
+assert_fails "cancelled 後 start 報錯" ab "$D10" start "$idc2"
+idc3="$(ab "$D10" send bob --from alice --message "c3" 2>/dev/null)"
+ab "$D10" receive "$idc3" >/dev/null 2>&1
+ab "$D10" reply "$idc3" --message ok 2>/dev/null
+assert_fails "cancel 於 completed 報錯" ab "$D10" cancel "$idc3"
+assert "cancel 失敗後狀態仍 completed" st_is "$D10" "$idc3" completed
+
+# ---- 13. await：等待終態 ----
+assert "await 於 completed：立即印 completed" \
+  test "$(ab "$D3" await "$id3" 2>/dev/null)" = completed
+assert "await 於 failed：印 failed" \
+  test "$(ab "$D9" await "$id9" 2>/dev/null)" = failed
+assert "await 於 cancelled：印 cancelled" \
+  test "$(ab "$D10" await "$idc1" 2>/dev/null)" = cancelled
+assert_fails "await 未知 task 報錯" ab "$D2" await 20990101T000000Z-dead
+assert_fails "await：--timeout 非整數被拒" ab "$D2" await "$id2" --timeout abc
+ab "$D2" await "$id2" --timeout 1 >/dev/null 2>"$TESTROOT/await-to.err"; rc=$?
+assert "await 逾時：非零退出" test "$rc" -ne 0
+assert "await 逾時：訊息含目前狀態" grep -q 'queued' "$TESTROOT/await-to.err"
+D11="$TESTROOT/d11"
+ab "$D11" register bob "$PANE_B" 2>/dev/null
+id11="$(ab "$D11" send bob --from alice --message "bg" 2>/dev/null)"
+ab "$D11" receive "$id11" >/dev/null 2>&1
+ab "$D11" await "$id11" --timeout 15 > "$TESTROOT/await-bg.out" 2>/dev/null &
+AWAIT_PID=$!
+sleep 0.5
+ab "$D11" reply "$id11" --message bg-done 2>/dev/null
+wait "$AWAIT_PID"; rc=$?
+assert "背景 await：reply 後返回 exit 0" test "$rc" -eq 0
+assert "背景 await：印出 completed" \
+  test "$(cat "$TESTROOT/await-bg.out")" = completed
+
+# ---- 14. tmux 整合：完整 round-trip ----
 ab "$DATA_IT" register agent-a "$PANE_A" 2>/dev/null
 ab "$DATA_IT" register agent-b "$PANE_B" 2>/dev/null
 REQ_IT="$TESTROOT/req-it.md"
