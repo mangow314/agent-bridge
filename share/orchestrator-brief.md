@@ -27,6 +27,12 @@ worker 做完一件事**不代表它該死**。它腦裡可能還留著沒寫進
 
 先跑 `agent-bridge idle` 看池況（`name / ready / disposable / idle_secs`）。
 
+**`await` 返回不代表 worker 收尾完畢。** worker 是先 `reply` 再宣告
+`disposable`，你的 `await` 在 reply 那一刻就返回了。緊接著看 `idle`，會看到一個
+還沒更新的 `-`。看到 `-` 只代表「此刻還沒宣告」，不代表對方不打算宣告——剛回覆
+完的 worker 給它幾秒再取樣。（真鏈驗收 2026-07-22 實地踩到，差點誤判成 brief
+沒生效。）
+
 **複用**——新任務與某個 worker 前一輪的工作**共用脈絡**時。它已經讀過那批檔、
 踩過那些坑，你等於免費拿到一份熱 context。這是保留 pane 的全部理由。
 
