@@ -1615,6 +1615,149 @@ assert "idle：不取鎖——執行後 locks/ 為空" \
   test -z "$(ls -A "$DIDLE/locks")"
 assert_fails "idle：多給參數被拒" ab "$DIDLE" idle extra
 
+# ---- 26. evict：驅逐前強制落地筆記（orchestrator Phase 3） ----
+# 三步 send → await → despawn。核心不變量：**pane 沒被收掉之前，筆記一定先
+# 落地**；唯一的例外是逾時，而逾時必須在審計線上看得出來（否則「筆記沒落地」
+# 這件事會混進正常回收裡，事後查不出來）
+DEV="$TESTROOT/devict"
+
+# resp_has <data-dir> <task-id> <pattern>：收尾筆記的內容比對
+# shellcheck disable=SC2329  # 經 assert 的 "$@" 間接呼叫
+resp_has() { ab "$1" read "$2" 2>/dev/null | grep -q "$3"; }
+
+# task_count <data-dir>：tasks/ 底下的任務數（用來證明「被拒時不留孤兒任務」）
+# shellcheck disable=SC2329  # 經 assert 的 "$@" 間接呼叫
+task_count() {
+  local x n=0
+  for x in "$1"/tasks/*/; do
+    [[ -d "$x" ]] && n=$((n + 1))
+  done
+  printf '%s' "$n"
+}
+
+# bg_reply <data-dir> <agent> <message>：背景等該 agent 的新任務出現後 receive+reply。
+# 前置 sleep 是刻意的：evict 若沒有「等筆記落地」那一步，它會在這個 replier
+# 動手之前就 despawn 完畢，下面「evict 返回當下筆記已落地」的斷言才必定見紅。
+# 沒有這段延遲，破壞-復原會變成時序賭博（可能空綠）
+# shellcheck disable=SC2329  # 經 assert 的 "$@" 間接呼叫
+bg_reply() {
+  local data="$1" who="$2" msg="$3"
+  (
+    sleep 0.8
+    local i d tid=""
+    for (( i = 0; i < 150; i++ )); do
+      for d in "$data"/tasks/*/; do
+        [[ -f "$d/metadata.json" ]] || continue
+        [[ "$(jq -r '.to // ""' "$d/metadata.json" 2>/dev/null)" == "$who" ]] || continue
+        [[ "$(<"$d/status")" == queued ]] || continue
+        tid="$(basename "$d")"
+        break
+      done
+      [[ -n "$tid" ]] && break
+      sleep 0.2
+    done
+    [[ -n "$tid" ]] || exit 1
+    ab "$data" receive "$tid" >/dev/null 2>&1
+    ab "$data" reply "$tid" --message "$msg" >/dev/null 2>&1
+  ) &
+}
+
+# 26a. 輸入與出身防護：一律在送出收尾任務**之前**擋掉。放行後才發現不該收，
+# 會留下一個沒人回收的孤兒任務，而且 pane 白白被打擾一次
+assert_fails "evict：缺參數被拒" ab "$DEV" evict
+assert_fails "evict：未註冊 agent 報錯" ab "$DEV" evict ghost
+assert_fails "evict：名稱不合法被拒" ab "$DEV" evict "bad name"
+before_t="$(task_count "$DEV")"
+ab "$DEV" register manual-e "$PANE_A" >/dev/null 2>&1
+assert_fails "evict：人工 agent 被拒（生命週期不歸 bridge 管）" ab "$DEV" evict manual-e
+assert "evict：人工 agent 被拒時不留孤兒收尾任務（擋在 send 之前）" \
+  test "$(task_count "$DEV")" -eq "$before_t"
+assert "evict：人工 agent 被拒後 registry 仍在（未被誤除名）" \
+  test -e "$DEV/agents/manual-e.json"
+
+pane_ev1="$(absp "$DEV" 0 spawn ev1 --runtime codex 2>/dev/null)"
+assert_fails "evict：--timeout 非數字被拒" ab "$DEV" evict ev1 --timeout abc
+assert_fails "evict：--timeout 缺參數被拒" ab "$DEV" evict ev1 --timeout
+assert_fails "evict：--from 名稱不合法被拒" ab "$DEV" evict ev1 --from "bad name"
+assert_fails "evict：未知參數被拒" ab "$DEV" evict ev1 --bogus
+assert "evict：參數被拒時不留孤兒收尾任務" test "$(task_count "$DEV")" -eq "$before_t"
+assert "evict：參數被拒時 pane 未被動" pane_alive "$pane_ev1"
+
+# 26b. 成功路徑：收尾任務送出 → worker 回筆記 → pane 才被收
+bg_reply "$DEV" ev1 "只存在我 context 裡的事實：X 在 foo.sh:42"
+tid_ev1="$(ab "$DEV" evict ev1 --from alice 2>"$TESTROOT/ev1.err")"; rc=$?
+# ★ 狀態要在 wait **之前**取樣。先 wait 等於等背景 replier 做完才看——那時
+# 任務當然是 completed，即使 evict 根本沒等過。M1 實測確認：這個順序寫反，
+# 「拆掉等待落地」的破壞-復原會整組空綠（本 repo 第六次踩同一個坑）
+st_ev1_now="$(ab "$DEV" status "$tid_ev1" 2>/dev/null)"
+wait
+assert "evict：成功路徑 exit 0" test "$rc" -eq 0
+assert "evict：stdout 只印一行收尾 task-id" \
+  test "$(printf '%s\n' "$tid_ev1" | wc -l)" -eq 1
+assert "evict：印出的 task-id 是真的存在的任務" test -d "$DEV/tasks/$tid_ev1"
+assert "evict：收尾任務確實派給被驅逐者" \
+  test "$(jq -r '.to' "$DEV/tasks/$tid_ev1/metadata.json")" = ev1
+assert "evict：--from 進了任務 metadata（審計得出是誰發起驅逐）" \
+  test "$(jq -r '.from' "$DEV/tasks/$tid_ev1/metadata.json")" = alice
+# 收尾文案是機制的一部分：任務內容若是空的，worker 不會知道要寫什麼
+assert "evict：收尾任務帶著收尾文案（不是一個空任務）" \
+  grep -q '收尾任務' "$DEV/tasks/$tid_ev1/request.md"
+# ★ 核心斷言：evict 返回的當下筆記就已經落地——不再等、不再輪詢。
+# 拆掉 await 那一步的話，這裡會抓到 queued/delivered → 紅
+assert "evict：返回當下收尾任務已 completed（筆記先落地才收 pane）" \
+  test "$st_ev1_now" = completed
+assert "evict：收尾筆記讀得回內容（read 拿得到 worker 寫的事實）" \
+  resp_has "$DEV" "$tid_ev1" 'foo.sh:42'
+assert "evict：registry 已除名" test ! -e "$DEV/agents/ev1.json"
+assert_fails "evict：pane 已回收（pane_alive 不再成立）" pane_alive "$pane_ev1"
+# 審計線：evicted 與 evicted-timeout 必須分得開，否則「筆記沒落地」查不出來
+assert "evict：agents.log 記 evicted（筆記已落地的驅逐）" \
+  grep -qE "Z evicted ev1 " "$DEV/agents.log"
+assert_fails "evict：成功路徑不得記成 evicted-timeout" \
+  grep -qE "Z evicted-timeout ev1 " "$DEV/agents.log"
+assert "evict：成功路徑後 locks/ 為空（三步分段取鎖，不得有殘留）" \
+  test -z "$(ls -A "$DEV/locks")"
+
+# 26c. 逾時路徑：worker 不回話。**仍然要 despawn**——否則一個不回話的 worker
+# 會把 cap 永久卡死，驅逐機制整個失效。代價是筆記沒落地，靠審計記號讓它可見
+pane_ev2="$(absp "$DEV" 0 spawn ev2 --runtime codex 2>/dev/null)"
+tid_ev2="$(ab "$DEV" evict ev2 --timeout 1 2>"$TESTROOT/ev2.err")"; rc=$?
+assert "evict：逾時仍 exit 0（cap 確實騰出來了）" test "$rc" -eq 0
+assert "evict：逾時仍印出收尾 task-id（事後仍可追這筆任務）" \
+  test -d "$DEV/tasks/$tid_ev2"
+assert "evict：逾時仍 despawn registry（不讓不回話的 worker 卡死 cap）" \
+  test ! -e "$DEV/agents/ev2.json"
+assert_fails "evict：逾時仍回收 pane（pane_alive 不再成立）" pane_alive "$pane_ev2"
+assert "evict：逾時在 agents.log 留 evicted-timeout（筆記沒落地要看得見）" \
+  grep -qE "Z evicted-timeout ev2 " "$DEV/agents.log"
+assert_fails "evict：逾時不得記成正常 evicted" \
+  grep -qE "Z evicted ev2 " "$DEV/agents.log"
+assert "evict：逾時有 stderr 警告（呼叫端不會以為筆記拿到了）" \
+  grep -q '逾時' "$TESTROOT/ev2.err"
+assert "evict：逾時後收尾任務仍留在非終態（事後可查、可 cancel）" \
+  test "$(ab "$DEV" status "$tid_ev2" 2>/dev/null)" != completed
+assert "evict：逾時後 locks/ 為空" test -z "$(ls -A "$DEV/locks")"
+
+# 26d. 未就緒（starting）的 worker 一樣收得掉：它可能就是卡在啟動才需要被驅逐
+pane_ev3="$(absp "$DEV" 0 spawn ev3 --runtime codex 2>/dev/null)"
+ab "$DEV" evict ev3 --timeout 1 >/dev/null 2>&1; rc=$?
+assert "evict：未 ready 的 worker 也驅逐得掉（卡在啟動正是要收的情形）" \
+  test "$rc" -eq 0
+assert "evict：未 ready 的 worker 驅逐後 registry 已除名" \
+  test ! -e "$DEV/agents/ev3.json"
+assert_fails "evict：未 ready 的 worker 驅逐後 pane 已回收（pane_alive 不再成立）" \
+  pane_alive "$pane_ev3"
+
+# 26e. 損壞 registry：出身不明就不能收——同 despawn/disposable 的 fail-closed
+absp "$DEV" 0 spawn ev4 --runtime codex >/dev/null 2>&1
+printf 'null\n' > "$DEV/agents/ev4.json"
+before_t4="$(task_count "$DEV")"
+assert_fails "evict：registry 是合法 JSON 但非 object → 拒絕（出身不明）" \
+  ab "$DEV" evict ev4 --timeout 1
+assert "evict：出身不明被拒時不送收尾任務" test "$(task_count "$DEV")" -eq "$before_t4"
+assert "evict：出身不明被拒時 registry 未被清掉（留給人工處理）" \
+  test -e "$DEV/agents/ev4.json"
+
 # ---- 總結 ----
 printf '\n共 %d PASS、%d FAIL\n' "$PASS" "$FAIL"
 if (( FAIL > 0 )); then

@@ -68,10 +68,15 @@ usage() {
                                                 （預設是保留：沒宣告過的一律視為仍有殘值）
   agent-bridge idle                             worker 池回收決策視圖；唯讀
                                                 （name<TAB>ready<TAB>disposable<TAB>idle_secs）
+  agent-bridge evict <name> [--timeout <secs>] [--from <sender>]
+                                                驅逐 worker：派收尾任務 → 等筆記落地 → despawn
+                                                stdout 只印收尾 task-id；逾時仍 despawn（審計記 evicted-timeout）
 
 --message-file 用 `-` 表示讀 stdin。
 資料目錄預設 ~/.local/share/agent-bridge/，可用 AGENT_BRIDGE_DATA 覆蓋。
 await 輪詢間隔預設 1 秒，可用 AGENT_BRIDGE_POLL_INTERVAL 覆蓋；--timeout 0（預設）＝不逾時。
+evict 的 --timeout 預設 300 秒、--from 預設 orchestrator；--timeout 0＝無限等，
+等於放棄「一定騰得出 cap」這個保證，只在確定 worker 還活著時才用。
 spawn 上限 AGENT_BRIDGE_MAX_SPAWN（預設 4）；就緒等待 AGENT_BRIDGE_READY_TIMEOUT
 秒（預設 30，0＝不等待），探針重送間隔 AGENT_BRIDGE_READY_PROBE_INTERVAL（預設 2）。
 EOF
@@ -1165,6 +1170,118 @@ cmd_idle() {
   done
 }
 
+# evict：撞 cap 時的驅逐，但**不是直接殺**——先派一輪收尾任務，讓 worker 把
+# 只存在於它 context 裡、response 之外的關鍵事實寫下來，落地之後才 despawn。
+# 上下文不會憑空消失，這是「預設保留」語意在 cap 壓力下的補償機制。
+#
+# 三步（send → await → despawn）刻意**不包在一把鎖裡**：LOCK_DIR 是單值
+# （見 acquire_lock），同時持有兩把鎖時 release_lock 只會放掉一把，留下一把
+# 沒人知道存在的鎖擋住之後每一次同類操作。分段的代價是每段之間都可能被中斷，
+# 失效方向分別是：
+#   send 後中斷  → 多一個沒人收的收尾 task（status 看得見），pane 仍在
+#   await 後中斷 → 筆記已落地、pane 沒收掉，最壞多佔一個 cap（可再 evict）
+# 兩個方向都不會刪掉還沒落地的脈絡——這是分段時唯一不可接受的失效。
+#
+# **逾時仍然 despawn**：否則一個不回話的 worker 會把 cap 永久卡死，驅逐機制
+# 直接失效。代價是筆記沒落地，所以審計線一定要看得出來（evicted-timeout），
+# 而不是混在正常的 evicted 裡。
+cmd_evict() {
+  (( $# >= 1 )) || die "用法：agent-bridge evict <name> [--timeout <secs>] [--from <sender>]"
+  local name="$1"; shift
+  local timeout=300 from="orchestrator"
+  while (( $# > 0 )); do
+    case "$1" in
+      --timeout)
+        shift; (( $# > 0 )) || die "--timeout 需要參數"
+        # 同 await：10# 強制十進位，位數上限擋 64 位算術溢位
+        [[ "$1" =~ ^[0-9]{1,9}$ ]] || die "--timeout 需為非負整數（秒，至多 9 位），0＝不逾時：$1"
+        timeout=$((10#$1)) ;;
+      --from)
+        shift; (( $# > 0 )) || die "--from 需要參數"
+        from="$1" ;;
+      *) die "未知參數：$1" ;;
+    esac
+    shift
+  done
+  [[ "$name" =~ $NAME_RE ]] || die "agent 名稱不合法（僅允許 [A-Za-z0-9_-]+）：$name"
+  [[ "$from" =~ $NAME_RE ]] || die "sender 名稱不合法（僅允許 [A-Za-z0-9_-]+）：$from"
+
+  # 出身快檢（不取鎖）：純 fail-fast，避免對人工註冊的 agent 送出一個之後
+  # 必定被 despawn 拒絕、沒人回收的孤兒收尾任務。權威判定仍在 cmd_despawn 的
+  # 鎖內（TOCTOU 歸它負責）——這裡放行不代表最後一定收得掉
+  local f="$AGENTS_DIR/$name.json"
+  [[ -f "$f" ]] || die "未註冊的 agent：$name"
+  local sp_rc=0
+  is_spawned "$f" || sp_rc=$?
+  case $sp_rc in
+    1) die "agent '$name' 非 spawn 出身，evict 拒絕（人工 pane 的生命週期不歸 bridge 管，請用 unregister）" ;;
+    2) die "agent '$name' 的 registry 無法解析，出身不明，evict 拒絕；請確認 $f 後手動處理" ;;
+  esac
+
+  # pane/runtime 在 despawn 前取：despawn 會刪掉 registry，之後就讀不到了
+  local pane runtime
+  pane="$(jq -r '.pane_id // "-"' "$f")"
+  runtime="$(jq -r '.runtime // "-"' "$f")"
+
+  # 收尾任務的文案硬編在這裡而不是抽到 share/：它是機制的一部分（「把只存在於
+  # 你 context 裡的事實寫下來」），不是可調策略。抽成檔案會多一條「檔案不存在
+  # 怎麼辦」的失敗路徑，而那條路徑一旦失敗，等於整個筆記機制悄悄消失
+  local msg
+  msg="$(cat <<'EOF'
+【收尾任務 — 這是你在被回收前的最後一輪】
+
+這個 pane 即將被回收，你的 context 會一併消失。請把「只存在於你 context 裡、
+先前 response 沒寫進去」的關鍵事實，用 reply 寫成一份筆記交回來。
+
+要寫的：
+- 你查到但沒寫進之前回覆的事實（含 file:line、指令、實測數字）
+- 走過的死路與原因（讓下一棒不必重走）
+- 未解的疑問、你當時的假設，以及哪些結論其實只是推測
+
+不要寫的：
+- 覆述已經在 response 裡的內容
+- 重新開工。這一輪只做整理，不要開始新的調查
+
+寫完請執行 agent-bridge reply <task-id> --message-file <path>（或 --message）。
+沒有值得留下的東西也請照樣 reply，寫一行「無殘值」即可——沒有回覆會被記成
+筆記未落地。
+EOF
+)"
+
+  local task_id
+  task_id="$(cmd_send "$name" --from "$from" --message "$msg")" \
+    || die "evict 中止：收尾任務送不出去，未動 pane（agent '$name' 仍在）"
+  info "evict：收尾任務 $task_id 已派給 '$name'，等待筆記落地（timeout ${timeout}s）"
+
+  # cmd_await 逾時是 die。直接呼叫會讓 evict 整支跟著退出、跳過 despawn，
+  # cap 就被一個不回話的 worker 永久卡死。包 subshell 讓 die 只殺得掉那一層
+  local final_st=""
+  final_st="$( cmd_await "$task_id" --timeout "$timeout" )" || final_st=""
+
+  local outcome
+  case "$final_st" in
+    completed) outcome=evicted ;;
+    # failed/cancelled 也是 await 的正常返回，不是逾時。全記成 evicted-timeout
+    # 會讓審計線說謊——「筆記沒落地」的原因不同，追查方向也不同
+    failed|cancelled) outcome=evicted-unfinished ;;
+    *) outcome=evicted-timeout ;;
+  esac
+
+  cmd_despawn "$name"
+  # 記在 despawn 成功之後：despawn 失敗代表 pane 還在、根本沒被驅逐，
+  # 這時寫一筆 evicted 進審計線就是假紀錄
+  log_agent_event "$outcome" "$name" "$pane" "$runtime"
+  case "$outcome" in
+    evicted)
+      info "已 evict agent '$name'；收尾筆記可用：agent-bridge read $task_id" ;;
+    evicted-unfinished)
+      err "警告：收尾任務 $task_id 以 $final_st 結束，筆記未落地；agent '$name' 仍已回收" ;;
+    *)
+      err "警告：收尾任務 $task_id 逾時（${timeout}s）未回覆，筆記未落地；agent '$name' 仍已回收（避免 cap 卡死）" ;;
+  esac
+  printf '%s\n' "$task_id"
+}
+
 main() {
   if (( $# == 0 )); then
     usage
@@ -1198,6 +1315,7 @@ main() {
     ready)      cmd_ready "$@" ;;
     disposable) cmd_disposable "$@" ;;
     idle)       cmd_idle "$@" ;;
+    evict)      cmd_evict "$@" ;;
     *)
       usage
       die "未知指令：$cmd"
