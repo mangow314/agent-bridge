@@ -194,6 +194,30 @@ agent-bridge despawn worker-1                          # 任務收尾：kill pan
 - 對 `ready: false` 的 spawned agent `send` 合法：stderr 警告但不拒送，訊息在
   mailbox 不會丟，只是通知可能延後。
 
+### relay：把主導權交給下一棒
+
+```bash
+agent-bridge relay <name> --runtime <codex|claude> --handoff <path> \
+  [--window] [--no-select] [--self-exit <my-name>]
+```
+
+`spawn` 開的是**等派工的 worker**；`relay` 開的是**接手者**——它一開始就拿到一份
+交接檔，讀完自己往下做，不等 `receive`。除了注入 `share/successor-brief.md`
+（而非 worker 守則）與切焦點之外，整條 pane 生命週期（cap／tag／回滾／夭折偵測／
+registry／審計）與 `spawn` 完全共用，不複製第二份安全不變量。
+
+- **`--self-exit <my-name>` 不是自殺，是請接手者回收前一棒。** 這不是繞路：
+  既有 `despawn` 的順序是「kill pane → 確認已死 → 清 registry → 寫審計」，
+  A 若殺自己的 pane，執行中的 process 會被 SIGHUP 帶走，永遠走不到後兩步——
+  registry 殘留、審計線斷掉。交給活著的 B 執行，順序不變量原封不動。
+- **接力鏈第一棒的人工閘門是免費的**：第一棒是人工開的 session，B 去 despawn 它
+  會被既有的「非 spawn 出身，despawn 拒絕」擋下。接手者守則明說看到這個訊息是
+  正常的、不要繞過，也不要改用 tmux 直接殺對方的 pane。
+- **`--no-select` 是 orchestrator 驅動時的常態**：主導者若是 agent 而非人，
+  切焦點沒有意義。互動接力時則預設切過去。
+- 交接檔路徑來自命令列，暴露面比內部常數大一級，因此走與 brief 相同的三道
+  防線（單引號 fail-closed、`-f && -r`、`cat --`），且全部在建 pane 之前。
+
 安全設計（全部機器可驗）：
 
 - **cap**：`.spawned == true` 的 agent 數達 `AGENT_BRIDGE_MAX_SPAWN`（預設 4）

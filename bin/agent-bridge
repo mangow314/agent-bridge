@@ -26,6 +26,14 @@ PANE_RE='^%[0-9]+$'
 SCRIPT_PATH="$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || printf '%s' "${BASH_SOURCE[0]}")"
 REPO_ROOT="$(dirname "$(dirname "$SCRIPT_PATH")")"
 WORKER_BRIEF="${AGENT_BRIDGE_WORKER_BRIEF:-$REPO_ROOT/share/worker-brief.md}"
+# 接手者守則：relay 注入的是這份而不是 worker 守則。兩者心智相反——worker 等
+# 派工、接手者一開始就有交接檔要自己往下做，把 worker 守則注入接手者會讓它
+# 空等 receive
+SUCCESSOR_BRIEF="${AGENT_BRIDGE_SUCCESSOR_BRIEF:-$REPO_ROOT/share/successor-brief.md}"
+# relay 模式旗標：非空＝cmd_spawn 走接手者路徑。用全域傳遞是為了讓 relay 共用
+# cmd_spawn 而不必改它的簽章（set -u，故必須先初始化）
+RELAY_HANDOFF=""
+RELAY_PREV=""
 
 err()  { printf 'agent-bridge: %s\n' "$*" >&2; }
 die()  { err "$*"; exit 1; }
@@ -52,6 +60,8 @@ usage() {
                                                 阻塞等待 task 到終態，印裸狀態字後 exit 0；逾時非零退出
   agent-bridge spawn <name> --runtime <codex|claude> [--window]
                                                 spawn 一個 worker pane 並註冊；stdout 只印 pane-id
+  agent-bridge relay <name> --runtime <codex|claude> --handoff <path> [--window] [--no-select] [--self-exit <my-name>]
+                                                把主導權交給新 session（注入接手者守則＋交接檔）；stdout 只印 pane-id
   agent-bridge despawn <name>                   回收 spawn 出身的 worker（kill pane＋除名；人工註冊拒殺）
   agent-bridge ready <name>                     （worker）回報就緒；僅限 spawned agent
 
@@ -659,6 +669,23 @@ worker_prompt_arg() {
     "$brief" "$name" "$name"
 }
 
+# relay 版的 initial prompt：接手者守則 ＋ 交接檔路徑 ＋（可選）要回收的前一棒。
+# 與 worker_prompt_arg 的三道防線相同，但這裡更要緊：handoff 路徑來自使用者
+# 命令列，不像 WORKER_BRIEF 是內部常數，暴露面大一級
+relay_prompt_arg() {
+  local name="$1" brief="$2" handoff="$3" prev="$4"
+  [[ "$brief" != *"'"* ]] || die "接手者 brief 路徑不可含單引號：$brief"
+  [[ "$handoff" != *"'"* ]] || die "交接檔路徑不可含單引號：$handoff"
+  # prev 已由呼叫端以 NAME_RE 驗過，這裡不再展開成 shell 字面值以外的東西
+  local tail=""
+  if [[ -n "$prev" ]]; then
+    tail="接手完成後，回收前一棒：執行 agent-bridge despawn $prev（若對方是人工開的 session，這個命令會被拒絕，那是正常的，看到就繼續做事）。"
+  fi
+  # shellcheck disable=SC2016  # $(cat …) 刻意不在此展開，留給 pane 內的 sh
+  printf '"$(cat -- '\''%s'\'')  ——以上是你的接手者守則。你的 agent 名稱是 %s。要接續的交接檔：%s。第一件事：立刻執行 agent-bridge ready %s，接著讀那份交接檔並依其「下一步」開始執行。%s"' \
+    "$brief" "$name" "$handoff" "$name" "$tail"
+}
+
 spawn_wait_ready() {
   local name="$1" pane="$2"
   # 兩個參數已由 validate_ready_opts 在建 pane 前驗過
@@ -741,8 +768,14 @@ cmd_spawn() {
   # `cat` 讀目錄會失敗、命令替換卻仍返回空字串，runtime 照樣被 exec 起來——
   # 於是開出一個沒有守則的 worker，正好是這道檢查要擋的東西。-f 一併擋掉
   # FIFO 與裝置檔（cat 會卡住或讀出無關內容）
-  [[ -f "$WORKER_BRIEF" && -r "$WORKER_BRIEF" ]] \
-    || die "worker brief 不是可讀的普通檔案：$WORKER_BRIEF（可用 AGENT_BRIDGE_WORKER_BRIEF 指定）"
+  # relay 模式注入接手者守則，其餘（cap、tag、回滾、夭折偵測、registry）完全
+  # 共用——那條路徑的安全不變量經過九輪複核，不複製第二份
+  local brief_path="$WORKER_BRIEF" brief_kind="worker brief" brief_env="AGENT_BRIDGE_WORKER_BRIEF"
+  if [[ -n "$RELAY_HANDOFF" ]]; then
+    brief_path="$SUCCESSOR_BRIEF"; brief_kind="接手者 brief"; brief_env="AGENT_BRIDGE_SUCCESSOR_BRIEF"
+  fi
+  [[ -f "$brief_path" && -r "$brief_path" ]] \
+    || die "$brief_kind 不是可讀的普通檔案：$brief_path（可用 $brief_env 指定）"
 
   validate_ready_opts
 
@@ -780,7 +813,13 @@ cmd_spawn() {
   # tag 抄進自己的 registry，就能讓 orchestrator 的 `despawn A` 殺掉 B 的 pane
   local tag tagged_cmd pane
   tag="ab-spawn-$name-$$-$(rand_suffix)$(rand_suffix)$(rand_suffix)"
-  tagged_cmd="AGENT_BRIDGE_SPAWN_TAG=$tag exec $runtime_cmd $(worker_prompt_arg "$name" "$WORKER_BRIEF")"
+  local prompt_arg
+  if [[ -n "$RELAY_HANDOFF" ]]; then
+    prompt_arg="$(relay_prompt_arg "$name" "$brief_path" "$RELAY_HANDOFF" "$RELAY_PREV")"
+  else
+    prompt_arg="$(worker_prompt_arg "$name" "$brief_path")"
+  fi
+  tagged_cmd="AGENT_BRIDGE_SPAWN_TAG=$tag exec $runtime_cmd $prompt_arg"
   # 回滾比對的是「env 前綴＋一個空白」，見 spawn_rollback
   SPAWN_RB_TAG="AGENT_BRIDGE_SPAWN_TAG=$tag"
   if (( use_window == 1 )); then
@@ -824,6 +863,72 @@ cmd_spawn() {
   printf '%s\n' "$pane" || true
   spawn_wait_ready "$name" "$pane" || true
   return 0
+}
+
+# relay：把主導權交給一個新 session。與 spawn 的差別只有兩處——注入接手者
+# 守則（而非 worker 守則）、以及把焦點切過去；cap／tag／回滾／夭折偵測／
+# registry 全部共用 cmd_spawn。
+#
+# --self-exit <my-name> 不是「自殺」：它把回收工作寫進接手者的 prompt，由 B
+# 在 ready 之後 `despawn A`。這樣做不是繞路，是因為既有 despawn 的順序是
+# 「kill pane → 確認已死 → 清 registry → 寫審計」（見 cmd_despawn），A 若殺
+# 自己的 pane，執行中的 process 會被 SIGHUP 帶走，永遠走不到後兩步——registry
+# 殘留、審計線斷掉。交給活著的 B 執行，順序不變量原封不動。
+# 附帶好處：接力鏈第一棒是人工 pane，B 去 despawn 它會被既有的「非 spawn 出身，
+# despawn 拒絕」擋下，第一棒的人工閘門不需要另寫檢查就成立。
+cmd_relay() {
+  (( $# >= 1 )) || die "用法：agent-bridge relay <name> --runtime <codex|claude> --handoff <path> [--window] [--no-select] [--self-exit <my-name>]"
+  local name="$1"; shift
+  local runtime="" use_window=0 handoff="" prev="" no_select=0
+  while (( $# > 0 )); do
+    case "$1" in
+      --runtime)
+        shift; (( $# > 0 )) || die "--runtime 需要參數"
+        runtime="$1" ;;
+      --handoff)
+        shift; (( $# > 0 )) || die "--handoff 需要參數"
+        handoff="$1" ;;
+      --self-exit)
+        shift; (( $# > 0 )) || die "--self-exit 需要參數（你自己的 agent 名稱）"
+        prev="$1" ;;
+      --window) use_window=1 ;;
+      --no-select) no_select=1 ;;
+      *) die "未知參數：$1" ;;
+    esac
+    shift
+  done
+  [[ -n "$handoff" ]] || die "relay 需要 --handoff <path>（要交棒的交接檔）"
+  [[ -z "$prev" || "$prev" =~ $NAME_RE ]] \
+    || die "--self-exit 的 agent 名稱不合法（僅允許 [A-Za-z0-9_-]+）：$prev"
+  # 交接檔的兩道檢查都必須在建 pane 之前，理由同 brief：pane 落地後才 die 會
+  # 留下佔 cap 的孤兒。-f 一併擋掉目錄與 FIFO（cat 讀目錄會失敗但命令替換仍
+  # 回空字串，接手者會拿到一份沒有交接內容的 prompt；FIFO 則讓 pane 卡在讀取）
+  [[ "$handoff" != *"'"* ]] || die "交接檔路徑不可含單引號：$handoff"
+  [[ -f "$handoff" && -r "$handoff" ]] \
+    || die "交接檔不是可讀的普通檔案：$handoff"
+
+  RELAY_HANDOFF="$handoff"
+  RELAY_PREV="$prev"
+
+  # 直接呼叫而非命令替換：cmd_spawn 的 die 必須終止整個 relay，包進 $( ) 會被
+  # subshell 吃掉、外層照常往下跑
+  local args=("$name" --runtime "$runtime")
+  (( use_window == 1 )) && args+=(--window)
+  cmd_spawn "${args[@]}"
+
+  # pane id 借自 cmd_spawn 的回滾變數（成功後仍保留），避免為了取值而開 subshell
+  local pane="$SPAWN_RB_PANE"
+  # 切焦點：orchestrator 驅動時沒有人在看畫面，--no-select 是那條路徑的常態。
+  # 失敗不致命——relay 主體（pane＋registry＋審計）此時已經成功落地
+  if (( no_select == 0 )); then
+    tmux select-window -t "$pane" 2>/dev/null || true
+    tmux select-pane -t "$pane" 2>/dev/null || true
+  fi
+  if [[ -n "$prev" ]]; then
+    info "已交棒給 '$name'；'$prev' 將由對方在接手後回收" || true
+  else
+    info "已交棒給 '$name'（前一棒未指定自動回收，請自行收尾）" || true
+  fi
 }
 
 cmd_despawn() {
@@ -959,6 +1064,7 @@ main() {
     read)       cmd_read "$@" ;;
     await)      cmd_await "$@" ;;
     spawn)      cmd_spawn "$@" ;;
+    relay)      cmd_relay "$@" ;;
     despawn)    cmd_despawn "$@" ;;
     ready)      cmd_ready "$@" ;;
     *)

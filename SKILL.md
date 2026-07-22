@@ -24,6 +24,8 @@ description: >
 ```bash
 agent-bridge list                     # 可委派 agent（name<TAB>pane_id<TAB>ready 欄：-/starting/ready）
 agent-bridge spawn <name> --runtime <codex|claude> [--window]  # 開 worker pane 並註冊；stdout 印 pane-id
+agent-bridge relay <name> --runtime <codex|claude> --handoff <path> [--window] [--no-select] [--self-exit <my-name>]
+                                      # 交棒：開接手者 pane（注入接手者守則＋交接檔），非 worker
 agent-bridge despawn <name>           # 回收自己 spawn 的 worker（人工註冊會被拒）
 agent-bridge ready <name>             # （worker）回報就緒；spawn 的探針會自動打這條
 id=$(agent-bridge send <worker> --from <me> --message-file - <<'EOF'

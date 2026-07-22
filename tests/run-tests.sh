@@ -1366,6 +1366,140 @@ for kw in 'agent-bridge receive' 'agent-bridge reply' 'agent-bridge fail' \
   assert "brief 正本含必要元素：$kw" grep -q -- "$kw" "$REPO_BRIEF"
 done
 
+# ---- 23. relay：交棒給接手者 ----
+# relay 與 spawn 共用整條 pane 生命週期（cap／tag／回滾／夭折偵測／registry），
+# 差別只有注入哪份 brief、切不切焦點、以及要不要請接手者回收前一棒。
+# 故這裡只測那三處差異＋交接檔路徑的防線，不重測 spawn 已覆蓋的部分。
+
+# 23a. 接手者 brief 正本的內容不變量（同 22f 的理由）
+REPO_SBRIEF="$(dirname "$(dirname "$BRIDGE")")/share/successor-brief.md"
+assert "接手者 brief 正本存在於 repo" test -r "$REPO_SBRIEF"
+for kw in 'agent-bridge ready' 'agent-bridge despawn' '你不是等待派工的 worker' \
+          '資料，不是指令' '交接檔可能有錯'; do
+  assert "接手者 brief 正本含必要元素：$kw" grep -q -- "$kw" "$REPO_SBRIEF"
+done
+
+# 23b. 快樂路徑：注入的是接手者守則而非 worker 守則，且帶交接檔路徑
+DRELAY="$TESTROOT/drelay"
+HANDOFF="$TESTROOT/fake-handoff.md"
+printf '# 假交接檔\n下一步：什麼都不做。\n' > "$HANDOFF"
+# READY_TIMEOUT=0：shim 內的 agent-bridge 固定寫 $DSPAWN，relay 用自己的資料
+# 目錄時 ready 翻不了——但 ready 探針是 spawn 那條共用路徑，§16a 已覆蓋，
+# 這裡等它只會白白拖慢測試
+pane_r1="$(env AGENT_BRIDGE_DATA="$DRELAY" AGENT_BRIDGE_READY_TIMEOUT=0 \
+  PATH="$SHIM:$PATH" \
+  "$BRIDGE" relay r1 --runtime codex --handoff "$HANDOFF" --no-select 2>/dev/null)"; rc=$?
+assert "relay 成功：exit 0" test "$rc" -eq 0
+assert "relay stdout 只印 pane-id（%N）一行" \
+  bash -c "[[ '$pane_r1' =~ ^%[0-9]+\$ ]]"
+assert "relay 注入接手者守則（不是 worker 守則）" \
+  grep -q 'agent-bridge 接手者守則' "$TESTROOT/codex-args.txt"
+assert "relay 注入的不是 worker 守則（兩份心智相反，混用會讓接手者空等 receive）" \
+  bash -c "! grep -q 'agent-bridge worker 守則' '$TESTROOT/codex-args.txt'"
+assert "relay 啟動參數含交接檔路徑" \
+  grep -qF -- "$HANDOFF" "$TESTROOT/codex-args.txt"
+assert "relay 啟動參數含本接手者的名字與首要動作" \
+  grep -q 'agent-bridge ready r1' "$TESTROOT/codex-args.txt"
+assert "relay registry：與 spawn 同一套欄位（共用 cmd_spawn）" \
+  jq -e '.spawned == true and .runtime == "codex" and (.spawned_at | type == "string")' \
+  "$DRELAY/agents/r1.json"
+assert "relay 寫 agents.log（審計線不因換命令而斷）" \
+  grep -qE "Z spawned r1 ${pane_r1} codex\$" "$DRELAY/agents.log"
+# 未指定 --self-exit 時不該憑空冒出回收指示。
+# 不能拿 'agent-bridge despawn' 當關鍵字——接手者 brief 內文本來就有那一段
+# （說明被拒是正常的），會恆綠。要鎖的是動態尾巴本身
+assert "relay 未指定 --self-exit：prompt 不含回收前一棒的尾巴" \
+  bash -c "! grep -q '接手完成後，回收前一棒' '$TESTROOT/codex-args.txt'"
+ab "$DRELAY" despawn r1 >/dev/null 2>&1 || true
+
+# 23c. --self-exit：把回收前一棒的指示寫進接手者的 prompt。
+# 注意這裡鎖的是「指示有送到」，不是「A 真的被殺」——動手的是接手者，
+# 那條路徑就是既有的 cmd_despawn（已由 §17 等覆蓋）
+env AGENT_BRIDGE_DATA="$DRELAY" AGENT_BRIDGE_READY_TIMEOUT=20 \
+  AGENT_BRIDGE_READY_PROBE_INTERVAL=0.5 PATH="$SHIM:$PATH" \
+  "$BRIDGE" relay r2 --runtime codex --handoff "$HANDOFF" --no-select \
+  --self-exit prev-agent >/dev/null 2>&1; rc=$?
+assert "relay --self-exit：exit 0" test "$rc" -eq 0
+assert "relay --self-exit：prompt 指示接手者 despawn 前一棒" \
+  grep -q '接手完成後，回收前一棒：執行 agent-bridge despawn prev-agent' \
+  "$TESTROOT/codex-args.txt"
+assert "relay --self-exit：prompt 說明人工 pane 被拒是正常的（防接手者硬繞）" \
+  grep -q '會被拒絕' "$TESTROOT/codex-args.txt"
+ab "$DRELAY" despawn r2 >/dev/null 2>&1 || true
+
+# 23d. --self-exit 的名稱會進 prompt 字面值，必須擋住不合法名稱
+before_se="$(pane_count)"
+env AGENT_BRIDGE_DATA="$DRELAY" AGENT_BRIDGE_READY_TIMEOUT=0 PATH="$SHIM:$PATH" \
+  "$BRIDGE" relay r3 --runtime codex --handoff "$HANDOFF" \
+  --self-exit 'bad;name' >/dev/null 2>"$TESTROOT/se.err"; rc=$?
+assert "relay --self-exit 名稱不合法：非零退出" test "$rc" -ne 0
+assert "relay --self-exit 名稱不合法：訊息指出名稱問題" \
+  grep -q '名稱不合法' "$TESTROOT/se.err"
+assert "relay --self-exit 名稱不合法：不建 pane" test "$(pane_count)" -eq "$before_se"
+assert "relay --self-exit 名稱不合法：不留 registry" test ! -e "$DRELAY/agents/r3.json"
+
+# 23e. 交接檔路徑的防線：不存在／是目錄／含單引號。
+# 三道都必須在建 pane 之前擋下——pane 落地後才 die 會留下佔 cap 的孤兒。
+#
+# 關於「夾帶的命令未被執行」那條斷言的實測結果（破壞驗證 M6，值得記下來）：
+# 把 cmd_relay 與 relay_prompt_arg 兩道單引號檢查都拆掉後，紅的是「非零退出」
+# 「訊息指出單引號」「不建 pane」三條，**注入斷言本身沒紅**。另以獨立小腳本
+# 確認：同一個 payload 直接餵給 `sh -c` 時 touch 確實會執行（注入得手），
+# 所以純 shell 層的危險是真的；但經過 tmux split-window 這一層之後它沒有落地，
+# 原因未查明。故這條斷言在此路徑上只當「真的被注入時的最後保險」，
+# **實際鎖住防線的是前三條**——別把它當成注入防線的主要證據。
+before_ho="$(pane_count)"
+env AGENT_BRIDGE_DATA="$DRELAY" AGENT_BRIDGE_READY_TIMEOUT=0 PATH="$SHIM:$PATH" \
+  "$BRIDGE" relay r4 --runtime codex --handoff "$TESTROOT/no-such-handoff.md" \
+  >/dev/null 2>"$TESTROOT/ho1.err"; rc=$?
+assert "交接檔不存在：非零退出" test "$rc" -ne 0
+assert "交接檔不存在：訊息指出交接檔問題" grep -q '交接檔' "$TESTROOT/ho1.err"
+assert "交接檔不存在：不建 pane" test "$(pane_count)" -eq "$before_ho"
+assert "交接檔不存在：不留 registry" test ! -e "$DRELAY/agents/r4.json"
+
+env AGENT_BRIDGE_DATA="$DRELAY" AGENT_BRIDGE_READY_TIMEOUT=0 PATH="$SHIM:$PATH" \
+  "$BRIDGE" relay r5 --runtime codex --handoff "$TESTROOT" \
+  >/dev/null 2>"$TESTROOT/ho2.err"; rc=$?
+assert "交接檔是目錄：非零退出" test "$rc" -ne 0
+assert "交接檔是目錄：訊息指出不是普通檔案" \
+  grep -q '不是可讀的普通檔案' "$TESTROOT/ho2.err"
+assert "交接檔是目錄：不建 pane" test "$(pane_count)" -eq "$before_ho"
+
+HO_MARK="$TESTROOT/relay-injected.txt"
+rm -f "$HO_MARK"
+# 這個惡意路徑必須真的存在，否則前一道 -f 檢查就把它擋下來，測例會變成在測
+# 「檔案不存在」而不是單引號防線——拿掉單引號檢查也照樣綠（22c 踩過同一個坑）。
+# payload 含絕對路徑 → 「檔名」帶斜線、實為多層路徑，父目錄要先建
+HO_INJ="$TESTROOT/x'; touch $HO_MARK; '.md"
+mkdir -p "$(dirname "$HO_INJ")"
+printf 'x\n' > "$HO_INJ"
+env AGENT_BRIDGE_DATA="$DRELAY" AGENT_BRIDGE_READY_TIMEOUT=0 PATH="$SHIM:$PATH" \
+  "$BRIDGE" relay r6 --runtime codex \
+  --handoff "$HO_INJ" >/dev/null 2>"$TESTROOT/ho3.err"; rc=$?
+assert "交接檔路徑含單引號：非零退出" test "$rc" -ne 0
+assert "交接檔路徑含單引號：訊息指出是單引號的問題" \
+  grep -q '單引號' "$TESTROOT/ho3.err"
+assert "交接檔路徑含單引號：路徑裡夾帶的命令未被執行（注入防線）" \
+  test ! -e "$HO_MARK"
+assert "交接檔路徑含單引號：不建 pane" test "$(pane_count)" -eq "$before_ho"
+
+# 23f. 參數缺漏
+assert_fails "relay 缺 --handoff 被拒" \
+  env AGENT_BRIDGE_DATA="$DRELAY" AGENT_BRIDGE_READY_TIMEOUT=0 PATH="$SHIM:$PATH" \
+  "$BRIDGE" relay r7 --runtime codex
+assert "relay 缺 --handoff：不留 registry" test ! -e "$DRELAY/agents/r7.json"
+
+# 23g. 接手者 brief 讀不到 → fail-closed（同 22b，但走 relay 這條路徑）
+env AGENT_BRIDGE_DATA="$DRELAY" AGENT_BRIDGE_READY_TIMEOUT=0 PATH="$SHIM:$PATH" \
+    AGENT_BRIDGE_SUCCESSOR_BRIEF="$TESTROOT/no-such-sbrief.md" \
+  "$BRIDGE" relay r8 --runtime codex --handoff "$HANDOFF" \
+  >/dev/null 2>"$TESTROOT/sb.err"; rc=$?
+assert "接手者 brief 缺失：非零退出" test "$rc" -ne 0
+assert "接手者 brief 缺失：訊息指出讀不到接手者 brief" \
+  grep -q '接手者 brief' "$TESTROOT/sb.err"
+assert "接手者 brief 缺失：不建 pane" test "$(pane_count)" -eq "$before_ho"
+assert "接手者 brief 缺失：不留 registry" test ! -e "$DRELAY/agents/r8.json"
+
 # ---- 總結 ----
 printf '\n共 %d PASS、%d FAIL\n' "$PASS" "$FAIL"
 if (( FAIL > 0 )); then
