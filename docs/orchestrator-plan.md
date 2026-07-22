@@ -1,6 +1,32 @@
-# orchestrator 層實作計畫（待確認）
+# orchestrator 層實作計畫
 
-狀態：**Phase 1／2／3 已完成，Phase 4／5 待做**
+狀態：**五個 phase 全部完成**（Phase 4 於 `2c41e6e`，Phase 5 真鏈驗收 2026-07-22 通過）
+
+## Phase 5 真鏈驗收記錄（2026-07-22，4 個真 claude worker）
+
+跑法：spawn w1 → 派一個「只准回 5 行、細節留在 context」的調查任務 → 再 spawn
+w2/w3/w4 撞滿 cap → 第 5 個 spawn 被拒 → `idle` 看池況 → `evict w1` → `read`
+收尾筆記 → spawn w5 成功。
+
+Gate 結果（全過）：
+- 撞 cap 拒絕 → evict 後 spawn 成功；`evict` 全程 28 秒
+- 收尾筆記 `read` 讀得回，內容含 file:line、「已驗證 vs 只是推測」的分級、
+  死路與未解疑問——**human judgment 判定：有實質價值**，不是空話
+- 執行前後 `locks/` 皆為空
+- `agents.log` 審計成對：`spawned w1` … `despawned w1` ＋ `evicted w1`
+
+兩個實地發現：
+
+1. **`idle_secs` 名稱重用 bug（已修）**：`last_task_at` 只認 agent 名不認 pane
+   實例，tasks/ 又是長期累積的，於是剛 spawn 39 秒的 w1 顯示 `idle_secs=21686`
+   （繼承同名前一個 worker 今早的任務）。後果是 LRU 優先驅逐一個還沒做過事的新
+   pane，決策視圖說謊。修法：`base` 取 `last_task_at` 與 `spawned_at` 較晚者。
+   已補測例 §25（破壞-復原：撤掉修補 → 精準紅 1 條）。
+2. **LRU 的反直覺處（寫進 brief）**：剛做完一輪大任務、之後沒再被派工的 worker
+   `idle_secs` 反而最大——LRU 挑中的往往正是殘值最高的那個。這不是排序壞了，
+   正是 evict 要先讓筆記落地的理由。
+
+Phase 3 落地時與本文的差異（以實作為準）：
 基線：`df400c5`（relay 已 shipped，真鏈驗證已通過）；Phase 1/2 於 `b770121` shipped
 
 Phase 3 落地時與本文的差異（以實作為準）：

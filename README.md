@@ -88,6 +88,10 @@ agent-bridge await <task-id> [--timeout <secs>]  # 阻塞至終態，印裸狀�
 agent-bridge spawn <name> --runtime <codex|claude> [--window]  # spawn worker pane；stdout 只印 pane-id
 agent-bridge despawn <name>                   # 回收 spawn 出身的 worker（人工註冊拒殺）
 agent-bridge ready <name>                     # （worker）回報就緒；僅限 spawned agent
+agent-bridge disposable <name>                # （worker）宣告本輪脈絡已無殘值，可即時回收
+agent-bridge idle                             # 回收決策視圖：name<TAB>ready<TAB>disposable<TAB>idle_secs
+agent-bridge evict <name> [--timeout <secs>] [--from <sender>]
+                                              # 派收尾任務 → 等筆記落地 → despawn；stdout 只印收尾 task-id
 ```
 
 輸出契約（機器可解析）：
@@ -285,6 +289,37 @@ registry／審計）與 `spawn` 完全共用，不複製第二份安全不變量
   夭折偵測擋下，看起來像 fail-closed 卻什麼也沒鎖住。
 - **審計**：spawn/despawn 各追加一行到 `agents.log`（append-only）。
 - despawn 對已消失的 pane（如 tmux server 重啟過）仍會清 registry，不卡死。
+
+## disposable／idle／evict：pane 的去留由上下文殘值決定
+
+worker 做完一件事不代表它該死。它腦裡可能還留著沒寫進 response 的東西——查過
+但沒寫的 file:line、走過的死路、當時的假設。那些只要還可能被追問，這個 pane
+就有價值。**預設保留**，判定者是 worker，最終回收權在 orchestrator。
+
+```bash
+agent-bridge idle                    # 看池況，挑一個
+agent-bridge evict w1                # 派收尾任務 → 等筆記落地 → despawn
+agent-bridge read <收尾 task-id>     # 讀它留下的筆記
+agent-bridge spawn w5 --runtime claude
+```
+
+- **`disposable` 是建議不是保護**：registry 位在 worker 可寫的目錄，worker 大可
+  自己改；但 `despawn` 認的是 `spawn_tag` 不是這個欄位，所以賴不掉。宣告後又被
+  派新任務時自動轉 `expired`（`disposable_at` 存在的唯一理由）。
+- **`evict` 逾時仍然 despawn**：否則一個不回話的 worker 會把 cap 永久卡死。代價
+  是筆記沒落地，所以審計要分得出來——`evicted`（已落地）／`evicted-unfinished`
+  （收尾任務 failed/cancelled）／`evicted-timeout`（等到逾時）。全記成同一種會讓
+  審計線說謊：「筆記沒落地」的原因不同，追查方向也不同。
+- **三步不包在一把鎖裡**：`LOCK_DIR` 是單值，同時持有兩把鎖時 `release_lock`
+  只放得掉一把。分段的兩個中斷點失效方向都是「多留一個佔 cap」，而不是「刪掉
+  還沒落地的脈絡」——後者是分段時唯一不可接受的失效。
+- **`spawn` 不會自動驅逐**：不加 `--evict-if-full`，殺與不殺永遠是一個獨立、
+  可審計的決定。
+- **`idle_secs` 取「最後任務」與「pane 誕生」兩者較晚者**：agent 名稱可以重用，
+  而 tasks/ 是長期累積的，只認名字會讓剛 spawn 的 worker 繼承前一個同名 pane 的
+  活動時間，在報表上看起來閒置好幾小時（真鏈驗收實地踩到：spawn 39 秒顯示 21686）。
+- 策略層完整守則見 `share/orchestrator-brief.md`（主導者）與
+  `share/worker-brief.md`（worker，spawn 時自動注入）。
 
 ## 測試
 
