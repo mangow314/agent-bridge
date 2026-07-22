@@ -57,6 +57,15 @@ wait_for() {
   "$@" >/dev/null 2>&1
 }
 
+# evt_grep <events.log> <event-name>：以「時間戳（...Z）後緊接事件名、
+# 事件名後接空白或行尾」為界比對，避免子字串誤判
+# （例：'failed' 誤中 'notify-failed' 的 'y-failed'）
+# shellcheck disable=SC2329  # 經 assert/wait_for 的 "$@" 間接呼叫
+evt_grep() {
+  local log="$1" ev="$2"
+  grep -qE "Z ${ev}([[:space:]]|\$)" "$log"
+}
+
 # ---- shim：讓 bridge 內部的 tmux 呼叫走測試 socket ----
 SHIM="$TESTROOT/shim"
 FAILSHIM="$TESTROOT/failshim"
@@ -154,7 +163,7 @@ assert "task 目錄含 metadata.json/request.md/status/events.log" bash -c \
    && test -f '$D2/tasks/$id2/status' && test -f '$D2/tasks/$id2/events.log'"
 assert "metadata version 為 JSON number 1" \
   bash -c "[[ \"\$(jq '.version' '$D2/tasks/$id2/metadata.json')\" == 1 ]]"
-assert "events.log 記錄 created" grep -q ' created ' "$D2/tasks/$id2/events.log"
+assert "events.log 記錄 created" evt_grep "$D2/tasks/$id2/events.log" created
 
 ab "$D2" read "$id2" >/dev/null 2>"$TESTROOT/d2-read.err"; rc=$?
 assert "read 於尚未 completed：非零退出" test "$rc" -ne 0
@@ -189,7 +198,7 @@ ab "$D3" receive "$id3" > "$TESTROOT/got3b.out" 2>/dev/null
 assert "re-receive 冪等：內容重印一致" diff -q "$TRICKY" "$TESTROOT/got3b.out"
 assert "re-receive 冪等：狀態仍 delivered" st_is "$D3" "$id3" delivered
 assert "re-receive 記入 events.log" \
-  grep -q ' re-receive' "$D3/tasks/$id3/events.log"
+  evt_grep "$D3/tasks/$id3/events.log" re-receive
 
 id3s="$(ab "$D3" send bob --from alice --message-file - < "$TRICKY" 2>/dev/null)"
 ab "$D3" receive "$id3s" > "$TESTROOT/got3s.out" 2>/dev/null
@@ -205,8 +214,8 @@ ab "$D3" read "$id3" > "$TESTROOT/rgot3.out" 2> "$TESTROOT/rgot3.hdr"
 assert "read stdout 與 response 原文 diff 為空" \
   diff -q "$TRICKY2" "$TESTROOT/rgot3.out"
 assert "read stderr 標頭含 task-id" grep -q "task-id: $id3" "$TESTROOT/rgot3.hdr"
-assert "events.log 記錄 replied 與 read" bash -c \
-  "grep -q ' replied' '$D3/tasks/$id3/events.log' && grep -q ' read' '$D3/tasks/$id3/events.log'"
+assert "events.log 記錄 replied" evt_grep "$D3/tasks/$id3/events.log" replied
+assert "events.log 記錄 read" evt_grep "$D3/tasks/$id3/events.log" read
 
 cp "$D3/tasks/$id3/status" "$TESTROOT/status-before"
 ab "$D3" reply "$id3" --message "again" >/dev/null 2>&1; rc=$?
@@ -226,7 +235,7 @@ assert "通知失敗：task 照常建立（queued）" st_is "$D5" "$id5" queued
 assert "通知失敗：stderr 有含 task-id 的警告" \
   grep -q "$id5" "$TESTROOT/d5-send.err"
 assert "通知失敗：events.log 記 notify-failed" \
-  grep -q ' notify-failed ' "$D5/tasks/$id5/events.log"
+  evt_grep "$D5/tasks/$id5/events.log" notify-failed
 
 # ---- 8b. 鎖失敗路徑：權限失敗 vs 真正鎖佔用 ----
 D6="$TESTROOT/d6"
@@ -267,7 +276,7 @@ ab "$D8" receive "$id8" >/dev/null 2>&1
 ab "$D8" start "$id8" 2>/dev/null; rc=$?
 assert "start 於 delivered：exit 0" test "$rc" -eq 0
 assert "start 後狀態 running" st_is "$D8" "$id8" running
-assert "events.log 記 started" grep -q ' started' "$D8/tasks/$id8/events.log"
+assert "events.log 記 started" evt_grep "$D8/tasks/$id8/events.log" started
 assert_fails "重複 start（running）報錯" ab "$D8" start "$id8"
 ab "$D8" receive "$id8" > "$TESTROOT/got8.out" 2>/dev/null
 assert "receive 於 running 冪等：內容一致" \
@@ -289,7 +298,7 @@ printf '失敗原因："權限不足"\n第二行\n' > "$FAILMSG"
 ab "$D9" fail "$id9" --message-file "$FAILMSG" 2>/dev/null; rc=$?
 assert "fail 於 delivered：exit 0" test "$rc" -eq 0
 assert "fail 後狀態 failed" st_is "$D9" "$id9" failed
-assert "events.log 記 failed" grep -q ' failed' "$D9/tasks/$id9/events.log"
+assert "events.log 記 failed" evt_grep "$D9/tasks/$id9/events.log" failed
 ab "$D9" read "$id9" > "$TESTROOT/rgot9.out" 2> "$TESTROOT/rgot9.hdr"; rc=$?
 assert "read 於 failed：exit 0" test "$rc" -eq 0
 assert "read 於 failed：內容與失敗原因 diff 為空" diff -q "$FAILMSG" "$TESTROOT/rgot9.out"
@@ -305,9 +314,9 @@ idc1="$(ab "$D10" send bob --from alice --message "c1" 2>/dev/null)"
 ab "$D10" cancel "$idc1" 2>/dev/null; rc=$?
 assert "cancel 於 queued：exit 0" test "$rc" -eq 0
 assert "cancel 後狀態 cancelled" st_is "$D10" "$idc1" cancelled
-assert "events.log 記 cancelled" grep -q ' cancelled' "$D10/tasks/$idc1/events.log"
+assert "events.log 記 cancelled" evt_grep "$D10/tasks/$idc1/events.log" cancelled
 assert "cancel 通知 worker（events 記 cmd=status）" \
-  grep -q 'cmd=status' "$D10/tasks/$idc1/events.log"
+  grep -q 'cmd=status$' "$D10/tasks/$idc1/events.log"
 assert_fails "cancelled 後 receive 報錯" ab "$D10" receive "$idc1"
 assert_fails "cancelled 後 reply 報錯" ab "$D10" reply "$idc1" --message x
 ab "$D10" read "$idc1" >/dev/null 2>"$TESTROOT/rc1.err"; rc=$?
@@ -325,6 +334,18 @@ ab "$D10" receive "$idc3" >/dev/null 2>&1
 ab "$D10" reply "$idc3" --message ok 2>/dev/null
 assert_fails "cancel 於 completed 報錯" ab "$D10" cancel "$idc3"
 assert "cancel 失敗後狀態仍 completed" st_is "$D10" "$idc3" completed
+
+# delivered → cancelled（不經 start，直接對已 receive 的 task 取消）
+idc4="$(ab "$D10" send bob --from alice --message "c4" 2>/dev/null)"
+ab "$D10" receive "$idc4" >/dev/null 2>&1
+assert "cancel 於 delivered：cancel 前狀態為 delivered" st_is "$D10" "$idc4" delivered
+ab "$D10" cancel "$idc4" 2>/dev/null; rc=$?
+assert "cancel 於 delivered：exit 0" test "$rc" -eq 0
+assert "cancel 於 delivered → cancelled" st_is "$D10" "$idc4" cancelled
+assert "cancel 於 delivered：events.log 記 cancelled" \
+  evt_grep "$D10/tasks/$idc4/events.log" cancelled
+assert_fails "cancel 於 delivered 後 reply 報錯" \
+  ab "$D10" reply "$idc4" --message late
 
 # ---- 13. await：等待終態 ----
 assert "await 於 completed：立即印 completed" \
@@ -368,12 +389,78 @@ printf '整合測試請求 "quoted"\n第二行\n' > "$REQ_IT"
 idIT="$(ab "$DATA_IT" send agent-b --from agent-a --message-file "$REQ_IT" 2>/dev/null)"
 assert "round-trip：目標 pane 自動執行 receive（→delivered）" \
   wait_for 15 st_is "$DATA_IT" "$idIT" delivered
-assert "round-trip：events.log 記錄 notified + delivered" bash -c \
-  "grep -q ' notified ' '$DATA_IT/tasks/$idIT/events.log' && grep -q ' delivered' '$DATA_IT/tasks/$idIT/events.log'"
+assert "round-trip：events.log 記錄 notified" \
+  evt_grep "$DATA_IT/tasks/$idIT/events.log" notified
+assert "round-trip：events.log 記錄 delivered" \
+  evt_grep "$DATA_IT/tasks/$idIT/events.log" delivered
 ab "$DATA_IT" reply "$idIT" --message "整合回覆 done" 2>/dev/null
 assert "round-trip：reply 後狀態 completed" st_is "$DATA_IT" "$idIT" completed
 assert "round-trip：sender pane 收到並執行 read 通知" \
   wait_for 15 grep -q 'Z read$' "$DATA_IT/tasks/$idIT/events.log"
+
+# ---- 15. 併發壓測：衝突轉換 + 大量平行 send ----
+
+# 15a. 同一 task 於 delivered 狀態並行射出 3 reply + 3 fail + 3 cancel：
+# 鎖序列化下應恰有一者得手，其餘全被狀態檢查擋下；驗證無雙終態、無殘鎖
+D12="$TESTROOT/d12"
+ab "$D12" register bob "$PANE_B" 2>/dev/null
+idp="$(ab "$D12" send bob --from alice --message "race" 2>/dev/null)"
+ab "$D12" receive "$idp" >/dev/null 2>&1
+for i in 1 2 3; do
+  ab "$D12" reply  "$idp" --message "r$i" >/dev/null 2>&1 &
+  ab "$D12" fail   "$idp" --message "f$i" >/dev/null 2>&1 &
+  ab "$D12" cancel "$idp"                 >/dev/null 2>&1 &
+done
+wait
+
+# shellcheck disable=SC2329  # 經 assert 的 "$@" 間接呼叫
+is_terminal_status() {
+  case "$1" in
+    completed|failed|cancelled) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+final_st="$(ab "$D12" status "$idp" 2>/dev/null)"
+assert "併發衝突轉換：最終狀態恰為終態三者之一" is_terminal_status "$final_st"
+
+term_count() {
+  grep -cE 'Z (replied|failed|cancelled)([[:space:]]|$)' "$1"
+}
+assert "併發衝突轉換：events.log 恰有一個終態事件" \
+  test "$(term_count "$D12/tasks/$idp/events.log")" -eq 1
+assert "併發衝突轉換：locks 目錄無殘鎖" \
+  test -z "$(ls -A "$D12/locks" 2>/dev/null)"
+
+# 15b. 同一 sender/receiver 並行 10 個 send：驗證 10 個互異 task-id、
+# 各自目錄存在且狀態合法
+D13="$TESTROOT/d13"
+ab "$D13" register bob "$PANE_B" 2>/dev/null
+PARDIR="$TESTROOT/par-send"
+mkdir -p "$PARDIR"
+for i in $(seq 1 10); do
+  ab "$D13" send bob --from alice --message "concurrent $i" \
+    > "$PARDIR/$i.id" 2>/dev/null &
+done
+wait
+mapfile -t ids13 < <(cat "$PARDIR"/*.id)
+assert "併發 send：產生 10 個 task-id" test "${#ids13[@]}" -eq 10
+assert "併發 send：10 個 task-id 互異" \
+  test "$(printf '%s\n' "${ids13[@]}" | sort -u | wc -l)" -eq 10
+
+# shellcheck disable=SC2329  # 經 assert 的 "$@" 間接呼叫
+all_ids13_ok() {
+  local id st
+  for id in "${ids13[@]}"; do
+    [[ -d "$D13/tasks/$id" ]] || return 1
+    st="$(ab "$D13" status "$id" 2>/dev/null)" || return 1
+    case "$st" in
+      queued|delivered|running|completed|failed|cancelled) ;;
+      *) return 1 ;;
+    esac
+  done
+  return 0
+}
+assert "併發 send：10 個 task 目錄皆存在且狀態合法" all_ids13_ok
 
 # ---- 總結 ----
 printf '\n共 %d PASS、%d FAIL\n' "$PASS" "$FAIL"
