@@ -1192,6 +1192,8 @@ assert "損壞 registry：pane 仍在（沒被除名成孤兒）" pane_alive "$p
 assert_fails "損壞 registry：register 拒絕覆寫" ab "$DBAD" register bad1 "$PANE_A"
 assert_fails "損壞 registry：despawn 拒絕（出身不明不動 pane）" ab "$DBAD" despawn bad1
 assert_fails "損壞 registry：ready 拒絕" ab "$DBAD" ready bad1
+assert_fails "損壞 registry：disposable 拒絕（出身不明不得標記可回收）" \
+  ab "$DBAD" disposable bad1
 assert "損壞 registry：以上拒絕都不動 pane" pane_alive "$pane_bad"
 # cap 保守計入：上限 1 且已有一份損壞 registry → 不得再 spawn
 env AGENT_BRIDGE_DATA="$DBAD" AGENT_BRIDGE_MAX_SPAWN=1 AGENT_BRIDGE_READY_TIMEOUT=0 \
@@ -1499,6 +1501,119 @@ assert "接手者 brief 缺失：訊息指出讀不到接手者 brief" \
   grep -q '接手者 brief' "$TESTROOT/sb.err"
 assert "接手者 brief 缺失：不建 pane" test "$(pane_count)" -eq "$before_ho"
 assert "接手者 brief 缺失：不留 registry" test ! -e "$DRELAY/agents/r8.json"
+
+# ---- 24. disposable：worker 自報脈絡無殘值（orchestrator Phase 1） ----
+# 語意刻意是單向宣告而非雙向旗標：預設保留，沒宣告過的一律視為仍有殘值。
+# 失效方向因此是「多留一個佔 cap」而不是「把還有用的脈絡殺掉」
+DDISP="$TESTROOT/ddisp"
+pane_dp1="$(absp "$DDISP" 0 spawn dp1 --runtime codex 2>/dev/null)"
+assert "disposable 預設不存在：剛 spawn 的 registry 沒有這個欄位（預設＝保留）" \
+  test "$(jq -r '.disposable // "absent"' "$DDISP/agents/dp1.json")" = absent
+ab "$DDISP" disposable dp1 2>/dev/null; rc=$?
+assert "disposable：exit 0" test "$rc" -eq 0
+assert "disposable：registry 翻 true" \
+  jq -e '.disposable == true' "$DDISP/agents/dp1.json"
+assert "disposable：寫下 disposable_at 時間戳（宣告可過期的依據）" \
+  jq -e '.disposable_at | test("^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$")' \
+  "$DDISP/agents/dp1.json"
+assert "disposable：不動 pane（只是宣告，不是回收）" pane_alive "$pane_dp1"
+assert "disposable：寫 agents.log 審計線（回收爭議的還原依據）" \
+  grep -qE "Z disposable dp1 " "$DDISP/agents.log"
+# 這欄位是建議不是保護：回收認的仍是 spawn_tag，故宣告不得動到 tag
+assert "disposable：spawn_tag 未被更動（回收仍認 tag，不認本欄位）" \
+  jq -e '.spawn_tag | startswith("AGENT_BRIDGE_SPAWN_TAG=")' "$DDISP/agents/dp1.json"
+assert "disposable：ready 狀態未被波及" \
+  jq -e 'has("ready")' "$DDISP/agents/dp1.json"
+ab "$DDISP" disposable dp1 2>/dev/null; rc=$?
+assert "disposable：重複宣告仍 exit 0（冪等）" test "$rc" -eq 0
+
+# 出身與輸入防護：形狀比照 ready
+ab "$DDISP" register manual-d "$PANE_A" >/dev/null 2>&1
+assert_fails "disposable：人工 agent 被拒（人工 pane 生命週期不歸 bridge 管）" \
+  ab "$DDISP" disposable manual-d
+assert "disposable：人工 agent 被拒後未寫入欄位" \
+  test "$(jq -r '.disposable // "absent"' "$DDISP/agents/manual-d.json")" = absent
+assert_fails "disposable：未註冊 agent 報錯" ab "$DDISP" disposable ghost
+assert_fails "disposable：名稱不合法被拒" ab "$DDISP" disposable "bad name"
+assert_fails "disposable：缺參數被拒" ab "$DDISP" disposable
+
+# is_spawned 的「無法判定」分支（rc=2）必須能被單獨證明。§20 那條走的是截斷成
+# 不合法 JSON 的路徑——那裡 jq 自己就會失敗、被 set -e 擋下，於是即使拆掉出身
+# 檢查測例照樣綠＝空綠（本 repo 第五次踩到同一個坑）。用「合法 JSON 但不是
+# object」才隔離得出 rc=2：jq 讀得動（null 取 field 回 null，`// "-"` 有預設值），
+# 只有 is_spawned 會擋
+printf 'null\n' > "$DDISP/agents/dp1.json"
+assert_fails "disposable：registry 是合法 JSON 但非 object → 拒絕（出身不明）" \
+  ab "$DDISP" disposable dp1
+assert "disposable：非 object registry 被拒後內容未被覆寫" \
+  test "$(tr -d '[:space:]' < "$DDISP/agents/dp1.json")" = null
+
+# ---- 25. idle：worker 池回收決策視圖（orchestrator Phase 2） ----
+DIDLE="$TESTROOT/didle"
+
+# idle_field <data-dir> <agent> <欄位序號 1-4>
+# shellcheck disable=SC2329  # 經 assert 的 "$@" 間接呼叫
+idle_field() {
+  ab "$1" idle 2>/dev/null | awk -F'\t' -v n="$2" -v c="$3" '$1 == n {print $c; exit}'
+}
+# shellcheck disable=SC2329  # 經 assert 的 "$@" 間接呼叫
+is_num() { [[ "$1" =~ ^[0-9]+$ ]]; }
+
+absp "$DIDLE" 0 spawn id1 --runtime codex >/dev/null 2>&1
+assert "idle：tasks 目錄空時不崩（exit 0）" ab "$DIDLE" idle
+assert "idle：輸出四欄 TSV（欄位順序是對外契約，orchestrator 依它決策）" \
+  test "$(ab "$DIDLE" idle 2>/dev/null | awk -F'\t' 'NR==1{print NF}')" = 4
+assert "idle：未就緒 spawned agent → ready 欄 starting" \
+  test "$(idle_field "$DIDLE" id1 2)" = starting
+assert "idle：未宣告 → disposable 欄為 -（預設保留）" \
+  test "$(idle_field "$DIDLE" id1 3)" = "-"
+assert "idle：從未被派工過也算得出 idle_secs（退回 registry 登記時間）" \
+  is_num "$(idle_field "$DIDLE" id1 4)"
+
+ab "$DIDLE" ready id1 >/dev/null 2>&1
+assert "idle：ready 後欄位變 ready" test "$(idle_field "$DIDLE" id1 2)" = ready
+ab "$DIDLE" disposable id1 >/dev/null 2>&1
+assert "idle：宣告後 disposable 欄為 yes（可即時回收）" \
+  test "$(idle_field "$DIDLE" id1 3)" = yes
+
+# 宣告過期：這是 disposable_at 存在的唯一理由——worker 宣告後若又被派新任務，
+# 它已累積新脈絡，舊宣告不該再讓 orchestrator 覺得可以直接收。
+# sleep 1 是必要的：時間戳是秒精度，同秒內 last_at 不會大於 disp_at
+sleep 1
+ab "$DIDLE" send id1 --from alice --message "後續任務" >/dev/null 2>&1
+assert "idle：宣告後又被派工 → disposable 轉 expired（宣告失效，不得誤收）" \
+  test "$(idle_field "$DIDLE" id1 3)" = expired
+assert "idle：派工後 idle_secs 改以最後任務時間計" \
+  is_num "$(idle_field "$DIDLE" id1 4)"
+
+# 人工註冊：生命週期不歸 bridge 管，兩欄都必須是 -
+ab "$DIDLE" register manual-i "$PANE_A" >/dev/null 2>&1
+assert "idle：人工 agent ready 欄為 -" test "$(idle_field "$DIDLE" manual-i 2)" = "-"
+assert "idle：人工 agent disposable 欄為 -（不歸 bridge 回收）" \
+  test "$(idle_field "$DIDLE" manual-i 3)" = "-"
+# 即使被手動塞了 disposable 欄位，人工 agent 也不得顯示成可回收
+printf '{"name":"manual-i","pane_id":"%s","registered_at":"2026-01-01T00:00:00Z","disposable":true,"disposable_at":"2026-01-01T00:00:00Z"}\n' \
+  "$PANE_A" > "$DIDLE/agents/manual-i.json"
+assert "idle：人工 agent 被手塞 disposable 仍顯示 -（不因可寫 registry 而可回收）" \
+  test "$(idle_field "$DIDLE" manual-i 3)" = "-"
+
+# 損壞 registry：不能讓整份報表消失，也不能靜靜跳過——它照樣佔著 cap
+printf '{' > "$DIDLE/agents/broken.json"
+assert "idle：損壞 registry 不讓整份報表掛掉（exit 0）" ab "$DIDLE" idle
+assert "idle：損壞 registry 以 ? 標出（照樣佔 cap，不得靜靜跳過）" \
+  test "$(idle_field "$DIDLE" broken 2)" = "?"
+assert "idle：損壞 registry 不影響其他 agent 照常列出" \
+  test "$(idle_field "$DIDLE" id1 2)" = ready
+
+# 唯讀：orchestrator 可能跑在只讀 sandbox；查詢命令不該需要寫權限
+snap_before="$(find "$DIDLE" | sort)"
+ab "$DIDLE" idle >/dev/null 2>&1
+snap_after="$(find "$DIDLE" | sort)"
+assert "idle：唯讀——執行前後檔案清單完全一致（不寫任何檔）" \
+  test "$snap_before" = "$snap_after"
+assert "idle：不取鎖——執行後 locks/ 為空" \
+  test -z "$(ls -A "$DIDLE/locks")"
+assert_fails "idle：多給參數被拒" ab "$DIDLE" idle extra
 
 # ---- 總結 ----
 printf '\n共 %d PASS、%d FAIL\n' "$PASS" "$FAIL"

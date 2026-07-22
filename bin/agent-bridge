@@ -64,6 +64,10 @@ usage() {
                                                 把主導權交給新 session（注入接手者守則＋交接檔）；stdout 只印 pane-id
   agent-bridge despawn <name>                   回收 spawn 出身的 worker（kill pane＋除名；人工註冊拒殺）
   agent-bridge ready <name>                     （worker）回報就緒；僅限 spawned agent
+  agent-bridge disposable <name>                （worker）宣告本輪脈絡已無殘值，可即時回收
+                                                （預設是保留：沒宣告過的一律視為仍有殘值）
+  agent-bridge idle                             worker 池回收決策視圖；唯讀
+                                                （name<TAB>ready<TAB>disposable<TAB>idle_secs）
 
 --message-file 用 `-` 表示讀 stdin。
 資料目錄預設 ~/.local/share/agent-bridge/，可用 AGENT_BRIDGE_DATA 覆蓋。
@@ -192,6 +196,29 @@ notify_pane() {
 check_task_id() {
   local id="$1"
   [[ "$id" =~ $TASK_ID_RE ]] || die "task-id 不合法：$id"
+}
+
+# last_task_at <agent>：最後一個派給該 agent 的任務建立時間（ISO），從未被派工
+# 則回空字串。掃 tasks/ 而不是在 send 時把 last_task_at 記進 registry——send 是
+# 核心路徑，加一次「取 registry 鎖＋寫入」會擴大它的失敗面（鎖競爭時 send 會
+# 整個失敗），而這個資訊只有回收決策要用。代價是 O(task 數)，task GC 是已知
+# backlog。
+# ISO 8601 UTC 定長字串可直接字典序比大小，不必轉 epoch。
+last_task_at() {
+  local who="$1" d latest="" ts to
+  shopt -s nullglob
+  for d in "$TASKS_DIR"/*/; do
+    [[ -f "$d/metadata.json" ]] || continue
+    # 單一損壞的 metadata 不該讓整份報表消失：跳過它，繼續看其他任務
+    to="$(jq -r '.to // ""' "$d/metadata.json" 2>/dev/null)" || continue
+    [[ "$to" == "$who" ]] || continue
+    ts="$(jq -r '.created_at // ""' "$d/metadata.json" 2>/dev/null)" || continue
+    [[ -n "$ts" ]] || continue
+    if [[ -z "$latest" || "$ts" > "$latest" ]]; then
+      latest="$ts"
+    fi
+  done
+  printf '%s' "$latest"
 }
 
 # ---- 指令 ----
@@ -558,7 +585,9 @@ cmd_await() {
 
 # ---- spawn / despawn：worker pane 生命週期 ----
 
-# 審計：$DATA_DIR/agents.log 追加 <ts> spawned|despawned <name> <pane> <runtime>
+# 審計：$DATA_DIR/agents.log 追加 <ts> spawned|despawned|disposable <name> <pane> <runtime>
+# disposable 也記一筆：它是回收決策的依據，日後若有「不該收的被收了」的爭議，
+# 審計線要能還原「誰在什麼時候宣告自己可拋」
 log_agent_event() {
   local action="$1" name="$2" pane="$3" runtime="$4"
   printf '%s %s %s %s %s\n' "$(now_iso)" "$action" "$name" "$pane" "$runtime" \
@@ -1036,6 +1065,106 @@ cmd_ready() {
   info "agent '$name' 已回報就緒（ready）"
 }
 
+# disposable：worker 宣告「本輪脈絡已無殘值，做完可以直接收」。
+#
+# 語意刻意是單向宣告而非雙向旗標：**預設保留**。沒宣告過的 worker 一律當成
+# 還有殘值，orchestrator 不該即時回收它。失效方向因此是安全的——worker 忘記
+# 宣告＝留著，最壞是多佔一個 cap（可由 evict 騰出），而不是把還有用的脈絡殺掉。
+#
+# 這個欄位是給 orchestrator 看的**建議，不是保護**。registry 位在每個 worker
+# 都可寫的資料目錄，worker 大可自己把它改掉賴著不走；但 despawn 認的是
+# spawn_tag 而不是這個欄位，所以賴不掉。不要把它當成權限機制使用。
+#
+# 一併寫 disposable_at 時間戳，是為了讓宣告能「過期」：worker 宣告後若又被派
+# 新任務，它就有了新脈絡，但標記還留著——此時 idle 比對「最後一個任務的時間
+# 晚於宣告時間」即可判定宣告失效。這樣不必在 send/receive 裡加清除邏輯，
+# 那兩條是核心路徑，能不動就不動。
+cmd_disposable() {
+  (( $# == 1 )) || die "用法：agent-bridge disposable <name>"
+  local name="$1"
+  [[ "$name" =~ $NAME_RE ]] || die "agent 名稱不合法（僅允許 [A-Za-z0-9_-]+）：$name"
+  local f="$AGENTS_DIR/$name.json"
+  # 同 ready：出身檢查與寫入之間 registry 可能被換掉，故一律鎖內檢查
+  acquire_lock agents-registry
+  [[ -f "$f" ]] || die "未註冊的 agent：$name"
+  local sp_rc=0
+  is_spawned "$f" || sp_rc=$?
+  case $sp_rc in
+    1) die "agent '$name' 非 spawn 出身，disposable 僅限 spawned agent（人工 pane 的生命週期不歸 bridge 管）" ;;
+    2) die "agent '$name' 的 registry 無法解析，disposable 拒絕；請確認 $f 後手動處理" ;;
+  esac
+  # pane/runtime 在鎖內取：出鎖後 registry 可能已被換掉，審計就記到別人頭上了
+  local pane runtime ts updated
+  pane="$(jq -r '.pane_id // "-"' "$f")"
+  runtime="$(jq -r '.runtime // "-"' "$f")"
+  ts="$(now_iso)"
+  updated="$(jq --arg ts "$ts" '.disposable = true | .disposable_at = $ts' "$f")"
+  printf '%s\n' "$updated" | atomic_write "$f"
+  release_lock
+  log_agent_event disposable "$name" "$pane" "$runtime"
+  info "agent '$name' 已宣告可回收（disposable）"
+}
+
+# idle：worker 池的回收決策視圖。**唯讀**——不取鎖、不寫任何檔案，理由同
+# cmd_await：orchestrator 可能跑在只讀 sandbox 裡，一個查詢命令不該需要寫權限。
+#
+# 輸出四欄 TSV：name / ready / disposable / idle_secs
+#
+# disposable 欄的三種值就是回收決策本身：
+#   yes      有效宣告 → 可即時回收
+#   expired  宣告過，但之後又被派了新任務——worker 已累積新脈絡，宣告失效
+#   -        沒宣告過（預設保留），或人工註冊（生命週期不歸 bridge 管）
+#
+# 「宣告會過期」刻意在**讀取端**判斷，而不是在 send/receive 裡清掉欄位：
+# 那兩條是核心路徑，能不動就不動。讀取端判斷的代價只是這裡多一次比對。
+#
+# idle_secs 取「最後一個派給它的任務建立時間」與現在的差；從未被派工過就用
+# registry 的登記時間。無法解析時間時印 `-` 而不是 0——0 會被誤讀成「剛剛才
+# 用過」，正好是驅逐決策最不該搞錯的方向。
+cmd_idle() {
+  (( $# == 0 )) || die "用法：agent-bridge idle（不接參數）"
+  local now f base_name name spawned ready disp disp_at last_at ref base secs base_epoch
+  now="$(date -u +%s)"
+  shopt -s nullglob
+  for f in "$AGENTS_DIR"/*.json; do
+    base_name="$(basename "$f" .json)"
+    # 損壞的 registry 不讓整份報表掛掉，但也不能靜靜跳過：它照樣佔著 cap，
+    # orchestrator 必須看得到「這裡有個判不出狀態的東西」
+    if ! jq -e 'type == "object"' "$f" >/dev/null 2>&1; then
+      printf '%s\t%s\t%s\t%s\n' "$base_name" '?' '?' '-'
+      continue
+    fi
+    name="$(jq -r '.name // ""' "$f")"
+    [[ -n "$name" ]] || name="$base_name"
+    spawned="$(jq -r 'if .spawned == true then "y" else "n" end' "$f")"
+    ready="$(jq -r 'if .spawned == true
+                    then (if .ready == true then "ready" else "starting" end)
+                    else "-" end' "$f")"
+    disp_at="$(jq -r 'if .disposable == true then (.disposable_at // "?") else "" end' "$f")"
+    ref="$(jq -r '.spawned_at // .registered_at // ""' "$f")"
+    last_at="$(last_task_at "$name")"
+
+    # 人工註冊的 pane 不歸 bridge 管生命週期，一律 `-`：即使有人手動塞了
+    # disposable 欄位，也不該讓它看起來可回收
+    if [[ "$spawned" != y || -z "$disp_at" ]]; then
+      disp="-"
+    elif [[ "$disp_at" != "?" && -n "$last_at" && "$last_at" > "$disp_at" ]]; then
+      disp="expired"
+    else
+      disp="yes"
+    fi
+
+    base="$last_at"
+    [[ -n "$base" ]] || base="$ref"
+    secs="-"
+    if [[ -n "$base" ]] && base_epoch="$(date -u -d "$base" +%s 2>/dev/null)"; then
+      secs=$(( now - base_epoch ))
+      (( secs < 0 )) && secs=0
+    fi
+    printf '%s\t%s\t%s\t%s\n' "$name" "$ready" "$disp" "$secs"
+  done
+}
+
 main() {
   if (( $# == 0 )); then
     usage
@@ -1067,6 +1196,8 @@ main() {
     relay)      cmd_relay "$@" ;;
     despawn)    cmd_despawn "$@" ;;
     ready)      cmd_ready "$@" ;;
+    disposable) cmd_disposable "$@" ;;
+    idle)       cmd_idle "$@" ;;
     *)
       usage
       die "未知指令：$cmd"
