@@ -10,7 +10,6 @@ DATA_DIR="${AGENT_BRIDGE_DATA:-$HOME/.local/share/agent-bridge}"
 AGENTS_DIR="$DATA_DIR/agents"
 TASKS_DIR="$DATA_DIR/tasks"
 LOCKS_DIR="$DATA_DIR/locks"
-LOGS_DIR="$DATA_DIR/logs"
 
 NAME_RE='^[A-Za-z0-9_-]+$'
 TASK_ID_RE='^[A-Za-z0-9._-]+$'
@@ -23,17 +22,25 @@ usage() {
   cat >&2 <<'EOF'
 用法：
   agent-bridge register <agent> <tmux-target>   註冊 agent 與其 tmux pane
+  agent-bridge unregister <agent>               移除 agent 註冊
   agent-bridge list                             列出已註冊 agent（name<TAB>pane_id）
   agent-bridge send <agent> --from <sender> (--message <text> | --message-file <path>)
                                                 委派任務；stdout 只印 task-id
   agent-bridge receive <task-id>                取出任務（標頭走 stderr、request 原文走 stdout）
+  agent-bridge start <task-id>                  （worker）標記開工（delivered → running）
   agent-bridge reply <task-id> (--message <text> | --message-file <path>)
-                                                回覆任務（僅 delivered 可回）
-  agent-bridge status <task-id>                 印裸狀態字（queued/delivered/completed）
-  agent-bridge read <task-id>                   讀回覆（標頭走 stderr、response 原文走 stdout）
+                                                回覆任務（delivered/running 可回）
+  agent-bridge fail <task-id> (--message <text> | --message-file <path>)
+                                                回報任務失敗（delivered/running 可；訊息＝失敗原因）
+  agent-bridge cancel <task-id>                 取消任務（queued/delivered/running 可）
+  agent-bridge status <task-id>                 印裸狀態字（queued/delivered/running/completed/failed/cancelled）
+  agent-bridge read <task-id>                   讀回覆（completed/failed 可；標頭走 stderr、response 原文走 stdout）
+  agent-bridge await <task-id> [--timeout <secs>]
+                                                阻塞等待 task 到終態，印裸狀態字後 exit 0；逾時非零退出
 
 --message-file 用 `-` 表示讀 stdin。
 資料目錄預設 ~/.local/share/agent-bridge/，可用 AGENT_BRIDGE_DATA 覆蓋。
+await 輪詢間隔預設 1 秒，可用 AGENT_BRIDGE_POLL_INTERVAL 覆蓋；--timeout 0（預設）＝不逾時。
 EOF
 }
 
@@ -41,7 +48,7 @@ now_iso() { date -u +%Y-%m-%dT%H:%M:%SZ; }
 
 rand_suffix() { head -c 2 /dev/urandom | od -An -tx1 | tr -d ' \n'; }
 
-ensure_dirs() { mkdir -p "$AGENTS_DIR" "$TASKS_DIR" "$LOCKS_DIR" "$LOGS_DIR"; }
+ensure_dirs() { mkdir -p "$AGENTS_DIR" "$TASKS_DIR" "$LOCKS_DIR"; }
 
 require_jq() {
   command -v jq >/dev/null 2>&1 \
@@ -155,6 +162,16 @@ cmd_register() {
   info "已註冊 agent '$name' → pane $pane"
 }
 
+cmd_unregister() {
+  (( $# == 1 )) || die "用法：agent-bridge unregister <agent>"
+  local name="$1"
+  [[ "$name" =~ $NAME_RE ]] || die "agent 名稱不合法（僅允許 [A-Za-z0-9_-]+）：$name"
+  local f="$AGENTS_DIR/$name.json"
+  [[ -f "$f" ]] || die "未註冊的 agent：$name"
+  rm -- "$f"
+  info "已移除 agent '$name' 的註冊"
+}
+
 cmd_list() {
   local f name pane
   shopt -s nullglob
@@ -244,11 +261,11 @@ cmd_receive() {
       update_meta_status "$dir" delivered
       log_event "$id" delivered
       ;;
-    delivered)
+    delivered|running)
       log_event "$id" re-receive
       ;;
     *)
-      die "task 狀態為 $st，無法 receive（僅 queued/delivered 可）"
+      die "task 狀態為 $st，無法 receive（僅 queued/delivered/running 可）"
       ;;
   esac
   release_lock
@@ -264,38 +281,45 @@ cmd_receive() {
   cat "$dir/request.md"
 }
 
-cmd_reply() {
-  (( $# >= 1 )) || die "用法：agent-bridge reply <task-id> (--message <text> | --message-file <path>)"
-  local id="$1"; shift
-  check_task_id "$id"
-  local mode="" val=""
+# parse_message_opts <cmd-name> <args...>：解析 --message / --message-file，
+# 結果放進 MSG_MODE / MSG_VAL（bash 函式無法回傳多值，走全域）
+MSG_MODE=""
+MSG_VAL=""
+parse_message_opts() {
+  local cmdname="$1"; shift
+  MSG_MODE=""; MSG_VAL=""
   while (( $# > 0 )); do
     case "$1" in
       --message)
         shift; (( $# > 0 )) || die "--message 需要參數"
-        [[ -z "$mode" ]] || die "--message 與 --message-file 只能擇一"
-        mode="text"; val="$1" ;;
+        [[ -z "$MSG_MODE" ]] || die "--message 與 --message-file 只能擇一"
+        MSG_MODE="text"; MSG_VAL="$1" ;;
       --message-file)
         shift; (( $# > 0 )) || die "--message-file 需要參數"
-        [[ -z "$mode" ]] || die "--message 與 --message-file 只能擇一"
-        mode="file"; val="$1" ;;
+        [[ -z "$MSG_MODE" ]] || die "--message 與 --message-file 只能擇一"
+        MSG_MODE="file"; MSG_VAL="$1" ;;
       *) die "未知參數：$1" ;;
     esac
     shift
   done
-  [[ -n "$mode" ]] || die "reply 需要 --message 或 --message-file"
+  [[ -n "$MSG_MODE" ]] || die "$cmdname 需要 --message 或 --message-file"
+}
 
+# respond_task <id> <final-status> <event> <cmd-name>：reply / fail 的共用主體——
+# 寫 response.md、轉終態、通知 sender 讀回覆（訊息內容取自 MSG_MODE/MSG_VAL）
+respond_task() {
+  local id="$1" final="$2" ev="$3" cmdname="$4"
   local dir="$TASKS_DIR/$id"
   [[ -d "$dir" ]] || die "找不到 task：$id"
 
   acquire_lock "$id"
   local st; st="$(<"$dir/status")"
-  if [[ "$st" != "delivered" ]]; then
-    die "task 狀態為 $st，僅 delivered 可 reply（queued 請先 receive；completed 不可重複 reply）"
+  if [[ "$st" != "delivered" && "$st" != "running" ]]; then
+    die "task 狀態為 $st，僅 delivered/running 可 $cmdname（queued 請先 receive；終態不可再變更）"
   fi
-  write_message "$dir/response.md" "$mode" "$val"
-  update_meta_status "$dir" completed
-  log_event "$id" replied
+  write_message "$dir/response.md" "$MSG_MODE" "$MSG_VAL"
+  update_meta_status "$dir" "$final"
+  log_event "$id" "$ev"
   release_lock
 
   local from; from="$(jq -r '.from' "$dir/metadata.json")"
@@ -308,7 +332,73 @@ cmd_reply() {
       err "警告：無法通知 $from（pane $pane）；請手動在對方 session 執行：agent-bridge read $id"
     fi
   fi
+}
+
+cmd_reply() {
+  (( $# >= 1 )) || die "用法：agent-bridge reply <task-id> (--message <text> | --message-file <path>)"
+  local id="$1"; shift
+  check_task_id "$id"
+  parse_message_opts reply "$@"
+  respond_task "$id" completed replied reply
   info "已回覆 task $id（completed）"
+}
+
+cmd_fail() {
+  (( $# >= 1 )) || die "用法：agent-bridge fail <task-id> (--message <text> | --message-file <path>)"
+  local id="$1"; shift
+  check_task_id "$id"
+  parse_message_opts fail "$@"
+  respond_task "$id" failed failed fail
+  info "已回報 task $id 失敗（failed）"
+}
+
+cmd_start() {
+  (( $# == 1 )) || die "用法：agent-bridge start <task-id>"
+  local id="$1"
+  check_task_id "$id"
+  local dir="$TASKS_DIR/$id"
+  [[ -d "$dir" ]] || die "找不到 task：$id"
+
+  acquire_lock "$id"
+  local st; st="$(<"$dir/status")"
+  if [[ "$st" != "delivered" ]]; then
+    die "task 狀態為 $st，僅 delivered 可 start（queued 請先 receive）"
+  fi
+  update_meta_status "$dir" running
+  log_event "$id" started
+  release_lock
+  info "task $id 開工（running）"
+}
+
+cmd_cancel() {
+  (( $# == 1 )) || die "用法：agent-bridge cancel <task-id>"
+  local id="$1"
+  check_task_id "$id"
+  local dir="$TASKS_DIR/$id"
+  [[ -d "$dir" ]] || die "找不到 task：$id"
+
+  acquire_lock "$id"
+  local st; st="$(<"$dir/status")"
+  case "$st" in
+    queued|delivered|running) ;;
+    *) die "task 狀態為 $st，無法 cancel（僅 queued/delivered/running 可）" ;;
+  esac
+  update_meta_status "$dir" cancelled
+  log_event "$id" cancelled
+  release_lock
+
+  # 通知 worker 查狀態（會看到 cancelled）；通知失敗不影響取消本身
+  local to; to="$(jq -r '.to' "$dir/metadata.json")"
+  if [[ -f "$AGENTS_DIR/$to.json" ]]; then
+    local pane; pane="$(jq -r '.pane_id' "$AGENTS_DIR/$to.json")"
+    if notify_pane "$pane" "agent-bridge status $id"; then
+      log_event "$id" notified "pane=$pane cmd=status"
+    else
+      log_event "$id" notify-failed "pane=$pane cmd=status"
+      err "警告：無法通知 $to（pane $pane）；對方查 status $id 時會看到 cancelled"
+    fi
+  fi
+  info "已取消 task $id（cancelled）"
 }
 
 cmd_status() {
@@ -328,9 +418,15 @@ cmd_read() {
   [[ -d "$dir" ]] || die "找不到 task：$id"
 
   local st; st="$(<"$dir/status")"
-  if [[ "$st" != "completed" ]]; then
-    die "task $id 尚未回覆（狀態：$st）；查詢進度請用 agent-bridge status $id"
-  fi
+  case "$st" in
+    completed|failed) ;;
+    cancelled)
+      die "task $id 已取消（cancelled），沒有回覆可讀"
+      ;;
+    *)
+      die "task $id 尚未回覆（狀態：$st）；查詢進度請用 agent-bridge status $id"
+      ;;
+  esac
 
   local from to
   from="$(jq -r '.from' "$dir/metadata.json")"
@@ -342,6 +438,43 @@ cmd_read() {
   } >&2
   log_event "$id" read
   cat "$dir/response.md"
+}
+
+# await：sender 端的等待原語。唯讀輪詢 status 檔（不寫 events、不取鎖），
+# 在只讀 sandbox 內也能用；設計給「送出後在背景等回覆」的用法。
+cmd_await() {
+  (( $# >= 1 )) || die "用法：agent-bridge await <task-id> [--timeout <secs>]"
+  local id="$1"; shift
+  check_task_id "$id"
+  local timeout=0
+  while (( $# > 0 )); do
+    case "$1" in
+      --timeout)
+        shift; (( $# > 0 )) || die "--timeout 需要參數"
+        [[ "$1" =~ ^[0-9]+$ ]] || die "--timeout 需為非負整數（秒），0＝不逾時：$1"
+        timeout="$1" ;;
+      *) die "未知參數：$1" ;;
+    esac
+    shift
+  done
+  local dir="$TASKS_DIR/$id"
+  [[ -d "$dir" ]] || die "找不到 task：$id"
+
+  local interval="${AGENT_BRIDGE_POLL_INTERVAL:-1}" st
+  SECONDS=0
+  while :; do
+    st="$(<"$dir/status")"
+    case "$st" in
+      completed|failed|cancelled)
+        printf '%s\n' "$st"
+        return 0
+        ;;
+    esac
+    if (( timeout > 0 && SECONDS >= timeout )); then
+      die "await 逾時（${timeout}s）：task $id 目前狀態 $st"
+    fi
+    sleep "$interval"
+  done
 }
 
 main() {
@@ -359,13 +492,18 @@ main() {
   require_jq
   ensure_dirs
   case "$cmd" in
-    register) cmd_register "$@" ;;
-    list)     cmd_list "$@" ;;
-    send)     cmd_send "$@" ;;
-    receive)  cmd_receive "$@" ;;
-    reply)    cmd_reply "$@" ;;
-    status)   cmd_status "$@" ;;
-    read)     cmd_read "$@" ;;
+    register)   cmd_register "$@" ;;
+    unregister) cmd_unregister "$@" ;;
+    list)       cmd_list "$@" ;;
+    send)       cmd_send "$@" ;;
+    receive)    cmd_receive "$@" ;;
+    start)      cmd_start "$@" ;;
+    reply)      cmd_reply "$@" ;;
+    fail)       cmd_fail "$@" ;;
+    cancel)     cmd_cancel "$@" ;;
+    status)     cmd_status "$@" ;;
+    read)       cmd_read "$@" ;;
+    await)      cmd_await "$@" ;;
     *)
       usage
       die "未知指令：$cmd"
