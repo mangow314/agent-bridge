@@ -1159,8 +1159,15 @@ cmd_idle() {
       disp="yes"
     fi
 
+    # 取「最後任務」與「這個 pane 誕生」兩者較晚者。agent 名稱可以重用，而
+    # last_task_at 只認名字不認 pane 實例：tasks/ 裡若留著同名前一個 worker 的
+    # 任務，剛 spawn 的 worker 會繼承那個時間，在 idle 報表上看起來閒置了好幾
+    # 小時，於是 LRU 優先驅逐一個其實還沒做過事的新 pane。閒置時間不該早於
+    # 誕生時間。（真鏈驗收 2026-07-22 實地踩到）
     base="$last_at"
-    [[ -n "$base" ]] || base="$ref"
+    if [[ -z "$base" || ( -n "$ref" && "$ref" > "$base" ) ]]; then
+      base="$ref"
+    fi
     secs="-"
     if [[ -n "$base" ]] && base_epoch="$(date -u -d "$base" +%s 2>/dev/null)"; then
       secs=$(( now - base_epoch ))

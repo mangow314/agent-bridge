@@ -1586,6 +1586,20 @@ assert "idle：宣告後又被派工 → disposable 轉 expired（宣告失效�
 assert "idle：派工後 idle_secs 改以最後任務時間計" \
   is_num "$(idle_field "$DIDLE" id1 4)"
 
+# 名稱重用：tasks/ 是長期累積的（GC 仍是 backlog），同一個名字可能有前一個
+# pane 留下的任務。idle_secs 若採信那個時間，剛 spawn 的 worker 會顯示成閒置
+# 好幾小時，LRU 就會優先驅逐一個還沒做過事的新 pane——決策視圖說謊。
+# 真鏈驗收 2026-07-22 實地踩到：w1 才 spawn 39 秒卻顯示 21686。
+ab "$DIDLE" send reborn --from alice --message "前世任務" >/dev/null 2>&1
+old_dirs=( "$DIDLE"/tasks/*/ )   # 目錄名是 UTC 時間戳，glob 的字典序＝時間序
+old_t="${old_dirs[-1]}"
+printf '{"id":"x","from":"alice","to":"reborn","created_at":"2020-01-01T00:00:00Z"}\n' \
+  > "$old_t/metadata.json"
+absp "$DIDLE" 0 spawn reborn --runtime codex >/dev/null 2>&1
+assert "idle：同名前一輪的舊任務不得讓新 pane 看起來閒置多年（LRU 會誤殺）" \
+  test "$(idle_field "$DIDLE" reborn 4)" -lt 3600
+ab "$DIDLE" despawn reborn >/dev/null 2>&1
+
 # 人工註冊：生命週期不歸 bridge 管，兩欄都必須是 -
 ab "$DIDLE" register manual-i "$PANE_A" >/dev/null 2>&1
 assert "idle：人工 agent ready 欄為 -" test "$(idle_field "$DIDLE" manual-i 2)" = "-"
