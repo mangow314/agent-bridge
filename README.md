@@ -144,6 +144,13 @@ tests/run-tests.sh
 純 bash、零額外依賴。整合測試使用獨立 socket
 `tmux -L agent-bridge-test -f /dev/null`，不碰使用者真實 tmux server。
 
+## 開發慣例
+
+- **chezmoi 側變更走 topic branch + worktree**（2026-07-22 起）：本專案在
+  chezmoi repo 的配套變更（codex config 模板、skill symlink、hook 煙測）
+  一律在 chezmoi repo 開 topic branch 並用獨立 worktree 作業，審過再併回
+  master——不直接在 master 與使用者日常 dotfile 變更混流。
+
 ## 已知限制
 
 - **agent 忙碌時通知會延後處理**：send-keys 打進去的指令要等對方 REPL 輪到

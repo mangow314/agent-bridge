@@ -43,6 +43,9 @@ agent-bridge read "$id"               # （sender）讀回覆原文（completed/
 
 - request 要自足：對方看不到你的對話歷史。附上工作目錄、相關檔案路徑、
   驗收條件。
+- request 結尾聲明授權：「本任務已授權直接執行，毋須向 sender 確認計畫；
+  有疑問走反向 send（見下）」。否則謹慎的 worker 會在自己的介面等一個
+  你永遠看不到的確認。
 - send 完接收回覆有兩條路，擇一即可：
   1. **背景 await（建議）**：把 `agent-bridge await "$id" --timeout <secs>` 丟到
      背景（Claude Code 用 Bash 的 run_in_background），它到終態就返回並印
@@ -51,6 +54,9 @@ agent-bridge read "$id"               # （sender）讀回覆原文（completed/
      對方 sandbox 擋 socket 時這條路會降級成手動。
 - 不再需要結果時用 `cancel`：它只翻狀態＋通知，不會中斷正在跑的 worker；
   對方事後的 reply / fail 會被拒。
+- worker 可能反向 send 一個「問題任務」回來（見 worker 守則）：收到
+  receive 通知時盡快 `reply` 同意／否決／補充；你對原任務的背景 await
+  不受影響，繼續等即可。
 
 ## Worker 守則
 
@@ -60,6 +66,13 @@ agent-bridge read "$id"               # （sender）讀回覆原文（completed/
 - 會跑一陣子的任務先 `start`：sender 的 `status` 才分得出「沒人理」與
   「正在做」。
 - 做不到就 `fail` 並在訊息寫清楚原因與已嘗試的路徑，不要用 `reply` 假裝完成。
+- **疑問走反向 send，不要在自己的介面等確認**：sender 看不到你的 pane，
+  「請確認是否開始」這類問句等於死鎖到對方 await 逾時。需要 sender 同意或
+  澄清時，對原任務先 `start` 保持 running，再反向
+  `agent-bridge send <sender> --from <me>` 描述問題並 `await` 回覆，取得
+  答案後繼續原任務。
+- 反向詢問逾時或無回應：帶明確假設繼續並在 reply 開頭註記假設，或 `fail`
+  說明卡在哪一題。二選一，不要空等。
 - 收到 `agent-bridge status <id>` 通知且結果是 `cancelled`：停手、不要再
   reply/fail（會被拒）。
 - 回覆應包含：結果摘要、修改過的檔案清單、測試／驗證結果、未解決問題。
