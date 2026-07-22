@@ -18,6 +18,15 @@ TASK_ID_RE='^[A-Za-z0-9._-]+$'
 # 一個 pane_id 寫成 `%1 ; kill-server` 就能殺掉整個 server
 PANE_RE='^%[0-9]+$'
 
+# worker brief：spawn 出來的 runtime 是一個全新、零脈絡的 session——它不知道
+# 自己是 worker，也不知道 pane 裡收到的 `agent-bridge receive <id>` 是要執行的
+# 命令而非有人在跟它說話。實測（codex 0.145）會把就緒探針當成對話反覆回覆
+# 文字、永遠不 ready。故啟動時把這份守則當 initial prompt 注入。
+# 正本是一份檔而不是內嵌字串：人工註冊的 worker 讀同一份，兩邊不會漂移。
+SCRIPT_PATH="$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || printf '%s' "${BASH_SOURCE[0]}")"
+REPO_ROOT="$(dirname "$(dirname "$SCRIPT_PATH")")"
+WORKER_BRIEF="${AGENT_BRIDGE_WORKER_BRIEF:-$REPO_ROOT/share/worker-brief.md}"
+
 err()  { printf 'agent-bridge: %s\n' "$*" >&2; }
 die()  { err "$*"; exit 1; }
 info() { printf '%s\n' "$*" >&2; }
@@ -629,6 +638,27 @@ validate_ready_opts() {
     || die "AGENT_BRIDGE_READY_PROBE_INTERVAL 需大於 0（否則探針會忙迴圈）：$i"
 }
 
+# 把 brief 檔＋動態尾巴組成 runtime 的 initial prompt 參數（單一 shell word）。
+# brief 全文刻意不進命令列：改讓 tmux 的 sh -c 在 pane 內展開 $(cat ...)，
+# 啟動指令因此維持短、pane_start_command 仍可讀，也免去把整份 Markdown 塞進
+# 命令字串的跳脫地獄。代價是展開時機延到 pane 啟動：brief 雖已於建 pane 前
+# 驗過是可讀的普通檔案，那之後仍有 TOCTOU 空隙——被刪或換掉會退化成沒有守則
+# 的 worker，換成 FIFO 之類讀不完的來源則會讓 pane 卡在讀取。兩者都不會殺錯
+# 東西，但後者會留下佔 cap 的 starting pane（見 README「殘留缺口」）
+worker_prompt_arg() {
+  local name="$1" brief="$2"
+  # 路徑要以單引號字面值送進 sh；含單引號就湊不出安全的字面值，fail-closed
+  [[ "$brief" != *"'"* ]] || die "worker brief 路徑不可含單引號：$brief"
+  # 尾巴保持單行：換行進 tmux 命令字串只是徒增變數。
+  # $name 已由 NAME_RE 限成 [A-Za-z0-9_-]+，沒有注入面
+  # shellcheck disable=SC2016  # $(cat …) 刻意不在此展開，留給 pane 內的 sh
+  # `cat --`：AGENT_BRIDGE_WORKER_BRIEF 是公開覆蓋介面，接得到相對路徑；
+  # 少了 option terminator，一個叫 `--help` 的檔案會被 cat 當成選項，
+  # spawn 照樣成功卻注入了完全錯誤的 prompt
+  printf '"$(cat -- '\''%s'\'')  ——以上是你的 worker 守則。你的 agent 名稱是 %s。第一件事：立刻執行 agent-bridge ready %s"' \
+    "$brief" "$name" "$name"
+}
+
 spawn_wait_ready() {
   local name="$1" pane="$2"
   # 兩個參數已由 validate_ready_opts 在建 pane 前驗過
@@ -671,6 +701,11 @@ cmd_spawn() {
   [[ "$name" =~ $NAME_RE ]] || die "agent 名稱不合法（僅允許 [A-Za-z0-9_-]+）：$name"
   [[ -n "$runtime" ]] || die "spawn 需要 --runtime <runtime>（v1 僅支援 codex）"
 
+  # runtime 表：指令 ＋ 守則注入方式。目前每個 runtime 都走「initial prompt
+  # 位置參數」（codex/claude/gemini 等 agent CLI 的共通形狀：`cmd [OPTIONS]
+  # [PROMPT]`）。新增 runtime 前先實測該 CLI 的位置參數確實會被當第一則 user
+  # message 執行；若某個 runtime 只吃 stdin 或需要別的旗標，這裡要一併長出
+  # 對應的注入方式，不要硬套。v1 只實作實測過的 codex
   local runtime_cmd
   case "$runtime" in
     codex) runtime_cmd="codex --profile agent-worker" ;;
@@ -679,6 +714,17 @@ cmd_spawn() {
   command -v tmux >/dev/null 2>&1 || die "找不到 tmux，spawn 需要 tmux"
   command -v "${runtime_cmd%% *}" >/dev/null 2>&1 \
     || die "找不到 runtime 指令：${runtime_cmd%% *}"
+
+  # brief 讀不到就不開 pane：沒有守則的 worker 收到探針只會當成對話回覆，
+  # 開出來也是壞的（正是這條路徑當初讓 Phase 4 gate 失敗）。檢查必須在建
+  # pane 之前，理由同 validate_ready_opts：pane 落地後才 die 會留下一個
+  # 佔著 cap 的 worker
+  # 要驗普通檔案，不能只驗可讀：`[[ -r ]]` 對目錄一樣成立，而 pane 內的
+  # `cat` 讀目錄會失敗、命令替換卻仍返回空字串，runtime 照樣被 exec 起來——
+  # 於是開出一個沒有守則的 worker，正好是這道檢查要擋的東西。-f 一併擋掉
+  # FIFO 與裝置檔（cat 會卡住或讀出無關內容）
+  [[ -f "$WORKER_BRIEF" && -r "$WORKER_BRIEF" ]] \
+    || die "worker brief 不是可讀的普通檔案：$WORKER_BRIEF（可用 AGENT_BRIDGE_WORKER_BRIEF 指定）"
 
   validate_ready_opts
 
@@ -716,7 +762,7 @@ cmd_spawn() {
   # tag 抄進自己的 registry，就能讓 orchestrator 的 `despawn A` 殺掉 B 的 pane
   local tag tagged_cmd pane
   tag="ab-spawn-$name-$$-$(rand_suffix)$(rand_suffix)$(rand_suffix)"
-  tagged_cmd="AGENT_BRIDGE_SPAWN_TAG=$tag exec $runtime_cmd"
+  tagged_cmd="AGENT_BRIDGE_SPAWN_TAG=$tag exec $runtime_cmd $(worker_prompt_arg "$name" "$WORKER_BRIEF")"
   # 回滾比對的是「env 前綴＋一個空白」，見 spawn_rollback
   SPAWN_RB_TAG="AGENT_BRIDGE_SPAWN_TAG=$tag"
   if (( use_window == 1 )); then

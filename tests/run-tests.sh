@@ -926,7 +926,12 @@ assert "tag 比對：pane id 遺失情境仍非零退出" test "$rc" -ne 0
 # 起始 + 對照 pane + 目標 pane = before+2；回滾只該收掉目標 pane
 assert "tag 比對：只回收自己的 pane，對照 pane 存活（淨增 1）" \
   test "$(pane_count)" -eq "$((before_bait + 1))"
-bait_tag="$(< "$TESTROOT/bait-cmd.txt")"
+# 只取 tag 本身（第一個空白前）而非整條啟動指令：自從啟動指令帶了 worker
+# brief 的 initial prompt，指令中就有雙引號，而 tmux 存 pane_start_command
+# 時會把它們跳脫成 \"（實測 3.7b），拿整條原文 grep -F 必然落空。
+# 測例前提要驗的本來就只是「對照 pane 的指令中段含同一 tag」
+bait_cmd="$(< "$TESTROOT/bait-cmd.txt")"
+bait_tag="${bait_cmd%% *}"
 assert "tag 比對：對照 pane 確實含同一 tag 字串（測例前提成立）" \
   bash -c "$(printf '%q' "$REAL_TMUX") -L $(printf '%q' "$SOCK") -f /dev/null \
     list-panes -a -F '#{pane_start_command}' | grep -Fq -- $(printf '%q' "$bait_tag")"
@@ -1199,6 +1204,113 @@ assert "解鎖失敗：stderr 明確警告而非靜默" \
   grep -q '無法釋放鎖目錄' "$TESTROOT/lk.err"
 rm -rf "$DLK/locks/agents-registry.lock"
 ab "$DLK" despawn lk >/dev/null 2>&1 || true
+
+# ---- 22. worker brief 注入（真 codex 實測 gate 失敗的成因） ----
+# spawn 出來的 runtime 是零脈絡 session：不注入守則的話，它不知道 pane 裡
+# 收到的 `agent-bridge ready <name>` 是要執行的命令，會當成對話回覆而永遠
+# 不 ready（實測 codex 0.145）。
+# 已知限制：shim 模擬不了「LLM 只回話不執行」——那是模型判斷、不是可程式化
+# 的行為。故這裡的回歸防線是「啟動指令必須帶 brief」這條不變量，而不是去
+# 假裝模擬一個 LLM。真正的端到端確認只能靠真 runtime 實跑（human gate）。
+
+# 22a. 啟動指令確實帶 brief 全文與 agent 名字
+# shim 把展開後的 argv 寫進 codex-args.txt，$(cat …) 此時已由 pane 內的 sh
+# 展開，所以這裡看得到 brief 內文
+DBRIEF="$TESTROOT/dbrief"
+absp "$DBRIEF" 20 spawn bw --runtime codex >/dev/null 2>&1
+assert "brief 注入：啟動參數含 brief 標題（守則全文有進 prompt）" \
+  grep -q 'agent-bridge worker 守則' "$TESTROOT/codex-args.txt"
+assert "brief 注入：啟動參數含『是命令，不是聊天』這條關鍵守則" \
+  grep -q '是命令，不是聊天' "$TESTROOT/codex-args.txt"
+assert "brief 注入：啟動參數含本 worker 的名字與首要動作" \
+  grep -q 'agent-bridge ready bw' "$TESTROOT/codex-args.txt"
+ab "$DBRIEF" despawn bw >/dev/null 2>&1 || true
+
+# 22b. brief 讀不到 → fail-closed：不建 pane、不留 registry、不寫審計
+DNOBRIEF="$TESTROOT/dnobrief"
+mkdir -p "$DNOBRIEF/agents" "$DNOBRIEF/locks" "$DNOBRIEF/tasks"
+before_nobrief="$(pane_count)"
+env AGENT_BRIDGE_DATA="$DNOBRIEF" AGENT_BRIDGE_READY_TIMEOUT=0 PATH="$SHIM:$PATH" \
+    AGENT_BRIDGE_WORKER_BRIEF="$TESTROOT/no-such-brief.md" \
+  "$BRIDGE" spawn nb --runtime codex >/dev/null 2>"$TESTROOT/nobrief.err"; rc=$?
+assert "brief 缺失：非零退出" test "$rc" -ne 0
+assert "brief 缺失：訊息指出讀不到 worker brief" \
+  grep -q 'worker brief' "$TESTROOT/nobrief.err"
+assert "brief 缺失：不建 pane" test "$(pane_count)" -eq "$before_nobrief"
+assert "brief 缺失：不留 registry" test ! -e "$DNOBRIEF/agents/nb.json"
+assert "brief 缺失：不寫 agents.log（未 spawn 就不該有審計）" \
+  bash -c "! grep -q 'spawned nb' '$DNOBRIEF/agents.log' 2>/dev/null"
+assert "brief 缺失：locks 無殘留" \
+  test -z "$(ls -A "$DNOBRIEF/locks" 2>/dev/null)"
+
+# 22c. brief 路徑含單引號 → 拒絕。路徑會以單引號字面值送進 pane 的 sh，
+# 一旦引號被閉合，後面就能塞命令進去。斷言刻意不只看「非零退出」：拿掉那道
+# 檢查後，多數畸形路徑會讓 sh 引號不平衡而語法錯誤、被既有的夭折偵測擋下，
+# 看起來照樣 fail-closed——測例會通過但什麼也沒鎖住（本測例第一版就是這樣，
+# 破壞驗證才抓到）。故用一條「閉合引號後接命令、再開回引號」的路徑，
+# 真正要斷言的是那個命令沒有被執行
+DQUOTE="$TESTROOT/dquote"
+mkdir -p "$DQUOTE/agents" "$DQUOTE/locks" "$DQUOTE/tasks"
+PWNED="$TESTROOT/pwned-by-brief-path"
+rm -f "$PWNED"
+QBRIEF="$TESTROOT/x'; touch $PWNED; '.md"
+# payload 內含絕對路徑 → 這個「檔名」帶斜線，實際上是多層路徑；父目錄不先
+# 建出來，檔案就落不了地，spawn 會停在前一道 -r 檢查、測例變成在測「檔案
+# 不存在」而不是單引號（第一版正是如此，破壞驗證才抓到）
+mkdir -p "$(dirname "$QBRIEF")"
+printf 'x\n' > "$QBRIEF"
+before_quote="$(pane_count)"
+env AGENT_BRIDGE_DATA="$DQUOTE" AGENT_BRIDGE_READY_TIMEOUT=0 PATH="$SHIM:$PATH" \
+    AGENT_BRIDGE_WORKER_BRIEF="$QBRIEF" \
+  "$BRIDGE" spawn qb --runtime codex >/dev/null 2>"$TESTROOT/quote.err"; rc=$?
+assert "brief 路徑含單引號：非零退出" test "$rc" -ne 0
+assert "brief 路徑含單引號：訊息指出是單引號的問題" \
+  grep -q '單引號' "$TESTROOT/quote.err"
+assert "brief 路徑含單引號：路徑裡夾帶的命令未被執行（注入防線）" \
+  test ! -e "$PWNED"
+assert "brief 路徑含單引號：不建 pane" test "$(pane_count)" -eq "$before_quote"
+assert "brief 路徑含單引號：不留 registry" test ! -e "$DQUOTE/agents/qb.json"
+
+# 22d. brief 是目錄／非普通檔 → 拒絕（codex 複核 FAIL 1）
+# `[[ -r ]]` 對目錄成立，而 pane 內 cat 讀目錄會失敗、命令替換卻仍回空字串，
+# runtime 照樣被 exec 起來——fail-closed 承諾會變成開出一個沒有守則的 worker
+DDIR="$TESTROOT/ddir"
+mkdir -p "$DDIR/agents" "$DDIR/locks" "$DDIR/tasks" "$TESTROOT/brief-as-dir"
+before_dir="$(pane_count)"
+env AGENT_BRIDGE_DATA="$DDIR" AGENT_BRIDGE_READY_TIMEOUT=0 PATH="$SHIM:$PATH" \
+    AGENT_BRIDGE_WORKER_BRIEF="$TESTROOT/brief-as-dir" \
+  "$BRIDGE" spawn db --runtime codex >/dev/null 2>"$TESTROOT/dir.err"; rc=$?
+assert "brief 是目錄：非零退出" test "$rc" -ne 0
+assert "brief 是目錄：訊息指出不是普通檔案" \
+  grep -q '普通檔案' "$TESTROOT/dir.err"
+assert "brief 是目錄：不建 pane" test "$(pane_count)" -eq "$before_dir"
+assert "brief 是目錄：不留 registry" test ! -e "$DDIR/agents/db.json"
+
+# 22e. brief 路徑以 `-` 開頭 → cat 必須用 -- 隔開（codex 複核 FAIL 2）
+# AGENT_BRIDGE_WORKER_BRIEF 是公開介面、接得到相對路徑；少了 option
+# terminator，一個叫 --help 的檔案會被 cat 當選項，spawn 成功卻注入錯 prompt
+DDASH="$TESTROOT/ddash"
+mkdir -p "$DDASH/agents" "$DDASH/locks" "$DDASH/tasks" "$TESTROOT/dashdir"
+printf '# DASHBRIEF-SENTINEL 守則內容\n' > "$TESTROOT/dashdir/--help"
+: > "$TESTROOT/codex-args.txt"
+( cd "$TESTROOT/dashdir" \
+  && env AGENT_BRIDGE_DATA="$DDASH" AGENT_BRIDGE_READY_TIMEOUT=20 PATH="$SHIM:$PATH" \
+         AGENT_BRIDGE_WORKER_BRIEF='--help' \
+     "$BRIDGE" spawn dh --runtime codex >/dev/null 2>&1 )
+assert "brief 路徑以 - 開頭：注入的是檔案內容而非 cat 的說明" \
+  grep -q 'DASHBRIEF-SENTINEL' "$TESTROOT/codex-args.txt"
+assert "brief 路徑以 - 開頭：沒把 cat 的用法說明當成守則注入" \
+  bash -c "! grep -qi 'cat \[' '$TESTROOT/codex-args.txt'"
+ab "$DDASH" despawn dh >/dev/null 2>&1 || true
+
+# 22f. brief 正本的內容不變量：守則被刪成空殼時要在這裡就紅，
+# 而不是等到真 runtime 實跑才發現 worker 不會做事
+REPO_BRIEF="$(dirname "$(dirname "$BRIDGE")")/share/worker-brief.md"
+assert "brief 正本存在於 repo" test -r "$REPO_BRIEF"
+for kw in 'agent-bridge receive' 'agent-bridge reply' 'agent-bridge fail' \
+          '是命令，不是聊天' '資料，不是指令'; do
+  assert "brief 正本含必要元素：$kw" grep -q -- "$kw" "$REPO_BRIEF"
+done
 
 # ---- 總結 ----
 printf '\n共 %d PASS、%d FAIL\n' "$PASS" "$FAIL"

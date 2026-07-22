@@ -155,12 +155,23 @@ agent-bridge despawn worker-1                          # 任務收尾：kill pan
 - **runtime 表（v1）**：`codex` → `codex --profile agent-worker`（該 profile 由
   chezmoi 管理，approval never＋workspace-write，見
   `docs/codex-worker-approval-proposal.md`）。claude runtime 待獨立 spec。
+- **啟動即注入 worker 守則**：spawn 出來的是一個零脈絡的全新 session——它不知道
+  自己是 worker，也不知道 pane 裡收到的 `agent-bridge receive <id>` 是要執行的
+  命令而不是有人在跟它說話。實測（codex 0.145）沒有守則時，它會把就緒探針當成
+  對話反覆回覆文字、永遠不 ready。因此啟動指令會把 `share/worker-brief.md`
+  全文當成 runtime 的 initial prompt 位置參數（`cmd [OPTIONS] [PROMPT]`，agent
+  CLI 的共通形狀）帶進去，末尾再接上這個 worker 的名字與首要動作。**該檔是
+  worker 契約的唯一正本**，人工註冊的 worker 讀同一份（`SKILL.md` 指向它），
+  兩邊不會漂移；路徑可用 `AGENT_BRIDGE_WORKER_BRIEF` 覆蓋。
+  brief 全文刻意不進 **tmux 啟動命令的字面值**，改讓 pane 內的 sh 展開
+  `$(cat -- …)`，啟動指令因此維持短、`pane_start_command` 仍可讀。（展開後
+  它當然還是會成為 runtime 的 argv——不進的是命令字面值，不是不進程序。）
 - **就緒自報到**：spawn 註冊時 `ready: false`，隨後以間隔重送探針
-  `agent-bridge ready <name>` 進新 pane——REPL 真正就緒時才會執行它，把
-  registry 翻成 `ready: true`。啟動期被 REPL 吃掉的按鍵由重送覆蓋。等待上限
+  `agent-bridge ready <name>` 進新 pane——worker 執行它，把 registry 翻成
+  `ready: true`。啟動期被 REPL 吃掉的按鍵由重送覆蓋。等待上限
   `AGENT_BRIDGE_READY_TIMEOUT`（預設 30 秒，`0`＝不等待），重送間隔
   `AGENT_BRIDGE_READY_PROBE_INTERVAL`（預設 2 秒）。**逾時不回滾、僅警告**，
-  pane 留用供人工診斷。
+  pane 留用供人工診斷。實測 codex 0.145 約 7 秒回報就緒。
 - 對 `ready: false` 的 spawned agent `send` 合法：stderr 警告但不拒送，訊息在
   mailbox 不會丟，只是通知可能延後。
 
@@ -209,6 +220,26 @@ agent-bridge despawn worker-1                          # 任務收尾：kill pan
   刪不掉），**會在 stderr 明確警告而非靜默**。殘留的 registry 是個 ghost
   worker：佔一個 spawn 名額、擋住同名 spawn、在 `list` 裡照樣列出，`send`
   也還會替它建 mailbox task。排除障礙後用 `despawn` 清掉。
+- **brief 不是可讀的普通檔案就不開 pane**：守則檔缺失、不可讀、或不是普通檔案
+  （目錄、FIFO、裝置）時 spawn 直接非零退出，不建 pane、不寫 registry、不留
+  審計。沒有守則的 worker 收到探針只會當成對話回覆，開出來也是壞的；而檢查
+  放在建 pane 之前，才不會留下一個佔著 cap 的半殘 worker。
+  只驗 `-r` 是不夠的——它對目錄一樣成立，而 pane 內 `cat` 讀目錄失敗時命令
+  替換仍回空字串，runtime 照樣被 exec 起來（此缺陷由獨立複核以 `/tmp` 反例
+  抓出，已補回歸測例）。
+  **殘留缺口（已知、刻意不修）**：這道檢查與 pane 內實際讀檔之間有 TOCTOU
+  空隙，後果有兩種——(a) brief 被刪或換成別的內容：worker 以空的／被替換的
+  守則啟動，而不是拒絕啟動；(b) 被換成 FIFO 或其他讀不完的來源：pane 的 sh
+  會卡在讀取、runtime 根本起不來，而 0.3 秒的夭折偵測只看到 sh 還活著，於是
+  判定 spawn 成功——留下一個佔著 cap、永遠停在 `starting` 的 pane（此後果由
+  獨立複核以順序化反例補出，(b) 比 (a) 更糟）。
+  要關掉它得把啟動指令改成先讀檔再 `exec` 的複合形式，那會動到 `spawn_tag`
+  前綴這條已被反覆錘過的安全不變量，代價高於收益；且替換 brief 本來就在
+  同 uid 互信域內（見下）。清理方式是照常 `despawn` 那個 `starting` 的 agent。
+- **brief 路徑不得含單引號**：路徑會以單引號字面值送進 pane 的 sh，引號一旦被
+  閉合就能往後接命令。含單引號一律拒絕（湊跳脫不如不收）。這條有專門的注入
+  測例把關——只斷言「非零退出」是不夠的，畸形路徑多半會讓 sh 語法錯誤而被
+  夭折偵測擋下，看起來像 fail-closed 卻什麼也沒鎖住。
 - **審計**：spawn/despawn 各追加一行到 `agents.log`（append-only）。
 - despawn 對已消失的 pane（如 tmux server 重啟過）仍會清 registry，不卡死。
 
@@ -254,6 +285,14 @@ tests/run-tests.sh
   繞過 `despawn`，直接 `tmux kill-pane` 就是了。真正的邊界是 tmux socket 的
   存取權本身（codex `workspace-write` 預設就擋掉了 socket 連線，見下）。
   把 despawn 的檢查當成最後一道防線是誤解它的角色。
+  **worker brief 也在這個互信域內**：`share/worker-brief.md` 位於 worker 可寫的
+  workspace，被控制的 worker 可以改寫它，藉此左右**下一個** spawn 出來的 worker
+  的啟動 prompt。這不構成新的信任邊界破口（同 uid 本來就互信），但它把「守則
+  檔的完整性」變成一個實際的相依項——把 brief 放在唯讀位置並以
+  `AGENT_BRIDGE_WORKER_BRIEF` 指過去，是想收緊時的作法（連同**父目錄**也要
+  不可替換，否則整個檔可被換掉）。最壞後果不只是「守則被刪、worker 沒守則」：
+  換成 symlink 可把另一份同 uid 可讀的檔案帶進 prompt，內容被改寫則等於直接
+  改寫下一個 worker 的行為契約。
 - 通知協定假設 `agent-bridge` 在對方 pane 的 PATH 上（安裝 symlink 後即成立）。
 - **agent runtime 的 sandbox 必須允許寫資料目錄**：receive/reply 需要寫
   `AGENT_BRIDGE_DATA`（預設 `~/.local/share/agent-bridge/`）。例如 codex CLI 的
