@@ -1758,6 +1758,34 @@ assert "evict：出身不明被拒時不送收尾任務" test "$(task_count "$DE
 assert "evict：出身不明被拒時 registry 未被清掉（留給人工處理）" \
   test -e "$DEV/agents/ev4.json"
 
+# ---- 27. brief 正本的策略不變量（Phase 4）----
+# 兩份 brief 是策略層的正本，機制對它們一無所知，所以只有這裡守得住：
+# 條款被刪或被改回舊語意時要在測試就紅，而不是等某個 worker 真的把自己
+# /clear 掉、脈絡連同 pane 一起消失才發現
+
+# 27a. worker-brief：新語意的正面斷言
+for kw in 'agent-bridge disposable' '你的 context 是資產' '收到收尾任務時' \
+          '要不要再往下委派 subagent' '正是之後可能被追問的東西嗎'; do
+  assert "worker brief 含 Phase 4 條款：$kw" grep -q -- "$kw" "$REPO_BRIEF"
+done
+
+# 27b. worker-brief：舊條款必須已經拔掉。
+# 「reply 後清空 context」與「保留脈絡供追問」直接矛盾——照做的話 reply 完
+# 脈絡就沒了，disposable 宣告與 evict 的收尾筆記全部失去意義
+assert "worker brief 已不含「reply 後清空 context」語句（與保留脈絡矛盾）" \
+  bash -c "! grep -q '清空自己的 context' '$REPO_BRIEF'"
+assert "worker brief 不再叫 worker 自行 /clear" \
+  bash -c "! grep -qE '完成 .reply. 後.*/clear' '$REPO_BRIEF'"
+
+# 27c. orchestrator-brief：存在 + 策略要點
+REPO_OBRIEF="$(dirname "$(dirname "$BRIDGE")")/share/orchestrator-brief.md"
+assert "orchestrator brief 正本存在於 repo" test -r "$REPO_OBRIEF"
+for kw in 'agent-bridge idle' 'agent-bridge evict' 'evicted-timeout' \
+          '預設保留' 'AGENT_BRIDGE_MAX_SPAWN' \
+          'Do not call the AgentTool'; do
+  assert "orchestrator brief 含必要元素：$kw" grep -q -- "$kw" "$REPO_OBRIEF"
+done
+
 # ---- 總結 ----
 printf '\n共 %d PASS、%d FAIL\n' "$PASS" "$FAIL"
 if (( FAIL > 0 )); then

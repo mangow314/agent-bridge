@@ -65,13 +65,19 @@ agent-bridge read "$id"               # （sender）讀回覆原文（completed/
 
 ## Orchestrator 守則（spawn/despawn）
 
+**策略正本在 `share/orchestrator-brief.md`**（repo 內）：pane 生命週期的語意、
+複用 vs spawn 的判準、撞 cap 的 `idle` → `evict` 流程、第三層委派的授權與成本。
+調度 worker 前先讀那份檔；這裡只留機制面的提要。
+
 - spawn 前先 `agent-bridge list` 看 cap 餘量：spawned agent 上限
-  `AGENT_BRIDGE_MAX_SPAWN`（預設 4），達上限先 despawn 閒置 worker 再 spawn。
+  `AGENT_BRIDGE_MAX_SPAWN`（預設 4）。達上限時**不要直接 despawn**——用
+  `agent-bridge evict <name>`，它會先派一輪收尾任務讓 worker 把只存在它
+  context 裡的事實寫成筆記，落地之後才回收。
 - **despawn 只回收自己 spawn 的 worker**：人工 register 的 agent 是別人的
   session，bridge 會拒殺，你也不該試。
-- 留用 vs 回收的判準：後續還有同 runtime 的任務 → 留用（省啟動時間，worker
-  reply 後會 `/clear` 等下一件）；工作告一段落、要換 runtime／組態、或 cap
-  吃緊 → despawn 回收，不留殭屍 pane。
+- 留用 vs 回收的判準：**預設留用**——worker 回覆後不清 context，它腦裡的殘值
+  正是後續追問的價值所在；只有 worker 自己宣告過 `disposable`、或要換
+  runtime／組態、或 cap 吃緊時才回收。
 - `list` 顯示 `starting` 時就 send 是合法的：訊息入 mailbox 不會丟，只是
   通知可能延後；急件等 `ready` 再派。
 - tmux server 重啟過的殘留 spawned registry（pane 已死）：直接 despawn 清掉。
