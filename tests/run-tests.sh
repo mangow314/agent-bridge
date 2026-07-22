@@ -24,6 +24,8 @@ tmx() { "$REAL_TMUX" -L "$SOCK" -f /dev/null "$@"; }
 # shellcheck disable=SC2329  # 經 trap EXIT 間接呼叫
 cleanup() {
   tmx kill-server 2>/dev/null || true
+  "$REAL_TMUX" -L agent-bridge-test-b -f /dev/null kill-server 2>/dev/null || true
+  "$REAL_TMUX" -L agent-bridge-test-c -f /dev/null kill-server 2>/dev/null || true
   if [[ -n "${TESTROOT:-}" && -d "$TESTROOT" ]]; then
     rm -rf -- "$TESTROOT"
   fi
@@ -79,6 +81,27 @@ printf '#!/usr/bin/env bash\necho "tmux: unavailable (test stub)" >&2\nexit 1\n'
   > "$FAILSHIM/tmux"
 chmod +x "$FAILSHIM/tmux"
 
+# ---- 假 codex：spawn 測試用的慢啟動 REPL ----
+# 啟動期（預設 2 秒，codex-delay 檔可調）持續讀掉並丟棄 stdin，模擬
+# 「REPL 啟動期按鍵被吃」；之後 exec bash 執行後續抵達的探針／通知。
+# codex-fail 檔存在時立即以非零碼退出，模擬 runtime 啟動即失敗。
+DSPAWN="$TESTROOT/dspawn"
+cat > "$SHIM/codex" <<EOF
+#!/usr/bin/env bash
+printf '%s ' "\$@" > "$TESTROOT/codex-args.txt"
+if [[ -e "$TESTROOT/codex-fail" ]]; then exit 127; fi
+export AGENT_BRIDGE_DATA="$DSPAWN"
+delay="\$(cat "$TESTROOT/codex-delay" 2>/dev/null || echo 2)"
+end=\$(( SECONDS + delay ))
+while (( SECONDS < end )); do IFS= read -r -t 0.2 _ || true; done
+exec bash --norc --noprofile
+EOF
+chmod +x "$SHIM/codex"
+
+# spawn 出來的 pane 由 tmux server 啟動，PATH 繼承自 server 環境；
+# 在 server 啟動前把 shim 排進 PATH，pane 才找得到假 codex 與 agent-bridge
+export PATH="$SHIM:$PATH"
+
 # ab <data-dir> <args...>：以指定資料目錄 + shim PATH 執行 bridge
 ab() {
   local data="$1"; shift
@@ -93,11 +116,24 @@ ab_notmux() {
 # shellcheck disable=SC2329  # 經 assert/wait_for 的 "$@" 間接呼叫
 st_is() { [[ "$(ab "$1" status "$2" 2>/dev/null)" == "$3" ]]; }
 
+# ---- spawn 測試 helper ----
+# absp <data-dir> <ready-timeout> <args...>：spawn 用短探針間隔執行 bridge
+absp() {
+  local data="$1" rt="$2"; shift 2
+  env AGENT_BRIDGE_DATA="$data" AGENT_BRIDGE_READY_TIMEOUT="$rt" \
+      AGENT_BRIDGE_READY_PROBE_INTERVAL=0.5 PATH="$SHIM:$PATH" "$BRIDGE" "$@"
+}
+# shellcheck disable=SC2329  # 經 assert/assert_fails 的 "$@" 間接呼叫
+pane_alive() { tmx list-panes -a -F '#{pane_id}' 2>/dev/null | grep -Fx "$1" >/dev/null; }
+pane_count() { tmx list-panes -a -F '#{pane_id}' 2>/dev/null | wc -l; }
+# shellcheck disable=SC2329  # 經 assert 的 "$@" 間接呼叫
+list_has() { ab "$1" list 2>/dev/null | grep -Fqx "$2"; }
+
 # ---- 測試 tmux server：兩個假 pane（跑 bash） ----
 DATA_IT="$TESTROOT/data-it"
 pane_cmd="$(printf 'env AGENT_BRIDGE_DATA=%q PATH=%q bash --norc --noprofile' \
   "$DATA_IT" "$SHIM:$PATH")"
-tmx new-session -d -s it -x 180 -y 40 "$pane_cmd"
+tmx new-session -d -s it -x 200 -y 100 "$pane_cmd"
 tmx split-window -d -t it "$pane_cmd"
 mapfile -t PANES < <(tmx list-panes -t it -F '#{pane_id}')
 PANE_A="${PANES[0]}"
@@ -114,11 +150,11 @@ fi
 # ---- 1. register / list（含同名覆蓋） ----
 D1="$TESTROOT/d1"
 ab "$D1" register alice "$PANE_A" 2>/dev/null
-assert "register+list：alice 對應 pane id" \
-  test "$(ab "$D1" list)" = "$(printf 'alice\t%s' "$PANE_A")"
+assert "register+list：alice 對應 pane id（人工註冊 ready 欄為 -）" \
+  test "$(ab "$D1" list)" = "$(printf 'alice\t%s\t-' "$PANE_A")"
 ab "$D1" register alice "$PANE_B" 2>/dev/null
 assert "同名 register 覆蓋 pane id" \
-  test "$(ab "$D1" list)" = "$(printf 'alice\t%s' "$PANE_B")"
+  test "$(ab "$D1" list)" = "$(printf 'alice\t%s\t-' "$PANE_B")"
 assert "覆蓋後 list 仍只有一行" \
   test "$(ab "$D1" list | wc -l)" -eq 1
 
@@ -461,6 +497,708 @@ all_ids13_ok() {
   return 0
 }
 assert "併發 send：10 個 task 目錄皆存在且狀態合法" all_ids13_ok
+
+# ---- 16. spawn：核心＋cap＋原子回滾（Phase 1） ----
+
+# 16a. 快樂路徑：假 codex 啟動期吃輸入 2 秒，首發探針必被吃，
+# ready 仍翻 true ＝ 探針重送機制生效（Phase 2 gate 一併覆蓋）
+pane_w1="$(absp "$DSPAWN" 20 spawn w1 --runtime codex 2>"$TESTROOT/spawn-w1.err")"; rc=$?
+assert "spawn 成功：exit 0" test "$rc" -eq 0
+assert "spawn stdout 只印 pane-id（%N）一行" \
+  bash -c "[[ '$pane_w1' =~ ^%[0-9]+\$ ]]"
+assert "spawn 的 pane 存在於 tmux" pane_alive "$pane_w1"
+assert "spawn registry：spawned/runtime/spawned_at 欄位齊" \
+  jq -e '.spawned == true and .runtime == "codex" and (.spawned_at | type == "string")' \
+  "$DSPAWN/agents/w1.json"
+assert "spawn 以 --profile agent-worker 啟動 runtime" \
+  grep -q -- '--profile agent-worker' "$TESTROOT/codex-args.txt"
+assert "spawn 等到 ready：registry ready == true（探針重送生效）" \
+  jq -e '.ready == true' "$DSPAWN/agents/w1.json"
+assert "agents.log 記 spawned w1" \
+  grep -qE "Z spawned w1 ${pane_w1} codex\$" "$DSPAWN/agents.log"
+assert "list：spawned＋就緒 agent ready 欄為 ready" \
+  list_has "$DSPAWN" "$(printf 'w1\t%s\tready' "$pane_w1")"
+assert "spawn 後 locks 無殘留" test -z "$(ls -A "$DSPAWN/locks" 2>/dev/null)"
+# 回滾靠 pane_start_command 認 tag（見 spawn_rollback）。tmux 會把含空格的
+# 啟動指令用雙引號包起來存（實測 3.7b），比對前必須剝得掉那層引號——鎖住
+# 這個不變量，否則 tmux 改存法時會變成默默漏殺孤兒 pane
+w1_cmd="$(tmx display -pt "$pane_w1" '#{pane_start_command}')"
+assert "pane_start_command 剝前導引號後以 spawn tag 前綴開頭（tmux 行為不變量）" \
+  bash -c "c=${w1_cmd@Q}; c=\"\${c#\\\"}\"; [[ \"\$c\" == AGENT_BRIDGE_SPAWN_TAG=ab-spawn-* ]]"
+
+# 16b. 參數與名稱衝突拒絕
+assert_fails "spawn 已註冊（spawned）名稱被拒" absp "$DSPAWN" 0 spawn w1 --runtime codex
+ab "$DSPAWN" register manual-x "$PANE_A" 2>/dev/null
+assert_fails "spawn 與人工註冊同名被拒" absp "$DSPAWN" 0 spawn manual-x --runtime codex
+assert_fails "spawn：不支援的 runtime 被拒" absp "$DSPAWN" 0 spawn wx --runtime claude
+assert "不支援 runtime：不留 registry" test ! -e "$DSPAWN/agents/wx.json"
+assert_fails "spawn 缺 --runtime 被拒" absp "$DSPAWN" 0 spawn wy
+assert_fails "spawn：名稱不合法被拒" absp "$DSPAWN" 0 spawn "bad name" --runtime codex
+assert "list：人工 agent ready 欄為 -" \
+  list_has "$DSPAWN" "$(printf 'manual-x\t%s\t-' "$PANE_A")"
+
+# 16c. cap：上限、人工註冊不計入、並行 spawn 不繞過
+DCAP="$TESTROOT/dcap"
+abcap() {
+  env AGENT_BRIDGE_DATA="$DCAP" AGENT_BRIDGE_MAX_SPAWN=2 \
+      AGENT_BRIDGE_READY_TIMEOUT=0 PATH="$SHIM:$PATH" "$BRIDGE" "$@"
+}
+abcap spawn c1 --runtime codex >/dev/null 2>&1
+abcap spawn c2 --runtime codex >/dev/null 2>&1
+assert "cap：上限內 spawn 成功（2/2）" bash -c \
+  "test -f '$DCAP/agents/c1.json' && test -f '$DCAP/agents/c2.json'"
+before_cap="$(pane_count)"
+abcap spawn c3 --runtime codex >/dev/null 2>"$TESTROOT/cap.err"; rc=$?
+assert "cap 超限：非零退出" test "$rc" -ne 0
+assert "cap 超限：訊息含 AGENT_BRIDGE_MAX_SPAWN" grep -q 'AGENT_BRIDGE_MAX_SPAWN' "$TESTROOT/cap.err"
+assert "cap 超限：不留 registry" test ! -e "$DCAP/agents/c3.json"
+assert "cap 超限：pane 數不變" test "$(pane_count)" -eq "$before_cap"
+# 人工註冊不計入 cap：despawn 一個後，即使多一個人工 agent 仍可 spawn
+ab "$DCAP" register human "$PANE_A" 2>/dev/null
+abcap despawn c2 >/dev/null 2>&1
+abcap spawn c4 --runtime codex >/dev/null 2>&1; rc=$?
+assert "cap：人工註冊不計入 spawned 上限" test "$rc" -eq 0
+abcap despawn c1 >/dev/null 2>&1
+abcap despawn c4 >/dev/null 2>&1
+
+# 並行 4 個 spawn 搶 cap=2：registry 鎖序列化下恰 2 個得手、無殘鎖
+DCON="$TESTROOT/dcon"
+before_con="$(pane_count)"
+for i in 1 2 3 4; do
+  env AGENT_BRIDGE_DATA="$DCON" AGENT_BRIDGE_MAX_SPAWN=2 \
+      AGENT_BRIDGE_READY_TIMEOUT=0 PATH="$SHIM:$PATH" \
+      "$BRIDGE" spawn "r$i" --runtime codex >/dev/null 2>&1 &
+done
+wait
+assert "並行 spawn 搶 cap：恰 2 個註冊成功" \
+  test "$(find "$DCON/agents" -name '*.json' | wc -l)" -eq 2
+assert "並行 spawn 搶 cap：pane 恰增加 2 個" \
+  test "$(pane_count)" -eq "$((before_con + 2))"
+assert "並行 spawn 搶 cap：locks 無殘留" test -z "$(ls -A "$DCON/locks" 2>/dev/null)"
+for f in "$DCON"/agents/*.json; do
+  ab "$DCON" despawn "$(jq -r '.name' "$f")" >/dev/null 2>&1
+done
+
+# 16d. 失敗注入零殘留：runtime 啟動即死、註冊寫入失敗（回滾 kill pane）
+DRB="$TESTROOT/drb"
+ab "$DRB" list >/dev/null 2>&1   # 先建出資料目錄
+touch "$TESTROOT/codex-fail"
+before_nf="$(pane_count)"
+absp "$DRB" 0 spawn nf --runtime codex >/dev/null 2>"$TESTROOT/nf.err"; rc=$?
+rm -f "$TESTROOT/codex-fail"
+assert "runtime 啟動即失敗：非零退出" test "$rc" -ne 0
+assert "runtime 啟動即失敗：stderr 說明" grep -q '啟動即失敗' "$TESTROOT/nf.err"
+assert "runtime 啟動即失敗：不留 registry" test ! -e "$DRB/agents/nf.json"
+assert "runtime 啟動即失敗：pane 數不變" test "$(pane_count)" -eq "$before_nf"
+assert "runtime 啟動即失敗：locks 無殘留" test -z "$(ls -A "$DRB/locks" 2>/dev/null)"
+
+chmod 555 "$DRB/agents"
+before_rb="$(pane_count)"
+absp "$DRB" 0 spawn rb --runtime codex >/dev/null 2>&1; rc=$?
+chmod 755 "$DRB/agents"
+assert "註冊寫入失敗：非零退出" test "$rc" -ne 0
+assert "註冊寫入失敗：回滾 kill 已建 pane（pane 數不變）" \
+  test "$(pane_count)" -eq "$before_rb"
+assert "註冊寫入失敗：不留 registry" test ! -e "$DRB/agents/rb.json"
+assert "註冊寫入失敗：locks 無殘留" test -z "$(ls -A "$DRB/locks" 2>/dev/null)"
+assert "失敗注入：agents.log 無 spawned 紀錄" bash -c \
+  "! grep -qE 'Z spawned (nf|rb) ' '$DRB/agents.log' 2>/dev/null"
+
+# --window 變體：pane 開在新 window
+pane_ww="$(absp "$DSPAWN" 0 spawn ww --runtime codex --window 2>/dev/null)"
+assert "spawn --window：pane 存在" pane_alive "$pane_ww"
+assert "spawn --window：與既有 pane 不同 window" bash -c \
+  "[[ \"\$($REAL_TMUX -L $SOCK display -pt '$pane_ww' '#{window_id}')\" != \
+     \"\$($REAL_TMUX -L $SOCK display -pt '$PANE_A' '#{window_id}')\" ]]"
+ab "$DSPAWN" despawn ww >/dev/null 2>&1
+
+# ---- 17. ready／探針（Phase 2） ----
+pane_w5="$(absp "$DSPAWN" 0 spawn w5 --runtime codex 2>/dev/null)"
+assert "READY_TIMEOUT=0：spawn 立即返回、ready 仍 false" \
+  jq -e '.ready == false' "$DSPAWN/agents/w5.json"
+assert "list：未就緒 spawned agent 欄為 starting" \
+  list_has "$DSPAWN" "$(printf 'w5\t%s\tstarting' "$pane_w5")"
+idw5="$(ab "$DSPAWN" send w5 --from alice --message hi 2>"$TESTROOT/w5-send.err")"; rc=$?
+assert "send 未就緒 agent：仍 exit 0（不拒送）" test "$rc" -eq 0
+assert "send 未就緒 agent：stderr 印警告" grep -q '尚未回報就緒' "$TESTROOT/w5-send.err"
+assert "send 未就緒 agent：任務照建" test -d "$DSPAWN/tasks/$idw5"
+ab "$DSPAWN" ready w5 2>/dev/null; rc=$?
+assert "ready：手動回報 exit 0" test "$rc" -eq 0
+assert "ready：registry 翻 true" jq -e '.ready == true' "$DSPAWN/agents/w5.json"
+assert "list：ready 後欄位變 ready" \
+  list_has "$DSPAWN" "$(printf 'w5\t%s\tready' "$pane_w5")"
+assert_fails "ready：人工 agent 被拒" ab "$DSPAWN" ready manual-x
+assert_fails "ready：未註冊 agent 報錯" ab "$DSPAWN" ready ghost
+assert_fails "ready：名稱不合法被拒" ab "$DSPAWN" ready "bad name"
+
+# 就緒逾時：慢到 600 秒的假 codex，timeout 1s → 僅警告、pane 留用、不回滾
+echo 600 > "$TESTROOT/codex-delay"
+pane_w6="$(absp "$DSPAWN" 1 spawn w6 --runtime codex 2>"$TESTROOT/w6.err")"; rc=$?
+echo 2 > "$TESTROOT/codex-delay"
+assert "就緒逾時：exit 0（僅警告不回滾）" test "$rc" -eq 0
+assert "就緒逾時：stderr 印未回報就緒警告" grep -q '未回報就緒' "$TESTROOT/w6.err"
+assert "就緒逾時：pane 留用供診斷" pane_alive "$pane_w6"
+assert "就緒逾時：registry 仍在、ready false" jq -e '.ready == false' "$DSPAWN/agents/w6.json"
+
+# ---- 18. despawn＋出身防護（Phase 3） ----
+assert_fails "despawn 人工 agent 被拒" ab "$DSPAWN" despawn manual-x
+assert "despawn 被拒：registry 檔仍在" test -f "$DSPAWN/agents/manual-x.json"
+ab "$DSPAWN" despawn w1 2>/dev/null; rc=$?
+assert "despawn spawned agent：exit 0" test "$rc" -eq 0
+assert_fails "despawn 後 pane 消失" pane_alive "$pane_w1"
+assert "despawn 後 registry 檔已刪" test ! -e "$DSPAWN/agents/w1.json"
+assert "agents.log 記 despawned w1" \
+  grep -qE "Z despawned w1 ${pane_w1} codex\$" "$DSPAWN/agents.log"
+assert_fails "despawn 未註冊 agent 報錯" ab "$DSPAWN" despawn w1
+assert_fails "despawn：名稱不合法被拒" ab "$DSPAWN" despawn "bad name"
+
+# 死 pane（如 tmux server 重啟）despawn 仍清 registry
+pane_w7="$(absp "$DSPAWN" 0 spawn w7 --runtime codex 2>/dev/null)"
+tmx kill-pane -t "$pane_w7"
+ab "$DSPAWN" despawn w7 2>/dev/null; rc=$?
+assert "死 pane despawn：exit 0" test "$rc" -eq 0
+assert "死 pane despawn：registry 已清" test ! -e "$DSPAWN/agents/w7.json"
+assert "死 pane despawn：agents.log 記 despawned" \
+  grep -qE "Z despawned w7 " "$DSPAWN/agents.log"
+
+# ---- 18b. despawn 的出身證據＝pane 啟動指令的 tag（codex 第三輪 FAIL 1） ----
+# pane id 會被 tmux 重用（不同 server／server 重啟後計數器歸零），registry 也
+# 可能被有資料目錄寫入權的 worker 偽造。只憑 pane_id 相符就殺，會殺到人工 pane。
+DTAG="$TESTROOT/dtag"
+pane_t="$(absp "$DTAG" 0 spawn tagged --runtime codex 2>/dev/null)"
+assert "spawn：registry 存下 spawn_tag" \
+  jq -e '.spawn_tag | startswith("AGENT_BRIDGE_SPAWN_TAG=ab-spawn-")' "$DTAG/agents/tagged.json"
+
+# 情境一：registry 指向一個「存在但不是我們開的」pane（模擬 id 重用／偽造）
+pane_innocent="$(tmx split-window -dP -F '#{pane_id}' "$pane_cmd")"
+jq --arg p "$pane_innocent" '.pane_id = $p' "$DTAG/agents/tagged.json" > "$TESTROOT/tg.tmp"
+mv "$TESTROOT/tg.tmp" "$DTAG/agents/tagged.json"
+ab "$DTAG" despawn tagged >/dev/null 2>"$TESTROOT/tag-stale.err"; rc=$?
+assert "tag 不符：despawn 不殺該 pane（人工 pane 存活）" pane_alive "$pane_innocent"
+assert "tag 不符：stderr 明確警告未動該 pane" \
+  grep -q '未動該 pane' "$TESTROOT/tag-stale.err"
+assert "tag 不符：仍清除過時註冊" test ! -e "$DTAG/agents/tagged.json"
+assert "tag 不符：exit 0（清理視為完成）" test "$rc" -eq 0
+assert "tag 不符：audit 記 despawn-stale" \
+  grep -qE "Z despawn-stale tagged " "$DTAG/agents.log"
+assert "tag 不符：locks 無殘留" test -z "$(ls -A "$DTAG/locks" 2>/dev/null)"
+tmx kill-pane -t "$pane_innocent" 2>/dev/null
+tmx kill-pane -t "$pane_t" 2>/dev/null
+
+# 情境二（codex 第四輪 FAIL 1）：registry 在 worker 的可寫範圍內，所以 tag 本身
+# 也必須驗格式與名字綁定，否則它只是個「攻擊者說了算」的欄位。
+# 弱偽造：spawn_tag 填 "bash"，指向一個跑 bash 的人工 pane，前綴比對就會命中
+DFORGE="$TESTROOT/dforge"
+# 啟動指令必須真的以 bash 開頭，才吃得到 spawn_tag="bash" 這個萬用鑰匙
+pane_bash="$(tmx split-window -dP -F '#{pane_id}' 'bash --norc --noprofile')"
+mkdir -p "$DFORGE/agents" "$DFORGE/locks" "$DFORGE/tasks"
+jq -n --arg p "$pane_bash" \
+  '{name: "forged", pane_id: $p, registered_at: "2026-01-01T00:00:00Z",
+    spawned: true, runtime: "codex", spawned_at: "2026-01-01T00:00:00Z",
+    ready: true, spawn_tag: "bash"}' \
+  > "$DFORGE/agents/forged.json"
+ab "$DFORGE" despawn forged >/dev/null 2>"$TESTROOT/forge.err"; rc=$?
+assert "偽造短 tag：人工 pane 未被殺" pane_alive "$pane_bash"
+assert "偽造短 tag：走 stale 分支（stderr 警告未動該 pane）" \
+  grep -q '未動該 pane' "$TESTROOT/forge.err"
+assert "偽造短 tag：exit 0（僅清除註冊）" test "$rc" -eq 0
+
+# 跨 worker 抄 tag：worker A 把 B 的 pane_id 與 spawn_tag 抄進自己的 registry，
+# 誘使 orchestrator 的 `despawn A` 殺掉 B 的 pane。tag 綁名字才擋得住
+DCOPY="$TESTROOT/dcopy"
+pane_b="$(absp "$DCOPY" 0 spawn bb --runtime codex 2>/dev/null)"
+b_tag="$(jq -r '.spawn_tag' "$DCOPY/agents/bb.json")"
+jq -n --arg p "$pane_b" --arg t "$b_tag" \
+  '{name: "aa", pane_id: $p, registered_at: "2026-01-01T00:00:00Z",
+    spawned: true, runtime: "codex", spawned_at: "2026-01-01T00:00:00Z",
+    ready: true, spawn_tag: $t}' > "$DCOPY/agents/aa.json"
+ab "$DCOPY" despawn aa >/dev/null 2>"$TESTROOT/copy.err"; rc=$?
+assert "抄別人的 tag：B 的 pane 未被殺" pane_alive "$pane_b"
+assert "抄別人的 tag：走 stale 分支" grep -q '未動該 pane' "$TESTROOT/copy.err"
+assert "抄別人的 tag：B 的 registry 未受影響" test -f "$DCOPY/agents/bb.json"
+assert "正常 despawn B 仍殺得掉（tag 綁名字沒有誤傷正常路徑）" \
+  bash -c "env AGENT_BRIDGE_DATA=$(printf '%q' "$DCOPY") PATH=$(printf '%q' "$SHIM:$PATH") \
+    $(printf '%q' "$BRIDGE") despawn bb >/dev/null 2>&1"
+assert_fails "正常 despawn B：pane 確實消失" pane_alive "$pane_b"
+tmx kill-pane -t "$pane_bash" 2>/dev/null
+
+# 情境二之二：pane_id 也是不可信的 registry 欄位，而它會進 tmux 命令字串
+# （if-shell 的 kill-pane）。tmux 命令裡 `;` 是分隔符，不驗格式就是命令注入
+DINJ="$TESTROOT/dinj"
+mkdir -p "$DINJ/agents" "$DINJ/locks" "$DINJ/tasks"
+jq -n '{name: "inj", pane_id: "%0 ; kill-server", registered_at: "2026-01-01T00:00:00Z",
+        spawned: true, runtime: "codex", spawned_at: "2026-01-01T00:00:00Z",
+        ready: true, spawn_tag: "AGENT_BRIDGE_SPAWN_TAG=ab-spawn-inj-1-aabbccddeeff"}' \
+  > "$DINJ/agents/inj.json"
+inj_before="$(pane_count)"
+ab "$DINJ" despawn inj >/dev/null 2>"$TESTROOT/inj.err"; rc=$?
+assert "pane_id 注入：非零退出" test "$rc" -ne 0
+assert "pane_id 注入：stderr 說明格式不合法" \
+  grep -q 'pane_id 格式不合法' "$TESTROOT/inj.err"
+assert "pane_id 注入：tmux server 存活、pane 數不變" \
+  test "$(pane_count)" -eq "$inj_before"
+assert "pane_id 注入：registry 保留（不因竄改而靜默清除）" test -f "$DINJ/agents/inj.json"
+
+# 情境三（codex 第四輪 FAIL 2）：驗證與 kill 之間 tmux server 被換掉。
+# shim 讓 list-panes 走 socket A（有合法 worker），if-shell/kill 走 socket B
+# （同一個 %N 是人工 pane）→ 原子 if-shell 在 B 上判 false，不得殺 B 的 pane
+SOCKB="agent-bridge-test-b"
+tmxb() { "$REAL_TMUX" -L "$SOCKB" -f /dev/null "$@"; }
+tmxb new-session -d -s b -x 200 -y 100 "$pane_cmd"
+mapfile -t BPANES < <(tmxb list-panes -a -F '#{pane_id}')
+PANE_B0="${BPANES[0]}"
+DSWAP="$TESTROOT/dswap"
+pane_s="$(absp "$DSWAP" 0 spawn sw --runtime codex 2>/dev/null)"
+# 把 registry 的 pane_id 改成 B server 上那個人工 pane 的 id，模擬「id 相同、
+# 但第二次連線落到另一個 server」
+jq --arg p "$PANE_B0" '.pane_id = $p' "$DSWAP/agents/sw.json" > "$TESTROOT/sw.tmp"
+mv "$TESTROOT/sw.tmp" "$DSWAP/agents/sw.json"
+SWAPSHIM="$TESTROOT/swapshim"
+mkdir -p "$SWAPSHIM"
+cat > "$SWAPSHIM/tmux" <<EOF
+#!/usr/bin/env bash
+unset TMUX
+# list-panes 回答 A server 的舊快照（偽造成目標 pane 帶著合法 tag），
+# 其餘呼叫（if-shell / 存活檢查）落到 B server
+if [[ "\$1" == "list-panes" && "\$*" == *pane_start_command* ]]; then
+  printf '%s "%s exec codex --profile agent-worker"\n' \
+    $(printf '%q' "$PANE_B0") "\$(jq -r '.spawn_tag' $(printf '%q' "$DSWAP/agents/sw.json"))"
+  exit 0
+fi
+exec $(printf '%q' "$REAL_TMUX") -L $(printf '%q' "$SOCKB") -f /dev/null "\$@"
+EOF
+chmod +x "$SWAPSHIM/tmux"
+ln -s "$BRIDGE" "$SWAPSHIM/agent-bridge"
+env AGENT_BRIDGE_DATA="$DSWAP" PATH="$SWAPSHIM:$PATH" "$BRIDGE" despawn sw \
+  >/dev/null 2>"$TESTROOT/swap.err"; rc=$?
+assert "server 中途替換：另一 server 的同 id 人工 pane 未被殺" \
+  bash -c "$(printf '%q' "$REAL_TMUX") -L $(printf '%q' "$SOCKB") -f /dev/null \
+    list-panes -a -F '#{pane_id}' | grep -Fxq $(printf '%q' "$PANE_B0")"
+assert "server 中途替換：非零退出" test "$rc" -ne 0
+assert "server 中途替換：registry 保留不動" test -f "$DSWAP/agents/sw.json"
+assert "server 中途替換：stderr 說明無法關閉 pane" \
+  grep -q '無法關閉 pane' "$TESTROOT/swap.err"
+"$REAL_TMUX" -L "$SOCKB" -f /dev/null kill-server 2>/dev/null || true
+tmx kill-pane -t "$pane_s" 2>/dev/null
+
+# ---- 18c. despawn 不得把 tmux 失敗當成「pane 已消失」（codex 第三輪 FAIL 2） ----
+DDSP="$TESTROOT/ddsp"
+pane_k="$(absp "$DDSP" 0 spawn kx --runtime codex 2>/dev/null)"
+
+# 查詢失敗：registry 必須原封不動，否則 pane 變成沒人回收的孤兒
+ab_notmux "$DDSP" despawn kx >/dev/null 2>"$TESTROOT/dsp-notmux.err"; rc=$?
+assert "list-panes 失敗：非零退出" test "$rc" -ne 0
+assert "list-panes 失敗：registry 保留不動" test -f "$DDSP/agents/kx.json"
+assert "list-panes 失敗：pane 仍在" pane_alive "$pane_k"
+assert "list-panes 失敗：stderr 說明 registry 未動" \
+  grep -qE '無法查詢 tmux pane|找不到 tmux' "$TESTROOT/dsp-notmux.err"
+assert "list-panes 失敗：不寫 despawned audit" \
+  bash -c "! grep -qE 'Z despawned kx ' '$DDSP/agents.log' 2>/dev/null"
+
+# kill 沒生效：同樣不得刪 registry。kill 現在由 tmux 在 if-shell 內部執行
+# （原子驗證，見 cmd_despawn），所以攔 if-shell 就等於「驗證沒過／kill 沒發生」
+KILLSHIM="$TESTROOT/killshim"
+mkdir -p "$KILLSHIM"
+cat > "$KILLSHIM/tmux" <<EOF
+#!/usr/bin/env bash
+unset TMUX
+if [[ "\$1" == "if-shell" ]]; then exit 0; fi
+exec $(printf '%q' "$REAL_TMUX") -L $(printf '%q' "$SOCK") -f /dev/null "\$@"
+EOF
+chmod +x "$KILLSHIM/tmux"
+ln -s "$BRIDGE" "$KILLSHIM/agent-bridge"
+env AGENT_BRIDGE_DATA="$DDSP" PATH="$KILLSHIM:$PATH" "$BRIDGE" despawn kx \
+  >/dev/null 2>"$TESTROOT/dsp-kill.err"; rc=$?
+assert "kill 未生效：非零退出" test "$rc" -ne 0
+assert "kill 未生效：registry 保留不動" test -f "$DDSP/agents/kx.json"
+assert "kill 未生效：pane 仍在" pane_alive "$pane_k"
+assert "kill 未生效：stderr 說明無法關閉 pane" \
+  grep -q '無法關閉 pane' "$TESTROOT/dsp-kill.err"
+assert "kill 未生效：locks 無殘留" test -z "$(ls -A "$DDSP/locks" 2>/dev/null)"
+ab "$DDSP" despawn kx >/dev/null 2>&1   # 正常路徑收尾
+assert "排除障礙後 despawn 正常完成" test ! -e "$DDSP/agents/kx.json"
+
+ab "$DSPAWN" despawn w5 >/dev/null 2>&1
+ab "$DSPAWN" despawn w6 >/dev/null 2>&1
+assert "spawn/despawn 全程後 locks 無殘留" \
+  test -z "$(ls -A "$DSPAWN/locks" 2>/dev/null)"
+
+# ---- 19. codex 複核回歸：出身防護的 TOCTOU 與回滾漏洞 ----
+
+# 19a. provenance race（codex FAIL 1）：出身檢查若在鎖外，despawn 可能先驗過
+# 舊的 spawned 紀錄、再殺到同名人工註冊的 pane。兩道防線分開驗。
+
+# 防線一：register 不得覆寫 spawned agent（同名替換這條路整個封死）
+DRACE="$TESTROOT/drace"
+pane_v="$(absp "$DRACE" 0 spawn victim --runtime codex 2>/dev/null)"
+pane_human="$(tmx split-window -dP -F '#{pane_id}' "$pane_cmd")"
+ab "$DRACE" register victim "$pane_human" >/dev/null 2>&1; rc=$?
+assert "register 拒絕覆寫 spawned agent" test "$rc" -ne 0
+# shellcheck disable=SC2016  # $p 是 jq 變數（由 --arg 傳入），非 shell 展開
+assert "register 被拒：registry 仍是 spawned 紀錄且 pane 未變" \
+  jq -e --arg p "$pane_v" '.spawned == true and .pane_id == $p' "$DRACE/agents/victim.json"
+
+# 防線二：出身檢查確實在鎖內——趁 despawn 等鎖時直接把 registry 換成人工紀錄
+# （繞過 register，模擬任何未來的替換途徑），放鎖後 despawn 必須拒殺
+mkdir -p "$DRACE/locks/agents-registry.lock"      # 卡住 despawn，製造窗口
+ab "$DRACE" despawn victim >/dev/null 2>"$TESTROOT/race-despawn.err" &
+race_pid=$!
+sleep 0.5
+jq -n --arg p "$pane_human" \
+  '{name: "victim", pane_id: $p, registered_at: "2026-01-01T00:00:00Z"}' \
+  > "$DRACE/agents/victim.json"
+rmdir "$DRACE/locks/agents-registry.lock"
+wait "$race_pid"; rc=$?
+assert "鎖內出身檢查：registry 於等鎖期間被換成人工紀錄 → despawn 非零退出" \
+  test "$rc" -ne 0
+assert "鎖內出身檢查：stderr 說明非 spawn 出身" \
+  grep -q '非 spawn 出身' "$TESTROOT/race-despawn.err"
+assert "鎖內出身檢查：人工 pane 未被誤殺" pane_alive "$pane_human"
+assert "鎖內出身檢查：人工 registry 未被刪" test -f "$DRACE/agents/victim.json"
+assert "鎖內出身檢查：locks 無殘留" \
+  test -z "$(ls -A "$DRACE/locks" 2>/dev/null)"
+tmx kill-pane -t "$pane_human" 2>/dev/null
+tmx kill-pane -t "$pane_v" 2>/dev/null
+rm -f "$DRACE/agents/victim.json"
+
+# unregister 不得把 spawned agent 除名（會留下沒人認領的 pane、cap 少算）
+pane_u="$(absp "$DRACE" 0 spawn uw --runtime codex 2>/dev/null)"
+assert_fails "unregister 拒絕移除 spawned agent" ab "$DRACE" unregister uw
+assert "unregister 被拒：registry 仍在" test -f "$DRACE/agents/uw.json"
+assert "unregister 被拒：pane 仍在" pane_alive "$pane_u"
+ab "$DRACE" despawn uw >/dev/null 2>&1
+
+# 19b. pane 已建但 pane id 沒回到手上（codex FAIL 2）：
+# tmux shim 照常建 pane 卻丟棄 -P 輸出 → 回滾必須靠啟動指令裡的 tag 掃出孤兒
+GAPSHIM="$TESTROOT/gapshim"
+mkdir -p "$GAPSHIM"
+cat > "$GAPSHIM/tmux" <<EOF
+#!/usr/bin/env bash
+unset TMUX
+if [[ "\$1" == "split-window" || "\$1" == "new-window" ]]; then
+  $(printf '%q' "$REAL_TMUX") -L $(printf '%q' "$SOCK") -f /dev/null "\$@" >/dev/null
+  exit 0
+fi
+exec $(printf '%q' "$REAL_TMUX") -L $(printf '%q' "$SOCK") -f /dev/null "\$@"
+EOF
+chmod +x "$GAPSHIM/tmux"
+ln -s "$BRIDGE" "$GAPSHIM/agent-bridge"
+ln -s "$SHIM/codex" "$GAPSHIM/codex"
+DGAP="$TESTROOT/dgap"
+before_gap="$(pane_count)"
+env AGENT_BRIDGE_DATA="$DGAP" AGENT_BRIDGE_READY_TIMEOUT=0 PATH="$GAPSHIM:$PATH" \
+  "$BRIDGE" spawn gap --runtime codex >/dev/null 2>"$TESTROOT/gap.err"; rc=$?
+assert "pane id 遺失：非零退出" test "$rc" -ne 0
+assert "pane id 遺失：stderr 說明未回傳 pane id" \
+  grep -q '未回傳 pane id' "$TESTROOT/gap.err"
+assert "pane id 遺失：不留 registry" test ! -e "$DGAP/agents/gap.json"
+assert "pane id 遺失：孤兒 pane 被 tag 掃出並回收（pane 數不變）" \
+  test "$(pane_count)" -eq "$before_gap"
+assert "pane id 遺失：locks 無殘留" test -z "$(ls -A "$DGAP/locks" 2>/dev/null)"
+
+# 19b'. tag 比對必須錨在啟動指令開頭（codex 第二輪 FAIL 1）：
+# 旁邊擺一個「參數裡碰巧含同一 tag 字串」的無關 pane，回滾不得誤殺它。
+# shim 把本次 tagged_cmd 寫出來，測試據此造出對照 pane 後才放行。
+BAITSHIM="$TESTROOT/baitshim"
+mkdir -p "$BAITSHIM"
+cat > "$BAITSHIM/tmux" <<EOF
+#!/usr/bin/env bash
+unset TMUX
+TMX=($(printf '%q' "$REAL_TMUX") -L $(printf '%q' "$SOCK") -f /dev/null)
+if [[ "\$1" == "split-window" || "\$1" == "new-window" ]]; then
+  for a in "\$@"; do :; done
+  printf '%s' "\$a" > "$TESTROOT/bait-cmd.txt"
+  # 對照 pane：命令中段含同一 tag 子字串，但不是以它開頭
+  "\${TMX[@]}" split-window -d "sleep 600 # bait \$a tail"
+  "\${TMX[@]}" "\$@" >/dev/null
+  exit 0
+fi
+exec "\${TMX[@]}" "\$@"
+EOF
+chmod +x "$BAITSHIM/tmux"
+ln -s "$BRIDGE" "$BAITSHIM/agent-bridge"
+ln -s "$SHIM/codex" "$BAITSHIM/codex"
+DBAIT="$TESTROOT/dbait"
+before_bait="$(pane_count)"
+env AGENT_BRIDGE_DATA="$DBAIT" AGENT_BRIDGE_READY_TIMEOUT=0 PATH="$BAITSHIM:$PATH" \
+  "$BRIDGE" spawn bait --runtime codex >/dev/null 2>&1; rc=$?
+assert "tag 比對：pane id 遺失情境仍非零退出" test "$rc" -ne 0
+# 起始 + 對照 pane + 目標 pane = before+2；回滾只該收掉目標 pane
+assert "tag 比對：只回收自己的 pane，對照 pane 存活（淨增 1）" \
+  test "$(pane_count)" -eq "$((before_bait + 1))"
+bait_tag="$(< "$TESTROOT/bait-cmd.txt")"
+assert "tag 比對：對照 pane 確實含同一 tag 字串（測例前提成立）" \
+  bash -c "$(printf '%q' "$REAL_TMUX") -L $(printf '%q' "$SOCK") -f /dev/null \
+    list-panes -a -F '#{pane_start_command}' | grep -Fq -- $(printf '%q' "$bait_tag")"
+# 清掉對照 pane
+while read -r bp bcmd; do
+  bcmd="${bcmd#\"}"   # tmux 存的是加了引號的整條指令，不剝就匹配不到
+  [[ "$bcmd" == "sleep 600 # bait "* ]] && tmx kill-pane -t "$bp" 2>/dev/null
+done < <(tmx list-panes -a -F '#{pane_id} #{pane_start_command}')
+
+# 19c. 審計寫入失敗仍須完整回滾且釋放鎖（codex FAIL 3 的路徑）：
+# agents.log 做成目錄 → log_agent_event 的 >> 失敗 → set -e 觸發 EXIT trap
+DTRAP="$TESTROOT/dtrap"
+mkdir -p "$DTRAP/agents" "$DTRAP/agents.log" "$DTRAP/locks" "$DTRAP/tasks"
+before_trap="$(pane_count)"
+absp "$DTRAP" 0 spawn audit-x --runtime codex >/dev/null 2>&1; rc=$?
+assert "審計寫入失敗：非零退出" test "$rc" -ne 0
+assert "審計寫入失敗：registry 鎖仍被釋放（無殘鎖）" \
+  test ! -d "$DTRAP/locks/agents-registry.lock"
+assert "審計寫入失敗：pane 被回收（pane 數不變）" \
+  test "$(pane_count)" -eq "$before_trap"
+assert "審計寫入失敗：不留 registry" test ! -e "$DTRAP/agents/audit-x.json"
+
+# 19c'. 回滾刪不掉 registry 時不得靜默（codex 第二輪 FAIL 2）：
+# date shim 在 registry 已寫入後把 agents/ 轉唯讀 → 審計失敗觸發回滾，
+# 但 rm 也失敗。殘留 registry 會繼續佔 cap，必須明講而非吞掉。
+DRES="$TESTROOT/dres"
+mkdir -p "$DRES/agents" "$DRES/agents.log" "$DRES/locks" "$DRES/tasks"
+RESSHIM="$TESTROOT/resshim"
+mkdir -p "$RESSHIM"
+cat > "$RESSHIM/date" <<EOF
+#!/usr/bin/env bash
+# registry 一旦落地就鎖住父目錄，讓後續回滾的 rm 必然失敗
+if [[ -f "$DRES/agents/res-x.json" ]]; then chmod 0555 "$DRES/agents"; fi
+exec /usr/bin/date "\$@"
+EOF
+chmod +x "$RESSHIM/date"
+before_res="$(pane_count)"
+env AGENT_BRIDGE_DATA="$DRES" AGENT_BRIDGE_READY_TIMEOUT=0 PATH="$RESSHIM:$SHIM:$PATH" \
+  "$BRIDGE" spawn res-x --runtime codex >/dev/null 2>"$TESTROOT/res.err"; rc=$?
+chmod 0755 "$DRES/agents"
+assert "回滾刪不掉 registry：非零退出" test "$rc" -ne 0
+assert "回滾刪不掉 registry：stderr 明確警告而非靜默" \
+  grep -q '回滾未能刪除 registry' "$TESTROOT/res.err"
+assert "回滾刪不掉 registry：仍釋放鎖（無殘鎖）" \
+  test ! -d "$DRES/locks/agents-registry.lock"
+assert "回滾刪不掉 registry：pane 仍被回收" \
+  test "$(pane_count)" -eq "$before_res"
+
+# 19d. 回滾殺不掉 pane 時也要出聲（codex 第三輪 FAIL 3）：
+# kill-pane 固定失敗 + agents.log 為目錄觸發回滾 → 必須警告而非靜默
+DRK="$TESTROOT/drk"
+mkdir -p "$DRK/agents" "$DRK/agents.log" "$DRK/locks" "$DRK/tasks"
+RKSHIM="$TESTROOT/rkshim"
+mkdir -p "$RKSHIM"
+cat > "$RKSHIM/tmux" <<EOF
+#!/usr/bin/env bash
+unset TMUX
+# 回滾的 kill 現在包在 if-shell 內（原子驗 tag），攔它＝kill 未生效
+if [[ "\$1" == "if-shell" ]]; then exit 0; fi
+exec $(printf '%q' "$REAL_TMUX") -L $(printf '%q' "$SOCK") -f /dev/null "\$@"
+EOF
+chmod +x "$RKSHIM/tmux"
+ln -s "$BRIDGE" "$RKSHIM/agent-bridge"
+ln -s "$SHIM/codex" "$RKSHIM/codex"
+env AGENT_BRIDGE_DATA="$DRK" AGENT_BRIDGE_READY_TIMEOUT=0 PATH="$RKSHIM:$PATH" \
+  "$BRIDGE" spawn rk --runtime codex >/dev/null 2>"$TESTROOT/rk.err"; rc=$?
+assert "回滾殺不掉 pane：非零退出" test "$rc" -ne 0
+assert "回滾殺不掉 pane：stderr 明確警告而非靜默" \
+  grep -q '回滾未能關閉 pane' "$TESTROOT/rk.err"
+assert "回滾殺不掉 pane：仍釋放鎖" test ! -d "$DRK/locks/agents-registry.lock"
+# 收拾這個刻意殺不掉的 pane
+while read -r rp rcmd; do
+  rcmd="${rcmd#\"}"
+  [[ "$rcmd" == AGENT_BRIDGE_SPAWN_TAG=* ]] && tmx kill-pane -t "$rp" 2>/dev/null
+done < <(tmx list-panes -a -F '#{pane_id} #{pane_start_command}')
+
+# 19e. 回滾也要原子驗 tag（codex 第五輪 FAIL）：split-window 走 A server 拿到
+# pane id，其餘呼叫落到 B server（同一個 id 在那裡是人工 pane）。回滾若直接
+# kill 那個 id，就殺掉 B 的人工 pane；驗 tag 才殺則不動它。
+SOCKC="agent-bridge-test-c"
+"$REAL_TMUX" -L "$SOCKC" -f /dev/null new-session -d -s c -x 200 -y 100 "$pane_cmd"
+mapfile -t CPANES < <("$REAL_TMUX" -L "$SOCKC" -f /dev/null list-panes -a -F '#{pane_id}')
+PANE_C0="${CPANES[0]}"
+DRBSWAP="$TESTROOT/drbswap"
+mkdir -p "$DRBSWAP/agents" "$DRBSWAP/agents.log" "$DRBSWAP/locks" "$DRBSWAP/tasks"
+RBSWAPSHIM="$TESTROOT/rbswapshim"
+mkdir -p "$RBSWAPSHIM"
+cat > "$RBSWAPSHIM/tmux" <<EOF
+#!/usr/bin/env bash
+unset TMUX
+# 建 pane 走 A server，但回報 B server 上那個人工 pane 的 id（模擬 id 相同、
+# 後續呼叫落到另一個 server）；其餘呼叫一律走 B server
+if [[ "\$1" == "split-window" || "\$1" == "new-window" ]]; then
+  $(printf '%q' "$REAL_TMUX") -L $(printf '%q' "$SOCK") -f /dev/null "\$@" >/dev/null
+  printf '%s\n' $(printf '%q' "$PANE_C0")
+  exit 0
+fi
+exec $(printf '%q' "$REAL_TMUX") -L $(printf '%q' "$SOCKC") -f /dev/null "\$@"
+EOF
+chmod +x "$RBSWAPSHIM/tmux"
+ln -s "$BRIDGE" "$RBSWAPSHIM/agent-bridge"
+ln -s "$SHIM/codex" "$RBSWAPSHIM/codex"
+env AGENT_BRIDGE_DATA="$DRBSWAP" AGENT_BRIDGE_READY_TIMEOUT=0 PATH="$RBSWAPSHIM:$PATH" \
+  "$BRIDGE" spawn rbsw --runtime codex >/dev/null 2>"$TESTROOT/rbswap.err"; rc=$?
+assert "回滾跨 server：非零退出" test "$rc" -ne 0
+assert "回滾跨 server：另一 server 的同 id 人工 pane 未被誤殺" \
+  bash -c "$(printf '%q' "$REAL_TMUX") -L $(printf '%q' "$SOCKC") -f /dev/null \
+    list-panes -a -F '#{pane_id}' | grep -Fxq $(printf '%q' "$PANE_C0")"
+assert "回滾跨 server：stderr 有未能關閉 pane 的警告" \
+  grep -q '回滾未能關閉 pane' "$TESTROOT/rbswap.err"
+assert "回滾跨 server：不留 registry" test ! -e "$DRBSWAP/agents/rbsw.json"
+assert "回滾跨 server：仍釋放鎖" test ! -d "$DRBSWAP/locks/agents-registry.lock"
+
+# 回滾期間 tmux 整個不可用：不得把「查不到」當成「pane 已消失」而靜默
+DRBNT="$TESTROOT/drbnt"
+mkdir -p "$DRBNT/agents" "$DRBNT/agents.log" "$DRBNT/locks" "$DRBNT/tasks"
+NTSHIM="$TESTROOT/ntshim"
+mkdir -p "$NTSHIM"
+cat > "$NTSHIM/tmux" <<EOF
+#!/usr/bin/env bash
+unset TMUX
+# 只讓建 pane 成功，之後的查詢／if-shell 全部失敗（模擬 tmux 中途不可用）
+if [[ "\$1" == "split-window" || "\$1" == "new-window" ]]; then
+  exec $(printf '%q' "$REAL_TMUX") -L $(printf '%q' "$SOCK") -f /dev/null "\$@"
+fi
+if [[ "\$1" == "list-panes" && "\$*" != *pane_start_command* ]]; then
+  echo "tmux: unavailable (test stub)" >&2; exit 1
+fi
+exec $(printf '%q' "$REAL_TMUX") -L $(printf '%q' "$SOCK") -f /dev/null "\$@"
+EOF
+chmod +x "$NTSHIM/tmux"
+ln -s "$BRIDGE" "$NTSHIM/agent-bridge"
+ln -s "$SHIM/codex" "$NTSHIM/codex"
+env AGENT_BRIDGE_DATA="$DRBNT" AGENT_BRIDGE_READY_TIMEOUT=0 PATH="$NTSHIM:$PATH" \
+  "$BRIDGE" spawn nt --runtime codex >/dev/null 2>"$TESTROOT/rbnt.err"; rc=$?
+assert "回滾期間 tmux 查詢失敗：非零退出" test "$rc" -ne 0
+assert "回滾期間 tmux 查詢失敗：警告而非靜默當成已回收" \
+  grep -q '回滾未能關閉 pane' "$TESTROOT/rbnt.err"
+
+# 同一個坑的另一半：pane id 遺失走 tag 掃描分支，而掃描用的 list-panes 也失敗
+# → 迴圈跑零次，看起來跟「沒有孤兒」一樣。不出聲就是謊報回滾乾淨
+DSCAN="$TESTROOT/dscan"
+SCANSHIM="$TESTROOT/scanshim"
+mkdir -p "$SCANSHIM"
+cat > "$SCANSHIM/tmux" <<EOF
+#!/usr/bin/env bash
+unset TMUX
+# 建 pane 成功但丟棄 -P 輸出（pane id 遺失 → 走 tag 掃描）
+if [[ "\$1" == "split-window" || "\$1" == "new-window" ]]; then
+  $(printf '%q' "$REAL_TMUX") -L $(printf '%q' "$SOCK") -f /dev/null "\$@" >/dev/null
+  exit 0
+fi
+# 掃描用的查詢失敗
+if [[ "\$1" == "list-panes" && "\$*" == *pane_start_command* ]]; then
+  echo "tmux: unavailable (test stub)" >&2; exit 1
+fi
+exec $(printf '%q' "$REAL_TMUX") -L $(printf '%q' "$SOCK") -f /dev/null "\$@"
+EOF
+chmod +x "$SCANSHIM/tmux"
+ln -s "$BRIDGE" "$SCANSHIM/agent-bridge"
+ln -s "$SHIM/codex" "$SCANSHIM/codex"
+env AGENT_BRIDGE_DATA="$DSCAN" AGENT_BRIDGE_READY_TIMEOUT=0 PATH="$SCANSHIM:$PATH" \
+  "$BRIDGE" spawn scan --runtime codex >/dev/null 2>"$TESTROOT/scan.err"; rc=$?
+assert "孤兒掃描查詢失敗：非零退出" test "$rc" -ne 0
+assert "孤兒掃描查詢失敗：警告而非靜默（不得謊報回滾乾淨）" \
+  grep -q '回滾無法查詢 tmux pane' "$TESTROOT/scan.err"
+assert "孤兒掃描查詢失敗：不留 registry" test ! -e "$DSCAN/agents/scan.json"
+while read -r rp rcmd; do
+  rcmd="${rcmd#\"}"
+  [[ "$rcmd" == AGENT_BRIDGE_SPAWN_TAG=* ]] && tmx kill-pane -t "$rp" 2>/dev/null
+done < <(tmx list-panes -a -F '#{pane_id} #{pane_start_command}')
+while read -r rp rcmd; do
+  rcmd="${rcmd#\"}"
+  [[ "$rcmd" == AGENT_BRIDGE_SPAWN_TAG=* ]] && tmx kill-pane -t "$rp" 2>/dev/null
+done < <(tmx list-panes -a -F '#{pane_id} #{pane_start_command}')
+"$REAL_TMUX" -L "$SOCKC" -f /dev/null kill-server 2>/dev/null || true
+# A server 上那個真的被建出來的 pane 要收掉
+while read -r rp rcmd; do
+  rcmd="${rcmd#\"}"
+  [[ "$rcmd" == AGENT_BRIDGE_SPAWN_TAG=* ]] && tmx kill-pane -t "$rp" 2>/dev/null
+done < <(tmx list-panes -a -F '#{pane_id} #{pane_start_command}')
+
+# 目錄型 registry 路徑：名稱衝突檢查用 -e，不得把目錄當成「未註冊」而寫進去
+DDIR="$TESTROOT/ddir"
+mkdir -p "$DDIR/agents/dirname.json" "$DDIR/locks" "$DDIR/tasks"
+before_ddir="$(pane_count)"
+absp "$DDIR" 0 spawn dirname --runtime codex >/dev/null 2>&1; rc=$?
+assert "目錄型 registry 路徑：spawn 被拒（非零退出）" test "$rc" -ne 0
+assert "目錄型 registry 路徑：不建 pane" test "$(pane_count)" -eq "$before_ddir"
+assert "目錄型 registry 路徑：無殘鎖" \
+  test ! -d "$DDIR/locks/agents-registry.lock"
+
+# ---- 20. 損壞 registry 的出身判斷必須 fail-closed（codex 第七輪 FAIL 1） ----
+# `jq -e '.spawned == true'` 會把「條件 false」與「JSON 壞掉」壓成同一個非零，
+# 於是損壞的 registry 被當成人工註冊：可被 register 覆寫、被 unregister 除名
+# （pane 變孤兒）、也不計入 cap
+DBAD="$TESTROOT/dbad"
+pane_bad="$(absp "$DBAD" 0 spawn bad1 --runtime codex 2>/dev/null)"
+printf '{' > "$DBAD/agents/bad1.json"     # 截斷成不合法 JSON
+assert_fails "損壞 registry：unregister 拒絕（否則 pane 變孤兒）" \
+  ab "$DBAD" unregister bad1
+assert "損壞 registry：unregister 被拒後檔案仍在" test -f "$DBAD/agents/bad1.json"
+assert "損壞 registry：pane 仍在（沒被除名成孤兒）" pane_alive "$pane_bad"
+assert_fails "損壞 registry：register 拒絕覆寫" ab "$DBAD" register bad1 "$PANE_A"
+assert_fails "損壞 registry：despawn 拒絕（出身不明不動 pane）" ab "$DBAD" despawn bad1
+assert_fails "損壞 registry：ready 拒絕" ab "$DBAD" ready bad1
+assert "損壞 registry：以上拒絕都不動 pane" pane_alive "$pane_bad"
+# cap 保守計入：上限 1 且已有一份損壞 registry → 不得再 spawn
+env AGENT_BRIDGE_DATA="$DBAD" AGENT_BRIDGE_MAX_SPAWN=1 AGENT_BRIDGE_READY_TIMEOUT=0 \
+  PATH="$SHIM:$PATH" "$BRIDGE" spawn bad2 --runtime codex >/dev/null 2>&1; rc=$?
+assert "損壞 registry：保守計入 cap（不得繞過上限）" test "$rc" -ne 0
+assert "損壞 registry：cap 擋下後不留 registry" test ! -e "$DBAD/agents/bad2.json"
+
+# 合法 JSON 但不是 object（字面 null）同樣判不出出身，不得被當成人工註冊
+printf 'null' > "$DBAD/agents/bad1.json"
+assert_fails "registry 是字面 null：unregister 拒絕" ab "$DBAD" unregister bad1
+assert_fails "registry 是字面 null：register 拒絕覆寫" \
+  ab "$DBAD" register bad1 "$PANE_A"
+assert "registry 是字面 null：pane 未受影響" pane_alive "$pane_bad"
+
+rm -f "$DBAD/agents/bad1.json"
+tmx kill-pane -t "$pane_bad" 2>/dev/null
+
+# ---- 20b. readiness 參數在建 pane 前就要驗（codex 第八輪 FAIL） ----
+# 非法值若留到 spawn_wait_ready 才 die，pane 與 registry 都已落地、回滾也已
+# 解除，呼叫端只看到非零退出，卻多了一個佔 cap 的 worker
+DRO="$TESTROOT/dro"
+mkdir -p "$DRO/agents" "$DRO/locks" "$DRO/tasks"
+for badopt in "AGENT_BRIDGE_READY_TIMEOUT=abc" "AGENT_BRIDGE_READY_PROBE_INTERVAL=invalid" \
+              "AGENT_BRIDGE_READY_PROBE_INTERVAL=0" "AGENT_BRIDGE_READY_PROBE_INTERVAL=.0" \
+              "AGENT_BRIDGE_READY_PROBE_INTERVAL=.00" "AGENT_BRIDGE_READY_PROBE_INTERVAL=00"; do
+  ro_before="$(pane_count)"
+  env AGENT_BRIDGE_DATA="$DRO" "$badopt" PATH="$SHIM:$PATH" \
+    "$BRIDGE" spawn "ro" --runtime codex >/dev/null 2>"$TESTROOT/ro.err"; rc=$?
+  assert "readiness 參數不合法（$badopt）：非零退出" test "$rc" -ne 0
+  assert "readiness 參數不合法（$badopt）：不建 pane" \
+    test "$(pane_count)" -eq "$ro_before"
+  assert "readiness 參數不合法（$badopt）：不留 registry" \
+    test ! -e "$DRO/agents/ro.json"
+done
+
+# 註冊之後的失敗不得回報成 spawn 失敗：worker 已存在且佔著 cap，呼叫端照著
+# 「失敗」重試或放棄都是錯的。stdout 被關（printf 失敗）是最實際的一種
+DSO="$TESTROOT/dso"
+env AGENT_BRIDGE_DATA="$DSO" AGENT_BRIDGE_READY_TIMEOUT=0 PATH="$SHIM:$PATH" \
+  "$BRIDGE" spawn so --runtime codex >&- 2>/dev/null; rc=$?
+assert "stdout 已關閉：spawn 仍 exit 0（worker 已建立不該報失敗）" test "$rc" -eq 0
+assert "stdout 已關閉：registry 確實寫入" test -f "$DSO/agents/so.json"
+ab "$DSO" despawn so >/dev/null 2>&1 || true
+
+# ---- 21. 解鎖失敗不得靜默（codex 第七輪 FAIL 3） ----
+# 鎖目錄被塞進檔案時 rmdir 會 Directory not empty，吞掉的話鎖就永久殘留、
+# 而且沒有任何人知道
+DLK="$TESTROOT/dlk"
+mkdir -p "$DLK/agents" "$DLK/locks" "$DLK/tasks"
+LKSHIM="$TESTROOT/lkshim"
+mkdir -p "$LKSHIM"
+cat > "$LKSHIM/date" <<EOF
+#!/usr/bin/env bash
+# spawn 取得 registry 鎖後才會呼叫 date（寫 registered_at）；趁機把鎖目錄弄成非空
+if [[ -d "$DLK/locks/agents-registry.lock" ]]; then
+  : > "$DLK/locks/agents-registry.lock/squatter"
+fi
+exec /usr/bin/date "\$@"
+EOF
+chmod +x "$LKSHIM/date"
+env AGENT_BRIDGE_DATA="$DLK" AGENT_BRIDGE_READY_TIMEOUT=0 PATH="$LKSHIM:$SHIM:$PATH" \
+  "$BRIDGE" spawn lk --runtime codex >/dev/null 2>"$TESTROOT/lk.err" || true
+assert "解鎖失敗：stderr 明確警告而非靜默" \
+  grep -q '無法釋放鎖目錄' "$TESTROOT/lk.err"
+rm -rf "$DLK/locks/agents-registry.lock"
+ab "$DLK" despawn lk >/dev/null 2>&1 || true
 
 # ---- 總結 ----
 printf '\n共 %d PASS、%d FAIL\n' "$PASS" "$FAIL"

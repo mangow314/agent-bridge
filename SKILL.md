@@ -22,7 +22,10 @@ description: >
 ## 指令速查
 
 ```bash
-agent-bridge list                     # 看有哪些 agent 可委派（name<TAB>pane_id）
+agent-bridge list                     # 可委派 agent（name<TAB>pane_id<TAB>ready 欄：-/starting/ready）
+agent-bridge spawn <name> --runtime codex [--window]  # 開 worker pane 並註冊；stdout 印 pane-id
+agent-bridge despawn <name>           # 回收自己 spawn 的 worker（人工註冊會被拒）
+agent-bridge ready <name>             # （worker）回報就緒；spawn 的探針會自動打這條
 id=$(agent-bridge send <worker> --from <me> --message-file - <<'EOF'
 <任務描述：目標／範圍／驗收條件／限制>
 EOF
@@ -57,6 +60,25 @@ agent-bridge read "$id"               # （sender）讀回覆原文（completed/
 - worker 可能反向 send 一個「問題任務」回來（見 worker 守則）：收到
   receive 通知時盡快 `reply` 同意／否決／補充；你對原任務的背景 await
   不受影響，繼續等即可。
+
+## Orchestrator 守則（spawn/despawn）
+
+- spawn 前先 `agent-bridge list` 看 cap 餘量：spawned agent 上限
+  `AGENT_BRIDGE_MAX_SPAWN`（預設 4），達上限先 despawn 閒置 worker 再 spawn。
+- **despawn 只回收自己 spawn 的 worker**：人工 register 的 agent 是別人的
+  session，bridge 會拒殺，你也不該試。
+- 留用 vs 回收的判準：後續還有同 runtime 的任務 → 留用（省啟動時間，worker
+  reply 後會 `/clear` 等下一件）；工作告一段落、要換 runtime／組態、或 cap
+  吃緊 → despawn 回收，不留殭屍 pane。
+- `list` 顯示 `starting` 時就 send 是合法的：訊息入 mailbox 不會丟，只是
+  通知可能延後；急件等 `ready` 再派。
+- tmux server 重啟過的殘留 spawned registry（pane 已死）：直接 despawn 清掉。
+  重啟後新 pane 可能拿到同一個 pane id，但 despawn 會核對啟動指令裡的
+  spawn tag，對不上就只清註冊、不動那個 pane（stderr 會警告）。
+- despawn 報「無法查詢 tmux pane」或「無法關閉 pane」時**註冊會保留**：那是
+  「沒能確認 pane 被回收」，不是失敗的清理。排除障礙後重跑，別手動刪 registry。
+- 每次 spawn/despawn 都會寫入 `agents.log` 審計（資料目錄下，append-only）；
+  不確定「這個 worker 是誰開的」時先查它。
 
 ## Worker 守則
 

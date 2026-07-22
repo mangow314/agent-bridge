@@ -13,6 +13,10 @@ LOCKS_DIR="$DATA_DIR/locks"
 
 NAME_RE='^[A-Za-z0-9_-]+$'
 TASK_ID_RE='^[A-Za-z0-9._-]+$'
+# registry 的 pane_id 對本程式是不可信輸入（資料目錄對每個 worker 都可寫），
+# 而它會被餵給 tmux。tmux 命令字串裡 `;` 是命令分隔符，
+# 一個 pane_id 寫成 `%1 ; kill-server` 就能殺掉整個 server
+PANE_RE='^%[0-9]+$'
 
 err()  { printf 'agent-bridge: %s\n' "$*" >&2; }
 die()  { err "$*"; exit 1; }
@@ -23,7 +27,7 @@ usage() {
 用法：
   agent-bridge register <agent> <tmux-target>   註冊 agent 與其 tmux pane
   agent-bridge unregister <agent>               移除 agent 註冊
-  agent-bridge list                             列出已註冊 agent（name<TAB>pane_id）
+  agent-bridge list                             列出已註冊 agent（name<TAB>pane_id<TAB>ready）
   agent-bridge send <agent> --from <sender> (--message <text> | --message-file <path>)
                                                 委派任務；stdout 只印 task-id
   agent-bridge receive <task-id>                取出任務（標頭走 stderr、request 原文走 stdout）
@@ -37,10 +41,16 @@ usage() {
   agent-bridge read <task-id>                   讀回覆（completed/failed 可；標頭走 stderr、response 原文走 stdout）
   agent-bridge await <task-id> [--timeout <secs>]
                                                 阻塞等待 task 到終態，印裸狀態字後 exit 0；逾時非零退出
+  agent-bridge spawn <name> --runtime codex [--window]
+                                                spawn 一個 worker pane 並註冊；stdout 只印 pane-id
+  agent-bridge despawn <name>                   回收 spawn 出身的 worker（kill pane＋除名；人工註冊拒殺）
+  agent-bridge ready <name>                     （worker）回報就緒；僅限 spawned agent
 
 --message-file 用 `-` 表示讀 stdin。
 資料目錄預設 ~/.local/share/agent-bridge/，可用 AGENT_BRIDGE_DATA 覆蓋。
 await 輪詢間隔預設 1 秒，可用 AGENT_BRIDGE_POLL_INTERVAL 覆蓋；--timeout 0（預設）＝不逾時。
+spawn 上限 AGENT_BRIDGE_MAX_SPAWN（預設 4）；就緒等待 AGENT_BRIDGE_READY_TIMEOUT
+秒（預設 30，0＝不等待），探針重送間隔 AGENT_BRIDGE_READY_PROBE_INTERVAL（預設 2）。
 EOF
 }
 
@@ -49,6 +59,22 @@ now_iso() { date -u +%Y-%m-%dT%H:%M:%SZ; }
 rand_suffix() { head -c 2 /dev/urandom | od -An -tx1 | tr -d ' \n'; }
 
 ensure_dirs() { mkdir -p "$AGENTS_DIR" "$TASKS_DIR" "$LOCKS_DIR"; }
+
+# is_spawned <registry-file>：0＝spawn 出身，1＝不是，2＝無法判定（JSON 損壞／讀不到）
+# 直接用 `jq -e '.spawned == true'` 會把「條件為 false」與「檔案是壞的」壓成同一個
+# 非零，出身判斷因此 fail-open：一份損壞的 registry 會被當成人工註冊而遭覆寫或除名
+is_spawned() {
+  local f="$1" out
+  # 非 object 的合法 JSON（例如字面 null）也算判不出來：那不是一份 registry，
+  # 當成「人工註冊」就會被覆寫或除名
+  out="$(jq -r 'if type != "object" then "bad" elif .spawned == true then "yes" else "no" end' \
+    "$f" 2>/dev/null)" || return 2
+  case "$out" in
+    yes) return 0 ;;
+    no)  return 1 ;;
+    *)   return 2 ;;
+  esac
+}
 
 require_jq() {
   command -v jq >/dev/null 2>&1 \
@@ -68,7 +94,10 @@ LOCK_DIR=""
 
 release_lock() {
   if [[ -n "$LOCK_DIR" && -d "$LOCK_DIR" ]]; then
-    rmdir "$LOCK_DIR" 2>/dev/null || true
+    # 解不掉的鎖會擋住之後每一次同類操作。吞掉這個失敗＝留下一把沒人知道
+    # 存在的鎖（例如鎖目錄被塞了檔案，rmdir 就會 Directory not empty）
+    rmdir "$LOCK_DIR" 2>/dev/null \
+      || err "警告：無法釋放鎖目錄 $LOCK_DIR（非空或權限問題），它會擋住後續操作，請手動移除"
   fi
   LOCK_DIR=""
 }
@@ -88,7 +117,7 @@ acquire_lock() {
     fi
     tries=$((tries + 1))
     if (( tries >= 25 )); then
-      die "無法取得 task 鎖（locks/$id.lock 佔用中或殘留），請稍後重試"
+      die "無法取得鎖（locks/$id.lock 佔用中或殘留），請稍後重試"
     fi
     sleep 0.2
   done
@@ -133,6 +162,7 @@ write_message() {
 # 會把同批抵達的文字+Enter 當成貼上，Enter 被吞掉導致指令留在輸入框不送出
 notify_pane() {
   local pane="$1" cmd="$2"
+  [[ "$pane" =~ $PANE_RE ]] || return 1
   command -v tmux >/dev/null 2>&1 || return 1
   tmux list-panes -a -F '#{pane_id}' 2>/dev/null | grep -Fx "$pane" >/dev/null || return 1
   tmux send-keys -t "$pane" "$cmd" 2>/dev/null || return 1
@@ -158,7 +188,19 @@ cmd_register() {
   ts="$(now_iso)"
   doc="$(jq -n --arg name "$name" --arg pane "$pane" --arg ts "$ts" \
     '{name: $name, pane_id: $pane, registered_at: $ts}')"
+  # 取 registry 鎖再寫：與 spawn/despawn/ready 互斥。覆寫 spawned agent 會洗掉
+  # 出身標記（pane 變成殺不掉的孤兒，且能誘使 despawn 殺到人工 pane），故拒絕
+  acquire_lock agents-registry
+  if [[ -e "$AGENTS_DIR/$name.json" ]]; then
+    local sp_rc=0
+    is_spawned "$AGENTS_DIR/$name.json" || sp_rc=$?
+    case $sp_rc in
+      0) die "agent '$name' 是 spawn 出身的 worker，register 拒絕覆寫（要換 pane 請先 despawn）" ;;
+      2) die "agent '$name' 的 registry 無法解析，出身不明，register 拒絕覆寫；請確認 $AGENTS_DIR/$name.json 後手動處理" ;;
+    esac
+  fi
   printf '%s\n' "$doc" | atomic_write "$AGENTS_DIR/$name.json"
+  release_lock
   info "已註冊 agent '$name' → pane $pane"
 }
 
@@ -167,18 +209,31 @@ cmd_unregister() {
   local name="$1"
   [[ "$name" =~ $NAME_RE ]] || die "agent 名稱不合法（僅允許 [A-Za-z0-9_-]+）：$name"
   local f="$AGENTS_DIR/$name.json"
+  # 鎖內檢查：單純除名 spawned agent 會留下沒人認領的 pane，且讓 cap 少算一個
+  acquire_lock agents-registry
   [[ -f "$f" ]] || die "未註冊的 agent：$name"
+  local sp_rc=0
+  is_spawned "$f" || sp_rc=$?
+  case $sp_rc in
+    0) die "agent '$name' 是 spawn 出身的 worker，unregister 拒絕（請用 despawn 一併回收 pane）" ;;
+    2) die "agent '$name' 的 registry 無法解析，出身不明，unregister 拒絕（若它其實是 spawned，除名會留下沒人回收的 pane）；請確認 $f 後手動處理" ;;
+  esac
   rm -- "$f"
+  release_lock
   info "已移除 agent '$name' 的註冊"
 }
 
 cmd_list() {
-  local f name pane
+  local f name pane ready
   shopt -s nullglob
   for f in "$AGENTS_DIR"/*.json; do
     name="$(jq -r '.name' "$f")"
     pane="$(jq -r '.pane_id' "$f")"
-    printf '%s\t%s\n' "$name" "$pane"
+    # ready 欄：人工註冊 `-`；spawned 依 .ready 顯示 starting/ready
+    ready="$(jq -r 'if .spawned == true
+                    then (if .ready == true then "ready" else "starting" end)
+                    else "-" end' "$f")"
+    printf '%s\t%s\t%s\n' "$name" "$pane" "$ready"
   done
 }
 
@@ -210,6 +265,9 @@ cmd_send() {
 
   local agent_file="$AGENTS_DIR/$to.json"
   [[ -f "$agent_file" ]] || die "未註冊的 agent：$to（先用 agent-bridge register）"
+  if jq -e '.spawned == true and .ready != true' "$agent_file" >/dev/null 2>&1; then
+    err "警告：agent '$to' 尚未回報就緒（starting），通知可能延後；訊息已入 mailbox 不會遺失"
+  fi
   local pane; pane="$(jq -r '.pane_id' "$agent_file")"
 
   local task_id dir tries=0
@@ -479,6 +537,336 @@ cmd_await() {
   done
 }
 
+# ---- spawn / despawn：worker pane 生命週期 ----
+
+# 審計：$DATA_DIR/agents.log 追加 <ts> spawned|despawned <name> <pane> <runtime>
+log_agent_event() {
+  local action="$1" name="$2" pane="$3" runtime="$4"
+  printf '%s %s %s %s %s\n' "$(now_iso)" "$action" "$name" "$pane" "$runtime" \
+    >> "$DATA_DIR/agents.log"
+}
+
+# spawn 失敗回滾：EXIT trap 讀取。解除回滾靠單一旗標而非逐一清空三個變數——
+# 訊號可能落在兩次賦值之間，讓 trap 看到「有 tag、沒有 registry 路徑」這種
+# 半清空狀態，於是殺了 pane 卻留下 registry
+SPAWN_DONE=0
+SPAWN_RB_PANE=""
+SPAWN_RB_REG=""
+SPAWN_RB_TAG=""
+# rb_kill_tagged <pane>：原子地「驗 tag 才殺」，並確認 pane 真的消失。
+# 與 cmd_despawn 同一套理由——分成「查一次、再殺一次」的話，中間 tmux server
+# 若被替換，第二次呼叫會殺到新 server 上同 id 的人工 pane。回傳 0＝已不存在
+# shellcheck disable=SC2329  # 經 spawn_rollback 間接呼叫
+rb_kill_tagged() {
+  local p="$1" after
+  [[ "$p" =~ $PANE_RE ]] || return 1
+  tmux if-shell -t "$p" -F "#{m:\"$SPAWN_RB_TAG *,#{pane_start_command}}" \
+    "kill-pane -t $p" 2>/dev/null || true
+  # 查詢失敗要回報「無法確認」而不是「已消失」：把 tmux 掛掉當成 pane 不見了，
+  # 正是 despawn 那條被揪出來的錯誤判斷方向
+  after="$(tmux list-panes -a -F '#{pane_id}' 2>/dev/null)" || return 1
+  ! grep -Fx "$p" <<< "$after" >/dev/null
+}
+
+# shellcheck disable=SC2329  # 經 EXIT trap 間接呼叫
+spawn_rollback() {
+  # spawn 已完成：單一旗標，讀到就整個 no-op
+  (( SPAWN_DONE == 1 )) && return 0
+  # 全程容錯：本函式在 EXIT trap 的第一順位，任一步以非零收場都會在 set -e
+  # 下吃掉後面的 release_lock，留下鎖殘留
+  if [[ -n "$SPAWN_RB_TAG" ]]; then
+    if [[ -n "$SPAWN_RB_PANE" ]]; then
+      rb_kill_tagged "$SPAWN_RB_PANE" \
+        || err "警告：回滾未能關閉 pane $SPAWN_RB_PANE，請手動確認後 tmux kill-pane -t $SPAWN_RB_PANE"
+    else
+      # pane 已建立但 pane id 沒回到手上（命令替換失敗、輸出遺失、中途被中斷）：
+      # 靠啟動指令裡的一次性 tag 掃出孤兒 pane，否則它永遠沒人認領。
+      # 比對必須錨在啟動指令**開頭**（tag 是我們自己加的 env 前綴）：無邊界的
+      # 子字串比對會誤殺任何參數裡碰巧含這串的別人 pane
+      # 查詢失敗不能吞：迴圈跑零次跟「沒有孤兒」長得一模一樣，
+      # 靜默下去就是留一個沒人認領的 pane 卻宣稱回滾乾淨
+      local pid cmd scan
+      if scan="$(tmux list-panes -a -F '#{pane_id} #{pane_start_command}' 2>/dev/null)"; then
+        while read -r pid cmd; do
+          # tmux 會把整條啟動指令加雙引號存進 pane_start_command（實測 3.7b），
+          # 先剝掉前導引號才錨得住開頭
+          cmd="${cmd#\"}"
+          if [[ "$cmd" == "$SPAWN_RB_TAG "* ]]; then
+            rb_kill_tagged "$pid" \
+              || err "警告：回滾未能關閉孤兒 pane $pid，請手動確認後 tmux kill-pane -t $pid"
+          fi
+        done <<< "$scan"
+      else
+        err "警告：回滾無法查詢 tmux pane，可能殘留一個啟動指令帶 $SPAWN_RB_TAG 的孤兒 pane，請手動確認並關閉"
+      fi
+    fi
+  fi
+  if [[ -n "$SPAWN_RB_REG" ]]; then
+    # 刪不掉要講出來：靜默吞掉會留下一筆沒有 pane 的殭屍 registry，
+    # 它照樣佔 cap、也擋住同名 spawn。不中止 trap（否則吃掉 release_lock）
+    rm -f -- "$SPAWN_RB_REG" 2>/dev/null \
+      || err "警告：回滾未能刪除 registry $SPAWN_RB_REG，請手動清除（它仍佔用 spawn 名額）"
+  fi
+  # 回滾只做一次：同樣用單一旗標，不逐一清空（理由同上）
+  SPAWN_DONE=1
+}
+
+# 就緒自報到：間隔重送探針（agent-bridge ready <name>）直到 registry 翻
+# ready 或逾時。REPL 啟動期吃掉的按鍵靠重送覆蓋；逾時不回滾、僅警告，
+# pane 留用供人工診斷。
+# validate_ready_opts：兩個 readiness 參數必須在建 pane 之前就驗。等到
+# spawn_wait_ready 才 die 的話，pane 與 registry 都已落地、回滾也已解除，
+# 呼叫端只看到非零退出，卻留下一個佔著 cap 的 worker
+validate_ready_opts() {
+  local t="${AGENT_BRIDGE_READY_TIMEOUT:-30}" i="${AGENT_BRIDGE_READY_PROBE_INTERVAL:-2}"
+  [[ "$t" =~ ^[0-9]{1,9}$ ]] \
+    || die "AGENT_BRIDGE_READY_TIMEOUT 需為非負整數（秒，至多 9 位；0＝不等待）：$t"
+  [[ "$i" =~ ^([0-9]+|[0-9]*\.[0-9]+)$ ]] \
+    || die "AGENT_BRIDGE_READY_PROBE_INTERVAL 需為正數（秒）：$i"
+  # 格式已確認是數字，所以「小數點前後都只有 0（或省略整數位）」即代表零值。
+  # 寫成 ^0+... 會漏掉 .0／.00 這種省略整數位的零
+  [[ ! "$i" =~ ^0*(\.0+)?$ ]] \
+    || die "AGENT_BRIDGE_READY_PROBE_INTERVAL 需大於 0（否則探針會忙迴圈）：$i"
+}
+
+spawn_wait_ready() {
+  local name="$1" pane="$2"
+  # 兩個參數已由 validate_ready_opts 在建 pane 前驗過
+  local timeout="${AGENT_BRIDGE_READY_TIMEOUT:-30}"
+  local interval="${AGENT_BRIDGE_READY_PROBE_INTERVAL:-2}"
+  timeout=$((10#$timeout))
+  if (( timeout == 0 )); then
+    return 0
+  fi
+  local reg="$AGENTS_DIR/$name.json"
+  SECONDS=0
+  while :; do
+    if jq -e '.ready == true' "$reg" >/dev/null 2>&1; then
+      info "agent '$name' 已回報就緒（ready）"
+      return 0
+    fi
+    if (( SECONDS >= timeout )); then
+      err "警告：agent '$name' 於 ${timeout}s 內未回報就緒；pane $pane 留用供診斷，可於該 pane 手動執行：agent-bridge ready $name"
+      return 0
+    fi
+    notify_pane "$pane" "agent-bridge ready $name" || true
+    sleep "$interval"
+  done
+}
+
+cmd_spawn() {
+  (( $# >= 1 )) || die "用法：agent-bridge spawn <name> --runtime codex [--window]"
+  local name="$1"; shift
+  local runtime="" use_window=0
+  while (( $# > 0 )); do
+    case "$1" in
+      --runtime)
+        shift; (( $# > 0 )) || die "--runtime 需要參數"
+        runtime="$1" ;;
+      --window) use_window=1 ;;
+      *) die "未知參數：$1" ;;
+    esac
+    shift
+  done
+  [[ "$name" =~ $NAME_RE ]] || die "agent 名稱不合法（僅允許 [A-Za-z0-9_-]+）：$name"
+  [[ -n "$runtime" ]] || die "spawn 需要 --runtime <runtime>（v1 僅支援 codex）"
+
+  local runtime_cmd
+  case "$runtime" in
+    codex) runtime_cmd="codex --profile agent-worker" ;;
+    *) die "不支援的 runtime：$runtime（v1 僅支援 codex）" ;;
+  esac
+  command -v tmux >/dev/null 2>&1 || die "找不到 tmux，spawn 需要 tmux"
+  command -v "${runtime_cmd%% *}" >/dev/null 2>&1 \
+    || die "找不到 runtime 指令：${runtime_cmd%% *}"
+
+  validate_ready_opts
+
+  local max="${AGENT_BRIDGE_MAX_SPAWN:-4}"
+  [[ "$max" =~ ^[0-9]{1,9}$ ]] || die "AGENT_BRIDGE_MAX_SPAWN 需為非負整數：$max"
+  max=$((10#$max))
+
+  # cap 檢查、建 pane、註冊全部包在 registry 鎖內，杜絕並行 spawn 繞過 cap；
+  # 鎖內任一步失敗 → EXIT trap 回滾（kill 已建 pane＋刪 registry 檔）
+  acquire_lock agents-registry
+  trap 'spawn_rollback || true; release_lock' EXIT
+
+  if [[ -e "$AGENTS_DIR/$name.json" ]]; then
+    die "agent '$name' 已註冊，spawn 不覆蓋（人工註冊請先 unregister；spawned 請先 despawn）"
+  fi
+
+  # 無法解析的 registry 保守計入 cap：漏算會讓上限形同虛設，寧可少開一個
+  local count=0 f sp_rc
+  for f in "$AGENTS_DIR"/*.json; do
+    [[ -e "$f" ]] || continue
+    sp_rc=0
+    is_spawned "$f" || sp_rc=$?
+    case $sp_rc in
+      0|2) count=$((count + 1)) ;;
+    esac
+  done
+  (( count < max )) \
+    || die "已達 spawn 上限（AGENT_BRIDGE_MAX_SPAWN=$max，現有 spawned agent $count 個）；先 despawn 閒置 worker"
+
+  # 一次性 tag 先於建 pane 設好：pane 一旦誕生就認得出是誰的，即使 pane id
+  # 沒能回到手上，回滾仍掃得到（見 spawn_rollback）
+  # tag 是刪除的依據，熵不能省：PID 會重用，光靠 16 位隨機值在舊 pane 仍留著
+  # 啟動指令的情況下有誤中風險，故取 48 位。agent 名字也編進去：registry 位在
+  # worker 可寫的資料目錄，若 tag 與名字無關，被注入的 worker A 只要把 B 的
+  # tag 抄進自己的 registry，就能讓 orchestrator 的 `despawn A` 殺掉 B 的 pane
+  local tag tagged_cmd pane
+  tag="ab-spawn-$name-$$-$(rand_suffix)$(rand_suffix)$(rand_suffix)"
+  tagged_cmd="AGENT_BRIDGE_SPAWN_TAG=$tag exec $runtime_cmd"
+  # 回滾比對的是「env 前綴＋一個空白」，見 spawn_rollback
+  SPAWN_RB_TAG="AGENT_BRIDGE_SPAWN_TAG=$tag"
+  if (( use_window == 1 )); then
+    pane="$(tmux new-window -dP -F '#{pane_id}' "$tagged_cmd")" \
+      || die "tmux new-window 失敗"
+  else
+    pane="$(tmux split-window -dP -F '#{pane_id}' "$tagged_cmd")" \
+      || die "tmux split-window 失敗"
+  fi
+  [[ -n "$pane" ]] || die "tmux 未回傳 pane id"
+  SPAWN_RB_PANE="$pane"
+
+  # 立刻夭折偵測：runtime 指令不存在／啟動即出錯時 pane 會瞬間消失
+  sleep 0.3
+  if ! tmux list-panes -a -F '#{pane_id}' 2>/dev/null | grep -Fx "$pane" >/dev/null; then
+    die "runtime 啟動即失敗（pane $pane 已消失）：$runtime_cmd"
+  fi
+
+  local ts doc
+  ts="$(now_iso)"
+  # spawn_tag 一併存進 registry：pane id 會被 tmux 重用（不同 server、server
+  # 重啟後計數器歸零），光憑 id 無法證明「這個 pane 就是我 spawn 的那一個」。
+  # despawn 殺之前用它跟 pane 的啟動指令對得上才動手
+  doc="$(jq -n --arg name "$name" --arg pane "$pane" --arg ts "$ts" --arg rt "$runtime" \
+              --arg tag "$SPAWN_RB_TAG" \
+    '{name: $name, pane_id: $pane, registered_at: $ts,
+      spawned: true, runtime: $rt, spawned_at: $ts, ready: false,
+      spawn_tag: $tag}')"
+  SPAWN_RB_REG="$AGENTS_DIR/$name.json"
+  printf '%s\n' "$doc" | atomic_write "$AGENTS_DIR/$name.json"
+  log_agent_event spawned "$name" "$pane" "$runtime"
+
+  # 註冊完成即視為 spawn 成功：一次賦值解除回滾，之後就緒逾時只警告不回滾
+  SPAWN_DONE=1
+  release_lock || true
+
+  # 這之後 worker 已經存在且註冊在案，任何失敗都不該讓呼叫端以為 spawn 失敗
+  # ——它會照著「失敗」去重試或放棄，實際卻留著一個佔 cap 的 worker。
+  # 輸出寫不出去（stdout/stderr 被關、EPIPE）是最實際的一種
+  info "已 spawn agent '$name' → pane $pane（runtime：$runtime）" || true
+  printf '%s\n' "$pane" || true
+  spawn_wait_ready "$name" "$pane" || true
+  return 0
+}
+
+cmd_despawn() {
+  (( $# == 1 )) || die "用法：agent-bridge despawn <name>"
+  local name="$1"
+  [[ "$name" =~ $NAME_RE ]] || die "agent 名稱不合法（僅允許 [A-Za-z0-9_-]+）：$name"
+  local f="$AGENTS_DIR/$name.json"
+  # 出身檢查必須在鎖內：檢查與 kill-pane 之間若 registry 被同名 register 換掉，
+  # 鎖外檢查會拿舊紀錄放行、卻殺到新的人工 pane（TOCTOU）
+  acquire_lock agents-registry
+  [[ -f "$f" ]] || die "未註冊的 agent：$name"
+  local sp_rc=0
+  is_spawned "$f" || sp_rc=$?
+  case $sp_rc in
+    1) die "agent '$name' 非 spawn 出身，despawn 拒絕（人工註冊請用 unregister）" ;;
+    2) die "agent '$name' 的 registry 無法解析，出身不明，despawn 拒絕；請確認 $f 後手動處理" ;;
+  esac
+
+  local pane runtime tag
+  pane="$(jq -r '.pane_id' "$f")"
+  runtime="$(jq -r '.runtime // "-"' "$f")"
+  tag="$(jq -r '.spawn_tag // ""' "$f")"
+  # pane_id 會被展開進 tmux 命令字串（if-shell 的 kill-pane），而 `;` 在
+  # tmux 命令中是分隔符——不驗格式的話 registry 就是一條命令注入通道
+  [[ "$pane" =~ $PANE_RE ]] \
+    || die "registry 的 pane_id 格式不合法（疑似遭竄改），拒絕操作：$pane"
+
+  command -v tmux >/dev/null 2>&1 || die "找不到 tmux，despawn 無法確認 pane 是否回收"
+
+  # 查詢失敗（tmux server 不可達、sandbox 擋 socket）與「pane 不存在」是兩件事：
+  # 前者無從判斷，不能當成 pane 已死而逕自清 registry——那會留下沒人回收的孤兒
+  local panes
+  panes="$(tmux list-panes -a -F '#{pane_id} #{pane_start_command}' 2>&1)" \
+    || die "無法查詢 tmux pane（registry 保留不動，請排除後重試）：$panes"
+
+  local live_cmd=""  found=0
+  local pid cmd
+  while read -r pid cmd; do
+    if [[ "$pid" == "$pane" ]]; then
+      found=1
+      live_cmd="${cmd#\"}"
+      break
+    fi
+  done <<< "$panes"
+
+  if (( found == 1 )); then
+    # pane id 對得上還不夠：id 會被重用，registry 也可能被寫入資料目錄的 worker
+    # 竄改。啟動指令帶不帶我們當初埋的 tag，才是這個 pane 的出身證據。
+    # tag 本身也要驗格式：否則 registry 裡填個 spawn_tag="bash" 就成了萬用鑰匙，
+    # 任何跑 bash 的人工 pane 都會被前綴比對命中。格式含本 agent 的名字，
+    # 抄別人的 tag 也對不上
+    local tag_re="^AGENT_BRIDGE_SPAWN_TAG=ab-spawn-${name}-[0-9]+-[0-9a-f]{12}\$"
+    if [[ ! "$tag" =~ $tag_re || "$live_cmd" != "$tag "* ]]; then
+      rm -f -- "$f" \
+        || die "pane $pane 已非本 agent 所有，且 registry 刪除失敗，請手動清除 $f"
+      log_agent_event despawn-stale "$name" "$pane" "$runtime"
+      release_lock
+      err "警告：pane $pane 目前的啟動指令不帶 '$name' 的 spawn tag（id 已被別的 pane 佔用，或 registry 遭竄改）；已清除註冊，未動該 pane"
+      return 0
+    fi
+    # 驗證與 kill 分成兩次 tmux 呼叫，中間 server 若死掉重啟、新 server 把同一個
+    # %N 發給人工 pane，第二次呼叫就會殺錯人。if-shell 讓「再驗一次 tag」與
+    # kill 在同一次 client 連線內完成：換了 server 就判 false，不動手。
+    # tmux 會把含空白的啟動指令加上雙引號存（實測 3.7b），故 pattern 帶前導引號；
+    # 萬一未來版本改了存法，這裡會判 false → 不殺 → 被下面的存活檢查擋成
+    # 「保留 registry 並報錯」，失效方向是漏殺而非誤殺
+    tmux if-shell -t "$pane" -F "#{m:\"$tag *,#{pane_start_command}}" \
+      "kill-pane -t $pane" 2>/dev/null || true
+    local after
+    after="$(tmux list-panes -a -F '#{pane_id}' 2>&1)" \
+      || die "kill 後無法確認 pane $pane 狀態（registry 保留不動，請排除後重試）：$after"
+    if grep -Fx "$pane" <<< "$after" >/dev/null; then
+      die "無法關閉 pane $pane（kill 失敗，或 tmux server 在驗證後被替換）；registry 保留不動，請排除後重試"
+    fi
+  fi
+
+  rm -f -- "$f"
+  log_agent_event despawned "$name" "$pane" "$runtime"
+  release_lock
+  if (( found == 1 )); then
+    info "已 despawn agent '$name'（pane $pane）"
+  else
+    info "已 despawn agent '$name'（pane $pane 已不存在，僅清除註冊）"
+  fi
+}
+
+cmd_ready() {
+  (( $# == 1 )) || die "用法：agent-bridge ready <name>"
+  local name="$1"
+  [[ "$name" =~ $NAME_RE ]] || die "agent 名稱不合法（僅允許 [A-Za-z0-9_-]+）：$name"
+  local f="$AGENTS_DIR/$name.json"
+  # 同 despawn：出身檢查與寫入之間 registry 可能被換掉，故一律鎖內檢查
+  acquire_lock agents-registry
+  [[ -f "$f" ]] || die "未註冊的 agent：$name"
+  local sp_rc=0
+  is_spawned "$f" || sp_rc=$?
+  case $sp_rc in
+    1) die "agent '$name' 非 spawn 出身，ready 僅限 spawned agent" ;;
+    2) die "agent '$name' 的 registry 無法解析，ready 拒絕；請確認 $f 後手動處理" ;;
+  esac
+  local updated
+  updated="$(jq '.ready = true' "$f")"
+  printf '%s\n' "$updated" | atomic_write "$f"
+  release_lock
+  info "agent '$name' 已回報就緒（ready）"
+}
+
 main() {
   if (( $# == 0 )); then
     usage
@@ -506,6 +894,9 @@ main() {
     status)     cmd_status "$@" ;;
     read)       cmd_read "$@" ;;
     await)      cmd_await "$@" ;;
+    spawn)      cmd_spawn "$@" ;;
+    despawn)    cmd_despawn "$@" ;;
+    ready)      cmd_ready "$@" ;;
     *)
       usage
       die "未知指令：$cmd"
