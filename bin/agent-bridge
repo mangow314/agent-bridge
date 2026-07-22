@@ -50,7 +50,7 @@ usage() {
   agent-bridge read <task-id>                   讀回覆（completed/failed 可；標頭走 stderr、response 原文走 stdout）
   agent-bridge await <task-id> [--timeout <secs>]
                                                 阻塞等待 task 到終態，印裸狀態字後 exit 0；逾時非零退出
-  agent-bridge spawn <name> --runtime codex [--window]
+  agent-bridge spawn <name> --runtime <codex|claude> [--window]
                                                 spawn 一個 worker pane 並註冊；stdout 只印 pane-id
   agent-bridge despawn <name>                   回收 spawn 出身的 worker（kill pane＋除名；人工註冊拒殺）
   agent-bridge ready <name>                     （worker）回報就緒；僅限 spawned agent
@@ -685,7 +685,7 @@ spawn_wait_ready() {
 }
 
 cmd_spawn() {
-  (( $# >= 1 )) || die "用法：agent-bridge spawn <name> --runtime codex [--window]"
+  (( $# >= 1 )) || die "用法：agent-bridge spawn <name> --runtime <codex|claude> [--window]"
   local name="$1"; shift
   local runtime="" use_window=0
   while (( $# > 0 )); do
@@ -699,17 +699,35 @@ cmd_spawn() {
     shift
   done
   [[ "$name" =~ $NAME_RE ]] || die "agent 名稱不合法（僅允許 [A-Za-z0-9_-]+）：$name"
-  [[ -n "$runtime" ]] || die "spawn 需要 --runtime <runtime>（v1 僅支援 codex）"
+  [[ -n "$runtime" ]] || die "spawn 需要 --runtime <runtime>（支援 codex、claude）"
 
   # runtime 表：指令 ＋ 守則注入方式。目前每個 runtime 都走「initial prompt
   # 位置參數」（codex/claude/gemini 等 agent CLI 的共通形狀：`cmd [OPTIONS]
   # [PROMPT]`）。新增 runtime 前先實測該 CLI 的位置參數確實會被當第一則 user
   # message 執行；若某個 runtime 只吃 stdin 或需要別的旗標，這裡要一併長出
-  # 對應的注入方式，不要硬套。v1 只實作實測過的 codex
+  # 對應的注入方式，不要硬套。
+  #
+  # claude 的取捨（實測 Claude Code，形狀 `claude [options] [command] [prompt]`）：
+  #   - `--permission-mode auto`：worker 必須零人工介入執行探針命令。auto 雖已是
+  #     此機器的預設，仍明寫——runtime 表不該依賴使用者哪天改掉 defaultMode。
+  #     刻意不用 bypassPermissions。理由只取官方文件明載的部分，不臆測機制：
+  #     官方把該模式定位為「Isolated containers and VMs only」，而 worker pane
+  #     就跑在使用者本機、與主 session 共用檔案系統與憑證，不是隔離環境；
+  #     auto 則是「Everything, with background safety checks」，保留那層背景
+  #     檢查，且 protected paths 的寫入在除 bypass 外的所有模式都不會被自動
+  #     核准。（注意：bypassPermissions 並不停用 hooks——停用 hooks 的是
+  #     --bare；deny 與 explicit ask 規則在該模式下也仍然適用。早期版本的這段
+  #     註解兩度寫錯這個因果，由獨立複核對照官方文件糾正）
+  #   - 刻意不加 --settings/--setting-sources：worker 繼承使用者全域設定，
+  #     與主 session 同一套安全規則。代價是 worker brief 與全域守則並存，
+  #     可能被全域規則改寫命令形式（實測見過 echo 重導向被換成 Write 工具）；
+  #     `agent-bridge` 是外部 CLI、沒有等價工具，故不受這條影響
+  #   - 不可用 -p/--print：那是 headless，跑完即退出，pane 不會留下來收探針
   local runtime_cmd
   case "$runtime" in
     codex) runtime_cmd="codex --profile agent-worker" ;;
-    *) die "不支援的 runtime：$runtime（v1 僅支援 codex）" ;;
+    claude) runtime_cmd="claude --permission-mode auto" ;;
+    *) die "不支援的 runtime：$runtime（支援 codex、claude）" ;;
   esac
   command -v tmux >/dev/null 2>&1 || die "找不到 tmux，spawn 需要 tmux"
   command -v "${runtime_cmd%% *}" >/dev/null 2>&1 \

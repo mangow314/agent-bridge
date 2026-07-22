@@ -85,7 +85,7 @@ agent-bridge cancel <task-id>                 # （sender）queued/delivered/run
 agent-bridge status <task-id>                 # stdout 只印裸狀態字一行
 agent-bridge read <task-id>                   # completed/failed 可讀；標頭走 stderr、原文走 stdout
 agent-bridge await <task-id> [--timeout <secs>]  # 阻塞至終態，印裸狀態字；逾時非零退出
-agent-bridge spawn <name> --runtime codex [--window]  # spawn worker pane；stdout 只印 pane-id
+agent-bridge spawn <name> --runtime <codex|claude> [--window]  # spawn worker pane；stdout 只印 pane-id
 agent-bridge despawn <name>                   # 回收 spawn 出身的 worker（人工註冊拒殺）
 agent-bridge ready <name>                     # （worker）回報就緒；僅限 spawned agent
 ```
@@ -152,9 +152,28 @@ agent-bridge list          # worker-1  %N  starting → ready
 agent-bridge despawn worker-1                          # 任務收尾：kill pane＋除名＋審計
 ```
 
-- **runtime 表（v1）**：`codex` → `codex --profile agent-worker`（該 profile 由
-  chezmoi 管理，approval never＋workspace-write，見
-  `docs/codex-worker-approval-proposal.md`）。claude runtime 待獨立 spec。
+- **runtime 表**：
+  - `codex` → `codex --profile agent-worker`（該 profile 由 chezmoi 管理，
+    approval never＋workspace-write，見 `docs/codex-worker-approval-proposal.md`）
+  - `claude` → `claude --permission-mode auto`。三個選擇都是刻意的：**auto**
+    讓 worker 零人工介入執行探針命令（實測確認），而 auto 雖已是本機預設仍明寫，
+    runtime 表不該依賴使用者哪天改掉 `defaultMode`；**不用 `bypassPermissions`**，
+    理由只取[官方文件](https://code.claude.com/docs/en/permission-modes)明載的部分：
+    該模式被定位為「Isolated containers and VMs only」，而 worker pane 就跑在本機、
+    與主 session 共用檔案系統與憑證，不是隔離環境；`auto` 則是「Everything, with
+    background safety checks」，保留那層背景檢查，且 protected paths 的寫入在除
+    bypass 外的所有模式都不會被自動核准。
+    ⚠️ 別把理由寫成「bypass 會繞過 hooks／讓 ask 消失」——**都不對**：停用 hooks 的
+    是另一個旗標 `--bare`，而 deny 與 explicit ask 規則官方明載「apply in every mode,
+    including `bypassPermissions`」。這段因果在本檔前後寫錯過兩次，都是獨立複核對照
+    官方文件抓出來的；**不加
+    `--settings`／`--setting-sources`**，worker 繼承使用者全域設定，與主 session
+    同一套安全規則。代價是 worker brief 與全域守則並存、可能被全域規則改寫命令
+    形式（實測見過 `echo` 重導向被換成 Write 工具），但 `agent-bridge` 是外部
+    CLI、沒有等價工具可替換，故這條路徑不受影響。另外**不可用 `-p/--print`**：
+    那是 headless，跑完即退出，pane 不會留下來收探針
+  - 新增 runtime 前必須實測該 CLI 的位置參數確實會被當第一則 user message 執行
+    且執行完 session 常駐；只吃 stdin 或需要別的旗標的 CLI 要另外長出注入方式
 - **啟動即注入 worker 守則**：spawn 出來的是一個零脈絡的全新 session——它不知道
   自己是 worker，也不知道 pane 裡收到的 `agent-bridge receive <id>` 是要執行的
   命令而不是有人在跟它說話。實測（codex 0.145）沒有守則時，它會把就緒探針當成

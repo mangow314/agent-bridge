@@ -81,22 +81,36 @@ printf '#!/usr/bin/env bash\necho "tmux: unavailable (test stub)" >&2\nexit 1\n'
   > "$FAILSHIM/tmux"
 chmod +x "$FAILSHIM/tmux"
 
-# ---- 假 codex：spawn 測試用的慢啟動 REPL ----
-# 啟動期（預設 2 秒，codex-delay 檔可調）持續讀掉並丟棄 stdin，模擬
+# ---- 假 runtime：spawn 測試用的慢啟動 REPL ----
+# 啟動期（預設 2 秒，<rt>-delay 檔可調）持續讀掉並丟棄 stdin，模擬
 # 「REPL 啟動期按鍵被吃」；之後 exec bash 執行後續抵達的探針／通知。
-# codex-fail 檔存在時立即以非零碼退出，模擬 runtime 啟動即失敗。
+# <rt>-fail 檔存在時立即以非零碼退出，模擬 runtime 啟動即失敗。
+# 每個 runtime 各自一份 args/argv/delay/fail 檔，互不干擾。
+# 兩種 args 格式並存是刻意的：`-args.txt` 一行式（空白分隔）方便比對相鄰的
+# 旗標＋值，例如 `--profile agent-worker`；`-argv.txt` 以 NUL 分隔，保留 argv
+# 邊界，是唯一能斷言「完整參數集合恰好是什麼」的形式——子字串比對擋不住
+# 「在後面偷偷追加一個旗標」這類退化（獨立複核以 mutation 反例證明）。
+# 分隔符必須是 NUL 不能是換行：worker brief prompt 本身含大量換行，
+# 用換行分隔會讓「參數個數」變成「brief 行數」，斷言直接失去意義。
 DSPAWN="$TESTROOT/dspawn"
-cat > "$SHIM/codex" <<EOF
+make_runtime_shim() {
+  local rt="$1"
+  cat > "$SHIM/$rt" <<EOF
 #!/usr/bin/env bash
-printf '%s ' "\$@" > "$TESTROOT/codex-args.txt"
-if [[ -e "$TESTROOT/codex-fail" ]]; then exit 127; fi
+printf '%s ' "\$@" > "$TESTROOT/$rt-args.txt"
+printf '%s\0' "\$@" > "$TESTROOT/$rt-argv.txt"
+if [[ -e "$TESTROOT/$rt-fail" ]]; then exit 127; fi
 export AGENT_BRIDGE_DATA="$DSPAWN"
-delay="\$(cat "$TESTROOT/codex-delay" 2>/dev/null || echo 2)"
+delay="\$(cat "$TESTROOT/$rt-delay" 2>/dev/null || echo 2)"
 end=\$(( SECONDS + delay ))
 while (( SECONDS < end )); do IFS= read -r -t 0.2 _ || true; done
 exec bash --norc --noprofile
 EOF
-chmod +x "$SHIM/codex"
+  chmod +x "$SHIM/$rt"
+}
+make_runtime_shim codex
+# 真 claude 也在 PATH 上，但 shim 排在最前面，測試不會叫到真的
+make_runtime_shim claude
 
 # spawn 出來的 pane 由 tmux server 啟動，PATH 繼承自 server 環境；
 # 在 server 啟動前把 shim 排進 PATH，pane 才找得到假 codex 與 agent-bridge
@@ -526,11 +540,51 @@ w1_cmd="$(tmx display -pt "$pane_w1" '#{pane_start_command}')"
 assert "pane_start_command 剝前導引號後以 spawn tag 前綴開頭（tmux 行為不變量）" \
   bash -c "c=${w1_cmd@Q}; c=\"\${c#\\\"}\"; [[ \"\$c\" == AGENT_BRIDGE_SPAWN_TAG=ab-spawn-* ]]"
 
+# 16a2. claude runtime：注入形狀與 codex 同（實測 Claude Code 會把位置參數
+# 當第一則 user message 執行、且執行完 session 常駐收得到探針），差別只在
+# 啟動旗標。這裡鎖住的是那些旗標的選擇理由，不是形狀：
+#   - `--permission-mode auto` 換成 bypassPermissions 是安全降級：官方把後者
+#     定位為僅限隔離容器／VM，而 worker pane 跑在本機、與主 session 共用檔案
+#     系統與憑證。（理由到此為止——bypass 並不停用 hooks，deny 與 explicit ask
+#     也仍適用；詳見 README，那段因果曾兩度寫錯）
+#   - 混進 -p/--print 會讓 pane 跑完即退，worker 根本不存在
+#   - 混進 --settings/--setting-sources 會讓 worker 脫離使用者的安全設定
+# 關鍵是**精確的完整參數集合**而非子字串：獨立複核以 mutation 反例證明，
+# 只比對子字串時 `--permission-mode auto --permission-mode bypassPermissions
+# --setting-sources project <prompt>` 這種 argv 能讓所有斷言全綠——後面偷偷
+# 追加的旗標才是真正生效的那個。白名單式斷言（恰好三個參數）比逐條列黑名單
+# 更強：任何多餘旗標都會讓行數對不上。
+# 測完立刻 despawn，避免佔用 DSPAWN 的 spawn cap 影響後續測例
+pane_wc="$(absp "$DSPAWN" 20 spawn wc1 --runtime claude 2>/dev/null)"; rc=$?
+assert "spawn --runtime claude：exit 0" test "$rc" -eq 0
+assert "claude runtime registry：runtime 欄為 claude" \
+  jq -e '.runtime == "claude"' "$DSPAWN/agents/wc1.json"
+assert "claude runtime 以 --permission-mode auto 啟動" \
+  grep -q -- '--permission-mode auto' "$TESTROOT/claude-args.txt"
+# 否定式斷言必須先證明「有東西可否定」：spawn 若整個失敗，args 檔根本不存在，
+# 光 grep 找不到 -p 也會綠——那是空綠，什麼都沒鎖住（這個 repo 踩過的坑）
+assert "claude runtime 不帶 -p/--print（headless 會讓 pane 跑完即退）" \
+  bash -c "[[ -s '$TESTROOT/claude-args.txt' ]] && ! grep -qE -- '(^| )(-p|--print)( |\$)' '$TESTROOT/claude-args.txt'"
+assert "claude runtime 一樣注入 worker brief（走同一條 worker_prompt_arg）" \
+  grep -q -- '以上是你的 worker 守則' "$TESTROOT/claude-args.txt"
+# 白名單：argv 必須「恰好」是 --permission-mode / auto / <prompt> 三個。
+# 這條才是真正擋住「追加旗標」的防線，上面幾條子字串斷言擋不住
+assert "claude runtime argv 恰好三個參數（追加任何旗標都該紅）" \
+  bash -c "mapfile -d '' -t A < '$TESTROOT/claude-argv.txt'; (( \${#A[@]} == 3 ))"
+assert "claude runtime argv 前兩個恰為 --permission-mode auto、第三個是 prompt 非旗標" \
+  bash -c "mapfile -d '' -t A < '$TESTROOT/claude-argv.txt'; [[ \${A[0]} == '--permission-mode' && \${A[1]} == 'auto' && \${A[2]} != -* ]]"
+assert "claude runtime 探針重送生效：ready == true" \
+  jq -e '.ready == true' "$DSPAWN/agents/wc1.json"
+assert "agents.log 記 spawned wc1 … claude" \
+  grep -qE "Z spawned wc1 ${pane_wc} claude\$" "$DSPAWN/agents.log"
+assert "claude runtime worker 可正常 despawn" ab "$DSPAWN" despawn wc1
+assert_fails "despawn 後 claude worker 的 pane 消失" pane_alive "$pane_wc"
+
 # 16b. 參數與名稱衝突拒絕
 assert_fails "spawn 已註冊（spawned）名稱被拒" absp "$DSPAWN" 0 spawn w1 --runtime codex
 ab "$DSPAWN" register manual-x "$PANE_A" 2>/dev/null
 assert_fails "spawn 與人工註冊同名被拒" absp "$DSPAWN" 0 spawn manual-x --runtime codex
-assert_fails "spawn：不支援的 runtime 被拒" absp "$DSPAWN" 0 spawn wx --runtime claude
+assert_fails "spawn：不支援的 runtime 被拒" absp "$DSPAWN" 0 spawn wx --runtime gemini
 assert "不支援 runtime：不留 registry" test ! -e "$DSPAWN/agents/wx.json"
 assert_fails "spawn 缺 --runtime 被拒" absp "$DSPAWN" 0 spawn wy
 assert_fails "spawn：名稱不合法被拒" absp "$DSPAWN" 0 spawn "bad name" --runtime codex
