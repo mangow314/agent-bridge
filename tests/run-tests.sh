@@ -1578,13 +1578,32 @@ assert "idle：宣告後 disposable 欄為 yes（可即時回收）" \
 
 # 宣告過期：這是 disposable_at 存在的唯一理由——worker 宣告後若又被派新任務，
 # 它已累積新脈絡，舊宣告不該再讓 orchestrator 覺得可以直接收。
-# sleep 1 是必要的：時間戳是秒精度，同秒內 last_at 不會大於 disp_at
+# 先測「明確晚於宣告」這個一般情形；同秒的邊界另有專門測例（見下）
 sleep 1
 ab "$DIDLE" send id1 --from alice --message "後續任務" >/dev/null 2>&1
 assert "idle：宣告後又被派工 → disposable 轉 expired（宣告失效，不得誤收）" \
   test "$(idle_field "$DIDLE" id1 3)" = expired
 assert "idle：派工後 idle_secs 改以最後任務時間計" \
   is_num "$(idle_field "$DIDLE" id1 4)"
+
+# 同秒邊界：宣告與新任務落在同一秒（worker 宣告完 orchestrator 立刻派工）。
+# 舊實作用嚴格大於，那一秒內 idle 仍報 yes，orchestrator 會直接 despawn 一個
+# 剛拿到新任務、正在累積新脈絡的 worker——不走 evict、不留筆記，語意基石反轉。
+# 這條原本被上面那個 sleep 1 繞過去了：測試迴避了缺陷而不是暴露它。
+# （獨立複核 2026-07-22 以重現實驗抓出）
+DSEC="$TESTROOT/dsamesec"
+mkdir -p "$DSEC"/{agents,tasks,locks}
+now_ts="$(date -u +%FT%TZ)"
+jq -n --arg ts "$now_ts" \
+  '{name:"samesec",pane_id:"%99",registered_at:$ts,spawned:true,runtime:"codex",
+    spawned_at:$ts,ready:true,disposable:true,disposable_at:$ts}' \
+  > "$DSEC/agents/samesec.json"
+mkdir -p "$DSEC/tasks/${now_ts//[:-]/}-aaaa"
+jq -n --arg ts "$now_ts" \
+  '{id:"x",from:"alice",to:"samesec",created_at:$ts,status:"queued"}' \
+  > "$DSEC/tasks/${now_ts//[:-]/}-aaaa/metadata.json"
+assert "idle：宣告與新任務同秒 → 仍須轉 expired（否則會誤殺已有新脈絡的 worker）" \
+  test "$(idle_field "$DSEC" samesec 3)" = expired
 
 # 名稱重用：tasks/ 是長期累積的（GC 仍是 backlog），同一個名字可能有前一個
 # pane 留下的任務。idle_secs 若採信那個時間，剛 spawn 的 worker 會顯示成閒置
@@ -1761,6 +1780,51 @@ assert "evict：未 ready 的 worker 驅逐後 registry 已除名" \
   test ! -e "$DEV/agents/ev3.json"
 assert_fails "evict：未 ready 的 worker 驅逐後 pane 已回收（pane_alive 不再成立）" \
   pane_alive "$pane_ev3"
+
+# 26f. generation 綁定：evict 是三段式的，await 與 despawn 之間同名 agent 可能
+# 已被換掉一代（另一次 evict、或 despawn＋重 spawn）。只憑名字 despawn 會殺掉
+# 那個沒收過收尾任務、也沒宣告 disposable 的新 worker——這一層唯一不可接受的
+# 失效。這裡用「回覆前先把 registry 的 spawn_tag 換掉」模擬換代。
+# （獨立複核 2026-07-22 以逐行可達路徑指出，此測例補上動態重現）
+# 換代用「真的 despawn 再 spawn 同名」而不是竄改 registry 的 tag：後者會讓
+# registry 與 pane 啟動指令不一致，被既有的 despawn-stale 防線攔下，測不到最壞
+# 情況。真實換代兩者是一致的（都屬 G2），stale 防線不會作用——只有 generation
+# 綁定擋得住。換代做在回覆之前，讓時序可控：await 一返回，現場就已經是 G2。
+pane_ev6="$(absp "$DEV" 0 spawn ev6 --runtime codex 2>/dev/null)"
+gen2_file="$TESTROOT/ev6-gen2.pane"
+(
+  sleep 0.8
+  for (( i = 0; i < 150; i++ )); do
+    for d in "$DEV"/tasks/*/; do
+      [[ -f "$d/metadata.json" ]] || continue
+      [[ "$(jq -r '.to // ""' "$d/metadata.json" 2>/dev/null)" == ev6 ]] || continue
+      [[ "$(<"$d/status")" == queued ]] || continue
+      ab "$DEV" despawn ev6 >/dev/null 2>&1
+      absp "$DEV" 0 spawn ev6 --runtime codex 2>/dev/null > "$gen2_file"
+      ab "$DEV" receive "$(basename "$d")" >/dev/null 2>&1
+      ab "$DEV" reply "$(basename "$d")" --message "筆記" >/dev/null 2>&1
+      exit 0
+    done
+    sleep 0.2
+  done
+) &
+ab "$DEV" evict ev6 --timeout 20 >/dev/null 2>&1; rc=$?
+wait
+pane_ev6_gen2="$(<"$gen2_file")"
+assert "evict：目標在等待期間被換代 → 非零退出（不確定收的是誰就不收）" \
+  test "$rc" -ne 0
+assert "evict：換代後新一代的 registry 保留（那是別人的 worker，不得除名）" \
+  test -e "$DEV/agents/ev6.json"
+# ★ 核心斷言：G2 沒收過收尾任務、也沒宣告 disposable，它的 context 不可被丟掉
+assert "evict：換代後不得殺掉新一代的 pane（它沒收過收尾任務）" \
+  pane_alive "$pane_ev6_gen2"
+assert_fails "evict：換代後不得寫 evicted 審計（沒收成就不能記成收了）" \
+  grep -qE "Z evicted ev6 " "$DEV/agents.log"
+assert "evict：換代拒絕後 locks/ 為空（die 路徑也要放鎖）" \
+  test -z "$(ls -A "$DEV/locks")"
+ab "$DEV" despawn ev6 >/dev/null 2>&1 || true
+tmx kill-pane -t "$pane_ev6" 2>/dev/null || true
+tmx kill-pane -t "$pane_ev6_gen2" 2>/dev/null || true
 
 # 26e. 損壞 registry：出身不明就不能收——同 despawn/disposable 的 fail-closed
 absp "$DEV" 0 spawn ev4 --runtime codex >/dev/null 2>&1

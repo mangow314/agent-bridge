@@ -46,8 +46,39 @@ Gate 結果（全過）：
 的文案。教訓與前六次同形：**斷言「某件事沒發生」時，取樣點必須晚於那件事可能
 發生的最後時刻**。自動化測試有這條紀律，手動驗收同樣適用。
 
-Phase 3 落地時與本文的差異（以實作為準）：
 基線：`df400c5`（relay 已 shipped，真鏈驗證已通過）；Phase 1/2 於 `b770121` shipped
+
+## 跨供應商獨立複核（2026-07-22，codex worker `rev1`）
+
+以 agent-bridge 自身派工給 codex worker 做唯讀對抗審查（dogfood）。三條 finding
+都成立，兩條已修：
+
+1. **`disposable` 同秒失效**（已修，idle 判定改「不小於」）：時間戳是秒精度，
+   宣告與新任務落在同一秒時 `>` 為 false，`idle` 仍報 `yes`；orchestrator 據此
+   直接回收，就殺掉一個剛拿到新任務的 worker。
+   §25 的 `sleep 1` **明知**秒精度限制卻用它繞開，只覆蓋跨秒路徑——測試迴避了
+   缺陷而不是暴露它。已補同秒測例（M：改回 `>` → 紅）。
+2. **`cmd_evict` 未綁 generation**（已修，`DESPAWN_EXPECT_TAG`）：evict 三段之間
+   同名 worker 若被換代（另一次 evict、或 despawn＋重 spawn），最後那句
+   `cmd_despawn "$name"` 會殺掉 G2——沒收過收尾任務、沒宣告 disposable 的新
+   worker，且審計說謊（`despawned` 記 G2、`evicted` 記舊 G1 的 pane）。
+   已在 despawn 鎖內比對 spawn_tag，不符即拒收。
+   **測例第一版太弱**：用竄改 registry tag 模擬換代，會被既有的 despawn-stale
+   防線攔下，測不到「殺掉 G2」；改成真的 despawn＋重 spawn 才重現得出來
+   （M：拆掉綁定 → 4 紅，含核心那條）。
+3. **`idle` 快照與回收之間無原子重驗**（策略層處理）：`idle` 不取鎖，看到 `yes`
+   到動手之間可能已被派新任務。orchestrator-brief 已改為明寫「即使 disposable
+   也一律走 evict，不要直接 despawn」——賭錯與省下的代價不對等。
+
+**過程中的教訓**：codex 的安全過濾把這份 brief 判成 cybersecurity request 而
+拒絕輸出報告（措辭堆疊：「對抗審查」「攻擊面」「注入面」「kill pane」），任務
+本身是良性的 shell 正確性複核。兩個後果值得記：
+
+- **worker 的 runtime 拒絕時不會 reply，task 永遠停在 `running`**。sender 分不出
+  「正在做」與「永不回覆」，唯一防線是 `await --timeout`。
+- **殘值機制救回了這輪**：pane 還活著、報告還在它 context 裡，而 `evict` 的中性
+  收尾文案沒有觸發過濾，整份 finding 被完整撈回。這是 evict 最有力的一次實戰
+  驗證——被回收的 worker 不是「做完了」，而是「說不出話但腦裡有東西」。
 
 Phase 3 落地時與本文的差異（以實作為準）：
 

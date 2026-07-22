@@ -117,6 +117,12 @@ atomic_write() {
   mv "$tmp" "$dest"
 }
 
+# despawn 的 generation 綁定：由 cmd_evict 在呼叫前設成它一開始看到的
+# spawn_tag，空字串＝不綁定（直接 despawn 的一般情形）。用全域而非參數，是為了
+# 不把這個內部契約暴露成對外的 CLI 參數——despawn 的參數面是安全路徑，多一個
+# 未文件化的參數就多一條要防的輸入
+DESPAWN_EXPECT_TAG=""
+
 # ---- 鎖：mkdir lock，短暫重試後報錯 ----
 LOCK_DIR=""
 
@@ -985,6 +991,16 @@ cmd_despawn() {
   pane="$(jq -r '.pane_id' "$f")"
   runtime="$(jq -r '.runtime // "-"' "$f")"
   tag="$(jq -r '.spawn_tag // ""' "$f")"
+
+  # generation 綁定（evict 專用；比對必須在這把鎖內，鎖外驗完到 kill 之間仍可
+  # 能被換掉）。evict 是三段式的：send → await → despawn。await 與 despawn 之間
+  # 同名 agent 可能已經換了一代（另一次 evict、或 despawn＋重 spawn）。只憑名字
+  # 就殺，會殺掉一個沒收過收尾任務、也沒宣告 disposable 的新 worker——那正是這
+  # 一層唯一不可接受的失效（順帶讓審計說謊：despawned 記新 pane、evicted 記舊）。
+  # 拒絕後 pane 留著，失效方向是多佔一個 cap。（獨立複核 2026-07-22 指出）
+  if [[ -n "$DESPAWN_EXPECT_TAG" && "$tag" != "$DESPAWN_EXPECT_TAG" ]]; then
+    die "agent '$name' 已不是 evict 當初鎖定的那一個（spawn tag 不符，期間被換過一代）；拒絕回收以免殺掉未收尾的 worker"
+  fi
   # pane_id 會被展開進 tmux 命令字串（if-shell 的 kill-pane），而 `;` 在
   # tmux 命令中是分隔符——不驗格式的話 registry 就是一條命令注入通道
   [[ "$pane" =~ $PANE_RE ]] \
@@ -1153,7 +1169,14 @@ cmd_idle() {
     # disposable 欄位，也不該讓它看起來可回收
     if [[ "$spawned" != y || -z "$disp_at" ]]; then
       disp="-"
-    elif [[ "$disp_at" != "?" && -n "$last_at" && "$last_at" > "$disp_at" ]]; then
+    # 同秒也算過期（`>=` 而非 `>`）。時間戳是秒精度，宣告與新任務落在同一秒
+    # 完全可能——worker 宣告後 orchestrator 立刻派工就是。用嚴格大於的話那一秒
+    # 內 idle 仍報 yes，orchestrator 會直接 despawn 一個剛拿到新任務、正在累積
+    # 新脈絡的 worker，且不走 evict、不留筆記：語意基石反轉。
+    # 兩個方向的代價不對等——`>=` 誤判時只是多派一輪收尾（多佔 cap），
+    # `>` 誤判時是殺掉還有用的脈絡。後者是這一層唯一不可接受的失效。
+    # （bash 無字串 `>=`，故寫成「不小於」。獨立複核 2026-07-22 以重現實驗抓出）
+    elif [[ "$disp_at" != "?" && -n "$last_at" ]] && ! [[ "$last_at" < "$disp_at" ]]; then
       disp="expired"
     else
       disp="yes"
@@ -1229,6 +1252,10 @@ cmd_evict() {
   local pane runtime
   pane="$(jq -r '.pane_id // "-"' "$f")"
   runtime="$(jq -r '.runtime // "-"' "$f")"
+  # 記下這一代的 spawn_tag，最後 despawn 時綁定比對（見 cmd_despawn 的
+  # DESPAWN_EXPECT_TAG 段）：收尾任務是派給「這一代」的，回收也只能收這一代
+  local gen_tag
+  gen_tag="$(jq -r '.spawn_tag // ""' "$f")"
 
   # 收尾任務的文案硬編在這裡而不是抽到 share/：它是機制的一部分（「把只存在於
   # 你 context 裡的事實寫下來」），不是可調策略。抽成檔案會多一條「檔案不存在
@@ -1274,7 +1301,9 @@ EOF
     *) outcome=evicted-timeout ;;
   esac
 
+  DESPAWN_EXPECT_TAG="$gen_tag"
   cmd_despawn "$name"
+  DESPAWN_EXPECT_TAG=""
   # 記在 despawn 成功之後：despawn 失敗代表 pane 還在、根本沒被驅逐，
   # 這時寫一筆 evicted 進審計線就是假紀錄
   log_agent_event "$outcome" "$name" "$pane" "$runtime"
