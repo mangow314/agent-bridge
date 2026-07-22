@@ -1,7 +1,11 @@
 # 提案：codex worker 的核准放寬（agent-worker profile）
 
-狀態：**待審**（2026-07-22 擬）。審過才動 chezmoi；落地走「chezmoi 側變更
-走 topic branch + worktree」慣例（README「開發慣例」）。
+狀態：**已落地、驗收通過**（2026-07-22）。chezmoi `45f689c`（走 topic
+branch + worktree 慣例併回）；live `~/.codex/agent-worker.config.toml`
+已 apply（600、re-diff 空）。驗收（task 20260722T035038Z-66f2，worker 以
+`codex --profile agent-worker` 執行）：`start` 建鎖成功——證實 profile 疊加
+下基底 `writable_roots` 仍生效（原 `[unverified]` 點就此銷案）；含 3 個
+shell 指令的任務全程 **0 次人工核准**；reply 正常送達。
 
 ## 問題
 
@@ -70,7 +74,7 @@ sandbox_mode = "workspace-write"
 | 步驟 | gate（機器可判） |
 |---|---|
 | 1. chezmoi worktree 加 `dot_codex/agent-worker.config.toml` | `chezmoi diff` 只含新檔；`tomllib` parse 過 |
-| 2. 驗證 profile 疊加語意：`[sandbox_workspace_write]` 是表級合併還是整表覆蓋（此點目前未驗證 [unverified — 0.144.6 help 只講 layer on top，未寫表合併規則；落地時以 `codex --profile agent-worker` 實測 writable_roots 是否仍生效判定]） | worker profile 下 receive 能建鎖（寫入 `~/.local/share/agent-bridge`） |
+| 2. 驗證 profile 疊加語意：`[sandbox_workspace_write]` 是表級合併還是整表覆蓋（✅ 2026-07-22 實測銷案：profile 下 `start` 建鎖成功，基底 writable_roots 生效——本 overlay 未含該表，故無論合併規則為何皆不受影響） | worker profile 下 receive 能建鎖（寫入 `~/.local/share/agent-bridge`）✅ |
 | 3. worker pane 改用 `--profile agent-worker` 啟動 | `agent-bridge list` 可見；派一個唯讀測試任務 |
 | 4. 驗收輪 | 一輪真實委派全程 **0 次人工核准**且 reply 正常送達 |
 
