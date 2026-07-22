@@ -71,6 +71,9 @@ usage() {
   agent-bridge evict <name> [--timeout <secs>] [--from <sender>]
                                                 驅逐 worker：派收尾任務 → 等筆記落地 → despawn
                                                 stdout 只印收尾 task-id；逾時仍 despawn（審計記 evicted-timeout）
+  agent-bridge gc [--older-than <days>] [--apply] [--include-notes]
+                                                清掉夠舊的終態 task（預設 14 天）；未完成的與
+                                                evict 收尾筆記一律保留。預設只試算，--apply 才刪
 
 --message-file 用 `-` 表示讀 stdin。
 資料目錄預設 ~/.local/share/agent-bridge/，可用 AGENT_BRIDGE_DATA 覆蓋。
@@ -122,6 +125,12 @@ atomic_write() {
 # 不把這個內部契約暴露成對外的 CLI 參數——despawn 的參數面是安全路徑，多一個
 # 未文件化的參數就多一條要防的輸入
 DESPAWN_EXPECT_TAG=""
+
+# send 的 pin 標記：由 cmd_evict 在呼叫前設成 1，讓收尾任務的 metadata 帶
+# pinned:true，gc 一律跳過。收尾筆記是這一層刻意留下來的脈絡——「上下文不會憑空
+# 消失」這個承諾，若筆記會被 GC 靜靜清掉就只是延後兌現。同樣用全域而非參數：
+# send 是核心路徑，參數面不該為了內部契約變寬
+SEND_PIN=""
 
 # ---- 鎖：mkdir lock，短暫重試後報錯 ----
 LOCK_DIR=""
@@ -344,10 +353,11 @@ cmd_send() {
   ts="$(now_iso)"
   wd="$(pwd)"
   doc="$(jq -n --arg id "$task_id" --arg from "$from" --arg to "$to" \
-              --arg ts "$ts" --arg wd "$wd" \
+              --arg ts "$ts" --arg wd "$wd" --arg pin "$SEND_PIN" \
     '{version: 1, task_id: $id, from: $from, to: $to,
       created_at: $ts, updated_at: $ts,
-      working_directory: $wd, status: "queued"}')"
+      working_directory: $wd, status: "queued"}
+     + (if $pin == "1" then {pinned: true} else {} end)')"
   printf '%s\n' "$doc" | atomic_write "$dir/metadata.json"
   printf 'queued\n' | atomic_write "$dir/status"
   log_event "$task_id" created "from=$from to=$to"
@@ -1142,6 +1152,102 @@ cmd_disposable() {
 # idle_secs 取「最後一個派給它的任務建立時間」與現在的差；從未被派工過就用
 # registry 的登記時間。無法解析時間時印 `-` 而不是 0——0 會被誤讀成「剛剛才
 # 用過」，正好是驅逐決策最不該搞錯的方向。
+# gc：清掉夠舊的終態 task 目錄。tasks/ 原本只增不減，這不只是磁碟問題——
+# idle 的回收決策直接吃 tasks/ 的內容（last_task_at 掃全目錄），資料越髒決策越
+# 不可信，而且那是 O(task 數) 的掃描。名稱重用那個 bug 的根因就是這裡。
+#
+# 三道保留線，失效方向一律是「留著」而不是「刪掉」：
+#   1. 非終態（queued/delivered/running）一律不動——那是還在進行的任務
+#   2. pinned（evict 的收尾筆記）一律不動，除非明確 --include-notes
+#   3. 預設 dry-run，要 --apply 才真的刪
+# 刪除不可逆，而這個工具的整層語意都建立在「寧可多佔空間也不要弄丟脈絡」上。
+cmd_gc() {
+  local days=14 apply=0 include_notes=0
+  while (( $# > 0 )); do
+    case "$1" in
+      --older-than)
+        shift; (( $# > 0 )) || die "--older-than 需要參數"
+        [[ "$1" =~ ^[0-9]{1,5}$ ]] || die "--older-than 需為 0-99999 的整數天：$1"
+        days="$((10#$1))" ;;
+      --apply) apply=1 ;;
+      --include-notes) include_notes=1 ;;
+      *) die "未知參數：$1" ;;
+    esac
+    shift
+  done
+
+  local now cutoff kept_live=0 kept_pin=0 kept_young=0 removed=0 failed=0
+  now="$(date -u +%s)"
+  cutoff=$(( now - days * 86400 ))
+
+  local d id st pinned ts epoch
+  shopt -s nullglob
+  for d in "$TASKS_DIR"/*/; do
+    id="$(basename "$d")"
+    # 目錄名不合 task-id 格式就不碰：這裡是唯一會刪東西的地方，寧可漏掉也不要
+    # 讓一個奇怪的目錄名走進 rm 的參數
+    [[ "$id" =~ $TASK_ID_RE ]] || continue
+    [[ -f "$d/metadata.json" && -f "$d/status" ]] || continue
+
+    st="$(<"$d/status")"
+    case "$st" in
+      completed|failed|cancelled) ;;
+      *) kept_live=$((kept_live + 1)); continue ;;
+    esac
+
+    if (( include_notes == 0 )); then
+      pinned="$(jq -r '.pinned // false' "$d/metadata.json" 2>/dev/null)" || pinned=true
+      if [[ "$pinned" == true ]]; then
+        kept_pin=$((kept_pin + 1)); continue
+      fi
+    fi
+
+    # 用 metadata 的 created_at 而不是目錄 mtime：mtime 會被備份、rsync、
+    # 檔案系統操作改掉，created_at 是這個任務自己的事實
+    ts="$(jq -r '.created_at // ""' "$d/metadata.json" 2>/dev/null)" || ts=""
+    # 讀不到時間就當它還年輕：判不出年紀的東西不刪
+    if [[ -z "$ts" ]] || ! epoch="$(date -u -d "$ts" +%s 2>/dev/null)"; then
+      kept_young=$((kept_young + 1)); continue
+    fi
+    if (( epoch >= cutoff )); then
+      kept_young=$((kept_young + 1)); continue
+    fi
+
+    if (( apply == 0 )); then
+      printf '%s\t%s\t%s\n' "$id" "$st" "$ts"
+      removed=$((removed + 1))
+      continue
+    fi
+
+    # 取這個 task 的鎖再刪：狀態轉換都在同一把鎖下，不取就可能在 reply 寫到一半
+    # 時把目錄抽走。整段包 subshell 有兩個理由：acquire_lock 取不到鎖是 die，
+    # 直接呼叫會讓 gc 整支退出、剩下的目錄全不處理；而 subshell 內的 EXIT trap
+    # 會自動釋放它自己那把鎖，不碰外層的 LOCK_DIR（單值，見 acquire_lock）
+    local rc2=0
+    (
+      acquire_lock "$id" 2>/dev/null
+      # 拿到鎖後重驗狀態：等鎖那段時間裡它可能已經被 receive／reply 動過
+      case "$(<"$d/status")" in
+        completed|failed|cancelled) rm -rf -- "$d" ;;
+        *) exit 2 ;;
+      esac
+    ) || rc2=$?
+    case $rc2 in
+      0) removed=$((removed + 1)) ;;
+      2) kept_live=$((kept_live + 1)) ;;
+      *) failed=$((failed + 1)) ;;
+    esac
+  done
+
+  if (( apply == 0 )); then
+    info "gc（試算）：可刪 $removed 個；保留 未完成 $kept_live／收尾筆記 $kept_pin／未滿 ${days} 天 $kept_young"
+    info "確認無誤後加 --apply 才會真的刪除"
+  else
+    info "gc：已刪 $removed 個；保留 未完成 $kept_live／收尾筆記 $kept_pin／未滿 ${days} 天 $kept_young"
+    (( failed == 0 )) || err "警告：$failed 個目錄未能刪除（鎖被佔用或權限問題），下次再試"
+  fi
+}
+
 cmd_idle() {
   (( $# == 0 )) || die "用法：agent-bridge idle（不接參數）"
   local now f base_name name spawned ready disp disp_at last_at ref base secs base_epoch
@@ -1282,9 +1388,13 @@ cmd_evict() {
 EOF
 )"
 
+  # 收尾任務 pin 住：它裝的是「只存在 worker context 裡」的事實，被 gc 清掉的話
+  # 這一層對「上下文不會憑空消失」的承諾就只是延後兌現
   local task_id
+  SEND_PIN=1
   task_id="$(cmd_send "$name" --from "$from" --message "$msg")" \
-    || die "evict 中止：收尾任務送不出去，未動 pane（agent '$name' 仍在）"
+    || { SEND_PIN=""; die "evict 中止：收尾任務送不出去，未動 pane（agent '$name' 仍在）"; }
+  SEND_PIN=""
   info "evict：收尾任務 $task_id 已派給 '$name'，等待筆記落地（timeout ${timeout}s）"
 
   # cmd_await 逾時是 die。直接呼叫會讓 evict 整支跟著退出、跳過 despawn，
@@ -1352,6 +1462,7 @@ main() {
     disposable) cmd_disposable "$@" ;;
     idle)       cmd_idle "$@" ;;
     evict)      cmd_evict "$@" ;;
+    gc)         cmd_gc "$@" ;;
     *)
       usage
       die "未知指令：$cmd"

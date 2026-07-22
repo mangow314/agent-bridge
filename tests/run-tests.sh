@@ -1864,6 +1864,105 @@ for kw in 'agent-bridge idle' 'agent-bridge evict' 'evicted-timeout' \
   assert "orchestrator brief 含必要元素：$kw" grep -q -- "$kw" "$REPO_OBRIEF"
 done
 
+# ---- 28. gc：清舊 task，但三道保留線都不能破 ----
+# tasks/ 只增不減不只是磁碟問題：idle 的回收決策直接掃這個目錄，資料越髒決策
+# 越不可信（名稱重用那個 bug 的根因就是這裡）。但這是唯一會刪東西的命令，
+# 失效方向必須一律偏向「留著」。
+DGC="$TESTROOT/dgc"
+mkdir -p "$DGC"/{agents,tasks,locks}
+
+# mk_task <id> <status> <created_at> [pinned]
+mk_task() {
+  local id="$1" st="$2" ts="$3" pin="${4:-}"
+  mkdir -p "$DGC/tasks/$id"
+  jq -n --arg id "$id" --arg ts "$ts" --arg pin "$pin" \
+    '{version:1, task_id:$id, from:"alice", to:"bob", created_at:$ts,
+      updated_at:$ts, working_directory:"/tmp", status:"completed"}
+     + (if $pin == "1" then {pinned: true} else {} end)' \
+    > "$DGC/tasks/$id/metadata.json"
+  printf '%s\n' "$st" > "$DGC/tasks/$id/status"
+  printf 'x\n' > "$DGC/tasks/$id/request.md"
+}
+OLD_TS="2020-01-01T00:00:00Z"
+NEW_TS="$(date -u +%FT%TZ)"
+mk_task 20200101T000000Z-old1 completed "$OLD_TS"
+mk_task 20200101T000000Z-old2 cancelled "$OLD_TS"
+mk_task 20200101T000000Z-live running   "$OLD_TS"
+mk_task 20200101T000000Z-note completed "$OLD_TS" 1
+mk_task 20200101T000000Z-quee queued    "$OLD_TS"
+mk_task 20260101T000000Z-new1 completed "$NEW_TS"
+# 判不出年紀的：壞掉的 created_at 不該讓它被當成很舊而刪掉
+mk_task 20200101T000000Z-bad1 completed "not-a-timestamp"
+
+# 28a. 預設是試算：一個都不能真的刪
+gc_out="$(ab "$DGC" gc --older-than 1 2>/dev/null)"
+assert "gc：預設只試算，不刪任何東西" \
+  test -d "$DGC/tasks/20200101T000000Z-old1"
+assert "gc：試算列出可刪的舊終態 task" \
+  bash -c "grep -q '20200101T000000Z-old1' <<< '$gc_out'"
+assert "gc：試算不列出未完成的 task" \
+  bash -c "! grep -q '20200101T000000Z-live' <<< '$gc_out'"
+assert "gc：試算不列出收尾筆記（pinned）" \
+  bash -c "! grep -q '20200101T000000Z-note' <<< '$gc_out'"
+
+# 28b. --apply：該刪的刪、三道保留線一條都不能破
+ab "$DGC" gc --older-than 1 --apply >/dev/null 2>&1
+assert "gc：--apply 刪掉夠舊的 completed" \
+  test ! -d "$DGC/tasks/20200101T000000Z-old1"
+assert "gc：--apply 刪掉夠舊的 cancelled" \
+  test ! -d "$DGC/tasks/20200101T000000Z-old2"
+# ★ 保留線一：進行中的任務不是垃圾，刪掉等於把還在跑的工作抹掉
+assert "gc：running 的 task 不刪（未完成一律保留）" \
+  test -d "$DGC/tasks/20200101T000000Z-live"
+assert "gc：queued 的 task 不刪（還沒人取）" \
+  test -d "$DGC/tasks/20200101T000000Z-quee"
+# ★ 保留線二：evict 的收尾筆記是這一層刻意留下的脈絡。它若會被 gc 清掉，
+# 「上下文不會憑空消失」就只是延後兌現
+assert "gc：pinned 的收尾筆記不刪（預設）" \
+  test -d "$DGC/tasks/20200101T000000Z-note"
+# ★ 保留線三：判不出年紀就不刪
+assert "gc：created_at 壞掉的 task 不刪（判不出年紀就留著）" \
+  test -d "$DGC/tasks/20200101T000000Z-bad1"
+assert "gc：未滿保留期的 task 不刪" \
+  test -d "$DGC/tasks/20260101T000000Z-new1"
+assert "gc：執行後 locks/ 為空（每個 task 各取各的鎖，不得殘留）" \
+  test -z "$(ls -A "$DGC/locks")"
+
+# 28c. --include-notes 才動筆記，且仍受其他兩條線約束
+ab "$DGC" gc --older-than 1 --apply --include-notes >/dev/null 2>&1
+assert "gc：--include-notes 才刪得掉收尾筆記" \
+  test ! -d "$DGC/tasks/20200101T000000Z-note"
+assert "gc：--include-notes 仍不刪未完成的 task" \
+  test -d "$DGC/tasks/20200101T000000Z-live"
+
+# 28d. 參數防線
+assert_fails "gc：--older-than 非數字被拒" ab "$DGC" gc --older-than abc
+assert_fails "gc：未知參數被拒" ab "$DGC" gc --bogus
+# 目錄名不合 task-id 格式的東西一律不碰：這是唯一會 rm 的地方，寧可漏掉也不要
+# 讓奇怪的名字走進 rm 的參數。用含空白的名字——TASK_ID_RE 允許 [A-Za-z0-9._-]，
+# 普通目錄名都會通過，只有這類才測得到那道防線
+stray="$DGC/tasks/bad name"
+mkdir -p "$stray"
+jq -n --arg ts "$OLD_TS" \
+  '{version:1, task_id:"x", from:"a", to:"b", created_at:$ts, updated_at:$ts,
+    working_directory:"/tmp", status:"completed"}' > "$stray/metadata.json"
+printf 'completed\n' > "$stray/status"
+ab "$DGC" gc --older-than 1 --apply >/dev/null 2>&1
+assert "gc：目錄名不合 task-id 格式就不碰（即使其他條件都夠格被刪）" \
+  test -d "$stray"
+
+# 28e. evict 的收尾任務要真的被 pin 起來（不是只有測試資料會 pin）
+DGP="$TESTROOT/dgcpin"
+absp "$DGP" 0 spawn gp1 --runtime codex >/dev/null 2>&1
+tid_gp="$(ab "$DGP" evict gp1 --timeout 1 2>/dev/null)"
+assert "gc：evict 送出的收尾任務帶 pinned 標記（否則會被 gc 清掉）" \
+  test "$(jq -r '.pinned // false' "$DGP/tasks/$tid_gp/metadata.json")" = true
+# 一般 send 不該被 pin，否則 gc 永遠清不掉任何東西
+ab "$DGP" register plain-a "$PANE_A" >/dev/null 2>&1
+tid_pl="$(ab "$DGP" send plain-a --from alice --message "一般任務" 2>/dev/null)"
+assert "gc：一般 send 不帶 pinned（否則 gc 等於失效）" \
+  test "$(jq -r '.pinned // false' "$DGP/tasks/$tid_pl/metadata.json")" = false
+
 # ---- 總結 ----
 printf '\n共 %d PASS、%d FAIL\n' "$PASS" "$FAIL"
 if (( FAIL > 0 )); then

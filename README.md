@@ -92,6 +92,8 @@ agent-bridge disposable <name>                # （worker）宣告本輪脈絡�
 agent-bridge idle                             # 回收決策視圖：name<TAB>ready<TAB>disposable<TAB>idle_secs
 agent-bridge evict <name> [--timeout <secs>] [--from <sender>]
                                               # 派收尾任務 → 等筆記落地 → despawn；stdout 只印收尾 task-id
+agent-bridge gc [--older-than <days>] [--apply] [--include-notes]
+                                              # 清舊終態 task（預設 14 天）；預設只試算，--apply 才刪
 ```
 
 輸出契約（機器可解析）：
@@ -320,6 +322,32 @@ agent-bridge spawn w5 --runtime claude
   活動時間，在報表上看起來閒置好幾小時（真鏈驗收實地踩到：spawn 39 秒顯示 21686）。
 - 策略層完整守則見 `share/orchestrator-brief.md`（主導者）與
   `share/worker-brief.md`（worker，spawn 時自動注入）。
+
+### gc：清舊 task，但保留線不能破
+
+`tasks/` 原本只增不減。這不只是磁碟問題——`idle` 的回收決策直接掃這個目錄
+（`last_task_at`），資料越髒決策越不可信，而且那是 O(task 數) 的掃描。
+「同名前一個 pane 的任務讓新 worker 看起來閒置六小時」那個 bug 的根因就在這裡。
+
+```bash
+agent-bridge gc                    # 試算：列出可刪的，不動任何東西
+agent-bridge gc --apply            # 真的刪
+agent-bridge gc --older-than 30 --apply
+```
+
+三道保留線，失效方向一律是「留著」而不是「刪掉」：
+
+1. **未完成的不刪**（queued／delivered／running）——那是還在跑的工作。這條有
+   兩層：掃描時擋一次，取鎖後真刪之前再驗一次狀態（等鎖那段時間裡它可能被
+   `receive`／`reply` 動過）。
+2. **evict 的收尾筆記不刪**（metadata 帶 `pinned: true`），除非明確加
+   `--include-notes`。那些筆記是這一層刻意留下來的脈絡；會被 GC 靜靜清掉的話，
+   「上下文不會憑空消失」就只是延後兌現。
+3. **判不出年紀的不刪**：`created_at` 缺失或無法解析就留著。年齡看 metadata 的
+   `created_at` 而非目錄 mtime——mtime 會被備份、rsync、檔案系統操作改掉。
+
+外加兩條：預設是**試算**，`--apply` 才會刪；目錄名不合 task-id 格式的一律不碰
+（這是唯一會 `rm` 的路徑）。
 
 ## 測試
 
