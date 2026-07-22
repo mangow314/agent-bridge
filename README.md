@@ -93,8 +93,8 @@ agent-bridge await <task-id> [--timeout <secs>]  # 阻塞至終態，印裸狀�
   （查詢進度請用 `status`）；於 cancelled 的任務報「已取消」、非零退出。
 - `await` 是**唯讀**輪詢（不取鎖、不寫 events），只讀 sandbox 內也能用；
   到達終態（completed / failed / cancelled）即印裸狀態字並 exit 0，
-  `--timeout 0`（預設）表示不逾時。輪詢間隔預設 1 秒，
-  可用 `AGENT_BRIDGE_POLL_INTERVAL` 覆蓋。
+  `--timeout 0`（預設）表示不逾時；秒數上限 9 位數（十進位解讀，
+  前導零合法）。輪詢間隔預設 1 秒，可用 `AGENT_BRIDGE_POLL_INTERVAL` 覆蓋。
 - 所有錯誤路徑：訊息走 stderr、非零 exit code。
 
 ## 兩個 pane 完整走一遍

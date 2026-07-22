@@ -338,6 +338,15 @@ assert_fails "await：--timeout 非整數被拒" ab "$D2" await "$id2" --timeout
 ab "$D2" await "$id2" --timeout 1 >/dev/null 2>"$TESTROOT/await-to.err"; rc=$?
 assert "await 逾時：非零退出" test "$rc" -ne 0
 assert "await 逾時：訊息含目前狀態" grep -q 'queued' "$TESTROOT/await-to.err"
+# 回歸（codex 複核 finding）：前導零 timeout 曾被 Bash 算術當八進位，
+# 08 令逾時永不觸發且輪詢每圈爆 "value too great for base"
+assert "await：--timeout 前導零（08）通過驗證" \
+  test "$(ab "$D3" await "$id3" --timeout 08 2>/dev/null)" = completed
+timeout 1 env AGENT_BRIDGE_DATA="$D2" AGENT_BRIDGE_POLL_INTERVAL=0.05 \
+  "$BRIDGE" await "$id2" --timeout 08 >/dev/null 2>"$TESTROOT/await-oct.err"
+assert "await：--timeout 08 輪詢無八進位算術錯誤" \
+  bash -c "! grep -q 'value too great' '$TESTROOT/await-oct.err'"
+assert_fails "await：--timeout 超過 9 位被拒" ab "$D2" await "$id2" --timeout 1234567890
 D11="$TESTROOT/d11"
 ab "$D11" register bob "$PANE_B" 2>/dev/null
 id11="$(ab "$D11" send bob --from alice --message "bg" 2>/dev/null)"
