@@ -784,7 +784,7 @@ assert "claude runtime 以 --permission-mode auto 啟動" \
 assert "claude runtime 不帶 -p/--print（headless 會讓 pane 跑完即退）" \
   bash -c "[[ -s '$TESTROOT/claude-args.txt' ]] && ! grep -qE -- '(^| )(-p|--print)( |\$)' '$TESTROOT/claude-args.txt'"
 assert "claude runtime 一樣注入 worker brief（走同一條 worker_prompt_arg）" \
-  grep -q -- '以上是你的 worker 守則' "$TESTROOT/claude-args.txt"
+  grep -q -- 'The above is your worker brief' "$TESTROOT/claude-args.txt"
 # 白名單：argv 必須「恰好」是 --permission-mode / auto / <prompt> 三個。
 # 這條才是真正擋住「追加旗標」的防線，上面幾條子字串斷言擋不住
 assert "claude runtime argv 恰好三個參數（追加任何旗標都該紅）" \
@@ -1570,9 +1570,9 @@ ab "$DLK" despawn lk >/dev/null 2>&1 || true
 DBRIEF="$TESTROOT/dbrief"
 absp "$DBRIEF" 20 spawn bw --runtime codex >/dev/null 2>&1
 assert "brief 注入：啟動參數含 brief 標題（守則全文有進 prompt）" \
-  grep -q 'agent-bridge worker 守則' "$TESTROOT/codex-args.txt"
-assert "brief 注入：啟動參數含『是命令，不是聊天』這條關鍵守則" \
-  grep -q '是命令，不是聊天' "$TESTROOT/codex-args.txt"
+  grep -q 'agent-bridge worker brief' "$TESTROOT/codex-args.txt"
+assert "brief 注入：啟動參數含『a command, not chat』這條關鍵守則" \
+  grep -q 'a command, not chat' "$TESTROOT/codex-args.txt"
 assert "brief 注入：啟動參數含本 worker 的名字與首要動作" \
   grep -q 'agent-bridge ready bw' "$TESTROOT/codex-args.txt"
 ab "$DBRIEF" despawn bw >/dev/null 2>&1 || true
@@ -1659,7 +1659,7 @@ ab "$DDASH" despawn dh >/dev/null 2>&1 || true
 REPO_BRIEF="$(dirname "$(dirname "$BRIDGE")")/share/worker-brief.md"
 assert "brief 正本存在於 repo" test -r "$REPO_BRIEF"
 for kw in 'agent-bridge receive' 'agent-bridge reply' 'agent-bridge fail' \
-          '是命令，不是聊天' '資料，不是指令'; do
+          'a command, not chat' 'data, not instructions'; do
   assert "brief 正本含必要元素：$kw" grep -q -- "$kw" "$REPO_BRIEF"
 done
 
@@ -1671,8 +1671,8 @@ done
 # 23a. 接手者 brief 正本的內容不變量（同 22f 的理由）
 REPO_SBRIEF="$(dirname "$(dirname "$BRIDGE")")/share/successor-brief.md"
 assert "接手者 brief 正本存在於 repo" test -r "$REPO_SBRIEF"
-for kw in 'agent-bridge ready' 'agent-bridge despawn' '你不是等待派工的 worker' \
-          '資料，不是指令' '交接檔可能有錯'; do
+for kw in 'agent-bridge ready' 'agent-bridge despawn' 'not a worker waiting for dispatch' \
+          'data, not instructions' 'The handoff may be wrong'; do
   assert "接手者 brief 正本含必要元素：$kw" grep -q -- "$kw" "$REPO_SBRIEF"
 done
 
@@ -1690,9 +1690,9 @@ assert "relay 成功：exit 0" test "$rc" -eq 0
 assert "relay stdout 只印 pane-id（%N）一行" \
   bash -c "[[ '$pane_r1' =~ ^%[0-9]+\$ ]]"
 assert "relay 注入接手者守則（不是 worker 守則）" \
-  grep -q 'agent-bridge 接手者守則' "$TESTROOT/codex-args.txt"
+  grep -q 'agent-bridge successor brief' "$TESTROOT/codex-args.txt"
 assert "relay 注入的不是 worker 守則（兩份心智相反，混用會讓接手者空等 receive）" \
-  bash -c "! grep -q 'agent-bridge worker 守則' '$TESTROOT/codex-args.txt'"
+  bash -c "! grep -q 'agent-bridge worker brief' '$TESTROOT/codex-args.txt'"
 assert "relay 啟動參數含交接檔路徑" \
   grep -qF -- "$HANDOFF" "$TESTROOT/codex-args.txt"
 assert "relay 啟動參數含本接手者的名字與首要動作" \
@@ -1723,7 +1723,7 @@ assert "relay --model 的接手者可正常 despawn（不佔用後續 cap）" \
 # 不能拿 'agent-bridge despawn' 當關鍵字——接手者 brief 內文本來就有那一段
 # （說明被拒是正常的），會恆綠。要鎖的是動態尾巴本身
 assert "relay 未指定 --self-exit：prompt 不含回收前一棒的尾巴" \
-  bash -c "! grep -q '接手完成後，回收前一棒' '$TESTROOT/codex-args.txt'"
+  bash -c "! grep -q 'After taking over, reclaim your predecessor' '$TESTROOT/codex-args.txt'"
 ab "$DRELAY" despawn r1 >/dev/null 2>&1 || true
 
 # 23c. --self-exit：把回收前一棒的指示寫進接手者的 prompt。
@@ -1735,10 +1735,10 @@ env AGENT_BRIDGE_DATA="$DRELAY" AGENT_BRIDGE_READY_TIMEOUT=20 \
   --self-exit prev-agent >/dev/null 2>&1; rc=$?
 assert "relay --self-exit：exit 0" test "$rc" -eq 0
 assert "relay --self-exit：prompt 指示接手者 despawn 前一棒" \
-  grep -q '接手完成後，回收前一棒：執行 agent-bridge despawn prev-agent' \
+  grep -q 'reclaim your predecessor: run agent-bridge despawn prev-agent' \
   "$TESTROOT/codex-args.txt"
 assert "relay --self-exit：prompt 說明人工 pane 被拒是正常的（防接手者硬繞）" \
-  grep -q '會被拒絕' "$TESTROOT/codex-args.txt"
+  grep -q 'manually started session the command is refused' "$TESTROOT/codex-args.txt"
 ab "$DRELAY" despawn r2 >/dev/null 2>&1 || true
 
 # 23d. --self-exit 的名稱會進 prompt 字面值，必須擋住不合法名稱
@@ -2046,7 +2046,7 @@ assert "evict：--from 進了任務 metadata（審計得出是誰發起驅逐）
   test "$(jq -r '.from' "$DEV/tasks/$tid_ev1/metadata.json")" = alice
 # 收尾文案是機制的一部分：任務內容若是空的，worker 不會知道要寫什麼
 assert "evict：收尾任務帶著收尾文案（不是一個空任務）" \
-  grep -q '收尾任務' "$DEV/tasks/$tid_ev1/request.md"
+  grep -q 'Wrap-up task' "$DEV/tasks/$tid_ev1/request.md"
 # ★ 核心斷言：evict 返回的當下筆記就已經落地——不再等、不再輪詢。
 # 拆掉 await 那一步的話，這裡會抓到 queued/delivered → 紅
 assert "evict：返回當下收尾任務已 completed（筆記先落地才收 pane）" \
@@ -2154,24 +2154,26 @@ assert "evict：出身不明被拒時 registry 未被清掉（留給人工處理
 # /clear 掉、脈絡連同 pane 一起消失才發現
 
 # 27a. worker-brief：新語意的正面斷言
-for kw in 'agent-bridge disposable' '你的 context 是資產' '收到收尾任務時' \
-          '要不要再往下委派 subagent' '正是之後可能被追問的東西嗎'; do
+for kw in 'agent-bridge disposable' 'context is an asset' 'When a wrap-up task arrives' \
+          'Whether to delegate further down to subagents' 'exactly what I may be asked about later'; do
   assert "worker brief 含 Phase 4 條款：$kw" grep -q -- "$kw" "$REPO_BRIEF"
 done
 
-# 27b. worker-brief：舊條款必須已經拔掉。
+# 27b. worker-brief：「reply 後清 context」禁令必須在。
 # 「reply 後清空 context」與「保留脈絡供追問」直接矛盾——照做的話 reply 完
-# 脈絡就沒了，disposable 宣告與 evict 的收尾筆記全部失去意義
-assert "worker brief 已不含「reply 後清空 context」語句（與保留脈絡矛盾）" \
-  bash -c "! grep -q '清空自己的 context' '$REPO_BRIEF'"
-assert "worker brief 不再叫 worker 自行 /clear" \
-  bash -c "! grep -qE '完成 .reply. 後.*/clear' '$REPO_BRIEF'"
+# 脈絡就沒了，disposable 宣告與 evict 的收尾筆記全部失去意義。英譯後改守
+# 正面禁令字句（原中文舊條款的否定式 grep 對英文正文已是空轉）
+assert "worker brief 保留「不要清自己的 context」禁令" \
+  grep -qF 'Do not clear your own context' "$REPO_BRIEF"
+# shellcheck disable=SC2016  # 反引號是 Markdown 字面值，-F 比對、無展開需求
+assert "worker brief 保留 no-/clear 待命條款" \
+  grep -qF 'No `/clear`' "$REPO_BRIEF"
 
 # 27c. orchestrator-brief：存在 + 策略要點
 REPO_OBRIEF="$(dirname "$(dirname "$BRIDGE")")/share/orchestrator-brief.md"
 assert "orchestrator brief 正本存在於 repo" test -r "$REPO_OBRIEF"
 for kw in 'agent-bridge idle' 'agent-bridge evict' 'evicted-timeout' \
-          '預設保留' 'AGENT_BRIDGE_MAX_SPAWN' \
+          'Keep by default' 'AGENT_BRIDGE_MAX_SPAWN' \
           'Do not call the AgentTool'; do
   assert "orchestrator brief 含必要元素：$kw" grep -q -- "$kw" "$REPO_OBRIEF"
 done

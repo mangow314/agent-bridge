@@ -813,7 +813,7 @@ worker_prompt_arg() {
   # `cat --`：AGENT_BRIDGE_WORKER_BRIEF 是公開覆蓋介面，接得到相對路徑；
   # 少了 option terminator，一個叫 `--help` 的檔案會被 cat 當成選項，
   # spawn 照樣成功卻注入了完全錯誤的 prompt
-  printf '"$(cat -- '\''%s'\'')  ——以上是你的 worker 守則。你的 agent 名稱是 %s。第一件事：立刻執行 agent-bridge ready %s"' \
+  printf '"$(cat -- '\''%s'\'')  -- The above is your worker brief. Your agent name is %s. First action: immediately run agent-bridge ready %s"' \
     "$brief" "$name" "$name"
 }
 
@@ -827,10 +827,10 @@ relay_prompt_arg() {
   # prev 已由呼叫端以 NAME_RE 驗過，這裡不再展開成 shell 字面值以外的東西
   local tail=""
   if [[ -n "$prev" ]]; then
-    tail="接手完成後，回收前一棒：執行 agent-bridge despawn $prev（若對方是人工開的 session，這個命令會被拒絕，那是正常的，看到就繼續做事）。"
+    tail="After taking over, reclaim your predecessor: run agent-bridge despawn $prev (if it was a manually started session the command is refused — that is normal; keep working)."
   fi
   # shellcheck disable=SC2016  # $(cat …) 刻意不在此展開，留給 pane 內的 sh
-  printf '"$(cat -- '\''%s'\'')  ——以上是你的接手者守則。你的 agent 名稱是 %s。要接續的交接檔：%s。第一件事：立刻執行 agent-bridge ready %s，接著讀那份交接檔並依其「下一步」開始執行。%s"' \
+  printf '"$(cat -- '\''%s'\'')  -- The above is your successor brief. Your agent name is %s. Handoff file to continue from: %s. First action: immediately run agent-bridge ready %s, then read that handoff and start on its next steps. %s"' \
     "$brief" "$name" "$handoff" "$name" "$tail"
 }
 
@@ -1538,23 +1538,25 @@ cmd_evict() {
   # 怎麼辦」的失敗路徑，而那條路徑一旦失敗，等於整個筆記機制悄悄消失
   local msg
   msg="$(cat <<'EOF'
-【收尾任務 — 這是你在被回收前的最後一輪】
+[Wrap-up task — your final round before this pane is reclaimed]
 
-這個 pane 即將被回收，你的 context 會一併消失。請把「只存在於你 context 裡、
-先前 response 沒寫進去」的關鍵事實，用 reply 寫成一份筆記交回來。
+This pane is about to be reclaimed and your context vanishes with it.
+Use reply to hand back a note with the key facts that exist only in your
+context and never made it into earlier responses.
 
-要寫的：
-- 你查到但沒寫進之前回覆的事實（含 file:line、指令、實測數字）
-- 走過的死路與原因（讓下一棒不必重走）
-- 未解的疑問、你當時的假設，以及哪些結論其實只是推測
+Write:
+- facts you found but never put into a reply (file:line, commands, measured numbers)
+- dead ends you walked and why they failed (so the next runner skips them)
+- open questions, the assumptions you held, and which conclusions were
+  actually conjecture rather than verified
 
-不要寫的：
-- 覆述已經在 response 裡的內容
-- 重新開工。這一輪只做整理，不要開始新的調查
+Do not write:
+- restatements of what is already in your responses
+- new work: this round is consolidation only — start no new investigation
 
-寫完請執行 agent-bridge reply <task-id> --message-file <path>（或 --message）。
-沒有值得留下的東西也請照樣 reply，寫一行「無殘值」即可——沒有回覆會被記成
-筆記未落地。
+When done, run agent-bridge reply <task-id> --message-file <path> (or --message).
+Even with nothing worth keeping, reply anyway with the single line
+"no residual value" — a missing reply is recorded as notes-never-landed.
 EOF
 )"
 
