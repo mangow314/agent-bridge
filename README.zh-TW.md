@@ -19,8 +19,11 @@ context 保持短而乾淨。
 3. **活過主 session 的清洗**：worker 的 context 活在它自己的 pane 裡，主 session
    `/clear`、被 compact、甚至整個重開都不動它。subagent 的生命週期綁在召喚它的
    那一次 turn，主 session 一清就沒了。
-4. **再往下委派（第三層）**：worker 自己是完整 session，能再 spawn／dispatch 它
-   自己的 worker 或 subagent。subagent 不能再長出 subagent。
+4. **再往下委派（第三層）**：worker 自己是完整 session，能再 spawn 它自己的
+   worker 或 subagent。Claude Code 的 subagent 巢狀預設關閉、設
+   `CLAUDE_CODE_MAX_SUBAGENT_SPAWN_DEPTH` 也開得起來，但長出來的每一層仍是
+   同 runtime 的黑盒，逐層只回摘要；worker 的下一層跟它自己同級——可以跨廠、
+   可以被看見、可以留著追問。
 
 一句話：agent-bridge 是一層**活過主 session 清洗的 context**。這也是它的取捨
 裁判——一個提議若不服務上面四件事之一，就不屬於這裡。

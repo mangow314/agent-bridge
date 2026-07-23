@@ -25,7 +25,12 @@ things they can't do:
    its own pane. The main session can `/clear`, get compacted, or restart
    entirely without touching it.
 4. **Third-layer delegation** — a worker is a full session and can spawn its
-   own workers or subagents (when the request authorizes it).
+   own workers or subagents (when the request authorizes it). Claude Code
+   subagents can nest too once you set
+   `CLAUDE_CODE_MAX_SUBAGENT_SPAWN_DEPTH`, but every nested layer is another
+   same-vendor black box reporting summaries upward; a worker's next layer is
+   the same kind of thing the worker is — cross-vendor, observable, and still
+   there to question afterwards.
 
 In one sentence: agent-bridge is **a layer of context that outlives the main
 session's wipes**.
