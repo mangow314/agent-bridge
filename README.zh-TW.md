@@ -6,6 +6,11 @@
 claude / codex CLI session 互相委派任務與回覆，把工作拆細、讓每個 agent 的
 context 保持短而乾淨。
 
+![示範：spawn worker pane、委派任務、讀回覆](docs/assets/demo.gif)
+
+*示範以 stub runtime 錄製、未打真實 API；錄影劇本與腳本見
+[docs/demo/](docs/demo/)。*
+
 ## 為什麼不是內建 subagent
 
 要「把一塊活丟出去、拿回結論」，用 agent runtime 內建的 subagent 就好——更省、

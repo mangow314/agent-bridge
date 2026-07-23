@@ -10,6 +10,11 @@ agent keeps its context short and clean. Pure bash + filesystem, no daemon.
 > — the Traditional Chinese README is the canonical, in-depth documentation;
 > this file is a condensed overview.
 
+![demo: spawn a worker pane, delegate a task, read the reply back](docs/assets/demo.gif)
+
+*Recorded against a stub runtime — no real API calls; the tape and scripts
+live in [docs/demo/](docs/demo/).*
+
 ## Why not just built-in subagents?
 
 If you only need "send a chunk of work out, get a conclusion back", the agent
