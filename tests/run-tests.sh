@@ -764,7 +764,7 @@ assert "pane_start_command 剝前導引號後以 spawn tag 前綴開頭（tmux �
 #   - `--permission-mode auto` 換成 bypassPermissions 是安全降級：官方把後者
 #     定位為僅限隔離容器／VM，而 worker pane 跑在本機、與主 session 共用檔案
 #     系統與憑證。（理由到此為止——bypass 並不停用 hooks，deny 與 explicit ask
-#     也仍適用；詳見 README，那段因果曾兩度寫錯）
+#     也仍適用；詳見 README.zh-TW.md，那段因果曾兩度寫錯）
 #   - 混進 -p/--print 會讓 pane 跑完即退，worker 根本不存在
 #   - 混進 --settings/--setting-sources 會讓 worker 脫離使用者的安全設定
 # 關鍵是**精確的完整參數集合**而非子字串：獨立複核以 mutation 反例證明，
@@ -846,8 +846,8 @@ assert "被拒的 spawn 不留 registry" \
 assert_fails "despawn 後 claude worker 的 pane 消失" pane_alive "$pane_wc"
 
 # 16a4. proxy 環境穿透：pane 的環境繼承自 tmux server 而非 spawn 呼叫者，
-# orchestrator shell 的 proxy 變數必須拼進啟動指令才到得了 worker（work 機
-# 實測：runtime 直連被內網 MITM 擋下，第一隻 worker 陣亡）。env -u 清場＋
+# orchestrator shell 的 proxy 變數必須拼進啟動指令才到得了 worker（受限網路
+# 實測：runtime 直連被 MITM 擋下，第一隻 worker 陣亡）。env -u 清場＋
 # sentinel 值讓斷言不受宿主機真實 proxy 設定影響。no_proxy 值刻意帶空白與
 # 逗號：實作若退化成不跳脫（丟掉 printf %q），啟動指令在此拆詞、往返必損，
 # 兩層斷言（啟動指令片段＋worker 程序實拿的值）都會紅

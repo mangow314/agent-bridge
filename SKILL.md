@@ -9,8 +9,8 @@ description: >
 
 # agent-bridge 委派協定
 
-（正本在 repo；Claude Code 端由 chezmoi 管理的 symlink
-`~/.claude/skills/agent-bridge/SKILL.md` 指向本檔。）
+（正本在 repo；Claude Code 端把 `~/.claude/skills/agent-bridge/SKILL.md`
+symlink 指向本檔即可載入，見 README 安裝節。）
 
 ## 何時委派
 

@@ -802,7 +802,7 @@ validate_ready_opts() {
 # 命令字串的跳脫地獄。代價是展開時機延到 pane 啟動：brief 雖已於建 pane 前
 # 驗過是可讀的普通檔案，那之後仍有 TOCTOU 空隙——被刪或換掉會退化成沒有守則
 # 的 worker，換成 FIFO 之類讀不完的來源則會讓 pane 卡在讀取。兩者都不會殺錯
-# 東西，但後者會留下佔 cap 的 starting pane（見 README「殘留缺口」）
+# 東西，但後者會留下佔 cap 的 starting pane（見 README.zh-TW.md「殘留缺口」）
 worker_prompt_arg() {
   local name="$1" brief="$2"
   # 路徑要以單引號字面值送進 sh；含單引號就湊不出安全的字面值，fail-closed
@@ -981,7 +981,7 @@ cmd_spawn() {
   fi
   # proxy 環境穿透：pane 的環境繼承自 tmux server，不是 spawn 呼叫者——
   # orchestrator shell 才有的 proxy 變數（profile/alias 注入）到不了 worker，
-  # 在強制走 proxy 的網路裡 runtime 會直連而死（work 機實測：內網 MITM 憑證
+  # 在強制走 proxy 的網路裡 runtime 會直連而死（受限網路實測：MITM 憑證
   # 過期，SSL 錯誤）。故把呼叫者環境裡的標準 proxy 變數拼進啟動指令。
   # 值以 printf %q 逐個跳脫（值來自 orchestrator 自己的環境，與執行 spawn 的
   # 人同一信任域，跳脫是防意外拆詞，不是防注入）；空值照傳（保持與呼叫者
