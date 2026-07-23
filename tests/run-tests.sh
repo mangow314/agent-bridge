@@ -293,9 +293,9 @@ assert "通知失敗：events.log 記 notify-failed" \
 # 印出對話框特徵後進 `while read` 迴圈、把收到的每一行記進 got 檔。攔截生效＝got 不
 # 含通知文字。為排除「其實送了、只是還沒 append」的偽陰性，先送一個哨兵行、確認 got
 # 記得到它（證明記錄機制活著），再斷言 got 裡沒有 task-id。
-# 註：capture 失敗 fail-closed（B1）與送 Enter 前二次掃描（B3）是邏輯路徑，真 tmux
-# 環境難穩定構造「capture 失敗但 send-keys 成功」與「文字送出後才彈框」，由 code
-# review＋shellcheck 把關，不在此列測例。
+# 註：capture 失敗 fail-closed（B1）與送 Enter 前二次掃描（B3）真 tmux 難穩定構造
+# （「capture 失敗但 send-keys 成功」與「文字送出後才彈框」），由 8a④/8a⑤ 的
+# 有狀態 tmux shim 決定性鎖住。
 D5a="$TESTROOT/d5a"
 p_ask="$(tmx split-window -dP -F '#{pane_id}' -t it "$pane_cmd")"
 ab "$D5a" register dodo "$p_ask" 2>/dev/null
@@ -312,6 +312,7 @@ assert "對話框偵測(Bash 框)：記錄機制活著（哨兵行有進 got）"
 # return 1」的 regression——那會讓 got 多一個空白行、仍不含 task-id 卻已送出危險
 # 的 Enter。改斷言 got 內容整行等於哨兵、且列數恰為 1，空白行／額外 Enter／任何
 # 通知文字都會讓它失敗（二輪複核 B4）
+# shellcheck disable=SC2016  # $1/$2 由內層 bash 展開，刻意單引號
 assert "對話框偵測(Bash 框)：got 恰好只有哨兵一行（通知的文字與 Enter 都沒送進來）" \
   bash -c 'test "$(wc -l < "$1")" -eq 1 && grep -Fxq "$2" "$1"' _ "$TESTROOT/ask1-got.txt" 'SENTINEL-ask1'
 assert "對話框偵測(Bash 框)：events.log 記 notify-failed" \
@@ -333,6 +334,7 @@ id5c="$(ab "$D5c" send didi --from alice --message hi 2>/dev/null)"
 tmx send-keys -t "$p_edit" 'SENTINEL-ask2' Enter
 assert "對話框偵測(Edit 框)：記錄機制活著（哨兵行有進 got）" \
   wait_for 10 grep -q 'SENTINEL-ask2' "$TESTROOT/ask2-got.txt"
+# shellcheck disable=SC2016  # 同上，內層 bash 展開
 assert "對話框偵測(Edit 框)：got 恰好只有哨兵一行（Edit 型也一個按鍵都沒送）" \
   bash -c 'test "$(wc -l < "$1")" -eq 1 && grep -Fxq "$2" "$1"' _ "$TESTROOT/ask2-got.txt" 'SENTINEL-ask2'
 assert "對話框偵測(Edit 框)：events.log 記 notify-failed" \
@@ -353,6 +355,83 @@ assert "非對話框畫面：pane 收到通知文字（通知照送）" \
 assert_fails "非對話框畫面：通知未降級（events.log 不記 notify-failed）" \
   evt_grep "$D5b/tasks/$id5b/events.log" notify-failed
 tmx kill-pane -t "$p_ok" 2>/dev/null || true
+
+# 8a④ B1 regression（有狀態 shim）：「capture-pane 失敗但 send-keys 可用」在真
+# tmux 幾乎構造不出來（pane 活著時 capture 不會失敗），shim 讓 capture 一律非零、
+# send-keys 只記 argv 不透傳。鎖住 fail-closed 方向：查不到 pane 狀態必須整個放棄
+# 送鍵，不得退化成「capture 失敗就當沒對話框」的 fail-open——那會讓防線被整個
+# 略過（複核 B1）。marker 檔證明 capture 真的被呼叫且被 shim 攔截，排除「PATH
+# 沒生效、其實走了正常路徑」的偽陰性。
+D5d="$TESTROOT/d5d"
+CAPSHIM="$TESTROOT/capshim"
+mkdir -p "$CAPSHIM"
+cat > "$CAPSHIM/tmux" <<EOF
+#!/usr/bin/env bash
+unset TMUX
+if [[ "\$1" == "capture-pane" ]]; then
+  touch $(printf '%q' "$TESTROOT/b1-cap-hit")
+  echo "capture failed (test stub)" >&2; exit 1
+fi
+if [[ "\$1" == "send-keys" ]]; then
+  { printf '%s ' "\$@"; printf '\n'; } >> $(printf '%q' "$TESTROOT/b1-sendkeys.log")
+  exit 0
+fi
+exec $(printf '%q' "$REAL_TMUX") -L $(printf '%q' "$SOCK") -f /dev/null "\$@"
+EOF
+chmod +x "$CAPSHIM/tmux"
+env AGENT_BRIDGE_DATA="$D5d" PATH="$CAPSHIM:$PATH" "$BRIDGE" \
+  register kaka "$PANE_B" 2>/dev/null
+id5d="$(env AGENT_BRIDGE_DATA="$D5d" PATH="$CAPSHIM:$PATH" "$BRIDGE" \
+  send kaka --from alice --message hi 2>/dev/null)"; rc=$?
+assert "capture 失敗 fail-closed(B1)：send 仍 exit 0（訊息留 mailbox）" test "$rc" -eq 0
+assert "capture 失敗 fail-closed(B1)：capture 確實被呼叫且失敗（shim 生效證據）" \
+  test -f "$TESTROOT/b1-cap-hit"
+assert "capture 失敗 fail-closed(B1)：send-keys 一次都沒被呼叫" \
+  test ! -e "$TESTROOT/b1-sendkeys.log"
+assert "capture 失敗 fail-closed(B1)：events.log 記 notify-failed" \
+  evt_grep "$D5d/tasks/$id5d/events.log" notify-failed
+
+# 8a⑤ B3 regression（有狀態 shim）：第一次掃描時畫面乾淨、通知文字送出後的延遲
+# 期間 worker 才彈出權限框——真 tmux 難穩定構造這個時序，shim 用計數檔讓第一次
+# capture 回正常畫面、第二次回對話框特徵。鎖住二次掃描：send-keys 恰好只被呼叫
+# 一次（文字那次，行內含 task-id），Enter 那次必須被攔下；刪掉二次掃描的
+# regression 會讓 log 多出 Enter 行（wc 變 2）、拿掉整段延遲重掃則 capcount
+# 停在 1，兩條斷言互為犄角（複核 B3）。
+D5e="$TESTROOT/d5e"
+RACESHIM="$TESTROOT/raceshim"
+mkdir -p "$RACESHIM"
+cat > "$RACESHIM/tmux" <<EOF
+#!/usr/bin/env bash
+unset TMUX
+if [[ "\$1" == "capture-pane" ]]; then
+  n=\$(cat $(printf '%q' "$TESTROOT/b3-capcount") 2>/dev/null || echo 0)
+  n=\$((n+1)); printf '%s' "\$n" > $(printf '%q' "$TESTROOT/b3-capcount")
+  if [[ "\$n" -eq 1 ]]; then
+    printf '%s\n' 'just some normal worker output'
+  else
+    printf '%s\n' 'Do you want to proceed?' 'Esc to cancel · Tab to amend'
+  fi
+  exit 0
+fi
+if [[ "\$1" == "send-keys" ]]; then
+  { printf '%s ' "\$@"; printf '\n'; } >> $(printf '%q' "$TESTROOT/b3-sendkeys.log")
+  exit 0
+fi
+exec $(printf '%q' "$REAL_TMUX") -L $(printf '%q' "$SOCK") -f /dev/null "\$@"
+EOF
+chmod +x "$RACESHIM/tmux"
+env AGENT_BRIDGE_DATA="$D5e" PATH="$RACESHIM:$PATH" "$BRIDGE" \
+  register keke "$PANE_B" 2>/dev/null
+id5e="$(env AGENT_BRIDGE_DATA="$D5e" AGENT_BRIDGE_NOTIFY_DELAY=0.05 \
+  PATH="$RACESHIM:$PATH" "$BRIDGE" send keke --from alice --message hi 2>/dev/null)"
+assert "延遲中彈框(B3)：兩次掃描都發生（capture 恰被呼叫 2 次）" \
+  test "$(cat "$TESTROOT/b3-capcount" 2>/dev/null)" = 2
+# shellcheck disable=SC2016  # 同上，內層 bash 展開
+assert "延遲中彈框(B3)：send-keys 恰好一次且是通知文字（Enter 被二次掃描攔下）" \
+  bash -c 'test "$(wc -l < "$1")" -eq 1 && grep -q "$2" "$1"' _ \
+  "$TESTROOT/b3-sendkeys.log" "$id5e"
+assert "延遲中彈框(B3)：events.log 記 notify-failed" \
+  evt_grep "$D5e/tasks/$id5e/events.log" notify-failed
 
 # ---- 8b. 鎖失敗路徑：權限失敗 vs 真正鎖佔用 ----
 D6="$TESTROOT/d6"
