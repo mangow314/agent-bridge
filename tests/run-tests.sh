@@ -433,6 +433,77 @@ assert "延遲中彈框(B3)：send-keys 恰好一次且是通知文字（Enter �
 assert "延遲中彈框(B3)：events.log 記 notify-failed" \
   evt_grep "$D5e/tasks/$id5e/events.log" notify-failed
 
+# 8a⑥ plan mode 退出確認框：標題不含「Do you want to 」、footer 不含「Esc to
+# cancel」，第一組特徵比對不到；它的 Enter 預設是「Yes, and use auto mode」，
+# 誤觸比權限框更糟（批准 plan＋切 auto mode）。特徵是標題行的兩個片段 AND
+# （2026-07-23 真 UI 實測，文案見 screen_has_prompt 註解）
+D5f="$TESTROOT/d5f"
+p_plan="$(tmx split-window -dP -F '#{pane_id}' -t it "$pane_cmd")"
+ab "$D5f" register pupu "$p_plan" 2>/dev/null
+tmx send-keys -t "$p_plan" \
+  "printf '%s\n' 'Claude has written up a plan and is ready to execute. Would you like to proceed?' ; touch $TESTROOT/ask3-ready ; while IFS= read -r l ; do printf '%s\n' \"\$l\" >> $TESTROOT/ask3-got.txt ; done" Enter
+wait_for 10 test -f "$TESTROOT/ask3-ready"
+id5f="$(ab "$D5f" send pupu --from alice --message hi 2>/dev/null)"
+tmx send-keys -t "$p_plan" 'SENTINEL-ask3' Enter
+assert "對話框偵測(plan 框)：記錄機制活著（哨兵行有進 got）" \
+  wait_for 10 grep -q 'SENTINEL-ask3' "$TESTROOT/ask3-got.txt"
+# shellcheck disable=SC2016  # $1/$2 由內層 bash 展開，刻意單引號
+assert "對話框偵測(plan 框)：got 恰好只有哨兵一行（plan 框也一個按鍵都沒送）" \
+  bash -c 'test "$(wc -l < "$1")" -eq 1 && grep -Fxq "$2" "$1"' _ "$TESTROOT/ask3-got.txt" 'SENTINEL-ask3'
+assert "對話框偵測(plan 框)：events.log 記 notify-failed" \
+  evt_grep "$D5f/tasks/$id5f/events.log" notify-failed
+tmx kill-pane -t "$p_plan" 2>/dev/null || true
+
+# 8a⑥b 折行版 plan 框：窄 pane 下 TUI word-wrap 會把 80 字元的標題拆行，特徵
+# 片段「Would you like to proceed」被折點切開。逐行 grep 在這種畫面必偽陰性
+# （複核以 fold 反例證實），靠 screen_has_prompt 的空白正規化拼回。fixture 直接
+# 印拆行後的兩行，鎖住「折行的 plan 框也攔得住」
+D5h="$TESTROOT/d5h"
+p_wrap="$(tmx split-window -dP -F '#{pane_id}' -t it "$pane_cmd")"
+ab "$D5h" register wawa "$p_wrap" 2>/dev/null
+tmx send-keys -t "$p_wrap" \
+  "printf '%s\n' 'Claude has written up a plan and is ready to execute. Would you like to' 'proceed?' ; touch $TESTROOT/ask4-ready ; while IFS= read -r l ; do printf '%s\n' \"\$l\" >> $TESTROOT/ask4-got.txt ; done" Enter
+wait_for 10 test -f "$TESTROOT/ask4-ready"
+id5h="$(ab "$D5h" send wawa --from alice --message hi 2>/dev/null)"
+tmx send-keys -t "$p_wrap" 'SENTINEL-ask4' Enter
+assert "對話框偵測(折行 plan 框)：記錄機制活著（哨兵行有進 got）" \
+  wait_for 10 grep -q 'SENTINEL-ask4' "$TESTROOT/ask4-got.txt"
+# shellcheck disable=SC2016  # $1/$2 由內層 bash 展開，刻意單引號
+assert "對話框偵測(折行 plan 框)：got 恰好只有哨兵一行（折行拆散片段仍攔住）" \
+  bash -c 'test "$(wc -l < "$1")" -eq 1 && grep -Fxq "$2" "$1"' _ "$TESTROOT/ask4-got.txt" 'SENTINEL-ask4'
+assert "對話框偵測(折行 plan 框)：events.log 記 notify-failed" \
+  evt_grep "$D5h/tasks/$id5h/events.log" notify-failed
+tmx kill-pane -t "$p_wrap" 2>/dev/null || true
+
+# 8a⑦ 半特徵放行對照：plan 框特徵是兩片段 AND，任一片段單獨出現在普通輸出
+# （worker 引述、討論文字）都不得誤攔——兩個片段各測一次，缺一則「實作退化成
+# 只檢查另一片段」的 mutation 抓不到（複核 B2）
+D5g="$TESTROOT/d5g"
+p_half="$(tmx split-window -dP -F '#{pane_id}' -t it "$pane_cmd")"
+ab "$D5g" register haha "$p_half" 2>/dev/null
+tmx send-keys -t "$p_half" \
+  "printf '%s\n' 'Would you like to proceed with the deployment?' ; touch $TESTROOT/half-ready ; while IFS= read -r l ; do printf '%s\n' \"\$l\" >> $TESTROOT/half-got.txt ; done" Enter
+wait_for 10 test -f "$TESTROOT/half-ready"
+id5g="$(ab "$D5g" send haha --from alice --message hi 2>/dev/null)"
+assert "半特徵畫面(片段二)：pane 收到通知文字（單片段不誤攔）" \
+  wait_for 10 grep -q "$id5g" "$TESTROOT/half-got.txt"
+assert_fails "半特徵畫面(片段二)：通知未降級（events.log 不記 notify-failed）" \
+  evt_grep "$D5g/tasks/$id5g/events.log" notify-failed
+tmx kill-pane -t "$p_half" 2>/dev/null || true
+
+D5i="$TESTROOT/d5i"
+p_half1="$(tmx split-window -dP -F '#{pane_id}' -t it "$pane_cmd")"
+ab "$D5i" register hoho "$p_half1" 2>/dev/null
+tmx send-keys -t "$p_half1" \
+  "printf '%s\n' 'the agent has written up a plan for later review' ; touch $TESTROOT/half1-ready ; while IFS= read -r l ; do printf '%s\n' \"\$l\" >> $TESTROOT/half1-got.txt ; done" Enter
+wait_for 10 test -f "$TESTROOT/half1-ready"
+id5i="$(ab "$D5i" send hoho --from alice --message hi 2>/dev/null)"
+assert "半特徵畫面(片段一)：pane 收到通知文字（單片段不誤攔）" \
+  wait_for 10 grep -q "$id5i" "$TESTROOT/half1-got.txt"
+assert_fails "半特徵畫面(片段一)：通知未降級（events.log 不記 notify-failed）" \
+  evt_grep "$D5i/tasks/$id5i/events.log" notify-failed
+tmx kill-pane -t "$p_half1" 2>/dev/null || true
+
 # ---- 8b. 鎖失敗路徑：權限失敗 vs 真正鎖佔用 ----
 D6="$TESTROOT/d6"
 ab "$D6" register bob "$PANE_B" 2>/dev/null

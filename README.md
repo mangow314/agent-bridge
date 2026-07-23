@@ -457,11 +457,14 @@ tests/run-tests.sh
   時實際會撞到的權限框。**侷限（刻意揭露）**：(1) 這是對可見文字的字串匹配，
   Claude Code 改文案或本地化會讓特徵失效——方向是 fail-open（退回原本會誤觸的
   行為），因為漏判（替 worker 誤按批准）比偽陽性（通知延後、訊息可復原）更糟，
-  偵測刻意偏攔。(2) 其他句式的確認框——plan mode 的
-  `Would you like to proceed?`、`Do you want to use this API key?`、workspace
-  trust 等——目前**不涵蓋**，其在 `--permission-mode auto` worker 場景的可達性
-  尚未實測（獨立複核指出，未升格為 blocking）；要擴大保護得先實測這些框的 footer、
-  Enter 預設行為與 worker 可達性。(3) 第二次掃描與 send-keys 之間仍有無法在 tmux
+  偵測刻意偏攔。(2) 特徵涵蓋兩組（2026-07-23 真 UI 實測）：上述權限框，以及
+  plan mode 的退出確認框——後者標題不含 `Do you want to `、footer 不含
+  `Esc to cancel`，且 Enter 預設是「Yes, and use auto mode」，誤觸不只批准
+  plan 還把 worker 切進 auto mode，比權限框更糟，故以標題兩片段 AND 另列特徵；
+  `Do you want to use this API key?` 框實測落在權限框特徵內（footer 同為
+  `Esc to cancel`，Enter 預設是安全方向的 `No (recommended)`）。workspace
+  trust 框在已 onboarding 的本機實測不出現、拿不到第一手特徵，**不涵蓋**；
+  其他未知句式的新框同樣漏判，方向一律 fail-open（回到會誤觸的行為）。(3) 第二次掃描與 send-keys 之間仍有無法在 tmux
   層消除的微小 race。codex worker 走 `approval_policy = never`、不彈這種對話框，
   天然不受影響。
 - **同一個資料目錄＝同一個互信域，出身檢查不是對抗惡意 agent 的邊界**：

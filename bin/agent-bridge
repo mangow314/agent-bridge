@@ -227,11 +227,31 @@ write_message() {
 # approval_policy=never（見 ~/.codex/agent-worker.config.toml）不彈此框，故只認 CC 形狀。
 # 代價方向：漏判＝那個 Enter 替 worker 按下批准（最壞），偽陽性＝通知降級成
 # notify-failed、訊息仍在 mailbox、只是晚一步被取（可復原）。兩者不對等，故 fail-
-# closed 偏攔——寧可偶爾偽陽性，也不放行一個可能誤批的 Enter
+# closed 偏攔——寧可偶爾偽陽性，也不放行一個可能誤批的 Enter。
+# 第二組特徵：plan mode 的退出確認框（2026-07-23 真 UI 實測）。標題整行是
+# 「Claude has written up a plan and is ready to execute. Would you like to
+# proceed?」——不含「Do you want to 」；footer 是「ctrl+g to edit in …」——不含
+# 「Esc to cancel」，第一組特徵完全比對不到。它的 Enter 預設是「1. Yes, and use
+# auto mode」：誤觸不只替 worker 批准 plan，還把它切進 auto mode，比權限框更糟；
+# 而 worker 的 SessionStart 提醒本來就引導中等任務先進 plan mode，此框對 worker
+# 可達（實測）。標題拆成兩個較短片段 AND：整行在窄 pane 會被 tmux 折行，任一片
+# 段單獨出現在普通輸出（如引述）則不攔。不取 footer 當特徵是因為它含編輯器名
+# （隨 $EDITOR 環境變動）；不取選項行是因為選項文案隨 feature flag 增減。
+# API key 框（「Do you want to use this API key?」＋「Esc to cancel」footer）實測
+# 落在第一組特徵內，且其 Enter 預設是「No (recommended)」，無需另列。
+# 匹配前先把整屏空白（含換行）摺疊成單一空格：TUI 的 word-wrap 硬換行與 tmux
+# 軟折行都會把特徵片段拆到兩行，逐行比對必偽陰性——漏判＝放行誤批的 Enter，
+# 是最壞方向（獨立複核以 fold 反例證實窄 pane 必漏）。正規化把折行拼回；代價
+# 是不相鄰的行可能偽拼接出特徵，那是偽陽性方向，落在既定的 fail-closed 偏攔
+# 內。同理，worker 自我檢視含這些字串的源碼／測試／diff 時會自觸發誤攔（兩片
+# 段同屏），同屬既定代價：通知降級 notify-failed、訊息仍在 mailbox，可復原。
 screen_has_prompt() {
-  local screen="$1"
-  grep -qF 'Do you want to ' <<<"$screen" \
-    && grep -qF 'Esc to cancel' <<<"$screen"
+  local screen
+  screen="$(tr -s '[:space:]' ' ' <<<"$1")"
+  { grep -qF 'Do you want to ' <<<"$screen" \
+      && grep -qF 'Esc to cancel' <<<"$screen"; } \
+  || { grep -qF 'has written up a plan' <<<"$screen" \
+      && grep -qF 'Would you like to proceed' <<<"$screen"; }
 }
 
 # notify_pane <pane_id> <one-line-cmd>：先驗證 pane 存活再 send-keys；失敗回非零
@@ -248,8 +268,10 @@ notify_pane() {
   # 仍在 mailbox，交由呼叫端既有的 notify-failed 路徑處理。
   # capture 失敗＝無法確認 pane 狀態，一律 fail-closed（return 1）而非放行送鍵：
   # live pane 的 capture 可能因暫時性原因失敗、而後續 send-keys 卻成功，那樣防線
-  # 就被整個略過（獨立複核以 shim 反例證實這不只是「pane 已死」一種路徑）
-  screen="$(tmux capture-pane -p -t "$pane" 2>/dev/null)" || return 1
+  # 就被整個略過（獨立複核以 shim 反例證實這不只是「pane 已死」一種路徑）。
+  # -J 把 tmux 軟折行接回原樣，配合 screen_has_prompt 的空白正規化雙保險對付
+  # 折行拆散特徵片段的偽陰性
+  screen="$(tmux capture-pane -pJ -t "$pane" 2>/dev/null)" || return 1
   ! screen_has_prompt "$screen" || return 1
   tmux send-keys -t "$pane" "$cmd" 2>/dev/null || return 1
   sleep "${AGENT_BRIDGE_NOTIFY_DELAY:-0.3}"
@@ -258,7 +280,7 @@ notify_pane() {
   # 掃描把那個 Enter 攔下。殘留 race（已知、無法在 tmux 層消除）：這第二次 capture
   # 與下一行 send-keys 之間仍有微小空窗，要完全關掉需判斷與按鍵在同一 pane-side
   # 原子操作內完成，tmux send-keys 給不了這種原子性
-  screen="$(tmux capture-pane -p -t "$pane" 2>/dev/null)" || return 1
+  screen="$(tmux capture-pane -pJ -t "$pane" 2>/dev/null)" || return 1
   ! screen_has_prompt "$screen" || return 1
   tmux send-keys -t "$pane" Enter 2>/dev/null
 }
