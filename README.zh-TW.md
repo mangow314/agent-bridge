@@ -54,7 +54,7 @@ context 管理都要自己來。agent-bridge 編排的是你平常手上在用�
 
 三個組成，全部本機、無常駐程序：
 
-1. **薄 bash CLI**（`bin/agent-bridge`）：十五個子指令，唯一的進入點。
+1. **薄 bash CLI**（`bin/agent-bridge`）：二十個子指令，唯一的進入點。
 2. **檔案系統 mailbox**（預設 `~/.local/share/agent-bridge/`，可用環境變數
    `AGENT_BRIDGE_DATA` 覆蓋）：
    - `agents/<name>.json`：agent 註冊表（`{name, pane_id, registered_at}`；
@@ -139,9 +139,12 @@ agent-bridge read <task-id>                   # completed/failed 可讀；標頭
 agent-bridge await <task-id> [--timeout <secs>]  # 阻塞至終態，印裸狀態字；逾時非零退出
 agent-bridge spawn <name> --runtime <codex|claude> [--model <model>] [--window]
                                               # spawn worker pane；stdout 只印 pane-id
+agent-bridge relay <name> --runtime <codex|claude> [--model <model>] --handoff <path> \
+                          [--window] [--no-select] [--self-exit <my-name>]
+                                              # 把主導權交給接手者 session（注入接手者守則＋交接檔）；stdout 只印 pane-id
 agent-bridge despawn <name>                   # 回收 spawn 出身的 worker（人工註冊拒殺）
 agent-bridge ready <name>                     # （worker）回報就緒；僅限 spawned agent
-agent-bridge disposable <name>                # （worker）宣告本輪脈絡已無殘值，可即時回收
+agent-bridge disposable <name>                # （worker，僅限 spawned）宣告本輪脈絡已無殘值，可即時回收
 agent-bridge idle                             # 回收決策視圖：name<TAB>ready<TAB>disposable<TAB>idle_secs
 agent-bridge evict <name> [--timeout <secs>] [--from <sender>]
                                               # 派收尾任務 → 等筆記落地 → despawn；stdout 只印收尾 task-id
