@@ -12,7 +12,12 @@ TASKS_DIR="$DATA_DIR/tasks"
 LOCKS_DIR="$DATA_DIR/locks"
 
 NAME_RE='^[A-Za-z0-9_-]+$'
-TASK_ID_RE='^[A-Za-z0-9._-]+$'
+# task-id 首字元強制英數：純寬鬆字元集會放行 `.` 與 `..`，它們拼進
+# "$TASKS_DIR/$id" 後分別 alias 到 tasks/ 自身與整個資料目錄，且 `[[ -d ]]`
+# 照樣成立——status/read 會拿目錄當 task 查（獨立複核 2026-07-24 指出）。
+# 首字元英數同時擋掉 dotfile 形與 `-` 開頭被當旗標的形；send 生成的 id 以
+# 數字起首，不受影響
+TASK_ID_RE='^[A-Za-z0-9][A-Za-z0-9._-]*$'
 # registry 的 pane_id 對本程式是不可信輸入（資料目錄對每個 worker 都可寫），
 # 而它會被餵給 tmux。tmux 命令字串裡 `;` 是命令分隔符，
 # 一個 pane_id 寫成 `%1 ; kill-server` 就能殺掉整個 server
@@ -62,7 +67,8 @@ usage() {
   agent-bridge status <task-id>                 印裸狀態字（queued/delivered/running/completed/failed/cancelled）
   agent-bridge read <task-id>                   讀回覆（completed/failed 可；標頭走 stderr、response 原文走 stdout）
   agent-bridge await <task-id> [--timeout <secs>]
-                                                阻塞等待 task 到終態，印裸狀態字後 exit 0；逾時非零退出
+                                                阻塞等待 task 到終態，印裸狀態字後 exit 0；
+                                                逾時以 exit 124 退出（其他錯誤一律非 124，供呼叫端區分）
   agent-bridge spawn <name> --runtime <codex|claude> [--model <model>] [--window]
                                                 spawn 一個 worker pane 並註冊；stdout 只印 pane-id
                                                 （--model 不給＝該 CLI 的使用者預設模型）
@@ -142,6 +148,20 @@ SEND_PIN=""
 # despawn 不必再記 despawned-unsaved
 DESPAWN_NOTES_HANDLED=""
 
+# send 的 task 目錄回滾：mkdir 之後、metadata/status 寫齊之前的任何失敗
+# （來源檔在預檢後被刪或不可讀、jq／寫入失敗）都經 EXIT trap 把殘缺目錄
+# 收走。沒有 metadata/status 的目錄不屬於任何狀態、gc 又刻意只碰完整形狀，
+# 留下就是永久孤兒——預檢只擋得住「一開始就不存在」，涵蓋不了 TOCTOU 殘徑
+# （獨立複核 2026-07-24 第二輪指出）
+SEND_RB_DIR=""
+# shellcheck disable=SC2329  # 經 EXIT trap 間接呼叫
+send_rollback() {
+  [[ -n "$SEND_RB_DIR" ]] || return 0
+  rm -rf -- "$SEND_RB_DIR" 2>/dev/null \
+    || err "警告：殘缺 task 目錄清除失敗，請手動移除：$SEND_RB_DIR"
+  SEND_RB_DIR=""
+}
+
 # cmd_despawn 的結果回報給呼叫者：killed（真的關掉了 pane）／absent（pane 本來
 # 就不在，只清註冊）／stale（pane 還在但已不屬於這個 agent，只清註冊）。
 # evict 要靠它分辨——stale 代表那個 pane 沒被回收，這時寫 evicted 就是假紀錄
@@ -198,8 +218,14 @@ update_meta_status() {
   local dir="$1" new="$2" ts updated
   ts="$(now_iso)"
   updated="$(jq --arg s "$new" --arg t "$ts" '.status = $s | .updated_at = $t' "$dir/metadata.json")"
-  printf '%s\n' "$updated" | atomic_write "$dir/metadata.json"
+  # 先寫裸 status、再寫 metadata：兩次寫入之間沒有交易性，中間被 SIGKILL／
+  # 斷電就會各說各話（獨立複核 2026-07-24 指出）。狀態機與 await 全數讀裸
+  # status，它才是操作上的權威——先落它，殘留的分歧只會是 metadata.status
+  # 落後一步的展示性資訊；反過來（metadata 先落）殘留的是「status 停在舊態、
+  # 終態轉換可被重放（例如對已 completed 的 task 再 reply 覆寫 response）」，
+  # 兩個方向不對等
   printf '%s\n' "$new" | atomic_write "$dir/status"
+  printf '%s\n' "$updated" | atomic_write "$dir/metadata.json"
 }
 
 # write_message <dest> <mode:text|file> <value>；file 模式的 `-` 讀 stdin
@@ -424,6 +450,13 @@ cmd_send() {
   done
   [[ -n "$from" ]] || die "send 需要 --from <sender>"
   [[ -n "$mode" ]] || die "send 需要 --message 或 --message-file"
+  # 訊息來源先驗再建 task 目錄：來源檔不存在時，原本會先留下一個沒有
+  # metadata/status 的殘缺目錄才 die，而 gc 刻意只清完整形狀的目錄，
+  # 等於永久孤兒（獨立複核 2026-07-24 指出）。write_message 內的檢查保留
+  # 作為第二道（TOCTOU 空隙內被刪仍會擋）
+  if [[ "$mode" == "file" && "$val" != "-" ]]; then
+    [[ -f "$val" ]] || die "找不到訊息檔：$val"
+  fi
   [[ "$to" =~ $NAME_RE ]]   || die "agent 名稱不合法（僅允許 [A-Za-z0-9_-]+）：$to"
   [[ "$from" =~ $NAME_RE ]] || die "sender 名稱不合法（僅允許 [A-Za-z0-9_-]+）：$from"
 
@@ -445,7 +478,14 @@ cmd_send() {
     (( tries < 5 )) || die "無法建立 task 目錄（task-id 連續碰撞）"
   done
 
-  write_message "$dir/request.md" "$mode" "$val"
+  # 目錄一落地就掛回滾，直到 status 寫齊、成為完整形狀才解除（見 send_rollback）。
+  # 以下各步顯式 die、不倚賴 errexit：cmd_send 會被 evict 以 `||` 呼叫端形式
+  # 使用，該語境下 Bash 抑制 errexit（見 cmd_await 同款註記），裸失敗會靜靜
+  # 做出缺 request 或缺 status 的殘缺 task
+  SEND_RB_DIR="$dir"
+  trap send_rollback EXIT
+  write_message "$dir/request.md" "$mode" "$val" \
+    || die "send 無法寫入 request（殘缺目錄已回滾）"
 
   local ts wd doc
   ts="$(now_iso)"
@@ -455,10 +495,22 @@ cmd_send() {
     '{version: 1, task_id: $id, from: $from, to: $to,
       created_at: $ts, updated_at: $ts,
       working_directory: $wd, status: "queued"}
-     + (if $pin == "1" then {pinned: true} else {} end)')"
-  printf '%s\n' "$doc" | atomic_write "$dir/metadata.json"
-  printf 'queued\n' | atomic_write "$dir/status"
+     + (if $pin == "1" then {pinned: true} else {} end)')" \
+    || die "send 無法生成 metadata（殘缺目錄已回滾）"
+  printf '%s\n' "$doc" | atomic_write "$dir/metadata.json" \
+    || die "send 無法寫入 metadata（殘缺目錄已回滾）"
+  printf 'queued\n' | atomic_write "$dir/status" \
+    || die "send 無法寫入 status（殘缺目錄已回滾）"
+  SEND_RB_DIR=""
   log_event "$task_id" created "from=$from to=$to"
+
+  # 通知前重讀 pane：從上面首讀到這裡隔著建目錄＋三次寫檔，期間同名 agent
+  # 可能被 unregister＋register 換到別的 pane——舊 pane 若已屬別人的 session，
+  # 這行 command＋Enter 就打進無辜視窗（獨立複核 2026-07-24 指出）。重讀把
+  # 窗口縮到次毫秒級；徹底關閉需要「讀 registry 與 send-keys」原子化，tmux
+  # 給不了（殘留窗口見 README 已知限制）。registry 消失／損壞時 pane 為空，
+  # notify_pane 的 PANE_RE 會擋下、走既有 notify-failed 降級
+  pane="$(jq -r '.pane_id' "$agent_file" 2>/dev/null)" || pane=""
 
   if notify_pane "$pane" "agent-bridge receive $task_id"; then
     log_event "$task_id" notified "pane=$pane cmd=receive"
@@ -630,7 +682,12 @@ cmd_status() {
   check_task_id "$id"
   local dir="$TASKS_DIR/$id"
   [[ -d "$dir" ]] || die "找不到 task：$id"
-  printf '%s\n' "$(<"$dir/status")"
+  # 讀取走賦值再印，不內嵌在 printf 參數裡：內嵌時 $(<) 的讀取失敗只上
+  # stderr、printf 本身照樣成功，缺 status 檔的損壞 task 會以 rc=0＋空輸出
+  # 蒙混過監控（獨立複核 2026-07-24 指出）；賦值形式的失敗會傳導 rc
+  local st
+  st="$(<"$dir/status")" || die "task $id 的 status 檔讀取失敗（資料損壞），請檢查 $dir"
+  printf '%s\n' "$st"
 }
 
 cmd_read() {
@@ -640,6 +697,11 @@ cmd_read() {
   local dir="$TASKS_DIR/$id"
   [[ -d "$dir" ]] || die "找不到 task：$id"
 
+  # 取 task 鎖到 cat 完為止：gc --apply 刪目錄前取的就是這把鎖，read 不取的
+  # 話，從驗完狀態到 cat response 之間目錄可被整個抽走（獨立複核 2026-07-24
+  # 指出）。read 本就要寫 events.log，不是唯讀路徑，取鎖不改變它對 sandbox
+  # 的要求；真正唯讀的 status／await 維持無鎖。鎖內任何 die 由 EXIT trap 釋鎖
+  acquire_lock "$id"
   local st; st="$(<"$dir/status")"
   case "$st" in
     completed|failed) ;;
@@ -661,6 +723,7 @@ cmd_read() {
   } >&2
   log_event "$id" read
   cat "$dir/response.md"
+  release_lock
 }
 
 # await：sender 端的等待原語。唯讀輪詢 status 檔（不寫 events、不取鎖），
@@ -685,10 +748,24 @@ cmd_await() {
   local dir="$TASKS_DIR/$id"
   [[ -d "$dir" ]] || die "找不到 task：$id"
 
+  # 輪詢間隔在進迴圈前就驗：壞值會讓 sleep 立刻報錯，set -e 下 await 毫秒級
+  # 非零退出——呼叫端若把這種操作性失敗當成逾時（evict 曾如此），會殺掉還
+  # 活著的 worker（獨立複核 2026-07-24 指出，實測 10ms 即死）。格式與非零
+  # 檢查同 validate_ready_opts 的理由
   local interval="${AGENT_BRIDGE_POLL_INTERVAL:-1}" st
+  [[ "$interval" =~ ^([0-9]+|[0-9]*\.[0-9]+)$ ]] \
+    || die "AGENT_BRIDGE_POLL_INTERVAL 需為正數（秒）：$interval"
+  [[ ! "$interval" =~ ^0*(\.0+)?$ ]] \
+    || die "AGENT_BRIDGE_POLL_INTERVAL 需大於 0（否則輪詢忙迴圈）：$interval"
   SECONDS=0
   while :; do
-    st="$(<"$dir/status")"
+    # 迴圈內的讀取與 sleep 都顯式 die、不倚賴 errexit：本函式被 evict 以
+    # `||` 呼叫端包住，Bash 在該語境抑制整段 errexit——裸失敗（status 檔被
+    # 移走、sleep 出錯）不會終止函式，會被靜靜輪詢到期限、誤分類成逾時
+    # 124；--timeout 0 則變成無限輪詢（獨立複核 2026-07-24 第二輪以最小
+    # 重現證實）。顯式 die 維持「124 只等於真逾時」的對外契約
+    st="$(<"$dir/status")" \
+      || die "await 無法讀取 task $id 的 status 檔（任務目錄被移走？）"
     case "$st" in
       completed|failed|cancelled)
         printf '%s\n' "$st"
@@ -696,9 +773,14 @@ cmd_await() {
         ;;
     esac
     if (( timeout > 0 && SECONDS >= timeout )); then
-      die "await 逾時（${timeout}s）：task $id 目前狀態 $st"
+      # 逾時用專屬 exit 124（同 timeout(1) 慣例）：呼叫端要能把「等到期限」
+      # 與「await 自己壞掉」分開處置——前者是預期分支，後者不該觸發任何
+      # 不可逆動作
+      err "await 逾時（${timeout}s）：task $id 目前狀態 $st"
+      exit 124
     fi
-    sleep "$interval"
+    sleep "$interval" \
+      || die "await 的 sleep 失敗（interval=$interval）"
   done
 }
 
@@ -1149,6 +1231,13 @@ cmd_despawn() {
 
   command -v tmux >/dev/null 2>&1 || die "找不到 tmux，despawn 無法確認 pane 是否回收"
 
+  # 審計先驗可寫再動手：kill pane 與刪 registry 都不可逆，事後 agents.log
+  # append 失敗的話，set -e 讓整支非零收場——pane 已死、registry 已刪、審計
+  # 沒落地，呼叫端卻以為 despawn 失敗而去重試（獨立複核 2026-07-24 指出）。
+  # 以 append 模式實開一次 fd 驗證（不寫入位元組）；失敗時 pane 未動，安全方向
+  : >> "$DATA_DIR/agents.log" 2>/dev/null \
+    || die "agents.log 不可寫（審計無法落地），despawn 拒絕動手：$DATA_DIR/agents.log"
+
   # 查詢失敗（tmux server 不可達、sandbox 擋 socket）與「pane 不存在」是兩件事：
   # 前者無從判斷，不能當成 pane 已死而逕自清 registry——那會留下沒人回收的孤兒
   local panes
@@ -1175,7 +1264,10 @@ cmd_despawn() {
     if [[ ! "$tag" =~ $tag_re || "$live_cmd" != "$tag "* ]]; then
       rm -f -- "$f" \
         || die "pane $pane 已非本 agent 所有，且 registry 刪除失敗，請手動清除 $f"
-      log_agent_event despawn-stale "$name" "$pane" "$runtime"
+      # 預檢之後 append 仍可能失敗（ENOSPC 等）：不可逆動作已完成，這時只能
+      # 誠實揭露，不能讓 set -e 以非零收場誤導呼叫端重試
+      log_agent_event despawn-stale "$name" "$pane" "$runtime" \
+        || err "警告：registry 已清除，但審計未落地（agents.log append 失敗）"
       DESPAWN_RESULT=stale
       release_lock
       err "警告：pane $pane 目前的啟動指令不帶 '$name' 的 spawn tag（id 已被別的 pane 佔用，或 registry 遭竄改）；已清除註冊，未動該 pane"
@@ -1207,7 +1299,10 @@ cmd_despawn() {
     ev=despawned-unsaved
   fi
   rm -f -- "$f"
-  log_agent_event "$ev" "$name" "$pane" "$runtime"
+  # 同 stale 分支：預檢後 append 仍可能失敗，此時 pane 已回收、registry 已刪，
+  # 只能誠實揭露；以非零收場會讓呼叫端（含 evict）誤判 despawn 失敗
+  log_agent_event "$ev" "$name" "$pane" "$runtime" \
+    || err "警告：pane 已回收、registry 已刪，但審計未落地（agents.log append 失敗）"
   if (( found == 1 )); then DESPAWN_RESULT=killed; else DESPAWN_RESULT=absent; fi
   release_lock
   if (( found == 1 )); then
@@ -1274,7 +1369,10 @@ cmd_disposable() {
   updated="$(jq --arg ts "$ts" '.disposable = true | .disposable_at = $ts' "$f")"
   printf '%s\n' "$updated" | atomic_write "$f"
   release_lock
-  log_agent_event disposable "$name" "$pane" "$runtime"
+  # 宣告已落進 registry，審計 append 失敗只揭露不翻盤：以非零收場會讓 worker
+  # 誤以為宣告沒成立而重試或困惑，實際上 idle 已看得到 yes
+  log_agent_event disposable "$name" "$pane" "$runtime" \
+    || err "警告：disposable 已寫入 registry，但審計未落地（agents.log append 失敗）"
   info "agent '$name' 已宣告可回收（disposable）"
 }
 
@@ -1569,10 +1667,19 @@ EOF
   SEND_PIN=""
   info "evict：收尾任務 $task_id 已派給 '$name'，等待筆記落地（timeout ${timeout}s）"
 
-  # cmd_await 逾時是 die。直接呼叫會讓 evict 整支跟著退出、跳過 despawn，
-  # cap 就被一個不回話的 worker 永久卡死。包 subshell 讓 die 只殺得掉那一層
-  local final_st=""
-  final_st="$( cmd_await "$task_id" --timeout "$timeout" )" || final_st=""
+  # cmd_await 逾時是 exit 124。直接呼叫會讓 evict 整支跟著退出、跳過 despawn，
+  # cap 就被一個不回話的 worker 永久卡死。包 subshell 讓退出只殺得掉那一層
+  local final_st="" await_rc=0
+  final_st="$( cmd_await "$task_id" --timeout "$timeout" )" || await_rc=$?
+
+  # 只有真正的逾時（124）才走「筆記沒落地仍回收」；其他非零是 await 自己的
+  # 操作性失敗（壞輪詢間隔、status 檔消失等），worker 可能還活著、根本沒等
+  # 到期限——這時 despawn 等於把活的 context 當逾時殺掉，審計還記成 timeout
+  # （獨立複核 2026-07-24 指出，實測壞 interval 10ms 即觸發）。中止並保留
+  # pane，失效方向退回已文件化的「send 後中斷」：多一個看得見的收尾任務
+  if (( await_rc != 0 && await_rc != 124 )); then
+    die "evict 中止：await 操作性失敗（rc=$await_rc，非逾時），pane 未動（agent '$name' 仍在）；收尾任務 $task_id 留存可查"
+  fi
 
   local outcome
   case "$final_st" in
@@ -1599,8 +1706,10 @@ EOF
     return 0
   fi
   # 記在 despawn 成功之後：despawn 失敗代表 pane 還在、根本沒被驅逐，
-  # 這時寫一筆 evicted 進審計線就是假紀錄
-  log_agent_event "$outcome" "$name" "$pane" "$runtime"
+  # 這時寫一筆 evicted 進審計線就是假紀錄。append 失敗只揭露不改 rc——
+  # 驅逐本身已完成（despawn 有自己的預檢與揭露）
+  log_agent_event "$outcome" "$name" "$pane" "$runtime" \
+    || err "警告：evict 已完成，但審計未落地（agents.log append 失敗）"
   case "$outcome" in
     evicted)
       info "已 evict agent '$name'；收尾筆記可用：agent-bridge read $task_id" ;;
@@ -1624,8 +1733,19 @@ main() {
       return 0
       ;;
   esac
-  require_jq
-  ensure_dirs
+  # 查詢命令的「唯讀」宣稱要落到實作（獨立複核 2026-07-24 指出）：
+  # status/await 純讀檔、全程不用 jq；idle/list 只讀不寫。這四個不建目錄——
+  # 嚴格只讀 sandbox 下查詢不該因 mkdir 失敗而死，資料目錄不存在時也不該
+  # 無中生有（目錄缺失時 glob 走 nullglob 得空集、task 查詢以「找不到」收場，
+  # 都是正確的唯讀行為）
+  case "$cmd" in
+    status|await) ;;
+    *) require_jq ;;
+  esac
+  case "$cmd" in
+    status|await|idle|list) ;;
+    *) ensure_dirs ;;
+  esac
   case "$cmd" in
     register)   cmd_register "$@" ;;
     unregister) cmd_unregister "$@" ;;

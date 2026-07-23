@@ -141,7 +141,7 @@ agent-bridge fail <task-id> (--message <text> | --message-file <path>)  # 訊息
 agent-bridge cancel <task-id>                 # （sender）queued/delivered/running → cancelled
 agent-bridge status <task-id>                 # stdout 只印裸狀態字一行
 agent-bridge read <task-id>                   # completed/failed 可讀；標頭走 stderr、原文走 stdout
-agent-bridge await <task-id> [--timeout <secs>]  # 阻塞至終態，印裸狀態字；逾時非零退出
+agent-bridge await <task-id> [--timeout <secs>]  # 阻塞至終態，印裸狀態字；逾時 exit 124（其他錯誤非 124）
 agent-bridge spawn <name> --runtime <codex|claude> [--model <model>] [--window]
                                               # spawn worker pane；stdout 只印 pane-id
 agent-bridge relay <name> --runtime <codex|claude> [--model <model>] --handoff <path> \
@@ -517,6 +517,11 @@ tests/run-tests.sh
   其他未知句式的新框同樣漏判，方向一律 fail-open（回到會誤觸的行為）。(3) 第二次掃描與 send-keys 之間仍有無法在 tmux
   層消除的微小 race。codex worker 走 `approval_policy = never`、不彈這種對話框，
   天然不受影響。
+- **通知目標的 registry 讀取與 send-keys 之間仍有極小 race**：send 在發通知前
+  會重讀 registry 取最新 pane（把「建目錄＋三次寫檔」期間同名 agent 被
+  unregister＋register 換 pane 的窗口縮到次毫秒級），但「讀 registry」與
+  「send-keys」在 tmux 層無法原子化，理論上通知仍可能打進已易主的舊 pane。
+  只影響通知這一發按鍵；訊息本體在 mailbox，不受影響。
 - **同一個資料目錄＝同一個互信域，出身檢查不是對抗惡意 agent 的邊界**：
   所有 agent 以同一個 uid 跑、共用 `AGENT_BRIDGE_DATA`，registry 檔因此對每個
   worker 都可寫。上面的 `spawn_tag` 驗證擋得住**意外**殺錯（pane id 重用、

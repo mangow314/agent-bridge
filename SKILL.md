@@ -39,7 +39,7 @@ id=$(agent-bridge send <worker> --from <me> --message-file - <<'EOF'
 EOF
 )
 agent-bridge status "$id"             # queued/delivered/running/completed/failed/cancelled
-agent-bridge await "$id" --timeout 600  # (sender) block until terminal state, print bare status word
+agent-bridge await "$id" --timeout 600  # (sender) block until terminal state, print bare status word; timeout = exit 124
 agent-bridge cancel "$id"             # (sender) cancel (non-preemptive: flips state + notifies, nothing more)
 agent-bridge receive <task-id>        # (worker) fetch task: header on stderr, request body on stdout
 agent-bridge start <task-id>          # (worker, optional) mark work started -> running

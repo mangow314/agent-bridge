@@ -14,6 +14,11 @@ if ! REAL_TMUX="$(command -v tmux)"; then
   exit 1
 fi
 
+# 真 claude 執行檔要在 PATH 被 shim 汙染前解析（後面 spawn 測試會把假
+# claude/codex 前置進 PATH，屆時 command -v claude 只找得到 stub）。
+# CC canary（測例 30）用這個值，找不到就跳過
+REAL_CLAUDE="$(command -v claude 2>/dev/null || true)"
+
 TESTROOT="$(mktemp -d "${TMPDIR:-/tmp}/agent-bridge-tests.XXXXXX")"
 
 # await 測試走短輪詢間隔，避免整體測試時間被預設 1s 拖長
@@ -2174,7 +2179,8 @@ REPO_OBRIEF="$(dirname "$(dirname "$BRIDGE")")/share/orchestrator-brief.md"
 assert "orchestrator brief 正本存在於 repo" test -r "$REPO_OBRIEF"
 for kw in 'agent-bridge idle' 'agent-bridge evict' 'evicted-timeout' \
           'Keep by default' 'AGENT_BRIDGE_MAX_SPAWN' \
-          'Do not call the AgentTool'; do
+          'Do not call the AgentTool' \
+          'untrusted external' 'Route by blast radius'; do
   assert "orchestrator brief 含必要元素：$kw" grep -q -- "$kw" "$REPO_OBRIEF"
 done
 
@@ -2377,6 +2383,188 @@ printf 'completed\n' > "$DR3/tasks/foo/status"
 ab "$DR3" gc --older-than 0 --apply >/dev/null 2>&1
 assert "I5：不是 send 生成的目錄名不刪（唯一會 rm 的路徑要保守）" \
   test -d "$DR3/tasks/foo"
+
+# ---- 30. CC 權限框特徵 canary：安裝中的 claude 仍含防線依賴的字串 ----
+# screen_has_prompt 的特徵是對 Claude Code UI 文案的字串比對（bin 內註明以
+# 2.1.218 可執行檔 strings 佐證）。CC 改版改文案時，防線靜默退回 fail-open
+# （通知的 Enter 誤觸權限框會重現），沒有任何訊號——這組 canary 把「靜默
+# 失效」變成「測試紅燈」。比對目標是 readlink 解析後的實體執行檔（本機為
+# ELF，字串內嵌）；找不到 claude 時跳過不失敗，維持套件其餘部分零外部依賴。
+# 特徵字面值必須與 bin/agent-bridge 的 screen_has_prompt 保持逐字一致。
+if [[ -n "$REAL_CLAUDE" ]] && CANARY_REAL="$(readlink -f "$REAL_CLAUDE" 2>/dev/null)" \
+   && [[ -f "$CANARY_REAL" ]]; then
+  for kw in 'Do you want to ' 'Esc to cancel' \
+            'has written up a plan' 'Would you like to proceed'; do
+    assert "CC canary：claude 執行檔仍含特徵「$kw」" \
+      grep -qaF -- "$kw" "$CANARY_REAL"
+  done
+  # 特徵同步斷言：canary 驗的字串必須真的還是 bin 在用的字串，
+  # 否則 bin 改了特徵、canary 還在守舊字串，兩邊各測各的。
+  # 比對範圍限 screen_has_prompt 函式本體：前三組字串在函式外的註解也
+  # 出現，搜整檔會讓「函式改了 matcher、註解留著舊字串」照樣誤綠
+  # （獨立複核 2026-07-24 指出）。函式被改名或抽不出來時檔案為空，
+  # 後續 grep 全紅——失效方向是誤報而非漏報
+  sed -n '/^screen_has_prompt() {/,/^}/p' "$BRIDGE" > "$TESTROOT/canary-fn"
+  assert "CC canary：screen_has_prompt 函式本體可抽出" test -s "$TESTROOT/canary-fn"
+  for kw in 'Do you want to ' 'Esc to cancel' \
+            'has written up a plan' 'Would you like to proceed'; do
+    assert "CC canary：特徵「$kw」與 bin 的 screen_has_prompt 一致" \
+      grep -qF -- "$kw" "$TESTROOT/canary-fn"
+  done
+else
+  printf 'SKIP: CC canary（無可檢查的 claude 執行檔——PATH 找不到、readlink 失敗或非一般檔案；特徵漂移檢查未執行）\n'
+fi
+
+# ---- 31. 第三輪獨立複核的修補（2026-07-24）----
+# 複核輪抓出的缺口，各自鎖一個回歸；編號對應複核報告的 finding
+
+D31="$TESTROOT/d31"
+mkdir -p "$D31/tasks/20200101T000000Z-aaaa"
+printf 'queued\n' > "$D31/tasks/20200101T000000Z-aaaa/status"
+
+# 31a. F5：task-id 拒 `.`／`..`／dotfile／旗標形。`.`/`..` 會把
+# "$TASKS_DIR/$id" alias 到 tasks/ 與整個資料目錄且 [[ -d ]] 成立，
+# 修補前 `status .` 甚至以 rc=0 蒙混
+assert_fails "task-id '.' 被拒（曾 rc=0 蒙混）" ab "$D31" status .
+# 拒因要鎖在 regex 本身：光驗非零的話，regex 回退後 `.` 仍會因 alias 目錄
+# 缺 status 檔而非零，測試誤綠（第二輪複核指出）
+ab "$D31" status . 2> "$TESTROOT/err-31a" || true
+assert "task-id '.' 拒因是 task-id 不合法（鎖 regex 非碰巧讀不到）" \
+  grep -qF 'task-id 不合法' "$TESTROOT/err-31a"
+assert_fails "task-id '..' 被拒" ab "$D31" status ..
+assert_fails "task-id '.hidden' 被拒（dotfile 形）" ab "$D31" status .hidden
+assert_fails "task-id '-x' 被拒（旗標形）" ab "$D31" status -x
+
+# 31b. F5：缺 status 檔的損壞 task，查詢必須非零（修補前 rc=0＋空輸出，
+# 監控會當成功）
+mkdir -p "$D31/tasks/20200101T000000Z-bbbb"
+assert_fails "缺 status 檔的 status 查詢非零" ab "$D31" status 20200101T000000Z-bbbb
+
+# 31c. F1：await 的輪詢間隔進迴圈前就驗；真逾時專用 exit 124，
+# 操作性失敗不得偽裝成逾時
+rc=0
+env AGENT_BRIDGE_POLL_INTERVAL=bad AGENT_BRIDGE_DATA="$D31" PATH="$SHIM:$PATH" \
+  "$BRIDGE" await 20200101T000000Z-aaaa --timeout 300 >/dev/null 2>&1 || rc=$?
+assert "壞 POLL_INTERVAL：await 非零退出" test "$rc" -ne 0
+assert "壞 POLL_INTERVAL：rc 不是 124（不偽裝成逾時）" test "$rc" -ne 124
+# 拒因要鎖在進迴圈前的預先驗證：沒有驗證時 sleep 自己也會非零、非 124，
+# 上兩個斷言照樣綠（第二輪複核指出）
+env AGENT_BRIDGE_POLL_INTERVAL=bad AGENT_BRIDGE_DATA="$D31" PATH="$SHIM:$PATH" \
+  "$BRIDGE" await 20200101T000000Z-aaaa --timeout 300 2> "$TESTROOT/err-31c" || true
+assert "壞 POLL_INTERVAL 拒因是預先驗證（訊息含變數名）" \
+  grep -qF 'AGENT_BRIDGE_POLL_INTERVAL' "$TESTROOT/err-31c"
+rc=0
+env AGENT_BRIDGE_POLL_INTERVAL=0.1 AGENT_BRIDGE_DATA="$D31" PATH="$SHIM:$PATH" \
+  "$BRIDGE" await 20200101T000000Z-aaaa --timeout 1 >/dev/null 2>&1 || rc=$?
+assert "await 真逾時 exit 124" test "$rc" -eq 124
+
+# 31d. F1：evict 遇 await 操作性失敗必須中止並保留 worker——修補前空字串
+# 一律落 evicted-timeout，10ms 就殺掉活的 worker、審計還說是逾時
+mkdir -p "$D31/agents"
+jq -n '{name:"ev31", pane_id:"%999", registered_at:"2026-01-01T00:00:00Z",
+        spawned:true, runtime:"codex", model:"", spawned_at:"2026-01-01T00:00:00Z",
+        ready:true, spawn_tag:"AGENT_BRIDGE_SPAWN_TAG=ab-spawn-ev31-1-0123456789ab"}' \
+  > "$D31/agents/ev31.json"
+rc=0
+env AGENT_BRIDGE_POLL_INTERVAL=bad AGENT_BRIDGE_DATA="$D31" PATH="$SHIM:$PATH" \
+  "$BRIDGE" evict ev31 --timeout 300 >/dev/null 2>&1 || rc=$?
+assert "evict 遇 await 操作性失敗：非零中止" test "$rc" -ne 0
+assert "evict 中止：worker registry 未動" test -f "$D31/agents/ev31.json"
+assert_fails "evict 中止：無 evicted* 審計" evt_grep "$D31/agents.log" 'evicted[a-z-]*'
+
+# 31e. F2：審計不可寫時 despawn 拒絕動手（agents.log 換成目錄讓 append 必敗）；
+# 修補前 kill＋刪 registry 之後 append 才失敗，非零收場誤導呼叫端重試
+D31B="$TESTROOT/d31b"
+mkdir -p "$D31B/agents" "$D31B/agents.log"
+jq -n '{name:"aud31", pane_id:"%999", registered_at:"2026-01-01T00:00:00Z",
+        spawned:true, runtime:"codex", model:"", spawned_at:"2026-01-01T00:00:00Z",
+        ready:true, spawn_tag:"AGENT_BRIDGE_SPAWN_TAG=ab-spawn-aud31-1-0123456789ab"}' \
+  > "$D31B/agents/aud31.json"
+rc=0; ab "$D31B" despawn aud31 >/dev/null 2>&1 || rc=$?
+assert "audit 不可寫：despawn 拒絕動手（非零）" test "$rc" -ne 0
+assert "audit 不可寫：registry 未動" test -f "$D31B/agents/aud31.json"
+
+# 31f. F7：send 的訊息來源檔不存在→先驗先死，不留殘缺 task 目錄
+# （gc 只清完整形狀，殘缺目錄是永久孤兒）
+D31C="$TESTROOT/d31c"
+mkdir -p "$D31C/agents"
+jq -n '{name:"w31", pane_id:"%998", registered_at:"2026-01-01T00:00:00Z"}' \
+  > "$D31C/agents/w31.json"
+assert_fails "send 來源檔不存在被拒" \
+  ab "$D31C" send w31 --from me --message-file "$TESTROOT/no-such-file"
+assert "send 被拒後 tasks/ 零殘留" \
+  test -z "$(ls -A "$D31C/tasks" 2>/dev/null)"
+
+# 31g. F6：read 取 task 鎖，與 gc --apply 互斥——鎖被佔用時不硬讀
+# （模擬 gc 正持鎖刪目錄；約 5 秒重試後失敗是預期成本）
+D31D="$TESTROOT/d31d"
+mkdir -p "$D31D/tasks/20200101T000000Z-cccc" "$D31D/locks/20200101T000000Z-cccc.lock"
+printf 'completed\n' > "$D31D/tasks/20200101T000000Z-cccc/status"
+jq -n '{from:"a", to:"b"}' > "$D31D/tasks/20200101T000000Z-cccc/metadata.json"
+printf 'hi\n' > "$D31D/tasks/20200101T000000Z-cccc/response.md"
+assert_fails "read 在 task 鎖被佔用時不硬讀" ab "$D31D" read 20200101T000000Z-cccc
+rmdir "$D31D/locks/20200101T000000Z-cccc.lock"
+assert "釋鎖後 read 正常" ab "$D31D" read 20200101T000000Z-cccc
+
+# 31h. F8：唯讀查詢（status/await/idle/list）不建資料目錄——「唯讀」宣稱
+# 落到實作，嚴格只讀 sandbox 下查詢不再無中生有
+D31E="$TESTROOT/d31e"
+ab "$D31E" idle >/dev/null 2>&1 || true
+ab "$D31E" list >/dev/null 2>&1 || true
+ab "$D31E" status 20200101T000000Z-dddd >/dev/null 2>&1 || true
+ab "$D31E" await 20200101T000000Z-dddd --timeout 1 >/dev/null 2>&1 || true
+assert "唯讀查詢不建資料目錄" test ! -d "$D31E"
+
+# 31i. F3：update_meta_status 先寫裸 status 再寫 metadata（順序即修補本體：
+# 反向殘留的是「終態轉換可被重放」的 split-brain 方向）。源碼順序不變量，
+# 比照 §30 的函式本體抽取
+UMS_FN="$TESTROOT/ums-fn"
+sed -n '/^update_meta_status() {/,/^}/p' "$BRIDGE" > "$UMS_FN"
+assert "update_meta_status 函式本體可抽出" test -s "$UMS_FN"
+# shellcheck disable=SC2016  # $dir 是源碼字面值，刻意不展開
+sl="$(grep -n 'atomic_write "$dir/status"' "$UMS_FN" | cut -d: -f1 | head -1)"
+# shellcheck disable=SC2016  # 同上
+ml="$(grep -n 'atomic_write "$dir/metadata.json"' "$UMS_FN" | cut -d: -f1 | head -1)"
+assert "先寫 status 再寫 metadata（split-brain 方向鎖定）" \
+  test -n "$sl" -a -n "$ml" -a "$sl" -lt "$ml"
+
+# 31j. F1 第二輪：await 迴圈內 status 消失＝操作性失敗。evict 以 `||` 呼叫端
+# 包住 cmd_await，該語境抑制 errexit——修補前裸讀取失敗被靜靜輪詢到期限、
+# 誤分類成逾時而殺 pane；修補後迴圈內顯式 die，evict 必須中止且不動 worker
+D31F="$TESTROOT/d31f"
+mkdir -p "$D31F/agents"
+jq -n '{name:"ev31f", pane_id:"%999", registered_at:"2026-01-01T00:00:00Z",
+        spawned:true, runtime:"codex", model:"", spawned_at:"2026-01-01T00:00:00Z",
+        ready:true, spawn_tag:"AGENT_BRIDGE_SPAWN_TAG=ab-spawn-ev31f-1-0123456789ab"}' \
+  > "$D31F/agents/ev31f.json"
+(
+  env AGENT_BRIDGE_POLL_INTERVAL=0.2 AGENT_BRIDGE_DATA="$D31F" PATH="$SHIM:$PATH" \
+    "$BRIDGE" evict ev31f --timeout 60 >/dev/null 2>&1
+  echo "$?" > "$TESTROOT/evict-rc-31j"
+) &
+EV31J_PID=$!
+# 等收尾任務的 status 檔真的落地再抽走它（等目錄不夠：send 可能還沒寫到 status）
+wait_for 10 bash -c "compgen -G '$D31F/tasks/*/status' >/dev/null"
+rm -f "$D31F"/tasks/*/status
+wait_for 15 test -f "$TESTROOT/evict-rc-31j"
+wait "$EV31J_PID" 2>/dev/null || true
+assert "evict 遇 await 迴圈內操作失敗：非零中止（不偽裝逾時）" \
+  test "$(cat "$TESTROOT/evict-rc-31j" 2>/dev/null || echo 0)" -ne 0
+assert "迴圈內失敗：worker registry 未動" test -f "$D31F/agents/ev31f.json"
+assert_fails "迴圈內失敗：無 evicted* 審計" evt_grep "$D31F/agents.log" 'evicted[a-z-]*'
+
+# 31k. F7 第二輪：預檢通過、寫入階段才失敗（來源檔不可讀）→ 回滾殘缺目錄。
+# 光擋「一開始就不存在」涵蓋不了 TOCTOU 殘徑；此測例以權限製造確定性的
+# post-mkdir 失敗，驗 EXIT trap 回滾。（以一般使用者跑測試為前提；root 下
+# chmod 000 仍可讀，本測例會誤紅）
+BAD31="$TESTROOT/unreadable-msg"
+printf 'x\n' > "$BAD31"
+chmod 000 "$BAD31"
+assert_fails "send 來源檔不可讀：非零" \
+  ab "$D31C" send w31 --from me --message-file "$BAD31"
+assert "寫入階段失敗仍零殘留（EXIT trap 回滾）" \
+  test -z "$(ls -A "$D31C/tasks" 2>/dev/null)"
+chmod 600 "$BAD31"
 
 # ---- 總結 ----
 printf '\n共 %d PASS、%d FAIL\n' "$PASS" "$FAIL"
