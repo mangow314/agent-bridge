@@ -210,7 +210,10 @@ agent-bridge despawn worker-1                          # 任務收尾：kill pan
   字串，故驗證與 brief 路徑同級：字元集 `[A-Za-z0-9._-]{1,64}` 擋 sh/tmux
   分隔符，**首字元強制英數**擋旗標走私（否則 `--model --bare` 等於往 worker
   啟動旗標塞任意開關）。不合法一律在建 pane 之前拒絕。模型名存進 registry 的
-  `model` 欄，事後查得到「這個 worker 當時跑什麼」。
+  `model` 欄，事後查得到「這個 worker 當時跑什麼」。⚠️ claude runtime 對輕量級
+  模型會把 `--permission-mode auto` **靜默降回 manual**，worker 卡死在第一個
+  權限框（2026-07-23 實測 Haiku 4.5）——模型下限判準見
+  `share/orchestrator-brief.md` 的 `--model` 段。
 - **proxy 環境穿透**：pane 的環境繼承自 tmux server，不是執行 spawn 的程序——
   只存在 orchestrator 環境的 proxy 變數（例如以 `env https_proxy=… claude`
   別名啟動的受限網路環境）到不了 worker，runtime 會直連而死（work 機實測：

@@ -52,6 +52,11 @@ worker 做完一件事**不代表它該死**。它腦裡可能還留著沒寫進
 - **複核／對抗驗證類** → 高階模型：驗證層的強度不跟著執行層降級，
   maker 便宜、checker 強。
 - **不指定 `--model`** 只在你確認過該 CLI 的預設就是你要的層級時才合理。
+- **claude runtime 的 worker 有模型下限：不可派輕量級模型**。實測（2026-07-23，
+  Claude Code 2.1.218 級、Haiku 4.5）`--permission-mode auto` 在輕量級 session
+  會被 CLI **靜默降回 manual**（無錯誤、transcript 記 `permissionMode: default`），
+  worker 卡死在第一個權限框，違反 spawn 的零人工介入前提；中高階模型不受影響。
+  輕量級掃描本來就該走 subagent（Explore），不是 pane worker。
 - worker 跑什麼模型記在 registry 的 `model` 欄（空字串＝runtime 預設），
   `evict` 挑人或事後追查時查得到。
 
