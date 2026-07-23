@@ -17,6 +17,11 @@ TASK_ID_RE='^[A-Za-z0-9._-]+$'
 # 而它會被餵給 tmux。tmux 命令字串裡 `;` 是命令分隔符，
 # 一個 pane_id 寫成 `%1 ; kill-server` 就能殺掉整個 server
 PANE_RE='^%[0-9]+$'
+# --model 的值會被拼進 tagged_cmd（pane 的啟動命令字串），與 brief 路徑同級的
+# 暴露面，兩類都要擋：(1) 命令注入——字元集排除空白、引號、`;`、`$` 等 sh 與
+# tmux 的分隔符；(2) 旗標走私——首字元強制英數，否則 `--model --bare` 這種值
+# 會原樣落進 runtime 的 argv，變成往 worker 啟動旗標裡塞任意開關的後門
+MODEL_RE='^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$'
 
 # worker brief：spawn 出來的 runtime 是一個全新、零脈絡的 session——它不知道
 # 自己是 worker，也不知道 pane 裡收到的 `agent-bridge receive <id>` 是要執行的
@@ -58,9 +63,10 @@ usage() {
   agent-bridge read <task-id>                   讀回覆（completed/failed 可；標頭走 stderr、response 原文走 stdout）
   agent-bridge await <task-id> [--timeout <secs>]
                                                 阻塞等待 task 到終態，印裸狀態字後 exit 0；逾時非零退出
-  agent-bridge spawn <name> --runtime <codex|claude> [--window]
+  agent-bridge spawn <name> --runtime <codex|claude> [--model <model>] [--window]
                                                 spawn 一個 worker pane 並註冊；stdout 只印 pane-id
-  agent-bridge relay <name> --runtime <codex|claude> --handoff <path> [--window] [--no-select] [--self-exit <my-name>]
+                                                （--model 不給＝該 CLI 的使用者預設模型）
+  agent-bridge relay <name> --runtime <codex|claude> [--model <model>] --handoff <path> [--window] [--no-select] [--self-exit <my-name>]
                                                 把主導權交給新 session（注入接手者守則＋交接檔）；stdout 只印 pane-id
   agent-bridge despawn <name>                   回收 spawn 出身的 worker（kill pane＋除名；人工註冊拒殺）
   agent-bridge ready <name>                     （worker）回報就緒；僅限 spawned agent
@@ -209,16 +215,51 @@ write_message() {
   fi
 }
 
+# screen_has_prompt <screen-text>：一屏可見文字裡是否有 Claude Code 權限確認對話框
+# 的特徵。純字串判斷、不碰 tmux，好讓 notify_pane 自己掌握 capture 的成敗語意。
+# 盡力偵測、非防彈：靠固定字串匹配，Claude Code 改對話框文案或本地化都會讓特徵
+# 失效。特徵取「Do you want to 」前綴＋底部「Esc to cancel」操作提示，兩者並存：
+# 前綴涵蓋各 permission dialog 的實際標題——不只 Bash 的「Do you want to proceed?」，
+# 還有檔案 Edit/Write 的「Do you want to make this edit to …／overwrite／create」、
+# WebFetch 的「Do you want to allow Claude to fetch this content?」等（形狀以
+# claude 2.1.218 的 permission descriptor 為據，獨立複核由可執行檔 strings 佐證）；
+# 只認「Do you want to proceed?」會漏掉這些型別、退回會誤觸的行為。codex worker 走
+# approval_policy=never（見 ~/.codex/agent-worker.config.toml）不彈此框，故只認 CC 形狀。
+# 代價方向：漏判＝那個 Enter 替 worker 按下批准（最壞），偽陽性＝通知降級成
+# notify-failed、訊息仍在 mailbox、只是晚一步被取（可復原）。兩者不對等，故 fail-
+# closed 偏攔——寧可偶爾偽陽性，也不放行一個可能誤批的 Enter
+screen_has_prompt() {
+  local screen="$1"
+  grep -qF 'Do you want to ' <<<"$screen" \
+    && grep -qF 'Esc to cancel' <<<"$screen"
+}
+
 # notify_pane <pane_id> <one-line-cmd>：先驗證 pane 存活再 send-keys；失敗回非零
 # Enter 與文字拆成兩次送並隔一小段延遲：agent REPL（claude/codex 等 TUI）
 # 會把同批抵達的文字+Enter 當成貼上，Enter 被吞掉導致指令留在輸入框不送出
 notify_pane() {
-  local pane="$1" cmd="$2"
+  local pane="$1" cmd="$2" screen
   [[ "$pane" =~ $PANE_RE ]] || return 1
   command -v tmux >/dev/null 2>&1 || return 1
   tmux list-panes -a -F '#{pane_id}' 2>/dev/null | grep -Fx "$pane" >/dev/null || return 1
+  # 送鍵前確認 pane 沒停在權限確認對話框：那個 Enter 會被對話框當成「確認預設
+  # 選項（Yes）」，替一個正等人類決策的 worker 按下批准（實測 2026-07-23：外部
+  # 通知的 Enter 誤批了 worker 停著的 ask 對話框）。掃到就降級為通知失敗——訊息
+  # 仍在 mailbox，交由呼叫端既有的 notify-failed 路徑處理。
+  # capture 失敗＝無法確認 pane 狀態，一律 fail-closed（return 1）而非放行送鍵：
+  # live pane 的 capture 可能因暫時性原因失敗、而後續 send-keys 卻成功，那樣防線
+  # 就被整個略過（獨立複核以 shim 反例證實這不只是「pane 已死」一種路徑）
+  screen="$(tmux capture-pane -p -t "$pane" 2>/dev/null)" || return 1
+  ! screen_has_prompt "$screen" || return 1
   tmux send-keys -t "$pane" "$cmd" 2>/dev/null || return 1
   sleep "${AGENT_BRIDGE_NOTIFY_DELAY:-0.3}"
+  # 送 Enter 前再掃一次（同樣 fail-closed）：worker 未必只是被動監聽，可能正在跑
+  # 別的 turn，第一次掃時還沒彈框、卻在這段延遲內才進入 permission prompt——這次
+  # 掃描把那個 Enter 攔下。殘留 race（已知、無法在 tmux 層消除）：這第二次 capture
+  # 與下一行 send-keys 之間仍有微小空窗，要完全關掉需判斷與按鍵在同一 pane-side
+  # 原子操作內完成，tmux send-keys 給不了這種原子性
+  screen="$(tmux capture-pane -p -t "$pane" 2>/dev/null)" || return 1
+  ! screen_has_prompt "$screen" || return 1
   tmux send-keys -t "$pane" Enter 2>/dev/null
 }
 
@@ -797,14 +838,21 @@ spawn_wait_ready() {
 }
 
 cmd_spawn() {
-  (( $# >= 1 )) || die "用法：agent-bridge spawn <name> --runtime <codex|claude> [--window]"
+  (( $# >= 1 )) || die "用法：agent-bridge spawn <name> --runtime <codex|claude> [--model <model>] [--window]"
   local name="$1"; shift
-  local runtime="" use_window=0
+  local runtime="" model="" use_window=0
   while (( $# > 0 )); do
     case "$1" in
       --runtime)
         shift; (( $# > 0 )) || die "--runtime 需要參數"
         runtime="$1" ;;
+      --model)
+        shift; (( $# > 0 )) || die "--model 需要參數"
+        model="$1"
+        # 在解析點就驗、不等到用時：這個值會進 pane 啟動命令字串（見 MODEL_RE
+        # 的註解），不合法就必須在建 pane 之前死掉
+        [[ "$model" =~ $MODEL_RE ]] \
+          || die "model 名稱不合法（僅允許英數起首的 [A-Za-z0-9._-]{1,64}）：$model" ;;
       --window) use_window=1 ;;
       *) die "未知參數：$1" ;;
     esac
@@ -841,6 +889,11 @@ cmd_spawn() {
     claude) runtime_cmd="claude --permission-mode auto" ;;
     *) die "不支援的 runtime：$runtime（支援 codex、claude）" ;;
   esac
+  # --model：兩個 runtime 都吃 `--model` 長旗標（實測 claude --help 與
+  # codex --help，2026-07-23）。不指定＝繼承該 CLI 的使用者預設——注意主
+  # session 預設模型換到高階層級時，這裡的預設會跟著變貴；派工建議見
+  # share/orchestrator-brief.md
+  [[ -n "$model" ]] && runtime_cmd+=" --model $model"
   command -v tmux >/dev/null 2>&1 || die "找不到 tmux，spawn 需要 tmux"
   command -v "${runtime_cmd%% *}" >/dev/null 2>&1 \
     || die "找不到 runtime 指令：${runtime_cmd%% *}"
@@ -928,10 +981,12 @@ cmd_spawn() {
   # spawn_tag 一併存進 registry：pane id 會被 tmux 重用（不同 server、server
   # 重啟後計數器歸零），光憑 id 無法證明「這個 pane 就是我 spawn 的那一個」。
   # despawn 殺之前用它跟 pane 的啟動指令對得上才動手
+  # model 一併入 registry：空字串＝沿用 runtime CLI 的預設。回收決策（挑誰
+  # evict）與事後追查（這個 worker 當時跑什麼模型）都用得到
   doc="$(jq -n --arg name "$name" --arg pane "$pane" --arg ts "$ts" --arg rt "$runtime" \
-              --arg tag "$SPAWN_RB_TAG" \
+              --arg tag "$SPAWN_RB_TAG" --arg model "$model" \
     '{name: $name, pane_id: $pane, registered_at: $ts,
-      spawned: true, runtime: $rt, spawned_at: $ts, ready: false,
+      spawned: true, runtime: $rt, model: $model, spawned_at: $ts, ready: false,
       spawn_tag: $tag}')"
   SPAWN_RB_REG="$AGENTS_DIR/$name.json"
   printf '%s\n' "$doc" | atomic_write "$AGENTS_DIR/$name.json"
@@ -962,14 +1017,19 @@ cmd_spawn() {
 # 附帶好處：接力鏈第一棒是人工 pane，B 去 despawn 它會被既有的「非 spawn 出身，
 # despawn 拒絕」擋下，第一棒的人工閘門不需要另寫檢查就成立。
 cmd_relay() {
-  (( $# >= 1 )) || die "用法：agent-bridge relay <name> --runtime <codex|claude> --handoff <path> [--window] [--no-select] [--self-exit <my-name>]"
+  (( $# >= 1 )) || die "用法：agent-bridge relay <name> --runtime <codex|claude> [--model <model>] --handoff <path> [--window] [--no-select] [--self-exit <my-name>]"
   local name="$1"; shift
-  local runtime="" use_window=0 handoff="" prev="" no_select=0
+  local runtime="" model="" use_window=0 handoff="" prev="" no_select=0
   while (( $# > 0 )); do
     case "$1" in
       --runtime)
         shift; (( $# > 0 )) || die "--runtime 需要參數"
         runtime="$1" ;;
+      --model)
+        # 只收值、不在這裡驗：驗證的正本在 cmd_spawn 的解析點（同一條
+        # MODEL_RE），relay 直通即可，抄第二份遲早漂移
+        shift; (( $# > 0 )) || die "--model 需要參數"
+        model="$1" ;;
       --handoff)
         shift; (( $# > 0 )) || die "--handoff 需要參數"
         handoff="$1" ;;
@@ -998,6 +1058,7 @@ cmd_relay() {
   # 直接呼叫而非命令替換：cmd_spawn 的 die 必須終止整個 relay，包進 $( ) 會被
   # subshell 吃掉、外層照常往下跑
   local args=("$name" --runtime "$runtime")
+  [[ -n "$model" ]] && args+=(--model "$model")
   (( use_window == 1 )) && args+=(--window)
   cmd_spawn "${args[@]}"
 

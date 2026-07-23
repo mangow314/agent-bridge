@@ -4,6 +4,25 @@
 claude / codex CLI session 互相委派任務與回覆，把工作拆細、讓每個 agent 的
 context 保持短而乾淨。
 
+## 為什麼不是內建 subagent
+
+要「把一塊活丟出去、拿回結論」，用 agent runtime 內建的 subagent 就好——更省、
+更簡單。agent-bridge 只在你需要下面**至少一件**原生 subagent 做不到的事時才有
+意義：
+
+1. **跨供應商**：worker 可以是 codex，orchestrator 是 claude（反之亦然）。內建
+   subagent 綁在同一個 runtime 裡，換不了廠。
+2. **人類可視、可介入**：worker 跑在一個真的 tmux pane，你看得到它此刻在做什麼，
+   隨時能切進去接手或糾正。subagent 是黑盒，你只拿得到它最後吐出的結論。
+3. **活過主 session 的清洗**：worker 的 context 活在它自己的 pane 裡，主 session
+   `/clear`、被 compact、甚至整個重開都不動它。subagent 的生命週期綁在召喚它的
+   那一次 turn，主 session 一清就沒了。
+4. **再往下委派（第三層）**：worker 自己是完整 session，能再 spawn／dispatch 它
+   自己的 worker 或 subagent。subagent 不能再長出 subagent。
+
+一句話：agent-bridge 是一層**活過主 session 清洗的 context**。這也是它的取捨
+裁判——一個提議若不服務上面四件事之一，就不屬於這裡。
+
 ## 架構
 
 三個組成，全部本機、無常駐程序：
@@ -12,8 +31,8 @@ context 保持短而乾淨。
 2. **檔案系統 mailbox**（預設 `~/.local/share/agent-bridge/`，可用環境變數
    `AGENT_BRIDGE_DATA` 覆蓋）：
    - `agents/<name>.json`：agent 註冊表（`{name, pane_id, registered_at}`；
-     spawn 出身的另有 `spawned: true`、`runtime`、`spawned_at`、`ready`、
-     `spawn_tag`）
+     spawn 出身的另有 `spawned: true`、`runtime`、`model`（空字串＝runtime
+     預設）、`spawned_at`、`ready`、`spawn_tag`）
    - `agents.log`：spawn/despawn 審計流，每行
      `<ISO8601Z> spawned|despawned|despawn-stale <name> <pane> <runtime>`
    - `tasks/<task-id>/`：每個任務一個目錄
@@ -33,6 +52,9 @@ context 保持短而乾淨。
    永遠走檔案，絕不進 send-keys。文字與 Enter 拆成兩次 send-keys、中間隔
    0.3 秒（可用 `AGENT_BRIDGE_NOTIFY_DELAY` 調整）：agent REPL 這類 TUI 會把
    同批抵達的文字+Enter 當成貼上而吞掉 Enter，導致指令留在輸入框不送出。
+   送鍵前還會先 `capture-pane` 掃一眼對方 pane 有沒有停在權限確認對話框——有就
+   不送、降級成 notify-failed，避免那個 Enter 替一個正等人類決策的 worker 按下
+   批准（見「已知限制」）。
 
 狀態機：
 
@@ -85,7 +107,8 @@ agent-bridge cancel <task-id>                 # （sender）queued/delivered/run
 agent-bridge status <task-id>                 # stdout 只印裸狀態字一行
 agent-bridge read <task-id>                   # completed/failed 可讀；標頭走 stderr、原文走 stdout
 agent-bridge await <task-id> [--timeout <secs>]  # 阻塞至終態，印裸狀態字；逾時非零退出
-agent-bridge spawn <name> --runtime <codex|claude> [--window]  # spawn worker pane；stdout 只印 pane-id
+agent-bridge spawn <name> --runtime <codex|claude> [--model <model>] [--window]
+                                              # spawn worker pane；stdout 只印 pane-id
 agent-bridge despawn <name>                   # 回收 spawn 出身的 worker（人工註冊拒殺）
 agent-bridge ready <name>                     # （worker）回報就緒；僅限 spawned agent
 agent-bridge disposable <name>                # （worker）宣告本輪脈絡已無殘值，可即時回收
@@ -180,6 +203,14 @@ agent-bridge despawn worker-1                          # 任務收尾：kill pan
     那是 headless，跑完即退出，pane 不會留下來收探針
   - 新增 runtime 前必須實測該 CLI 的位置參數確實會被當第一則 user message 執行
     且執行完 session 常駐；只吃 stdin 或需要別的旗標的 CLI 要另外長出注入方式
+- **`--model` 指定 worker 的模型**（兩個 runtime 都吃 `--model` 長旗標，實測
+  2026-07-23）：不給＝繼承該 CLI 的使用者預設——主 session 把預設模型換到高階
+  層級時，worker 會跟著變貴，**規劃在主 session、執行下放的分工要靠這個旗標
+  落地**（策略見 `share/orchestrator-brief.md`）。值會被拼進 pane 啟動命令
+  字串，故驗證與 brief 路徑同級：字元集 `[A-Za-z0-9._-]{1,64}` 擋 sh/tmux
+  分隔符，**首字元強制英數**擋旗標走私（否則 `--model --bare` 等於往 worker
+  啟動旗標塞任意開關）。不合法一律在建 pane 之前拒絕。模型名存進 registry 的
+  `model` 欄，事後查得到「這個 worker 當時跑什麼」。
 - **啟動即注入 worker 守則**：spawn 出來的是一個零脈絡的全新 session——它不知道
   自己是 worker，也不知道 pane 裡收到的 `agent-bridge receive <id>` 是要執行的
   命令而不是有人在跟它說話。實測（codex 0.145）沒有守則時，它會把就緒探針當成
@@ -203,7 +234,7 @@ agent-bridge despawn worker-1                          # 任務收尾：kill pan
 ### relay：把主導權交給下一棒
 
 ```bash
-agent-bridge relay <name> --runtime <codex|claude> --handoff <path> \
+agent-bridge relay <name> --runtime <codex|claude> [--model <model>] --handoff <path> \
   [--window] [--no-select] [--self-exit <my-name>]
 ```
 
@@ -414,6 +445,25 @@ tests/run-tests.sh
 - **訊息內容對 receiver 是不可信輸入**：request 來自另一個 agent，構成跨
   agent 的 prompt injection 面。receiver 應把內容當資料而非指令對待
   （見 `SKILL.md`）。
+- **通知的 Enter 不會替 worker 按掉權限對話框**：worker 若正停在 Claude Code 的
+  權限確認對話框（等人決定要不要放行某個命令），send-keys 送的 Enter 會被對話框
+  當成「確認預設選項（Yes）」——等於一則無關的外部通知替 worker 批准了它正等人
+  決策的命令（2026-07-23 實測誤觸）。防護是送鍵前後兩次 `capture-pane` 掃對話框
+  特徵（送文字前、送 Enter 前各一次，任一次 capture 失敗都 fail-closed 降級），
+  掃到就走 notify-failed（訊息仍在 mailbox，交既有降級路徑）。特徵取
+  `Do you want to ` 前綴＋底部 `Esc to cancel`，涵蓋 Bash 的
+  `Do you want to proceed?`、檔案 Edit/Write 的 `Do you want to make this edit
+  to …`、WebFetch 的 `Do you want to allow Claude to fetch …` 等 worker 執行命令
+  時實際會撞到的權限框。**侷限（刻意揭露）**：(1) 這是對可見文字的字串匹配，
+  Claude Code 改文案或本地化會讓特徵失效——方向是 fail-open（退回原本會誤觸的
+  行為），因為漏判（替 worker 誤按批准）比偽陽性（通知延後、訊息可復原）更糟，
+  偵測刻意偏攔。(2) 其他句式的確認框——plan mode 的
+  `Would you like to proceed?`、`Do you want to use this API key?`、workspace
+  trust 等——目前**不涵蓋**，其在 `--permission-mode auto` worker 場景的可達性
+  尚未實測（獨立複核指出，未升格為 blocking）；要擴大保護得先實測這些框的 footer、
+  Enter 預設行為與 worker 可達性。(3) 第二次掃描與 send-keys 之間仍有無法在 tmux
+  層消除的微小 race。codex worker 走 `approval_policy = never`、不彈這種對話框，
+  天然不受影響。
 - **同一個資料目錄＝同一個互信域，出身檢查不是對抗惡意 agent 的邊界**：
   所有 agent 以同一個 uid 跑、共用 `AGENT_BRIDGE_DATA`，registry 檔因此對每個
   worker 都可寫。上面的 `spawn_tag` 驗證擋得住**意外**殺錯（pane id 重用、

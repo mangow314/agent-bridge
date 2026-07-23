@@ -287,6 +287,73 @@ assert "通知失敗：stderr 有含 task-id 的警告" \
 assert "通知失敗：events.log 記 notify-failed" \
   evt_grep "$D5/tasks/$id5/events.log" notify-failed
 
+# ---- 8a. 盲點 1：worker 停在權限對話框時，通知的按鍵不得送進去 ----
+# notify_pane 送鍵前 capture-pane 掃 Claude Code 權限對話框特徵，掃到就降級。這裡
+# 直接鎖住核心不變量「攔截時一個按鍵都沒送進 pane」——而非只驗 return code：假 pane
+# 印出對話框特徵後進 `while read` 迴圈、把收到的每一行記進 got 檔。攔截生效＝got 不
+# 含通知文字。為排除「其實送了、只是還沒 append」的偽陰性，先送一個哨兵行、確認 got
+# 記得到它（證明記錄機制活著），再斷言 got 裡沒有 task-id。
+# 註：capture 失敗 fail-closed（B1）與送 Enter 前二次掃描（B3）是邏輯路徑，真 tmux
+# 環境難穩定構造「capture 失敗但 send-keys 成功」與「文字送出後才彈框」，由 code
+# review＋shellcheck 把關，不在此列測例。
+D5a="$TESTROOT/d5a"
+p_ask="$(tmx split-window -dP -F '#{pane_id}' -t it "$pane_cmd")"
+ab "$D5a" register dodo "$p_ask" 2>/dev/null
+tmx send-keys -t "$p_ask" \
+  "printf '%s\n' 'Do you want to proceed?' 'Esc to cancel · Tab to amend' ; touch $TESTROOT/ask1-ready ; while IFS= read -r l ; do printf '%s\n' \"\$l\" >> $TESTROOT/ask1-got.txt ; done" Enter
+wait_for 10 test -f "$TESTROOT/ask1-ready"
+id5a="$(ab "$D5a" send dodo --from alice --message hi 2>"$TESTROOT/d5a-send.err")"
+rc=$?
+tmx send-keys -t "$p_ask" 'SENTINEL-ask1' Enter
+assert "對話框偵測(Bash 框)：send 仍 exit 0" test "$rc" -eq 0
+assert "對話框偵測(Bash 框)：記錄機制活著（哨兵行有進 got）" \
+  wait_for 10 grep -q 'SENTINEL-ask1' "$TESTROOT/ask1-got.txt"
+# 恰好只有哨兵一行才算攔截成功：只 grep task-id 缺席擋不住「只送一個 Enter 再
+# return 1」的 regression——那會讓 got 多一個空白行、仍不含 task-id 卻已送出危險
+# 的 Enter。改斷言 got 內容整行等於哨兵、且列數恰為 1，空白行／額外 Enter／任何
+# 通知文字都會讓它失敗（二輪複核 B4）
+assert "對話框偵測(Bash 框)：got 恰好只有哨兵一行（通知的文字與 Enter 都沒送進來）" \
+  bash -c 'test "$(wc -l < "$1")" -eq 1 && grep -Fxq "$2" "$1"' _ "$TESTROOT/ask1-got.txt" 'SENTINEL-ask1'
+assert "對話框偵測(Bash 框)：events.log 記 notify-failed" \
+  evt_grep "$D5a/tasks/$id5a/events.log" notify-failed
+assert "對話框偵測(Bash 框)：stderr 有含 task-id 的警告" \
+  grep -q "$id5a" "$TESTROOT/d5a-send.err"
+tmx kill-pane -t "$p_ask" 2>/dev/null || true
+
+# 8a②：Edit/Write 型的權限框標題不是「Do you want to proceed?」而是「Do you want to
+# make this edit to …」。特徵用「Do you want to 」前綴正是為了涵蓋這些型別；只認
+# proceed 會漏判、退回會誤觸的行為（B2）
+D5c="$TESTROOT/d5c"
+p_edit="$(tmx split-window -dP -F '#{pane_id}' -t it "$pane_cmd")"
+ab "$D5c" register didi "$p_edit" 2>/dev/null
+tmx send-keys -t "$p_edit" \
+  "printf '%s\n' 'Do you want to make this edit to foo.rs?' 'Esc to cancel · Tab to amend' ; touch $TESTROOT/ask2-ready ; while IFS= read -r l ; do printf '%s\n' \"\$l\" >> $TESTROOT/ask2-got.txt ; done" Enter
+wait_for 10 test -f "$TESTROOT/ask2-ready"
+id5c="$(ab "$D5c" send didi --from alice --message hi 2>/dev/null)"
+tmx send-keys -t "$p_edit" 'SENTINEL-ask2' Enter
+assert "對話框偵測(Edit 框)：記錄機制活著（哨兵行有進 got）" \
+  wait_for 10 grep -q 'SENTINEL-ask2' "$TESTROOT/ask2-got.txt"
+assert "對話框偵測(Edit 框)：got 恰好只有哨兵一行（Edit 型也一個按鍵都沒送）" \
+  bash -c 'test "$(wc -l < "$1")" -eq 1 && grep -Fxq "$2" "$1"' _ "$TESTROOT/ask2-got.txt" 'SENTINEL-ask2'
+assert "對話框偵測(Edit 框)：events.log 記 notify-failed" \
+  evt_grep "$D5c/tasks/$id5c/events.log" notify-failed
+tmx kill-pane -t "$p_edit" 2>/dev/null || true
+
+# 8a③ 放行對照：畫面無對話框特徵 → 通知照送，pane 確實收到通知文字（正向鎖住
+# 「不誤判把活 worker 打死」，且直接驗按鍵送達而非只驗沒記 notify-failed）
+D5b="$TESTROOT/d5b"
+p_ok="$(tmx split-window -dP -F '#{pane_id}' -t it "$pane_cmd")"
+ab "$D5b" register momo "$p_ok" 2>/dev/null
+tmx send-keys -t "$p_ok" \
+  "printf '%s\n' 'just some normal worker output' ; touch $TESTROOT/ok-ready ; while IFS= read -r l ; do printf '%s\n' \"\$l\" >> $TESTROOT/ok-got.txt ; done" Enter
+wait_for 10 test -f "$TESTROOT/ok-ready"
+id5b="$(ab "$D5b" send momo --from alice --message hi 2>/dev/null)"
+assert "非對話框畫面：pane 收到通知文字（通知照送）" \
+  wait_for 10 grep -q "$id5b" "$TESTROOT/ok-got.txt"
+assert_fails "非對話框畫面：通知未降級（events.log 不記 notify-failed）" \
+  evt_grep "$D5b/tasks/$id5b/events.log" notify-failed
+tmx kill-pane -t "$p_ok" 2>/dev/null || true
+
 # ---- 8b. 鎖失敗路徑：權限失敗 vs 真正鎖佔用 ----
 D6="$TESTROOT/d6"
 ab "$D6" register bob "$PANE_B" 2>/dev/null
@@ -578,6 +645,53 @@ assert "claude runtime 探針重送生效：ready == true" \
 assert "agents.log 記 spawned wc1 … claude" \
   grep -qE "Z spawned wc1 ${pane_wc} claude\$" "$DSPAWN/agents.log"
 assert "claude runtime worker 可正常 despawn" ab "$DSPAWN" despawn wc1
+
+# 16a3. spawn --model：模型下放。值會進 tagged_cmd（pane 啟動命令字串），
+# 與 brief 路徑同級暴露面，防線兩條：字元集擋 sh/tmux 分隔符（命令注入）、
+# 首字元強制英數（旗標走私——`--model --bare` 不擋的話就是往 worker 啟動
+# 旗標塞任意開關的後門）。argv 斷言沿用 16a2 的教訓走白名單：鎖「恰好五個
+# 參數」，子字串斷言擋不住偷偷追加的旗標
+absp "$DSPAWN" 20 spawn wm1 --runtime claude --model sonnet-t.0 >/dev/null 2>&1; rc=$?
+assert "spawn --model：exit 0" test "$rc" -eq 0
+assert "claude argv 恰好五個參數（--permission-mode auto --model <m> <prompt>）" \
+  bash -c "mapfile -d '' -t A < '$TESTROOT/claude-argv.txt'; (( \${#A[@]} == 5 ))"
+assert "claude argv 的 --model 值就位、prompt 仍是最後一個非旗標參數" \
+  bash -c "mapfile -d '' -t A < '$TESTROOT/claude-argv.txt'; [[ \${A[2]} == '--model' && \${A[3]} == 'sonnet-t.0' && \${A[4]} != -* ]]"
+assert "registry 記下 model 欄位" \
+  jq -e '.model == "sonnet-t.0"' "$DSPAWN/agents/wm1.json"
+assert "spawn --model 的 worker 可正常 despawn" ab "$DSPAWN" despawn wm1
+
+# codex 側走同一條 append 路徑
+absp "$DSPAWN" 20 spawn wm2 --runtime codex --model gpt-test >/dev/null 2>&1; rc=$?
+assert "spawn --runtime codex --model：exit 0" test "$rc" -eq 0
+assert "codex args 帶相鄰的 --model gpt-test" \
+  grep -q -- '--model gpt-test' "$TESTROOT/codex-args.txt"
+assert "codex --model worker 可正常 despawn" ab "$DSPAWN" despawn wm2
+
+# 未指定 --model：model 欄為空字串＝沿用 runtime 預設；argv 形狀由 16a2 的
+# 「恰好三個參數」白名單鎖住，這裡不重複（w1 是 16a 留下的無 --model spawn）
+assert "未指定 --model 時 registry model 欄為空字串" \
+  jq -e '.model == ""' "$DSPAWN/agents/w1.json"
+
+# 不合法的值必須在建 pane 之前死：pane 數不變、registry 不落地。
+# 「pane 數不變」先取樣再操作，斷言的是被拒路徑真的沒碰 tmux
+pc_before="$(pane_count)"
+assert_fails "拒絕含分隔符的 model（x;kill-server）" \
+  ab "$DSPAWN" spawn wm3 --runtime claude --model 'x;kill-server'
+assert_fails "拒絕含空白的 model" \
+  ab "$DSPAWN" spawn wm3 --runtime claude --model 'x y'
+assert_fails "拒絕以 - 起首的 model（旗標走私：--model --bare）" \
+  ab "$DSPAWN" spawn wm3 --runtime claude --model --bare
+assert_fails "拒絕空字串 model" \
+  ab "$DSPAWN" spawn wm3 --runtime claude --model ''
+assert_fails "拒絕超長 model（65 字元）" \
+  ab "$DSPAWN" spawn wm3 --runtime claude --model "$(printf 'a%.0s' {1..65})"
+assert_fails "--model 缺值時報錯" \
+  ab "$DSPAWN" spawn wm3 --runtime claude --model
+assert "被拒的 spawn 不建 pane（pane 數不變）" \
+  test "$(pane_count)" -eq "$pc_before"
+assert "被拒的 spawn 不留 registry" \
+  bash -c "[[ ! -e '$DSPAWN/agents/wm3.json' ]]"
 assert_fails "despawn 後 claude worker 的 pane 消失" pane_alive "$pane_wc"
 
 # 16b. 參數與名稱衝突拒絕
@@ -1409,6 +1523,23 @@ assert "relay registry：與 spawn 同一套欄位（共用 cmd_spawn）" \
   "$DRELAY/agents/r1.json"
 assert "relay 寫 agents.log（審計線不因換命令而斷）" \
   grep -qE "Z spawned r1 ${pane_r1} codex\$" "$DRELAY/agents.log"
+
+# 23b2. relay --model 直通 cmd_spawn（驗證正本在 spawn 的解析點，relay 不抄第二份）
+env AGENT_BRIDGE_DATA="$DRELAY" AGENT_BRIDGE_READY_TIMEOUT=0 \
+  PATH="$SHIM:$PATH" \
+  "$BRIDGE" relay r1m --runtime codex --model gpt-relay --handoff "$HANDOFF" --no-select >/dev/null 2>&1; rc=$?
+assert "relay --model：exit 0" test "$rc" -eq 0
+assert "relay 啟動參數含相鄰的 --model gpt-relay" \
+  grep -q -- '--model gpt-relay' "$TESTROOT/codex-args.txt"
+assert "relay --model 進 registry" \
+  jq -e '.model == "gpt-relay"' "$DRELAY/agents/r1m.json"
+assert_fails "relay 的不合法 model 一樣被 spawn 解析點擋下" \
+  env AGENT_BRIDGE_DATA="$DRELAY" AGENT_BRIDGE_READY_TIMEOUT=0 PATH="$SHIM:$PATH" \
+  "$BRIDGE" relay r1x --runtime codex --model 'x;kill-server' --handoff "$HANDOFF" --no-select
+assert "被拒的 relay 不留 registry" \
+  bash -c "[[ ! -e '$DRELAY/agents/r1x.json' ]]"
+assert "relay --model 的接手者可正常 despawn（不佔用後續 cap）" \
+  env AGENT_BRIDGE_DATA="$DRELAY" PATH="$SHIM:$PATH" "$BRIDGE" despawn r1m
 # 未指定 --self-exit 時不該憑空冒出回收指示。
 # 不能拿 'agent-bridge despawn' 當關鍵字——接手者 brief 內文本來就有那一段
 # （說明被拒是正常的），會恆綠。要鎖的是動態尾巴本身
