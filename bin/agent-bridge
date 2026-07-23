@@ -132,6 +132,15 @@ DESPAWN_EXPECT_TAG=""
 # send 是核心路徑，參數面不該為了內部契約變寬
 SEND_PIN=""
 
+# evict 呼叫 despawn 時設 1：表示收尾筆記已經走過流程（落地或已記未落地），
+# despawn 不必再記 despawned-unsaved
+DESPAWN_NOTES_HANDLED=""
+
+# cmd_despawn 的結果回報給呼叫者：killed（真的關掉了 pane）／absent（pane 本來
+# 就不在，只清註冊）／stale（pane 還在但已不屬於這個 agent，只清註冊）。
+# evict 要靠它分辨——stale 代表那個 pane 沒被回收，這時寫 evicted 就是假紀錄
+DESPAWN_RESULT=""
+
 # ---- 鎖：mkdir lock，短暫重試後報錯 ----
 LOCK_DIR=""
 
@@ -224,6 +233,32 @@ check_task_id() {
 # 整個失敗），而這個資訊只有回收決策要用。代價是 O(task 數)，task GC 是已知
 # backlog。
 # ISO 8601 UTC 定長字串可直接字典序比大小，不必轉 epoch。
+# disposable_effective <agent> <registry-file>：這個 agent 的「無殘值」宣告
+# 現在還算不算數。0＝仍有效（可即時回收）／1＝無效（沒宣告過，或宣告後又被
+# 派了新任務、已累積新脈絡）。
+#
+# 抽成共用函式是因為兩個地方要問同一個問題：idle 決定第三欄印 yes 還是
+# expired，despawn 決定審計記 despawned 還是 despawned-unsaved。這兩處若各寫
+# 一份，遲早漂移成兩套語意，而它們的錯誤方向都是「把有殘值的當成沒殘值」。
+#
+# 同秒也算過期（`>=` 而非 `>`）：時間戳是秒精度，worker 宣告後 orchestrator
+# 立刻派工就會落在同一秒。用嚴格大於的話那一秒內仍報 yes，於是一個剛拿到新
+# 任務、正在累積新脈絡的 worker 會被直接回收，不走 evict、不留筆記。兩個方向
+# 的代價不對等——判太嚴只是多派一輪收尾（多佔 cap），判太鬆是殺掉還有用的
+# 脈絡。（bash 無字串 `>=`，故寫成「不小於」。獨立複核 2026-07-22 抓出）
+disposable_effective() {
+  local name="$1" f="$2" disp_at last_at
+  disp_at="$(jq -r 'if .disposable == true then (.disposable_at // "?") else "" end' "$f" 2>/dev/null)" \
+    || return 1
+  [[ -n "$disp_at" ]] || return 1
+  # 宣告了但沒有時間戳：無從判斷是否被後續任務推翻，當成無效（偏保守那邊）
+  [[ "$disp_at" != "?" ]] || return 1
+  last_at="$(last_task_at "$name")"
+  [[ -n "$last_at" ]] || return 0
+  [[ "$last_at" < "$disp_at" ]] || return 1
+  return 0
+}
+
 last_task_at() {
   local who="$1" d latest="" ts to
   shopt -s nullglob
@@ -1045,6 +1080,7 @@ cmd_despawn() {
       rm -f -- "$f" \
         || die "pane $pane 已非本 agent 所有，且 registry 刪除失敗，請手動清除 $f"
       log_agent_event despawn-stale "$name" "$pane" "$runtime"
+      DESPAWN_RESULT=stale
       release_lock
       err "警告：pane $pane 目前的啟動指令不帶 '$name' 的 spawn tag（id 已被別的 pane 佔用，或 registry 遭竄改）；已清除註冊，未動該 pane"
       return 0
@@ -1065,8 +1101,18 @@ cmd_despawn() {
     fi
   fi
 
+  # 審計要看得出「這次回收有沒有丟掉東西」。despawn 是公開指令，任何人都能繞過
+  # evict 直接收掉一個沒宣告 disposable、也就是仍被視為有殘值的 worker——機制上
+  # 不擋（擋了會逼出 --force，而習慣性加旗標等於防線不存在），但不能讓審計線看
+  # 起來跟一次乾淨的回收一模一樣。evict 走過收尾流程，筆記已經處理過，由它設
+  # DESPAWN_NOTES_HANDLED 說明，不必記 unsaved。（獨立複核 2026-07-23 指出）
+  local ev=despawned
+  if [[ -z "$DESPAWN_NOTES_HANDLED" ]] && ! disposable_effective "$name" "$f"; then
+    ev=despawned-unsaved
+  fi
   rm -f -- "$f"
-  log_agent_event despawned "$name" "$pane" "$runtime"
+  log_agent_event "$ev" "$name" "$pane" "$runtime"
+  if (( found == 1 )); then DESPAWN_RESULT=killed; else DESPAWN_RESULT=absent; fi
   release_lock
   if (( found == 1 )); then
     info "已 despawn agent '$name'（pane $pane）"
@@ -1176,17 +1222,36 @@ cmd_gc() {
     shift
   done
 
-  local now cutoff kept_live=0 kept_pin=0 kept_young=0 removed=0 failed=0
+  local now cutoff kept_live=0 kept_pin=0 kept_young=0 kept_proof=0 removed=0 failed=0
   now="$(date -u +%s)"
   cutoff=$(( now - days * 86400 ))
+
+  # 「宣告已失效」的證據不能刪。idle 判斷一個 disposable 宣告是否被後續任務推翻，
+  # 靠的是掃 tasks/ 找晚於 disposable_at 的任務；那個任務一旦被 gc 清掉，證據就
+  # 消失，宣告會從 expired 復活成 yes，orchestrator 據此直接回收一個其實已有新
+  # 脈絡的 worker。收集現存 registry 裡還掛著宣告的 agent 與其時間戳，晚於它的
+  # 任務一律保留。（獨立複核 2026-07-23 以隔離實測抓出：GC 前 expired、GC 後 yes）
+  declare -A pledge=()
+  local af aname adisp
+  shopt -s nullglob
+  for af in "$AGENTS_DIR"/*.json; do
+    jq -e 'type == "object" and .disposable == true' "$af" >/dev/null 2>&1 || continue
+    aname="$(jq -r '.name // ""' "$af" 2>/dev/null)" || continue
+    adisp="$(jq -r '.disposable_at // ""' "$af" 2>/dev/null)" || continue
+    [[ -n "$aname" && -n "$adisp" ]] || continue
+    pledge["$aname"]="$adisp"
+  done
 
   local d id st pinned ts epoch
   shopt -s nullglob
   for d in "$TASKS_DIR"/*/; do
     id="$(basename "$d")"
-    # 目錄名不合 task-id 格式就不碰：這裡是唯一會刪東西的地方，寧可漏掉也不要
-    # 讓一個奇怪的目錄名走進 rm 的參數
-    [[ "$id" =~ $TASK_ID_RE ]] || continue
+    # 只碰 send 生出來的形狀（UTC 時間戳 ＋ 4 hex），不是寬鬆的 TASK_ID_RE。
+    # 這裡是唯一會刪東西的地方：公開驗證用的 TASK_ID_RE 連 `foo` 都算合法，
+    # 拿它當刪除門檻，等於把任何人放進 tasks/ 的目錄都納入清理範圍。
+    # 寧可漏掉幾個手工目錄，也不要讓一個不是我們生成的名字走進 rm 的參數。
+    # （獨立複核 2026-07-23 指出契約定義不一致）
+    [[ "$id" =~ ^[0-9]{8}T[0-9]{6}Z-[0-9a-f]{4}$ ]] || continue
     [[ -f "$d/metadata.json" && -f "$d/status" ]] || continue
 
     st="$(<"$d/status")"
@@ -1204,6 +1269,17 @@ cmd_gc() {
 
     # 用 metadata 的 created_at 而不是目錄 mtime：mtime 會被備份、rsync、
     # 檔案系統操作改掉，created_at 是這個任務自己的事實
+    # 這個任務是不是某個現存宣告的「已失效證據」？是的話留著（見上方 pledge）
+    local to_who
+    to_who="$(jq -r '.to // ""' "$d/metadata.json" 2>/dev/null)" || to_who=""
+    if [[ -n "$to_who" && -n "${pledge[$to_who]:-}" ]]; then
+      local tts
+      tts="$(jq -r '.created_at // ""' "$d/metadata.json" 2>/dev/null)" || tts=""
+      if [[ -n "$tts" ]] && ! [[ "$tts" < "${pledge[$to_who]}" ]]; then
+        kept_proof=$((kept_proof + 1)); continue
+      fi
+    fi
+
     ts="$(jq -r '.created_at // ""' "$d/metadata.json" 2>/dev/null)" || ts=""
     # 讀不到時間就當它還年輕：判不出年紀的東西不刪
     if [[ -z "$ts" ]] || ! epoch="$(date -u -d "$ts" +%s 2>/dev/null)"; then
@@ -1240,10 +1316,10 @@ cmd_gc() {
   done
 
   if (( apply == 0 )); then
-    info "gc（試算）：可刪 $removed 個；保留 未完成 $kept_live／收尾筆記 $kept_pin／未滿 ${days} 天 $kept_young"
+    info "gc（試算）：可刪 $removed 個；保留 未完成 $kept_live／收尾筆記 $kept_pin／宣告失效證據 $kept_proof／未滿 ${days} 天 $kept_young"
     info "確認無誤後加 --apply 才會真的刪除"
   else
-    info "gc：已刪 $removed 個；保留 未完成 $kept_live／收尾筆記 $kept_pin／未滿 ${days} 天 $kept_young"
+    info "gc：已刪 $removed 個；保留 未完成 $kept_live／收尾筆記 $kept_pin／宣告失效證據 $kept_proof／未滿 ${days} 天 $kept_young"
     (( failed == 0 )) || err "警告：$failed 個目錄未能刪除（鎖被佔用或權限問題），下次再試"
   fi
 }
@@ -1275,17 +1351,10 @@ cmd_idle() {
     # disposable 欄位，也不該讓它看起來可回收
     if [[ "$spawned" != y || -z "$disp_at" ]]; then
       disp="-"
-    # 同秒也算過期（`>=` 而非 `>`）。時間戳是秒精度，宣告與新任務落在同一秒
-    # 完全可能——worker 宣告後 orchestrator 立刻派工就是。用嚴格大於的話那一秒
-    # 內 idle 仍報 yes，orchestrator 會直接 despawn 一個剛拿到新任務、正在累積
-    # 新脈絡的 worker，且不走 evict、不留筆記：語意基石反轉。
-    # 兩個方向的代價不對等——`>=` 誤判時只是多派一輪收尾（多佔 cap），
-    # `>` 誤判時是殺掉還有用的脈絡。後者是這一層唯一不可接受的失效。
-    # （bash 無字串 `>=`，故寫成「不小於」。獨立複核 2026-07-22 以重現實驗抓出）
-    elif [[ "$disp_at" != "?" && -n "$last_at" ]] && ! [[ "$last_at" < "$disp_at" ]]; then
-      disp="expired"
-    else
+    elif disposable_effective "$name" "$f"; then
       disp="yes"
+    else
+      disp="expired"
     fi
 
     # 取「最後任務」與「這個 pane 誕生」兩者較晚者。agent 名稱可以重用，而
@@ -1360,8 +1429,13 @@ cmd_evict() {
   runtime="$(jq -r '.runtime // "-"' "$f")"
   # 記下這一代的 spawn_tag，最後 despawn 時綁定比對（見 cmd_despawn 的
   # DESPAWN_EXPECT_TAG 段）：收尾任務是派給「這一代」的，回收也只能收這一代
+  # tag 空的話 despawn 那邊的 generation 比對會整條被跳過（見 DESPAWN_EXPECT_TAG），
+  # 綁定等於沒有。正常 spawn 一定寫得出 tag，取不到代表 registry 被動過——這時
+  # 拒絕動作，而不是帶著一個失效的綁定往下走。（獨立複核 2026-07-23 指出）
   local gen_tag
   gen_tag="$(jq -r '.spawn_tag // ""' "$f")"
+  [[ -n "$gen_tag" ]] \
+    || die "agent '$name' 的 registry 沒有 spawn_tag，無法鎖定世代，evict 拒絕；請確認 $f 後手動處理"
 
   # 收尾任務的文案硬編在這裡而不是抽到 share/：它是機制的一部分（「把只存在於
   # 你 context 裡的事實寫下來」），不是可調策略。抽成檔案會多一條「檔案不存在
@@ -1412,8 +1486,20 @@ EOF
   esac
 
   DESPAWN_EXPECT_TAG="$gen_tag"
+  DESPAWN_NOTES_HANDLED=1
+  DESPAWN_RESULT=""
   cmd_despawn "$name"
   DESPAWN_EXPECT_TAG=""
+  DESPAWN_NOTES_HANDLED=""
+
+  # stale＝registry 清掉了，但那個 pane 還活著、已經不屬於這個 agent。它沒有被
+  # 回收，所以不能記 evicted*——despawn 自己已經記過 despawn-stale，再補一筆
+  # evicted 只會讓審計線宣稱發生過一次沒發生的回收。（獨立複核 2026-07-23 指出）
+  if [[ "$DESPAWN_RESULT" == stale ]]; then
+    err "警告：agent '$name' 的註冊已清除，但 pane $pane 已不屬於它、未被回收；收尾任務 $task_id（$final_st）請自行判讀"
+    printf '%s\n' "$task_id"
+    return 0
+  fi
   # 記在 despawn 成功之後：despawn 失敗代表 pane 還在、根本沒被驅逐，
   # 這時寫一筆 evicted 進審計線就是假紀錄
   log_agent_event "$outcome" "$name" "$pane" "$runtime"

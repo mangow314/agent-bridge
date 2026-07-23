@@ -346,8 +346,31 @@ agent-bridge gc --older-than 30 --apply
 3. **判不出年紀的不刪**：`created_at` 缺失或無法解析就留著。年齡看 metadata 的
    `created_at` 而非目錄 mtime——mtime 會被備份、rsync、檔案系統操作改掉。
 
-外加兩條：預設是**試算**，`--apply` 才會刪；目錄名不合 task-id 格式的一律不碰
-（這是唯一會 `rm` 的路徑）。
+外加三條：預設是**試算**，`--apply` 才會刪；只碰 `send` 生成的目錄名形狀
+（UTC 時間戳 ＋ 4 hex，不是寬鬆的公開 task-id 格式——這是唯一會 `rm` 的路徑）；
+以及**「宣告已失效」的證據不刪**。
+
+最後那條不直覺但要緊：`idle` 判斷一個 `disposable` 宣告有沒有被後續任務推翻，
+靠的就是掃 `tasks/` 找晚於 `disposable_at` 的任務。那個任務一旦被清掉，證據跟著
+消失，宣告會從 `expired` **復活成 `yes`**，orchestrator 據此直接回收一個其實已有
+新脈絡的 worker。所以只要 registry 裡還掛著某個宣告，晚於它的任務就一律保留。
+
+### 回收的審計記號
+
+`agents.log` 分得出這次回收有沒有丟掉東西：
+
+| 記號 | 意思 |
+|---|---|
+| `despawned` | 乾淨回收：該 worker 宣告過 `disposable` 且宣告仍有效 |
+| `despawned-unsaved` | 回收了一個仍被視為有殘值的 worker（沒宣告過，或宣告已被後續任務推翻）——繞過了收尾流程 |
+| `despawn-stale` | 註冊清掉了，但那個 pane 已不屬於這個 agent，**未被回收** |
+| `evicted` | 走完 evict，收尾筆記已落地 |
+| `evicted-unfinished` | 收尾任務以 failed／cancelled 收場 |
+| `evicted-timeout` | 等到逾時，pane 仍回收，筆記沒落地 |
+
+`despawn` 是公開指令，機制上**不阻止**你直接回收一個有殘值的 worker——擋下來只會
+逼出一個 `--force`，而習慣性加旗標等於沒有防線。改成讓它在審計線上看得出來。
+走 `evict` 的回收不會記 `unsaved`（收尾流程已經跑過）。
 
 ## 測試
 
@@ -364,6 +387,14 @@ tests/run-tests.sh
   chezmoi repo 的配套變更（codex config 模板、skill symlink、hook 煙測）
   一律在 chezmoi repo 開 topic branch 並用獨立 worktree 作業，審過再併回
   master——不直接在 master 與使用者日常 dotfile 變更混流。
+
+## 已知限制（補充：鎖的殘留）
+
+鎖是 `mkdir` 目錄鎖，靠 `trap release_lock EXIT` 清除。程序被 `SIGKILL` 或主機
+斷電時 trap 不會執行，`locks/<id>.lock` 會殘留，之後同類命令重試 25 次後失敗。
+目前沒有 owner PID 或 stale-lock 自動回收——加那套機制本身會引入「誤刪別人正在
+持有的鎖」這個更糟的失效方向，所以維持手動處理：確認沒有 agent-bridge 正在跑，
+然後刪掉 `locks/` 底下殘留的目錄。
 
 ## 已知限制
 

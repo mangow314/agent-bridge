@@ -80,6 +80,39 @@ Gate 結果（全過）：
   收尾文案沒有觸發過濾，整份 finding 被完整撈回。這是 evict 最有力的一次實戰
   驗證——被回收的 worker 不是「做完了」，而是「說不出話但腦裡有東西」。
 
+## 第二輪獨立複核（2026-07-23，codex worker `rev2`）
+
+措辭改成具名不變量（I1–I8）後重派。**仍然被同一個安全過濾擋住報告輸出**——
+所以觸發源不只是委託措辭，被審查的原始碼本身（tmux pane 操作、竄改防線、
+命令注入註解）就足以觸發。改寫措辭沒有解決問題，但這輪加的「每確認一條就
+先 append 到 /tmp 檔案」有效：中斷時發現已經落地，evict 又把完整報告撈回來。
+
+兩條確認、四條疑慮，五條已修：
+
+- **I1（已修）**：`despawn` 是公開指令，可繞過整個 evict 流程收掉一個未宣告
+  disposable、仍被視為有殘值的 worker，審計只有一行 `despawned`，看不出丟了
+  東西。**不改成禁止**——擋下來只會逼出 `--force`，習慣性加旗標等於沒有防線；
+  改成記 `despawned-unsaved`，讓它在審計線上看得見。
+- **I3（已修，本輪自造的回歸）**：`gc` 會刪掉「讓 disposable 宣告失效」的那個
+  任務，而 `idle` 判斷宣告是否被推翻正是靠掃 `tasks/`。證據一沒，宣告從
+  `expired` 復活成 `yes`。複核附隔離實測（GC 前 expired／GC 後 yes）。
+  修法是在 gc 加第四道保留線：晚於任何現存宣告的任務一律不刪。
+- **I2（已修）**：`spawn_tag` 缺失或空時，`DESPAWN_EXPECT_TAG` 為空會讓
+  generation 比對整條跳過，等於上一輪的修補被靜靜停用。evict 改為取不到 tag
+  就拒絕動作（fail-closed）。
+- **I6（已修）**：`cmd_despawn` 的 stale 路徑（registry 清了、pane 還在且已不屬
+  於這個 agent）`return 0`，evict 分不出來，仍補一筆 `evicted`——審計宣稱發生過
+  一次沒發生的回收。改用 `DESPAWN_RESULT` 回報，stale 時不寫 `evicted*`。
+- **I5（已修）**：`gc` 原本用公開的 `TASK_ID_RE`，那個 regex 連 `foo` 都算合法，
+  等於把任何人放進 `tasks/` 的目錄都納入清理範圍。改成只認 `send` 生成的形狀。
+- **I7（不修，寫進 README 已知限制）**：`SIGKILL`／斷電會留下 mkdir 鎖。加
+  owner PID 或 stale-lock 自動回收，本身會引入「誤刪別人正在持有的鎖」這個更糟
+  的失效方向。維持手動處理。
+
+順帶產出一個共用函式 `disposable_effective`：`idle` 與 `despawn` 都要問「這個
+宣告現在還算不算數」，兩處各寫一份遲早漂移，而它們的錯誤方向都是「把有殘值的
+當成沒殘值」。
+
 Phase 3 落地時與本文的差異（以實作為準）：
 
 - 審計記號分**三種**而非兩種：`evicted`（筆記已落地）／`evicted-timeout`（逾時）／

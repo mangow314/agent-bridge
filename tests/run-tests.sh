@@ -701,8 +701,10 @@ ab "$DSPAWN" despawn w1 2>/dev/null; rc=$?
 assert "despawn spawned agent：exit 0" test "$rc" -eq 0
 assert_fails "despawn 後 pane 消失" pane_alive "$pane_w1"
 assert "despawn 後 registry 檔已刪" test ! -e "$DSPAWN/agents/w1.json"
-assert "agents.log 記 despawned w1" \
-  grep -qE "Z despawned w1 ${pane_w1} codex\$" "$DSPAWN/agents.log"
+# 沒宣告過 disposable＝仍被視為有殘值，直接 despawn 等於繞過收尾流程。
+# 機制上不擋，但審計要看得出這次回收沒有筆記（見 cmd_despawn 的 ev 判定）
+assert "agents.log 記 despawned-unsaved w1（未宣告 disposable，繞過了收尾）" \
+  grep -qE "Z despawned-unsaved w1 ${pane_w1} codex\$" "$DSPAWN/agents.log"
 assert_fails "despawn 未註冊 agent 報錯" ab "$DSPAWN" despawn w1
 assert_fails "despawn：名稱不合法被拒" ab "$DSPAWN" despawn "bad name"
 
@@ -712,8 +714,8 @@ tmx kill-pane -t "$pane_w7"
 ab "$DSPAWN" despawn w7 2>/dev/null; rc=$?
 assert "死 pane despawn：exit 0" test "$rc" -eq 0
 assert "死 pane despawn：registry 已清" test ! -e "$DSPAWN/agents/w7.json"
-assert "死 pane despawn：agents.log 記 despawned" \
-  grep -qE "Z despawned w7 " "$DSPAWN/agents.log"
+assert "死 pane despawn：agents.log 記下這次回收（未宣告 disposable → unsaved）" \
+  grep -qE "Z despawned-unsaved w7 " "$DSPAWN/agents.log"
 
 # ---- 18b. despawn 的出身證據＝pane 啟動指令的 tag（codex 第三輪 FAIL 1） ----
 # pane id 會被 tmux 重用（不同 server／server 重啟後計數器歸零），registry 也
@@ -1885,55 +1887,55 @@ mk_task() {
 }
 OLD_TS="2020-01-01T00:00:00Z"
 NEW_TS="$(date -u +%FT%TZ)"
-mk_task 20200101T000000Z-old1 completed "$OLD_TS"
-mk_task 20200101T000000Z-old2 cancelled "$OLD_TS"
-mk_task 20200101T000000Z-live running   "$OLD_TS"
-mk_task 20200101T000000Z-note completed "$OLD_TS" 1
-mk_task 20200101T000000Z-quee queued    "$OLD_TS"
-mk_task 20260101T000000Z-new1 completed "$NEW_TS"
+mk_task 20200101T000000Z-0a01 completed "$OLD_TS"
+mk_task 20200101T000000Z-0a02 cancelled "$OLD_TS"
+mk_task 20200101T000000Z-0a03 running   "$OLD_TS"
+mk_task 20200101T000000Z-0a04 completed "$OLD_TS" 1
+mk_task 20200101T000000Z-0a05 queued    "$OLD_TS"
+mk_task 20260101T000000Z-0b01 completed "$NEW_TS"
 # 判不出年紀的：壞掉的 created_at 不該讓它被當成很舊而刪掉
-mk_task 20200101T000000Z-bad1 completed "not-a-timestamp"
+mk_task 20200101T000000Z-0a06 completed "not-a-timestamp"
 
 # 28a. 預設是試算：一個都不能真的刪
 gc_out="$(ab "$DGC" gc --older-than 1 2>/dev/null)"
 assert "gc：預設只試算，不刪任何東西" \
-  test -d "$DGC/tasks/20200101T000000Z-old1"
+  test -d "$DGC/tasks/20200101T000000Z-0a01"
 assert "gc：試算列出可刪的舊終態 task" \
-  bash -c "grep -q '20200101T000000Z-old1' <<< '$gc_out'"
+  bash -c "grep -q '20200101T000000Z-0a01' <<< '$gc_out'"
 assert "gc：試算不列出未完成的 task" \
-  bash -c "! grep -q '20200101T000000Z-live' <<< '$gc_out'"
+  bash -c "! grep -q '20200101T000000Z-0a03' <<< '$gc_out'"
 assert "gc：試算不列出收尾筆記（pinned）" \
-  bash -c "! grep -q '20200101T000000Z-note' <<< '$gc_out'"
+  bash -c "! grep -q '20200101T000000Z-0a04' <<< '$gc_out'"
 
 # 28b. --apply：該刪的刪、三道保留線一條都不能破
 ab "$DGC" gc --older-than 1 --apply >/dev/null 2>&1
 assert "gc：--apply 刪掉夠舊的 completed" \
-  test ! -d "$DGC/tasks/20200101T000000Z-old1"
+  test ! -d "$DGC/tasks/20200101T000000Z-0a01"
 assert "gc：--apply 刪掉夠舊的 cancelled" \
-  test ! -d "$DGC/tasks/20200101T000000Z-old2"
+  test ! -d "$DGC/tasks/20200101T000000Z-0a02"
 # ★ 保留線一：進行中的任務不是垃圾，刪掉等於把還在跑的工作抹掉
 assert "gc：running 的 task 不刪（未完成一律保留）" \
-  test -d "$DGC/tasks/20200101T000000Z-live"
+  test -d "$DGC/tasks/20200101T000000Z-0a03"
 assert "gc：queued 的 task 不刪（還沒人取）" \
-  test -d "$DGC/tasks/20200101T000000Z-quee"
+  test -d "$DGC/tasks/20200101T000000Z-0a05"
 # ★ 保留線二：evict 的收尾筆記是這一層刻意留下的脈絡。它若會被 gc 清掉，
 # 「上下文不會憑空消失」就只是延後兌現
 assert "gc：pinned 的收尾筆記不刪（預設）" \
-  test -d "$DGC/tasks/20200101T000000Z-note"
+  test -d "$DGC/tasks/20200101T000000Z-0a04"
 # ★ 保留線三：判不出年紀就不刪
 assert "gc：created_at 壞掉的 task 不刪（判不出年紀就留著）" \
-  test -d "$DGC/tasks/20200101T000000Z-bad1"
+  test -d "$DGC/tasks/20200101T000000Z-0a06"
 assert "gc：未滿保留期的 task 不刪" \
-  test -d "$DGC/tasks/20260101T000000Z-new1"
+  test -d "$DGC/tasks/20260101T000000Z-0b01"
 assert "gc：執行後 locks/ 為空（每個 task 各取各的鎖，不得殘留）" \
   test -z "$(ls -A "$DGC/locks")"
 
 # 28c. --include-notes 才動筆記，且仍受其他兩條線約束
 ab "$DGC" gc --older-than 1 --apply --include-notes >/dev/null 2>&1
 assert "gc：--include-notes 才刪得掉收尾筆記" \
-  test ! -d "$DGC/tasks/20200101T000000Z-note"
+  test ! -d "$DGC/tasks/20200101T000000Z-0a04"
 assert "gc：--include-notes 仍不刪未完成的 task" \
-  test -d "$DGC/tasks/20200101T000000Z-live"
+  test -d "$DGC/tasks/20200101T000000Z-0a03"
 
 # 28d. 參數防線
 assert_fails "gc：--older-than 非數字被拒" ab "$DGC" gc --older-than abc
@@ -1962,6 +1964,107 @@ ab "$DGP" register plain-a "$PANE_A" >/dev/null 2>&1
 tid_pl="$(ab "$DGP" send plain-a --from alice --message "一般任務" 2>/dev/null)"
 assert "gc：一般 send 不帶 pinned（否則 gc 等於失效）" \
   test "$(jq -r '.pinned // false' "$DGP/tasks/$tid_pl/metadata.json")" = false
+
+# ---- 29. 第二輪獨立複核的修補（2026-07-23）----
+DR2="$TESTROOT/drev2"
+mkdir -p "$DR2"/{agents,tasks,locks}
+
+# 29a. I1：直接 despawn 一個未宣告 disposable 的 worker，審計要看得出沒筆記。
+# 機制上不擋（擋了會逼出 --force，習慣性加旗標等於沒有防線），但審計線不能
+# 跟一次乾淨回收長得一模一樣
+absp "$DR2" 0 spawn r1 --runtime codex >/dev/null 2>&1
+ab "$DR2" despawn r1 >/dev/null 2>&1
+assert "I1：未宣告 disposable 就直接 despawn → 審計記 despawned-unsaved" \
+  grep -qE "Z despawned-unsaved r1 " "$DR2/agents.log"
+# 宣告過的則是一次乾淨的回收，不該被記成有損失
+absp "$DR2" 0 spawn r2 --runtime codex >/dev/null 2>&1
+ab "$DR2" disposable r2 >/dev/null 2>&1
+ab "$DR2" despawn r2 >/dev/null 2>&1
+assert "I1：宣告過 disposable 的 despawn 記 despawned（不是 unsaved）" \
+  grep -qE "Z despawned r2 " "$DR2/agents.log"
+assert_fails "I1：宣告過的不得被記成 unsaved（否則記號分不出真正的損失）" \
+  grep -qE "Z despawned-unsaved r2 " "$DR2/agents.log"
+# evict 走過收尾流程，筆記已處理，不該再記 unsaved
+absp "$DR2" 0 spawn r3 --runtime codex >/dev/null 2>&1
+ab "$DR2" evict r3 --timeout 1 >/dev/null 2>&1
+assert_fails "I1：evict 的 despawn 不記 unsaved（收尾流程已跑過）" \
+  grep -qE "Z despawned-unsaved r3 " "$DR2/agents.log"
+
+# 29b. I2：spawn_tag 空 → generation 綁定會整條失效，這時 evict 必須拒絕動作，
+# 而不是帶著一個形同不存在的綁定往下走
+pane_r4="$(absp "$DR2" 0 spawn r4 --runtime codex 2>/dev/null)"
+jq 'del(.spawn_tag)' "$DR2/agents/r4.json" > "$DR2/agents/r4.tmp" \
+  && mv "$DR2/agents/r4.tmp" "$DR2/agents/r4.json"
+before_t_r4="$(task_count "$DR2")"
+assert_fails "I2：registry 沒有 spawn_tag → evict 拒絕（綁定會失效）" \
+  ab "$DR2" evict r4 --timeout 1
+assert "I2：拒絕時不送收尾任務（不留孤兒）" \
+  test "$(task_count "$DR2")" -eq "$before_t_r4"
+assert "I2：拒絕時 pane 未被動" pane_alive "$pane_r4"
+ab "$DR2" despawn r4 >/dev/null 2>&1 || true
+tmx kill-pane -t "$pane_r4" 2>/dev/null || true
+
+# 29c. I3：gc 不能刪掉「宣告已失效」的證據。idle 判斷宣告有沒有被後續任務推翻
+# 靠的是掃 tasks/；那個任務被清掉，宣告就會從 expired 復活成 yes，
+# orchestrator 據此直接回收一個其實已有新脈絡的 worker
+DR3="$TESTROOT/drev3"
+mkdir -p "$DR3"/{agents,tasks,locks}
+absp "$DR3" 0 spawn r5 --runtime codex >/dev/null 2>&1
+ab "$DR3" disposable r5 >/dev/null 2>&1
+sleep 1
+tid_r5="$(ab "$DR3" send r5 --from alice --message "宣告後的新任務" 2>/dev/null)"
+ab "$DR3" receive "$tid_r5" >/dev/null 2>&1
+ab "$DR3" reply "$tid_r5" --message "done" >/dev/null 2>&1
+assert "I3：宣告後被派工 → idle 顯示 expired（前提）" \
+  test "$(idle_field "$DR3" r5 3)" = expired
+ab "$DR3" gc --older-than 0 --apply >/dev/null 2>&1
+assert "I3：gc 不得刪掉讓宣告失效的那個任務（它是唯一的證據）" \
+  test -d "$DR3/tasks/$tid_r5"
+# ★ 核心斷言：gc 跑完之後，宣告不能復活
+assert "I3：gc 之後 idle 仍是 expired（宣告不得復活成 yes）" \
+  test "$(idle_field "$DR3" r5 3)" = expired
+ab "$DR3" despawn r5 >/dev/null 2>&1 || true
+
+# 29e. I6：despawn 走 stale 路徑時（registry 清掉了、但那個 pane 已不屬於這個
+# agent，沒被回收）return 0，evict 不能把它當成回收成功而補一筆 evicted——
+# 那會讓審計線宣稱發生過一次沒發生的回收。
+# 模擬：回覆前把 registry 的 pane_id 指到另一個活著、但啟動指令不帶本 agent
+# tag 的 pane
+absp "$DR2" 0 spawn r6 --runtime codex >/dev/null 2>&1
+(
+  sleep 0.8
+  for (( i = 0; i < 150; i++ )); do
+    for d in "$DR2"/tasks/*/; do
+      [[ -f "$d/metadata.json" ]] || continue
+      [[ "$(jq -r '.to // ""' "$d/metadata.json" 2>/dev/null)" == r6 ]] || continue
+      [[ "$(<"$d/status")" == queued ]] || continue
+      jq --arg p "$PANE_A" '.pane_id = $p' "$DR2/agents/r6.json" \
+        > "$DR2/agents/r6.tmp" && mv "$DR2/agents/r6.tmp" "$DR2/agents/r6.json"
+      ab "$DR2" receive "$(basename "$d")" >/dev/null 2>&1
+      ab "$DR2" reply "$(basename "$d")" --message "筆記" >/dev/null 2>&1
+      exit 0
+    done
+    sleep 0.2
+  done
+) &
+ab "$DR2" evict r6 --timeout 20 >/dev/null 2>&1
+wait
+assert "I6：despawn 走 stale（pane 未回收）時不得寫 evicted 審計" \
+  bash -c "! grep -qE 'Z evicted r6 ' '$DR2/agents.log'"
+assert "I6：stale 本身仍要留審計（註冊確實被清掉了）" \
+  grep -qE "Z despawn-stale r6 " "$DR2/agents.log"
+assert "I6：被指到的無辜 pane 不得被回收" pane_alive "$PANE_A"
+
+# 29d. I5：gc 只碰 send 生成的形狀。公開的 TASK_ID_RE 連 `foo` 都算合法，
+# 拿它當刪除門檻等於把任何人放進 tasks/ 的目錄都納入清理範圍
+mkdir -p "$DR3/tasks/foo"
+jq -n '{version:1, task_id:"foo", from:"a", to:"b",
+        created_at:"2020-01-01T00:00:00Z", updated_at:"2020-01-01T00:00:00Z",
+        working_directory:"/tmp", status:"completed"}' > "$DR3/tasks/foo/metadata.json"
+printf 'completed\n' > "$DR3/tasks/foo/status"
+ab "$DR3" gc --older-than 0 --apply >/dev/null 2>&1
+assert "I5：不是 send 生成的目錄名不刪（唯一會 rm 的路徑要保守）" \
+  test -d "$DR3/tasks/foo"
 
 # ---- 總結 ----
 printf '\n共 %d PASS、%d FAIL\n' "$PASS" "$FAIL"
