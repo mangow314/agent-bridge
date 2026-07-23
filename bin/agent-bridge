@@ -979,7 +979,20 @@ cmd_spawn() {
   else
     prompt_arg="$(worker_prompt_arg "$name" "$brief_path")"
   fi
-  tagged_cmd="AGENT_BRIDGE_SPAWN_TAG=$tag exec $runtime_cmd $prompt_arg"
+  # proxy 環境穿透：pane 的環境繼承自 tmux server，不是 spawn 呼叫者——
+  # orchestrator shell 才有的 proxy 變數（profile/alias 注入）到不了 worker，
+  # 在強制走 proxy 的網路裡 runtime 會直連而死（work 機實測：內網 MITM 憑證
+  # 過期，SSL 錯誤）。故把呼叫者環境裡的標準 proxy 變數拼進啟動指令。
+  # 值以 printf %q 逐個跳脫（值來自 orchestrator 自己的環境，與執行 spawn 的
+  # 人同一信任域，跳脫是防意外拆詞，不是防注入）；空值照傳（保持與呼叫者
+  # 環境等價）。tag 必須維持第一個 token：rollback 與 despawn 都以
+  # 「tag＋空白」做 pane_start_command 前綴比對
+  local proxy_env="" pv
+  for pv in http_proxy https_proxy all_proxy no_proxy \
+            HTTP_PROXY HTTPS_PROXY ALL_PROXY NO_PROXY; do
+    [[ -n "${!pv+x}" ]] && proxy_env+="$pv=$(printf %q "${!pv}") "
+  done
+  tagged_cmd="AGENT_BRIDGE_SPAWN_TAG=$tag ${proxy_env}exec $runtime_cmd $prompt_arg"
   # 回滾比對的是「env 前綴＋一個空白」，見 spawn_rollback
   SPAWN_RB_TAG="AGENT_BRIDGE_SPAWN_TAG=$tag"
   if (( use_window == 1 )); then

@@ -211,6 +211,14 @@ agent-bridge despawn worker-1                          # 任務收尾：kill pan
   分隔符，**首字元強制英數**擋旗標走私（否則 `--model --bare` 等於往 worker
   啟動旗標塞任意開關）。不合法一律在建 pane 之前拒絕。模型名存進 registry 的
   `model` 欄，事後查得到「這個 worker 當時跑什麼」。
+- **proxy 環境穿透**：pane 的環境繼承自 tmux server，不是執行 spawn 的程序——
+  只存在 orchestrator 環境的 proxy 變數（例如以 `env https_proxy=… claude`
+  別名啟動的受限網路環境）到不了 worker，runtime 會直連而死（work 機實測：
+  內網 MITM 憑證擋下 SSL）。故 spawn 把呼叫者環境裡**有設定的**標準 proxy
+  變數（`http_proxy`／`https_proxy`／`all_proxy`／`no_proxy` 及大寫版）以
+  `printf %q` 跳脫後拼進啟動指令，未設定的不注入。值來自 orchestrator 自己的
+  環境、與執行 spawn 的人同一信任域，跳脫是防意外拆詞而非防注入；worker 環境
+  因此也帶著這些變數，授權的第三層 spawn 會繼續往下傳。
 - **啟動即注入 worker 守則**：spawn 出來的是一個零脈絡的全新 session——它不知道
   自己是 worker，也不知道 pane 裡收到的 `agent-bridge receive <id>` 是要執行的
   命令而不是有人在跟它說話。實測（codex 0.145）沒有守則時，它會把就緒探針當成

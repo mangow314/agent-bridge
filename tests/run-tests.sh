@@ -99,6 +99,7 @@ make_runtime_shim() {
 #!/usr/bin/env bash
 printf '%s ' "\$@" > "$TESTROOT/$rt-args.txt"
 printf '%s\0' "\$@" > "$TESTROOT/$rt-argv.txt"
+env > "$TESTROOT/$rt-env.txt"
 if [[ -e "$TESTROOT/$rt-fail" ]]; then exit 127; fi
 export AGENT_BRIDGE_DATA="$DSPAWN"
 delay="\$(cat "$TESTROOT/$rt-delay" 2>/dev/null || echo 2)"
@@ -843,6 +844,34 @@ assert "被拒的 spawn 不建 pane（pane 數不變）" \
 assert "被拒的 spawn 不留 registry" \
   bash -c "[[ ! -e '$DSPAWN/agents/wm3.json' ]]"
 assert_fails "despawn 後 claude worker 的 pane 消失" pane_alive "$pane_wc"
+
+# 16a4. proxy 環境穿透：pane 的環境繼承自 tmux server 而非 spawn 呼叫者，
+# orchestrator shell 的 proxy 變數必須拼進啟動指令才到得了 worker（work 機
+# 實測：runtime 直連被內網 MITM 擋下，第一隻 worker 陣亡）。env -u 清場＋
+# sentinel 值讓斷言不受宿主機真實 proxy 設定影響。no_proxy 值刻意帶空白與
+# 逗號：實作若退化成不跳脫（丟掉 printf %q），啟動指令在此拆詞、往返必損，
+# 兩層斷言（啟動指令片段＋worker 程序實拿的值）都會紅
+rm -f "$TESTROOT/claude-env.txt"
+env -u http_proxy -u all_proxy -u HTTP_PROXY -u HTTPS_PROXY -u ALL_PROXY -u NO_PROXY \
+    https_proxy='http://sentinel:1' no_proxy='st a,b' \
+    AGENT_BRIDGE_DATA="$DSPAWN" AGENT_BRIDGE_READY_TIMEOUT=20 \
+    AGENT_BRIDGE_READY_PROBE_INTERVAL=0.5 PATH="$SHIM:$PATH" \
+    "$BRIDGE" spawn wp1 --runtime claude >/dev/null 2>&1; rc=$?
+assert "spawn（帶 proxy 環境）：exit 0" test "$rc" -eq 0
+wp1_cmd="$(tmx display -pt "$(jq -r .pane_id "$DSPAWN/agents/wp1.json")" '#{pane_start_command}')"
+# tmux 存 pane_start_command 除了整條加雙引號，還會把反斜線跳脫成 \\
+# （實測 3.7b，獨立 socket + cat -A 驗證），故期望片段裡的 %q 反斜線要寫雙份
+wp1_frag=' https_proxy=http://sentinel:1 no_proxy=st\\ a\\,b exec '
+assert "啟動指令帶跳脫後的 proxy 前綴，且 tag 仍是第一個 token" \
+  bash -c "c=${wp1_cmd@Q}; f=${wp1_frag@Q}; c=\"\${c#\\\"}\"; [[ \"\$c\" == AGENT_BRIDGE_SPAWN_TAG=ab-spawn-wp1-* && \"\$c\" == *\"\$f\"* ]]"
+assert "未設定的 proxy 變數不被注入啟動指令" \
+  bash -c "c=${wp1_cmd@Q}; [[ \"\$c\" != *' http_proxy='* && \"\$c\" != *' all_proxy='* && \"\$c\" != *' HTTP_PROXY='* && \"\$c\" != *' HTTPS_PROXY='* && \"\$c\" != *' ALL_PROXY='* && \"\$c\" != *' NO_PROXY='* ]]"
+assert "worker 程序環境實拿 https_proxy（sentinel 值完整）" \
+  grep -Fxq 'https_proxy=http://sentinel:1' "$TESTROOT/claude-env.txt"
+assert "worker 程序環境實拿含空白逗號的 no_proxy（%q 跳脫往返無損）" \
+  grep -Fxq 'no_proxy=st a,b' "$TESTROOT/claude-env.txt"
+assert "帶 proxy 前綴的 worker 可正常 despawn（tag 綁定比對不受影響）" \
+  ab "$DSPAWN" despawn wp1
 
 # 16b. 參數與名稱衝突拒絕
 assert_fails "spawn 已註冊（spawned）名稱被拒" absp "$DSPAWN" 0 spawn w1 --runtime codex
