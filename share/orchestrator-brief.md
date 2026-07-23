@@ -40,7 +40,9 @@ worker 做完一件事**不代表它該死**。它腦裡可能還留著沒寫進
 的 worker，等於用新任務把它腦裡的殘值擠掉，比殺了它更糟：cap 沒省下，殘值卻沒
 了，而且沒有筆記。
 
-**換 runtime／組態時一律 spawn 新的**，不要試圖改造既有 worker。
+**換 runtime／組態時一律 spawn 新的**，不要試圖改造既有 worker；因此不再
+需要的舊 worker，回到一般回收流程處置——照下面「撞 cap 的流程」一樣走
+`evict`，換組態不構成直接 `despawn` 的授權。
 
 ## spawn 時指定 --model：別讓 worker 繼承你的模型
 
