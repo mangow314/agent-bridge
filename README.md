@@ -30,6 +30,35 @@ things they can't do:
 In one sentence: agent-bridge is **a layer of context that outlives the main
 session's wipes**.
 
+## Compared with agent teams and other approaches
+
+**Claude Code agent teams** (experimental, behind
+`CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS`) solve a different problem: running a
+team of Claude sessions inside one session. Their coordination is much richer
+than agent-bridge — shared task list, teammate-to-teammate messaging,
+self-claiming — and split-pane mode lets you click into a teammate just like a
+bridge worker. The hard boundaries are what matter
+([docs](https://code.claude.com/docs/en/agent-teams), v2.1.178): every
+teammate is Claude; one team per session, the lead is fixed for life and the
+team dies with the session (`/resume` doesn't bring in-process teammates
+back); teammates can't spawn their own teams. agent-bridge workers are plain
+independent CLI sessions: a worker can be codex, it hangs off no lead, the
+main session can `/clear` or restart without touching it, `relay` hands
+leadership to a successor, and an authorized worker can delegate another
+layer down. The trade-off is simple: all-Claude tight collaboration → agent
+teams; cross-vendor, or workers that must outlive the main session →
+agent-bridge.
+
+**MCP cross-calls** (wrapping codex as an MCP server for claude to call) are
+synchronous: the caller's turn blocks, and the full reply lands in the
+caller's context — exactly what you were trying to avoid. `send` returns
+immediately; the reply sits in the mailbox until you `read` it.
+
+**API-level frameworks** (LangGraph, AutoGen, ...) orchestrate API calls —
+you manage keys, tools, and context yourself. agent-bridge orchestrates the
+CLI you already use by hand: workers inherit their CLI's own settings,
+permissions, and hooks, the same as a pane you opened yourself.
+
 ## Requirements
 
 `bash`, `jq`, `tmux`. Nothing else — no daemon, no network service.
@@ -42,11 +71,12 @@ ln -s ~/projects/agent-bridge/bin/agent-bridge ~/.local/bin/agent-bridge
 command -v agent-bridge   # should resolve to the symlink
 ```
 
-Optional — load the delegation-protocol skill into Claude Code:
+Optional — load the delegation-protocol skill into Claude Code by symlinking
+the whole repo as the skill directory (SKILL.md references `share/` briefs by
+relative path, so they must sit next to it):
 
 ```bash
-mkdir -p ~/.claude/skills/agent-bridge
-ln -s ~/projects/agent-bridge/SKILL.md ~/.claude/skills/agent-bridge/SKILL.md
+ln -s ~/projects/agent-bridge ~/.claude/skills/agent-bridge
 ```
 
 ## Quickstart

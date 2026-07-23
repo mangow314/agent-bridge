@@ -9,8 +9,9 @@ description: >
 
 # agent-bridge 委派協定
 
-（正本在 repo；Claude Code 端把 `~/.claude/skills/agent-bridge/SKILL.md`
-symlink 指向本檔即可載入，見 README 安裝節。）
+（正本在 repo；Claude Code 端把整個 repo symlink 成
+`~/.claude/skills/agent-bridge` 即可載入本檔與 `share/` briefs，見 README
+安裝節。）
 
 ## 何時委派
 
@@ -66,7 +67,7 @@ agent-bridge read "$id"               # （sender）讀回覆原文（completed/
 
 ## Orchestrator 守則（spawn/despawn）
 
-**策略正本在 `share/orchestrator-brief.md`**（repo 內）：pane 生命週期的語意、
+**策略正本在 `share/orchestrator-brief.md`**（本 skill 目錄下）：pane 生命週期的語意、
 複用 vs spawn 的判準、撞 cap 的 `idle` → `evict` 流程、第三層委派的授權與成本。
 調度 worker 前先讀那份檔；這裡只留機制面的提要。
 
@@ -91,7 +92,7 @@ agent-bridge read "$id"               # （sender）讀回覆原文（completed/
 
 ## Worker 守則
 
-**正本在 `share/worker-brief.md`**（repo 內），這裡不重複一份以免漂移。
+**正本在 `share/worker-brief.md`**（本 skill 目錄下），這裡不重複一份以免漂移。
 以 worker 身分接任務前先讀那份檔；`spawn` 出來的 worker 由 bridge 在啟動時
 自動把該檔全文注入為第一則訊息，毋須人工提供。
 

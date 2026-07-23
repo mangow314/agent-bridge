@@ -25,6 +25,28 @@ context 保持短而乾淨。
 一句話：agent-bridge 是一層**活過主 session 清洗的 context**。這也是它的取捨
 裁判——一個提議若不服務上面四件事之一，就不屬於這裡。
 
+## 跟其他多 agent 做法的差別
+
+**官方 agent teams**（Claude Code 實驗功能，開 `CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS`
+才有）解的是另一個問題：一個 session 裡開一隊 Claude 協作。它的協調機制比
+agent-bridge 豐富得多——共享任務清單、隊員互傳訊息、self-claim，也支援 tmux
+分割 pane 讓你直接點進去介入，這點跟 agent-bridge 一樣。差別在三個硬邊界
+（v2.1.178 [官方文件](https://code.claude.com/docs/en/agent-teams)）：全隊只能是
+Claude；一個 session 恰好一隊，lead 終身固定、不能把主導權交出去，session 結束
+隊伍就散（`/resume` 不會把 in-process 隊員帶回來）；隊員不能再開自己的隊。
+agent-bridge 的 worker 是各自獨立的 CLI session：可以是 codex，不掛在任何 lead
+底下，主 session `/clear` 或整個重開都動不到它；`relay` 就是把主導權交給下一棒；
+worker 經授權還能往下再開一層。所以取捨很直接——全用 Claude、要的是一場緊密
+協作，開 agent teams；要跨廠、要 worker 活得比主 session 久，才輪到 agent-bridge。
+
+**MCP 跨呼叫**（把 codex 包成 MCP server 給 claude 呼叫）：同步請求—回應，
+呼叫方整個 turn 卡著等，回覆全文直接灌進呼叫方的 context——這正是想避免的事。
+agent-bridge 的 `send` 丟出去就走，回覆躺在 mailbox，要讀的時候再 `read`。
+
+**API 級框架**（LangGraph、AutoGen 這類）：編排的對象是 API 呼叫，key、tool、
+context 管理都要自己來。agent-bridge 編排的是你平常手上在用的那個 CLI——worker
+繼承各自 CLI 的設定、權限、hooks，跟你自己開一個 pane 敲指令是同一件事。
+
 ## 架構
 
 三個組成，全部本機、無常駐程序：
@@ -89,13 +111,12 @@ ln -s ~/projects/agent-bridge/bin/agent-bridge ~/.local/bin/agent-bridge
 command -v agent-bridge   # 應解析到 symlink
 ```
 
-Claude Code 的委派協定 skill：把 `~/.claude/skills/agent-bridge/SKILL.md`
-symlink 指向 repo 內的 `SKILL.md` 即可載入（用 dotfiles 管理器管理這條
-symlink 亦可，效果等價）：
+Claude Code 的委派協定 skill：把**整個 repo** symlink 成 skill 目錄
+（SKILL.md 以相對路徑引用 `share/` 的 briefs，必須跟它們同目錄才解析得到；
+用 dotfiles 管理器管理這條 symlink 亦可，效果等價）：
 
 ```bash
-mkdir -p ~/.claude/skills/agent-bridge
-ln -s ~/projects/agent-bridge/SKILL.md ~/.claude/skills/agent-bridge/SKILL.md
+ln -s ~/projects/agent-bridge ~/.claude/skills/agent-bridge
 ```
 
 ## 指令
