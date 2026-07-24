@@ -22,6 +22,9 @@ TASK_ID_RE='^[A-Za-z0-9][A-Za-z0-9._-]*$'
 # 而它會被餵給 tmux。tmux 命令字串裡 `;` 是命令分隔符，
 # 一個 pane_id 寫成 `%1 ; kill-server` 就能殺掉整個 server
 PANE_RE='^%[0-9]+$'
+# registry 的 worker_window 同樣是不可信輸入且會被餵給 tmux（split-window -t），
+# 與 PANE_RE 同一套理由；@id 形式以外一律不採用
+WINDOW_RE='^@[0-9]+$'
 # --model 的值會被拼進 tagged_cmd（pane 的啟動命令字串），與 brief 路徑同級的
 # 暴露面，兩類都要擋：(1) 命令注入——字元集排除空白、引號、`;`、`$` 等 sh 與
 # tmux 的分隔符；(2) 旗標走私——首字元強制英數，否則 `--model --bare` 這種值
@@ -786,12 +789,40 @@ cmd_await() {
 
 # ---- spawn / despawn：worker pane 生命週期 ----
 
-# 審計：$DATA_DIR/agents.log 追加 <ts> spawned|despawned|disposable <name> <pane> <runtime>
+# 呼叫者定位："session_name:@window_id"。spawn 用它決定 worker 落點（owner），
+# 審計用它記行為者（actor）。只認 TMUX 與 TMUX_PANE 同時存在、且 display-message
+# 真的查得到的情況——TMUX_PANE 可能是繼承自已死 pane 或別台 server 的殘留值，
+# 查不到就視同 tmux 外
+caller_owner() {
+  [[ -n "${TMUX:-}" && -n "${TMUX_PANE:-}" ]] || return 1
+  local out
+  out="$(tmux display-message -p -t "$TMUX_PANE" '#{session_name}:#{window_id}' 2>/dev/null)" \
+    || return 1
+  [[ "$out" == *":@"* ]] || return 1
+  printf '%s\n' "$out"
+}
+
+# 審計：$DATA_DIR/agents.log 追加 <ts> <action> <name> <pane> <runtime> <actor>
 # disposable 也記一筆：它是回收決策的依據，日後若有「不該收的被收了」的爭議，
 # 審計線要能還原「誰在什麼時候宣告自己可拋」
+# actor＝動作執行者的呼叫者定位（tmux 外為 -）：despawn/evict 是公開指令，多
+# orchestrator 並用時審計線要能還原「誰收的」。第 5 參數省略時就地解析
 log_agent_event() {
-  local action="$1" name="$2" pane="$3" runtime="$4"
-  printf '%s %s %s %s %s\n' "$(now_iso)" "$action" "$name" "$pane" "$runtime" \
+  local action="$1" name="$2" pane="$3" runtime="$4" actor="${5:-}"
+  if [[ -z "$actor" ]]; then
+    actor="$(caller_owner)" || actor="-"
+  fi
+  # audit 行是空白分隔的固定 6 欄，但 name 以外的欄位可能取自 worker 可寫
+  # 的 registry（disposable/despawn 讀出的 pane、runtime）或可偽造的環境
+  # （actor 的 TMUX_PANE 指向誰、session 名含空白）。欄位安全在這個唯一
+  # 咽喉點保證：全欄摺空白、空值補 -，不靠上游自律（獨立複核 2026-07-25
+  # 兩輪：actor 7 欄、pane/runtime 8 欄實例）。identity 維持 best-effort：
+  # actor 是 provenance，不是認證
+  name="${name//[[:space:]]/_}";       [[ -n "$name" ]] || name="-"
+  pane="${pane//[[:space:]]/_}";       [[ -n "$pane" ]] || pane="-"
+  runtime="${runtime//[[:space:]]/_}"; [[ -n "$runtime" ]] || runtime="-"
+  actor="${actor//[[:space:]]/_}";     [[ -n "$actor" ]] || actor="-"
+  printf '%s %s %s %s %s %s\n' "$(now_iso)" "$action" "$name" "$pane" "$runtime" "$actor" \
     >> "$DATA_DIR/agents.log"
 }
 
@@ -1002,6 +1033,27 @@ cmd_spawn() {
   command -v "${runtime_cmd%% *}" >/dev/null 2>&1 \
     || die "找不到 runtime 指令：${runtime_cmd%% *}"
 
+  # owner 定位：worker 的落點跟著 orchestrator 走，不跟著使用者的眼睛走。
+  # tmux 對不帶 -t 的 split/new-window 解析到「attached client 的 active
+  # window」——orchestrator 放在背景 window 跑時，worker 會切進使用者正在
+  # 作業的視窗（實際故障回報 2026-07-25）。tmux 外呼叫或 TMUX_PANE 已失效
+  # 則 owner 為空，落點維持舊行為
+  # owner_win 另存 @window_id：new-window 的 -t 是 target-window、拒收 pane id
+  # （實測 "can't specify pane here"），錨點必須用 window 形式。session 名稱
+  # 理論上可含冒號，取尾段後再驗 WINDOW_RE，格式不對就整組放棄 owner
+  local owner="" owner_win="" owner_winname=""
+  if owner="$(caller_owner)"; then
+    owner_win="${owner##*:}"
+    if [[ "$owner_win" =~ $WINDOW_RE ]]; then
+      owner_winname="$(tmux display-message -p -t "$TMUX_PANE" '#{window_name}' 2>/dev/null)" \
+        || owner_winname=""
+    else
+      owner="" owner_win=""
+    fi
+  else
+    owner=""
+  fi
+
   # brief 讀不到就不開 pane：沒有守則的 worker 收到探針只會當成對話回覆，
   # 開出來也是壞的（正是這條路徑當初讓 Phase 4 gate 失敗）。檢查必須在建
   # pane 之前，理由同 validate_ready_opts：pane 落地後才 die 會留下一個
@@ -1077,10 +1129,56 @@ cmd_spawn() {
   tagged_cmd="AGENT_BRIDGE_SPAWN_TAG=$tag ${proxy_env}exec $runtime_cmd $prompt_arg"
   # 回滾比對的是「env 前綴＋一個空白」，見 spawn_rollback
   SPAWN_RB_TAG="AGENT_BRIDGE_SPAWN_TAG=$tag"
+  # per-owner worker window：同 owner 先前的 worker window 還活著就沿用（split
+  # 進去＋tiled 重排），否則新建一個緊鄰 orchestrator window 之後。回查走
+  # registry 的 worker_window @id，不比對 window 名字——名字可改可撞，@id 在
+  # server 存活期間唯一。--window 的專屬視窗不寫 worker_window，不會被撿去
+  # 共用。查表在 registry 鎖內：兩個並行 spawn 不會為同一 owner 各開一窗
+  local worker_win="" wf ww
+  if [[ -n "$owner" ]] && (( use_window == 0 )); then
+    for wf in "$AGENTS_DIR"/*.json; do
+      [[ -e "$wf" ]] || continue
+      ww="$(jq -r --arg o "$owner" \
+        'select((.owner // "") == $o) | .worker_window // empty' "$wf" 2>/dev/null)" \
+        || continue
+      [[ "$ww" =~ $WINDOW_RE ]] || continue
+      tmux list-windows -a -F '#{window_id}' 2>/dev/null | grep -Fx "$ww" >/dev/null \
+        || continue
+      # 反 confused-deputy（獨立複核 2026-07-25 兩輪收斂）：registry 對每個
+      # worker 可寫，@id 語法合法、window 存在都冒充得了；第一版 gate 驗
+      # 「同 session＋ab: 名稱」仍被第二輪反例擊穿——同 session 冒用他 owner
+      # 的合法 worker window。信任根源必須放在攻擊面之外：建窗時把 owner 印
+      # 記寫進 tmux 視窗選項 @ab_owner，沿用前驗證其值等於「本次 live 解析」
+      # 的 owner——只能寫 registry 的攻擊者碰不到 tmux 選項。未設選項時
+      # show-options 以非零收場（實測 tmux 3.7b），一樣走 continue。有 tmux
+      # 權限的敵意 agent 仍可繞（tmux 無隔離，見 README 已知限制），不在此
+      # 層防禦範圍
+      local ww_owner
+      ww_owner="$(tmux show-options -wv -t "$ww" '@ab_owner' 2>/dev/null)" \
+        || continue
+      [[ "$ww_owner" == "$owner" ]] || continue
+      worker_win="$ww"
+      break
+    done
+  fi
   if (( use_window == 1 )); then
-    pane="$(tmux new-window -dP -F '#{pane_id}' "$tagged_cmd")" \
+    if [[ -n "$owner" ]]; then
+      # 錨定在 orchestrator window 之後；不帶 -t 的落點跟著 client 焦點走
+      pane="$(tmux new-window -dP -a -t "$owner_win" -F '#{pane_id}' "$tagged_cmd")" \
+        || die "tmux new-window 失敗"
+    else
+      pane="$(tmux new-window -dP -F '#{pane_id}' "$tagged_cmd")" \
+        || die "tmux new-window 失敗"
+    fi
+  elif [[ -n "$worker_win" ]]; then
+    pane="$(tmux split-window -dP -t "$worker_win" -F '#{pane_id}' "$tagged_cmd")" \
+      || die "tmux split-window 失敗"
+    tmux select-layout -t "$worker_win" tiled >/dev/null 2>&1 || true
+  elif [[ -n "$owner" ]]; then
+    pane="$(tmux new-window -dP -a -t "$owner_win" -n "ab:${owner_winname:-workers}" -F '#{pane_id}' "$tagged_cmd")" \
       || die "tmux new-window 失敗"
   else
+    # tmux 外呼叫（腳本、CI、測試）：無從得知 owner，維持舊行為切在目前視窗
     pane="$(tmux split-window -dP -F '#{pane_id}' "$tagged_cmd")" \
       || die "tmux split-window 失敗"
   fi
@@ -1093,6 +1191,35 @@ cmd_spawn() {
     die "runtime 啟動即失敗（pane $pane 已消失）：$runtime_cmd"
   fi
 
+  # 落點記錄與身分標示：worker_window 供同 owner 後續 spawn 沿用（--window 的
+  # 專屬視窗不共用故不寫）；pane 標題讓多 worker 同窗時邊框直接可辨識。標示
+  # 失敗不致命——pane 已活著，裝飾性操作不該讓 spawn 翻盤
+  local placed_win="" reg_win=""
+  placed_win="$(tmux display-message -p -t "$pane" '#{window_id}' 2>/dev/null)" \
+    || placed_win=""
+  [[ "$placed_win" =~ $WINDOW_RE ]] || placed_win=""
+  if [[ -n "$owner" ]] && (( use_window == 0 )); then
+    reg_win="$placed_win"
+  fi
+  if [[ -n "$reg_win" ]]; then
+    if [[ -n "$worker_win" ]]; then
+      # 沿用：印記已驗證存在且正確才走得進來，重寫只是冪等，失敗無害
+      tmux set-option -w -t "$reg_win" '@ab_owner' "$owner" 2>/dev/null || true
+    else
+      # 新建：這筆寫入是 trust root 的建立，失敗必須翻盤——靜默吞掉會做出
+      # 「spawn 成功但永不可沿用」的窗，違反「同 owner 沿用同一窗」的文件化
+      # 行為且無任何警告（獨立複核第三輪指出）。此點在 SPAWN_RB_PANE 之後、
+      # SPAWN_DONE 之前，die 由 EXIT trap 回滾（sole-pane window 隨 pane
+      # 一同消失）
+      tmux set-option -w -t "$reg_win" '@ab_owner' "$owner" 2>/dev/null \
+        || die "worker window 所有權印記（@ab_owner）寫入失敗，回滾 spawn"
+    fi
+  fi
+  tmux select-pane -t "$pane" -T "$name (${runtime}${model:+/$model})" 2>/dev/null || true
+  if [[ -n "$owner" ]]; then
+    tmux set-option -w -t "$pane" pane-border-status top 2>/dev/null || true
+  fi
+
   local ts doc
   ts="$(now_iso)"
   # spawn_tag 一併存進 registry：pane id 會被 tmux 重用（不同 server、server
@@ -1100,14 +1227,17 @@ cmd_spawn() {
   # despawn 殺之前用它跟 pane 的啟動指令對得上才動手
   # model 一併入 registry：空字串＝沿用 runtime CLI 的預設。回收決策（挑誰
   # evict）與事後追查（這個 worker 當時跑什麼模型）都用得到
+  # owner／worker_window 一併入 registry：owner 是 per-owner window 回查與審計
+  # 行為者的依據；空字串＝tmux 外 spawn（舊行為落點，無主）
   doc="$(jq -n --arg name "$name" --arg pane "$pane" --arg ts "$ts" --arg rt "$runtime" \
               --arg tag "$SPAWN_RB_TAG" --arg model "$model" \
+              --arg owner "$owner" --arg wwin "$reg_win" \
     '{name: $name, pane_id: $pane, registered_at: $ts,
       spawned: true, runtime: $rt, model: $model, spawned_at: $ts, ready: false,
-      spawn_tag: $tag}')"
+      spawn_tag: $tag, owner: $owner, worker_window: $wwin}')"
   SPAWN_RB_REG="$AGENTS_DIR/$name.json"
   printf '%s\n' "$doc" | atomic_write "$AGENTS_DIR/$name.json"
-  log_agent_event spawned "$name" "$pane" "$runtime"
+  log_agent_event spawned "$name" "$pane" "$runtime" "${owner:--}"
 
   # 註冊完成即視為 spawn 成功：一次賦值解除回滾，之後就緒逾時只警告不回滾
   SPAWN_DONE=1

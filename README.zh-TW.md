@@ -64,9 +64,17 @@ context 管理都要自己來。agent-bridge 編排的是你平常手上在用�
    `AGENT_BRIDGE_DATA` 覆蓋）：
    - `agents/<name>.json`：agent 註冊表（`{name, pane_id, registered_at}`；
      spawn 出身的另有 `spawned: true`、`runtime`、`model`（空字串＝runtime
-     預設）、`spawned_at`、`ready`、`spawn_tag`）
-   - `agents.log`：spawn/despawn 審計流，每行
-     `<ISO8601Z> spawned|despawned|despawn-stale <name> <pane> <runtime>`
+     預設）、`spawned_at`、`ready`、`spawn_tag`、`owner`（spawn 呼叫者的
+     `session:@window_id`，tmux 外為空）、`worker_window`（該 owner 共用
+     worker window 的 `@id`；`--window` 專屬視窗與 tmux 外 spawn 為空））
+   - `agents.log`：spawn/despawn 審計流，每行固定 6 欄
+     `<ISO8601Z> <action> <name> <pane> <runtime> <actor>`，action 詞彙表：
+     `spawned`、`despawned`、`despawned-unsaved`、`despawn-stale`、
+     `disposable`、`evicted`、`evicted-unfinished`、`evicted-timeout`
+     （`actor`＝動作執行者的 `session:@window_id`，tmux 外為 `-`。六欄不變量
+     在寫入點保證：全欄空白摺成 `_`、空值補 `-`——pane/runtime 可能取自
+     worker 可寫的 registry，欄位安全不靠上游。`actor` 取自呼叫端環境的
+     `TMUX_PANE`，屬 best-effort 溯源而非認證——呼叫者可偽造，見「已知限制」）
    - `tasks/<task-id>/`：每個任務一個目錄
      - `metadata.json`：`version`（本輪為 1）、`task_id`、`from`、`to`、
        `created_at`、`updated_at`、`working_directory`、`status`（時間一律
@@ -214,10 +222,25 @@ stderr 會印含 task-id 的警告，人工在對方 session 補跑 `receive` / 
 `spawn` 讓 orchestrator 直接開一個 worker pane 並註冊，不必人工 split＋register：
 
 ```bash
-pane=$(agent-bridge spawn worker-1 --runtime codex)   # 預設 split-window；--window 開新 window
+pane=$(agent-bridge spawn worker-1 --runtime codex)   # 預設進 per-owner worker window；--window 開專屬 window
 agent-bridge list          # worker-1  %N  starting → ready
 agent-bridge despawn worker-1                          # 任務收尾：kill pane＋除名＋審計
 ```
+
+- **落點（per-owner worker window）**：在 tmux 內呼叫時，worker 進「這個
+  orchestrator 專屬的 worker window」（緊鄰其 window 之後、名為
+  `ab:<orchestrator window 名>`、tiled 均分、pane 邊框顯示 `名稱 (runtime/model)`）；
+  同一 owner 再 spawn 會沿用同一窗。落點錨定在呼叫者（registry 記
+  `owner`＝`session:@window_id`），不跟著你正在看的視窗跑——owner 的粒度是
+  **orchestrator 所在的 tmux window**：不同 window 的 orchestrator 各自成窗，
+  同一 window 裡的多個 orchestrator（罕見形態）會共用 owner 與 worker
+  window。審計 `agents.log` 尾欄記行為者。沿用 registry 的 `worker_window`
+  前會驗證該窗的 tmux 視窗選項 `@ab_owner`（建窗時寫入）等於呼叫者本次
+  live 解析的 owner——印記存在 tmux 裡、「只能寫 registry」的攻擊者碰不到，
+  同 session 冒用他 owner 的 worker window 也對不上；驗不過就另建新窗。`--window` 開完全獨立的 window（不與其他 worker 共用）。tmux 外
+  呼叫（腳本、CI）無 owner 可錨定，退回「目前視窗往下 split」的舊行為。
+  pane 標題可能被 runtime 自己的終端 title（OSC）蓋掉（實測 codex REPL 會），
+  window 名不受影響。
 
 - **runtime 表**：
   - `codex` → `codex --profile agent-worker`（profile 內容：approval never＋

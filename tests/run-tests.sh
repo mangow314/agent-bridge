@@ -752,7 +752,7 @@ assert "spawn 以 --profile agent-worker 啟動 runtime" \
 assert "spawn 等到 ready：registry ready == true（探針重送生效）" \
   jq -e '.ready == true' "$DSPAWN/agents/w1.json"
 assert "agents.log 記 spawned w1" \
-  grep -qE "Z spawned w1 ${pane_w1} codex\$" "$DSPAWN/agents.log"
+  grep -qE "Z spawned w1 ${pane_w1} codex -\$" "$DSPAWN/agents.log"
 assert "list：spawned＋就緒 agent ready 欄為 ready" \
   list_has "$DSPAWN" "$(printf 'w1\t%s\tready' "$pane_w1")"
 assert "spawn 後 locks 無殘留" test -z "$(ls -A "$DSPAWN/locks" 2>/dev/null)"
@@ -799,7 +799,7 @@ assert "claude runtime argv 前兩個恰為 --permission-mode auto、第三個�
 assert "claude runtime 探針重送生效：ready == true" \
   jq -e '.ready == true' "$DSPAWN/agents/wc1.json"
 assert "agents.log 記 spawned wc1 … claude" \
-  grep -qE "Z spawned wc1 ${pane_wc} claude\$" "$DSPAWN/agents.log"
+  grep -qE "Z spawned wc1 ${pane_wc} claude -\$" "$DSPAWN/agents.log"
 assert "claude runtime worker 可正常 despawn" ab "$DSPAWN" despawn wc1
 
 # 16a3. spawn --model：模型下放。值會進 tagged_cmd（pane 啟動命令字串），
@@ -1002,7 +1002,7 @@ assert "despawn 後 registry 檔已刪" test ! -e "$DSPAWN/agents/w1.json"
 # 沒宣告過 disposable＝仍被視為有殘值，直接 despawn 等於繞過收尾流程。
 # 機制上不擋，但審計要看得出這次回收沒有筆記（見 cmd_despawn 的 ev 判定）
 assert "agents.log 記 despawned-unsaved w1（未宣告 disposable，繞過了收尾）" \
-  grep -qE "Z despawned-unsaved w1 ${pane_w1} codex\$" "$DSPAWN/agents.log"
+  grep -qE "Z despawned-unsaved w1 ${pane_w1} codex -\$" "$DSPAWN/agents.log"
 assert_fails "despawn 未註冊 agent 報錯" ab "$DSPAWN" despawn w1
 assert_fails "despawn：名稱不合法被拒" ab "$DSPAWN" despawn "bad name"
 
@@ -1706,7 +1706,7 @@ assert "relay registry：與 spawn 同一套欄位（共用 cmd_spawn）" \
   jq -e '.spawned == true and .runtime == "codex" and (.spawned_at | type == "string")' \
   "$DRELAY/agents/r1.json"
 assert "relay 寫 agents.log（審計線不因換命令而斷）" \
-  grep -qE "Z spawned r1 ${pane_r1} codex\$" "$DRELAY/agents.log"
+  grep -qE "Z spawned r1 ${pane_r1} codex -\$" "$DRELAY/agents.log"
 
 # 23b2. relay --model 直通 cmd_spawn（驗證正本在 spawn 的解析點，relay 不抄第二份）
 env AGENT_BRIDGE_DATA="$DRELAY" AGENT_BRIDGE_READY_TIMEOUT=0 \
@@ -2565,6 +2565,183 @@ assert_fails "send 來源檔不可讀：非零" \
 assert "寫入階段失敗仍零殘留（EXIT trap 回滾）" \
   test -z "$(ls -A "$D31C/tasks" 2>/dev/null)"
 chmod 600 "$BAD31"
+
+# ---- 32. spawn 落點：per-owner worker window＋owner/actor 審計（2026-07-25）----
+# 前面所有測例都在 tmux 外呼叫 spawn（TMUX 已 unset）→ 舊行為（目前視窗
+# split），上面已覆蓋。本節驗「orchestrator 本身在 pane 內」的新路徑：
+# worker 落進 owner 的 worker window（不交給 tmux 的 client 焦點解析）、
+# 同 owner 第二次 spawn 沿用同一窗、registry 記 owner/worker_window、
+# agents.log 尾欄記 actor、--window 專屬視窗不寫 worker_window。
+# 測試環境沒有 attached client，無從重現「落到使用者焦點視窗」的原始故障；
+# 能驗的是落點已被顯式錨定到 owner。
+D32="$TESTROOT/d32"
+orc_cmd="$(printf 'env AGENT_BRIDGE_DATA=%q AGENT_BRIDGE_READY_TIMEOUT=1 AGENT_BRIDGE_READY_PROBE_INTERVAL=0.5 PATH=%q bash --norc --noprofile' \
+  "$D32" "$SHIM:$PATH")"
+tmx new-session -d -s orc -x 200 -y 100 "$orc_cmd"
+ORC_PANE="$(tmx list-panes -t orc -F '#{pane_id}')"
+ORC_WIN="$(tmx display-message -p -t "$ORC_PANE" '#{window_id}')"
+ORC_IDX="$(tmx display-message -p -t "$ORC_PANE" '#{window_index}')"
+tmx send-keys -t "$ORC_PANE" "$(printf 'touch %q' "$TESTROOT/orc-ready")" Enter
+if ! wait_for 10 test -f "$TESTROOT/orc-ready"; then
+  bad "32 前置：orchestrator 假 pane 未就緒"
+fi
+# -a 錨定的 sentinel：orc window 之後先放一個窗。spawn 未錨定（append）時
+# worker 會落在 sentinel 之後，index 斷言才抓得到 mutation
+SENT32="$(tmx new-window -dP -t orc: -n sentinel32 -F '#{window_id}')"
+
+# 32a. in-pane spawn：worker 進新開的 worker window，不與 orchestrator 同窗
+tmx send-keys -t "$ORC_PANE" \
+  "agent-bridge spawn w32a --runtime codex >$TESTROOT/w32a.out 2>/dev/null; echo rc=\$? >$TESTROOT/w32a.done" Enter
+wait_for 20 test -f "$TESTROOT/w32a.done"
+W32A_PANE="$(cat "$TESTROOT/w32a.out" 2>/dev/null || true)"
+# 空 pane 變數不可餵給 display-message：-t '' 會解析到 current window，
+# 讓後面的比較在 spawn 失敗時空洞通過
+W32A_WIN=""
+[[ -n "$W32A_PANE" ]] && W32A_WIN="$(tmx display-message -p -t "$W32A_PANE" '#{window_id}' 2>/dev/null || true)"
+assert "32a in-pane spawn：worker pane 存活" pane_alive "$W32A_PANE"
+assert "32a worker 不與 orchestrator 同窗" \
+  test -n "$W32A_WIN" -a "$W32A_WIN" != "$ORC_WIN"
+assert "32a worker 與 orchestrator 同 session" \
+  test -n "$W32A_PANE" -a "$(tmx display-message -p -t "${W32A_PANE:-%none}" '#{session_name}' 2>/dev/null)" = "orc"
+# shellcheck disable=SC2329  # 經 assert 的 "$@" 間接呼叫
+win_name_is_ab() { [[ "$(tmx display-message -p -t "$1" '#{window_name}' 2>/dev/null)" == ab:* ]]; }
+assert "32a worker window 名帶 ab: 前綴" win_name_is_ab "$W32A_PANE"
+assert "32a worker window 緊鄰 orchestrator window 之後（-a 錨定）" \
+  test "$(tmx display-message -p -t "${W32A_PANE:-%none}" '#{window_index}' 2>/dev/null)" = "$(( ORC_IDX + 1 ))"
+assert "32a -a 錨定：sentinel 被擠到 worker window 之後" \
+  test "$(tmx display-message -p -t "$SENT32" '#{window_index}' 2>/dev/null)" = "$(( ORC_IDX + 2 ))"
+assert "32a worker window 開 pane-border-status top" \
+  test "$(tmx show-options -wv -t "${W32A_PANE:-%none}" pane-border-status 2>/dev/null)" = "top"
+assert "32a pane 標題＝name (runtime)" \
+  test "$(tmx display-message -p -t "$W32A_PANE" '#{pane_title}' 2>/dev/null)" = "w32a (codex)"
+# shellcheck disable=SC2016  # $o/$w 是 jq 的變數，不是 shell 展開
+assert "32a registry 記 owner（session:@window）" \
+  jq -e --arg o "orc:$ORC_WIN" '.owner == $o' "$D32/agents/w32a.json"
+# shellcheck disable=SC2016
+assert "32a registry 記 worker_window" \
+  jq -e --arg w "$W32A_WIN" '.worker_window == $w' "$D32/agents/w32a.json"
+assert "32a agents.log spawned 尾欄記 actor＝owner" \
+  grep -qE "Z spawned w32a [^ ]+ codex orc:@[0-9]+\$" "$D32/agents.log"
+
+# 32b. 同 owner 第二次 spawn：沿用同一個 worker window
+tmx send-keys -t "$ORC_PANE" \
+  "agent-bridge spawn w32b --runtime codex >$TESTROOT/w32b.out 2>/dev/null; echo rc=\$? >$TESTROOT/w32b.done" Enter
+wait_for 20 test -f "$TESTROOT/w32b.done"
+W32B_PANE="$(cat "$TESTROOT/w32b.out" 2>/dev/null || true)"
+W32B_WIN=""
+[[ -n "$W32B_PANE" ]] && W32B_WIN="$(tmx display-message -p -t "$W32B_PANE" '#{window_id}' 2>/dev/null || true)"
+assert "32b 第二個 worker 沿用同一 worker window" \
+  test -n "$W32B_WIN" -a "$W32B_WIN" = "$W32A_WIN"
+# layout 均分不變量：2 pane 高度差 ≤1。實測（tmux 3.7b）tiled 對 2 pane 是
+# 上下堆疊（h=49/50），與預設 split 的幾何不可區分——第二輪複核建議的
+# pane_left 相異斷言實測不成立。「刪 select-layout」的 mutation 要第三個
+# spawn（3 pane 網格 vs 連續對半切）才鎖得住，成本不划算，裁決不鎖
+# （同 31e/31g/31h 類）。此斷言保「不出現極端不均的退化排版」這個較弱
+# 但真實的不變量
+# 差值容忍 2 而非 1：pane-border-status top 每 pane 佔一行、不計入
+# pane_height，tiled 均分後實測 48/50（重現腳本 scratchpad repro32）
+mapfile -t W32HS < <(tmx list-panes -t "${W32A_WIN:-@none}" -F '#{pane_height}' 2>/dev/null)
+W32HDIFF=$(( ${W32HS[0]:-0} - ${W32HS[1]:-0} ))
+W32HDIFF=${W32HDIFF#-}
+assert "32b worker window 均分（2 pane、高度差 ≤2，含 border-status 行）" \
+  test "${#W32HS[@]}" -eq 2 -a "$W32HDIFF" -le 2
+
+# 32c. --window：獨立視窗、不寫 worker_window（不被後續 spawn 撿去共用）
+tmx send-keys -t "$ORC_PANE" \
+  "agent-bridge spawn w32c --runtime codex --window >$TESTROOT/w32c.out 2>/dev/null; echo rc=\$? >$TESTROOT/w32c.done" Enter
+wait_for 20 test -f "$TESTROOT/w32c.done"
+W32C_PANE="$(cat "$TESTROOT/w32c.out" 2>/dev/null || true)"
+W32C_WIN=""
+[[ -n "$W32C_PANE" ]] && W32C_WIN="$(tmx display-message -p -t "$W32C_PANE" '#{window_id}' 2>/dev/null || true)"
+assert "32c --window：獨立於 worker window 與 orchestrator 窗" \
+  test -n "$W32C_WIN" -a "$W32C_WIN" != "$W32A_WIN" -a "$W32C_WIN" != "$ORC_WIN"
+assert "32c --window 不寫 worker_window" \
+  jq -e '.worker_window == ""' "$D32/agents/w32c.json"
+
+# 32d. tmux 外 despawn：審計 actor 記 -（既有 tmux 外 spawned 的 - 已在
+# 測例 12/13 的行尾錨定斷言覆蓋）
+ab "$D32" despawn w32c >/dev/null 2>&1
+assert "32d tmux 外 despawn：actor 記 -" \
+  grep -qE "Z despawned-unsaved w32c [^ ]+ codex -\$" "$D32/agents.log"
+
+# 32e. 敵意 registry：worker_window 填「語法合法且存在」的 @id，一個指向
+# 他 session 的窗、一個指向同 session 但非 ab: 建窗——兩者都不得改寫落點
+# （confused-deputy gate：同 session＋ab: 前綴驗證，獨立複核 2026-07-25 指出）
+IT_WIN="$(tmx display-message -p -t "$PANE_A" '#{window_id}')"
+jq -n --arg o "orc:$ORC_WIN" --arg w "$IT_WIN" \
+  '{name:"evil-a",pane_id:"%99",registered_at:"t",spawned:true,runtime:"codex",
+    model:"",spawned_at:"t",ready:false,spawn_tag:"x",owner:$o,worker_window:$w}' \
+  > "$D32/agents/evil-a.json"
+jq -n --arg o "orc:$ORC_WIN" --arg w "$ORC_WIN" \
+  '{name:"evil-b",pane_id:"%99",registered_at:"t",spawned:true,runtime:"codex",
+    model:"",spawned_at:"t",ready:false,spawn_tag:"x",owner:$o,worker_window:$w}' \
+  > "$D32/agents/evil-b.json"
+tmx send-keys -t "$ORC_PANE" \
+  "AGENT_BRIDGE_MAX_SPAWN=8 agent-bridge spawn w32e --runtime codex >$TESTROOT/w32e.out 2>/dev/null; echo rc=\$? >$TESTROOT/w32e.done" Enter
+wait_for 20 test -f "$TESTROOT/w32e.done"
+W32E_PANE="$(cat "$TESTROOT/w32e.out" 2>/dev/null || true)"
+W32E_WIN=""
+[[ -n "$W32E_PANE" ]] && W32E_WIN="$(tmx display-message -p -t "$W32E_PANE" '#{window_id}' 2>/dev/null || true)"
+assert "32e 敵意 worker_window（他 session／非 ab: 窗）不改寫落點，仍用合法窗" \
+  test -n "$W32E_WIN" -a "$W32E_WIN" != "$IT_WIN" -a "$W32E_WIN" != "$ORC_WIN" -a "$W32E_WIN" = "$W32A_WIN"
+
+# 32g. 第二輪反例：同 session、ab: 名稱、但 @ab_owner 印記屬他 owner 的窗
+# ——不得沿用（registry-only 攻擊者可冒 owner／worker_window，冒不了 tmux
+# 視窗選項）
+EVIL32_WIN="$(tmx new-window -dP -t orc: -n 'ab:stolen' -F '#{window_id}')"
+tmx set-option -w -t "$EVIL32_WIN" '@ab_owner' 'orc:@999'
+jq -n --arg o "orc:$ORC_WIN" --arg w "$EVIL32_WIN" \
+  '{name:"evil-c",pane_id:"%99",registered_at:"t",spawned:true,runtime:"codex",
+    model:"",spawned_at:"t",ready:false,spawn_tag:"x",owner:$o,worker_window:$w}' \
+  > "$D32/agents/evil-c.json"
+tmx send-keys -t "$ORC_PANE" \
+  "AGENT_BRIDGE_MAX_SPAWN=8 agent-bridge spawn w32g --runtime codex >$TESTROOT/w32g.out 2>/dev/null; echo rc=\$? >$TESTROOT/w32g.done" Enter
+wait_for 20 test -f "$TESTROOT/w32g.done"
+W32G_PANE="$(cat "$TESTROOT/w32g.out" 2>/dev/null || true)"
+W32G_WIN=""
+[[ -n "$W32G_PANE" ]] && W32G_WIN="$(tmx display-message -p -t "$W32G_PANE" '#{window_id}' 2>/dev/null || true)"
+assert "32g 他 owner 印記的 ab: 窗不被沿用，仍用自己的窗" \
+  test -n "$W32G_WIN" -a "$W32G_WIN" != "$EVIL32_WIN" -a "$W32G_WIN" = "$W32A_WIN"
+
+# 32h. 污染 registry 的 pane/runtime（含空白）流進 disposable 審計——寫入點
+# 必須摺疊，欄位安全不靠上游（獨立複核第二輪 8 欄實例）
+jq -n \
+  '{name:"evil-d",pane_id:"bad pane",registered_at:"t",spawned:true,
+    runtime:"co dex",model:"",spawned_at:"t",ready:false,spawn_tag:"x"}' \
+  > "$D32/agents/evil-d.json"
+assert "32h 污染 registry 的 disposable 仍成功" ab "$D32" disposable evil-d
+assert "32h 污染欄位寫入審計前被摺疊" \
+  grep -qE "Z disposable evil-d bad_pane co_dex -\$" "$D32/agents.log"
+
+# 32i. 新建窗的 @ab_owner 印記寫入失敗必須翻盤回滾（第三輪複核指出：
+# 靜默吞掉會做出 spawn 成功但永不可沿用的窗）。選擇性 shim：只讓帶
+# @ab_owner 的 tmux 呼叫失敗，其餘轉真 tmux；用新 owner（orc2 window）
+# 觸發「新建」分支——orc 的既有合法窗走的是沿用分支（重寫失敗容忍）
+STAMPFAIL="$TESTROOT/stampfail"
+mkdir -p "$STAMPFAIL"
+# shellcheck disable=SC2016  # $@ 是 shim 腳本的內容，要 literal 不展開
+printf '#!/usr/bin/env bash\nfor a in "$@"; do [[ "$a" == "@ab_owner" ]] && exit 1; done\nunset TMUX\nexec %q -L %q -f /dev/null "$@"\n' \
+  "$REAL_TMUX" "$SOCK" > "$STAMPFAIL/tmux"
+chmod +x "$STAMPFAIL/tmux"
+ORC2_PANE="$(tmx new-window -dPF '#{pane_id}' -t orc: "$orc_cmd")"
+tmx send-keys -t "$ORC2_PANE" "$(printf 'touch %q' "$TESTROOT/orc2-ready")" Enter
+wait_for 10 test -f "$TESTROOT/orc2-ready"
+PANES_BEFORE_32I="$(pane_count)"
+tmx send-keys -t "$ORC2_PANE" \
+  "PATH=$STAMPFAIL:\$PATH AGENT_BRIDGE_MAX_SPAWN=16 agent-bridge spawn w32i --runtime codex >$TESTROOT/w32i.out 2>$TESTROOT/w32i.err; echo rc=\$? >$TESTROOT/w32i.done" Enter
+wait_for 20 test -f "$TESTROOT/w32i.done"
+assert "32i 印記寫入失敗：spawn 非零收場" \
+  bash -c "grep -q 'rc=0' '$TESTROOT/w32i.done' && exit 1 || grep -q 'rc=' '$TESTROOT/w32i.done'"
+assert "32i 死因確為印記寫入（非 cap 等他因）" \
+  grep -q '@ab_owner' "$TESTROOT/w32i.err"
+assert "32i 回滾：registry 無 w32i" bash -c "! test -e '$D32/agents/w32i.json'"
+W32I_SURVIVORS="$(tmx list-panes -a -F '#{pane_start_command}' 2>/dev/null | grep -c 'ab-spawn-w32i' || true)"
+assert "32i 回滾：無 w32i pane 殘留" test "$W32I_SURVIVORS" -eq 0
+assert "32i 回滾：pane 數回到 spawn 前" test "$(pane_count)" -eq "$PANES_BEFORE_32I"
+
+# 32f. 欄位安全不變量：agents.log 每行恰 6 個空白分隔欄（含 32h 的污染注入）
+assert "32f agents.log 每行恰 6 欄" \
+  bash -c "! grep -qEv '^[^ ]+ [^ ]+ [^ ]+ [^ ]+ [^ ]+ [^ ]+\$' '$D32/agents.log'"
 
 # ---- 總結 ----
 printf '\n共 %d PASS、%d FAIL\n' "$PASS" "$FAIL"

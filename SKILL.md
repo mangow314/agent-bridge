@@ -25,6 +25,10 @@ agent-bridge register <name> <tmux-target>
                                       # manually register an existing pane as an agent (unregister to remove)
 agent-bridge spawn <name> --runtime <codex|claude> [--model <model>] [--window]
                                       # open + register a worker pane; prints pane-id on stdout (no --model = that CLI's default)
+                                      # placement: workers land in this orchestrator's own worker window (created
+                                      # next to it, reused across spawns, tiled); owner granularity is the caller's
+                                      # tmux window; --window = a fully separate window; outside tmux it falls
+                                      # back to splitting the current window
 agent-bridge relay <name> --runtime <codex|claude> [--model <model>] --handoff <path> [--window] [--no-select] [--self-exit <my-name>]
                                       # hand over: open a successor pane (injects successor brief + handoff file); not a worker
 agent-bridge despawn <name>           # reclaim a bridge-spawned worker (manually registered agents are refused)
@@ -112,9 +116,13 @@ not cover.
 
 - **despawn only reclaims bridge-spawned workers**: a manually registered
   agent is someone else's session — the bridge refuses to kill it, and
-  you should not try either. The bridge does not track *which* session
-  spawned a worker, so not despawning another orchestrator's workers is
-  on you — when unsure, check `agents.log` first.
+  you should not try either. The registry records a best-effort `owner`
+  (`session:@window_id` of the spawning caller) and `agents.log` records
+  an `actor` per event, but the bridge does not *enforce* ownership —
+  not despawning another orchestrator's workers is still on you; when
+  unsure, check the registry's `owner` and `agents.log` first (both are
+  provenance hints, not authentication: the underlying `TMUX_PANE` is
+  caller-controlled).
 - Stale spawned registry entries after a tmux server restart (pane
   dead): just despawn them. A new pane may get the same pane id, but
   despawn checks the spawn tag in the pane's start command; on mismatch
