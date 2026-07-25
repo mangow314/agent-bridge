@@ -878,6 +878,33 @@ assert "worker 程序環境實拿含空白逗號的 no_proxy（%q 跳脫往返�
 assert "帶 proxy 前綴的 worker 可正常 despawn（tag 綁定比對不受影響）" \
   ab "$DSPAWN" despawn wp1
 
+# 16a5. AGENT_BRIDGE_PASS_ENV：白名單版的環境穿透。與 16a4 同一條理由（pane 繼承
+# tmux server 而非呼叫者），差別是變數由呼叫端指名。典型用途是 headless 姿態旗標
+# （例如 CLAUDE_UNATTENDED）——那類變數沒跟過去，pane 會靜默退回有人值守的寬鬆
+# 姿態，比明確失敗難察覺。值同樣刻意帶空白與逗號驗 %q 跳脫往返。
+rm -f "$TESTROOT/claude-env.txt"
+env AGENT_BRIDGE_DATA="$DSPAWN" AGENT_BRIDGE_READY_TIMEOUT=20 \
+    AGENT_BRIDGE_READY_PROBE_INTERVAL=0.5 PATH="$SHIM:$PATH" \
+    AGENT_BRIDGE_PASS_ENV='PE_SET,PE_UNSET' PE_SET='v 1,x' \
+    "$BRIDGE" spawn wp2 --runtime claude >/dev/null 2>&1; rc=$?
+assert "spawn（帶 PASS_ENV）：exit 0" test "$rc" -eq 0
+wp2_cmd="$(tmx display -pt "$(jq -r .pane_id "$DSPAWN/agents/wp2.json")" '#{pane_start_command}')"
+wp2_frag=' PE_SET=v\\ 1\\,x '
+assert "指名且已設的變數進啟動指令（%q 跳脫），tag 仍是第一個 token" \
+  bash -c "c=${wp2_cmd@Q}; f=${wp2_frag@Q}; c=\"\${c#\\\"}\"; [[ \"\$c\" == AGENT_BRIDGE_SPAWN_TAG=ab-spawn-wp2-* && \"\$c\" == *\"\$f\"* ]]"
+assert "指名但未設的變數不塞空值進啟動指令" \
+  bash -c "c=${wp2_cmd@Q}; [[ \"\$c\" != *' PE_UNSET='* ]]"
+assert "worker 程序環境實拿 PE_SET（含空白逗號，往返無損）" \
+  grep -Fxq 'PE_SET=v 1,x' "$TESTROOT/claude-env.txt"
+assert "spawn 不是接力鏈的一環，不下傳 relay 深度" \
+  bash -c "c=${wp2_cmd@Q}; [[ \"\$c\" != *AGENT_BRIDGE_RELAY_DEPTH=* ]]"
+assert "帶 PASS_ENV 前綴的 worker 可正常 despawn" ab "$DSPAWN" despawn wp2
+assert_fails "PASS_ENV 含不合法變數名被拒（擋往啟動指令拼接的意外詞）" \
+  env AGENT_BRIDGE_DATA="$DSPAWN" AGENT_BRIDGE_READY_TIMEOUT=0 PATH="$SHIM:$PATH" \
+      AGENT_BRIDGE_PASS_ENV='OK_ONE,bad-name' \
+    "$BRIDGE" spawn wp3 --runtime claude
+assert "PASS_ENV 被拒：不留 registry" test ! -e "$DSPAWN/agents/wp3.json"
+
 # 16b. 參數與名稱衝突拒絕
 assert_fails "spawn 已註冊（spawned）名稱被拒" absp "$DSPAWN" 0 spawn w1 --runtime codex
 ab "$DSPAWN" register manual-x "$PANE_A" 2>/dev/null
@@ -1818,6 +1845,96 @@ assert "接手者 brief 缺失：訊息指出讀不到接手者 brief" \
   grep -q '接手者 brief' "$TESTROOT/sb.err"
 assert "接手者 brief 缺失：不建 pane" test "$(pane_count)" -eq "$before_ho"
 assert "接手者 brief 缺失：不留 registry" test ! -e "$DRELAY/agents/r8.json"
+
+# 23h. 接力鏈深度上限。接手者守則明文鼓勵「context 吃緊就再交棒」，沒有上界就是
+# 無界遞迴——無人值守時一路接下去，燒掉的額度沒有天花板。深度靠
+# AGENT_BRIDGE_RELAY_DEPTH 逐棒下傳，人工起的第一棒沒有這個變數＝深度 0。
+# 獨立資料目錄＋放大 MAX_SPAWN：本段連開數個接手者，不想撞到與本主題無關的 cap。
+DDEPTH="$TESTROOT/ddepth"
+env AGENT_BRIDGE_DATA="$DDEPTH" AGENT_BRIDGE_READY_TIMEOUT=0 PATH="$SHIM:$PATH" \
+    AGENT_BRIDGE_MAX_SPAWN=20 \
+  "$BRIDGE" relay rd1 --runtime codex --handoff "$HANDOFF" --no-select >/dev/null 2>&1; rc=$?
+assert "relay 首棒（呼叫端未設深度）：exit 0" test "$rc" -eq 0
+rd1_cmd="$(tmx display -pt "$(jq -r .pane_id "$DDEPTH/agents/rd1.json")" '#{pane_start_command}')"
+assert "首棒下傳深度 1，且深度是 exec 前最後一個 env" \
+  bash -c "c=${rd1_cmd@Q}; [[ \"\$c\" == *' AGENT_BRIDGE_RELAY_DEPTH=1 exec '* ]]"
+
+env AGENT_BRIDGE_DATA="$DDEPTH" AGENT_BRIDGE_READY_TIMEOUT=0 PATH="$SHIM:$PATH" \
+    AGENT_BRIDGE_MAX_SPAWN=20 AGENT_BRIDGE_RELAY_DEPTH=3 \
+  "$BRIDGE" relay rd2 --runtime codex --handoff "$HANDOFF" --no-select >/dev/null 2>&1
+rd2_cmd="$(tmx display -pt "$(jq -r .pane_id "$DDEPTH/agents/rd2.json")" '#{pane_start_command}')"
+assert "深度逐棒遞增（3 → 4）" \
+  bash -c "c=${rd2_cmd@Q}; [[ \"\$c\" == *' AGENT_BRIDGE_RELAY_DEPTH=4 exec '* ]]"
+
+# 達預設上限（10）：必須在建 pane 之前擋下，否則留一個佔 cap 的孤兒
+before_d="$(pane_count)"
+env AGENT_BRIDGE_DATA="$DDEPTH" AGENT_BRIDGE_READY_TIMEOUT=0 PATH="$SHIM:$PATH" \
+    AGENT_BRIDGE_MAX_SPAWN=20 AGENT_BRIDGE_RELAY_DEPTH=10 \
+  "$BRIDGE" relay rd3 --runtime codex --handoff "$HANDOFF" --no-select \
+  >/dev/null 2>"$TESTROOT/rd.err"; rc=$?
+assert "達接力上限：非零退出" test "$rc" -ne 0
+assert "達接力上限：訊息點明需要人介入" grep -q '人介入' "$TESTROOT/rd.err"
+assert "達接力上限：不建 pane" test "$(pane_count)" -eq "$before_d"
+assert "達接力上限：不留 registry" test ! -e "$DDEPTH/agents/rd3.json"
+
+assert_fails "自訂上限同樣生效（MAX=2、已在第 2 棒）" \
+  env AGENT_BRIDGE_DATA="$DDEPTH" AGENT_BRIDGE_READY_TIMEOUT=0 PATH="$SHIM:$PATH" \
+      AGENT_BRIDGE_MAX_SPAWN=20 AGENT_BRIDGE_RELAY_DEPTH=2 AGENT_BRIDGE_MAX_RELAY_DEPTH=2 \
+    "$BRIDGE" relay rd4 --runtime codex --handoff "$HANDOFF" --no-select
+
+# 0 ＝ 解除限制（逃生門：人確認過這條鏈該繼續）
+env AGENT_BRIDGE_DATA="$DDEPTH" AGENT_BRIDGE_READY_TIMEOUT=0 PATH="$SHIM:$PATH" \
+    AGENT_BRIDGE_MAX_SPAWN=20 AGENT_BRIDGE_RELAY_DEPTH=99 AGENT_BRIDGE_MAX_RELAY_DEPTH=0 \
+  "$BRIDGE" relay rd5 --runtime codex --handoff "$HANDOFF" --no-select >/dev/null 2>&1; rc=$?
+assert "MAX_RELAY_DEPTH=0：不設限，深度 99 仍可交棒" test "$rc" -eq 0
+rd5_cmd="$(tmx display -pt "$(jq -r .pane_id "$DDEPTH/agents/rd5.json")" '#{pane_start_command}')"
+assert "解除限制時深度仍照常遞增（99 → 100）" \
+  bash -c "c=${rd5_cmd@Q}; [[ \"\$c\" == *' AGENT_BRIDGE_RELAY_DEPTH=100 exec '* ]]"
+
+assert_fails "深度非數值被拒（不默默當 0 放行）" \
+  env AGENT_BRIDGE_DATA="$DDEPTH" AGENT_BRIDGE_READY_TIMEOUT=0 PATH="$SHIM:$PATH" \
+      AGENT_BRIDGE_MAX_SPAWN=20 AGENT_BRIDGE_RELAY_DEPTH=abc \
+    "$BRIDGE" relay rd6 --runtime codex --handoff "$HANDOFF" --no-select
+assert_fails "上限非數值被拒" \
+  env AGENT_BRIDGE_DATA="$DDEPTH" AGENT_BRIDGE_READY_TIMEOUT=0 PATH="$SHIM:$PATH" \
+      AGENT_BRIDGE_MAX_SPAWN=20 AGENT_BRIDGE_MAX_RELAY_DEPTH=x \
+    "$BRIDGE" relay rd7 --runtime codex --handoff "$HANDOFF" --no-select
+
+# 邊界：空字串必須與非數值同樣 fail-closed。`${VAR:-default}` 會把「已設但為空」
+# 吃成預設值，深度於是被靜默重置為 0、cap 形同虛設——獨立複核（2026-07-25）以
+# 對抗重跑抓到這條，故實作改用 `${VAR-default}`，這裡鎖住行為不回退
+assert_fails "深度為空字串被拒（不得靜默重置成 0）" \
+  env AGENT_BRIDGE_DATA="$DDEPTH" AGENT_BRIDGE_READY_TIMEOUT=0 PATH="$SHIM:$PATH" \
+      AGENT_BRIDGE_MAX_SPAWN=20 AGENT_BRIDGE_RELAY_DEPTH= \
+    "$BRIDGE" relay rd8 --runtime codex --handoff "$HANDOFF" --no-select
+assert "深度空字串被拒：不留 registry" test ! -e "$DDEPTH/agents/rd8.json"
+assert_fails "上限為空字串被拒（不得靜默回到預設 10）" \
+  env AGENT_BRIDGE_DATA="$DDEPTH" AGENT_BRIDGE_READY_TIMEOUT=0 PATH="$SHIM:$PATH" \
+      AGENT_BRIDGE_MAX_SPAWN=20 AGENT_BRIDGE_MAX_RELAY_DEPTH= \
+    "$BRIDGE" relay rd9 --runtime codex --handoff "$HANDOFF" --no-select
+assert_fails "深度為負數被拒" \
+  env AGENT_BRIDGE_DATA="$DDEPTH" AGENT_BRIDGE_READY_TIMEOUT=0 PATH="$SHIM:$PATH" \
+      AGENT_BRIDGE_MAX_SPAWN=20 AGENT_BRIDGE_RELAY_DEPTH=-1 \
+    "$BRIDGE" relay rd10 --runtime codex --handoff "$HANDOFF" --no-select
+assert_fails "深度超出 9 位數被拒（格式上限，不是溢位後才發現）" \
+  env AGENT_BRIDGE_DATA="$DDEPTH" AGENT_BRIDGE_READY_TIMEOUT=0 PATH="$SHIM:$PATH" \
+      AGENT_BRIDGE_MAX_SPAWN=20 AGENT_BRIDGE_RELAY_DEPTH=1000000000 \
+    "$BRIDGE" relay rd11 --runtime codex --handoff "$HANDOFF" --no-select
+# 前導零合法（與 AGENT_BRIDGE_POLL_INTERVAL 等既有數值參數同慣例），且要以
+# 十進位解析——沒有 10# 前綴的話 008/009 會被當八進位而報錯
+env AGENT_BRIDGE_DATA="$DDEPTH" AGENT_BRIDGE_READY_TIMEOUT=0 PATH="$SHIM:$PATH" \
+    AGENT_BRIDGE_MAX_SPAWN=20 AGENT_BRIDGE_RELAY_DEPTH=008 \
+  "$BRIDGE" relay rd12 --runtime codex --handoff "$HANDOFF" --no-select >/dev/null 2>&1; rc=$?
+assert "前導零深度合法且以十進位解析：exit 0" test "$rc" -eq 0
+rd12_cmd="$(tmx display -pt "$(jq -r .pane_id "$DDEPTH/agents/rd12.json")" '#{pane_start_command}')"
+assert "前導零 008 解析為 8，下傳 9（非八進位）" \
+  bash -c "c=${rd12_cmd@Q}; [[ \"\$c\" == *' AGENT_BRIDGE_RELAY_DEPTH=9 exec '* ]]"
+
+# 收乾淨：pane 是跨測試段共享的資源（registry 各自獨立，pane 不是），本段開的
+# 接手者若留著，後面 idle／evict 那些以 pane 佈局為前提的段落會被推歪
+for rdn in rd1 rd2 rd5 rd12; do
+  assert "23h 收尾：despawn $rdn（pane 還回共享池）" ab "$DDEPTH" despawn "$rdn"
+done
 
 # ---- 24. disposable：worker 自報脈絡無殘值（orchestrator Phase 1） ----
 # 語意刻意是單向宣告而非雙向旗標：預設保留，沒宣告過的一律視為仍有殘值。

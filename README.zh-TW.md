@@ -284,6 +284,17 @@ agent-bridge despawn worker-1                          # 任務收尾：kill pan
   `printf %q` 跳脫後拼進啟動指令，未設定的不注入。值來自 orchestrator 自己的
   環境、與執行 spawn 的人同一信任域，跳脫是防意外拆詞而非防注入；worker 環境
   因此也帶著這些變數，授權的第三層 spawn 會繼續往下傳。
+- **指名穿透**（`AGENT_BRIDGE_PASS_ENV`，逗號分隔的變數名）：同一條穿透路徑的
+  白名單版，讓呼叫端指定 proxy 以外還要帶哪些變數過去。典型用途是 headless 姿態
+  旗標——例如 cron wrapper 設的 `CLAUDE_UNATTENDED=1`，若不跟著過去，接手者 pane
+  會靜默退回有人值守的寬鬆姿態，而靜默降級比明確失敗難察覺得多。規則與 proxy
+  相同：只帶**有設定的**變數（未設的不塞空值）、`printf %q` 跳脫；變數名逐個驗
+  格式，不合法就 fail-closed。
+  例：`AGENT_BRIDGE_PASS_ENV=CLAUDE_UNATTENDED agent-bridge relay …`
+  **不要拿來傳秘密**：值會出現在 pane 的啟動指令裡（`pane_start_command`），任何
+  能操作這台 tmux 的人都看得到。白名單本身也只能由可信的 orchestrator 設定——
+  若讓不可信的請求決定要帶哪些變數，`PATH`／`BASH_ENV`／`LD_PRELOAD`／
+  `NODE_OPTIONS` 這類變數足以改變 runtime 的行為。
 - **啟動即注入 worker 守則**：spawn 出來的是一個零脈絡的全新 session——它不知道
   自己是 worker，也不知道 pane 裡收到的 `agent-bridge receive <id>` 是要執行的
   命令而不是有人在跟它說話。實測（codex 0.145）沒有守則時，它會把就緒探針當成
@@ -327,6 +338,15 @@ registry／審計）與 `spawn` 完全共用，不複製第二份安全不變量
   切焦點沒有意義。互動接力時則預設切過去。
 - 交接檔路徑來自命令列，暴露面比內部常數大一級，因此走與 brief 相同的三道
   防線（單引號 fail-closed、`-f && -r`、`cat --`），且全部在建 pane 之前。
+- **接力鏈有深度上限**（`AGENT_BRIDGE_MAX_RELAY_DEPTH`，預設 10，`0` ＝不設限）。
+  接手者守則鼓勵「context 吃緊就再交棒」，沒有上界的話那就是無界遞迴——無人值守
+  時一路接下去，燒掉的額度沒有天花板。深度由 `AGENT_BRIDGE_RELAY_DEPTH` 在鏈上
+  逐棒下傳（人工起的第一棒沒有這個變數＝深度 0，其後每 relay 一次 +1），達上限時
+  在建 pane 之前擋下，要人介入確認才續。兩個變數都只接受 1–9 位十進位數字（前導
+  零合法），**空字串一樣被拒**——`0` 才是「不設限」的寫法，空值若被當成預設就等於
+  靜默重置鏈深度。設 `0` 也仍受 9 位數的格式上限約束。**已知限制**：pane 內可以
+  自行改寫這個變數繞過（與 registry 同屬 worker 可寫面），這道 cap 擋的是失控
+  迴圈，不是蓄意繞過。
 
 安全設計（全部機器可驗）：
 

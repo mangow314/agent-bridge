@@ -31,6 +31,7 @@ agent-bridge spawn <name> --runtime <codex|claude> [--model <model>] [--window]
                                       # back to splitting the current window
 agent-bridge relay <name> --runtime <codex|claude> [--model <model>] --handoff <path> [--window] [--no-select] [--self-exit <my-name>]
                                       # hand over: open a successor pane (injects successor brief + handoff file); not a worker
+                                      # chain depth is capped (AGENT_BRIDGE_MAX_RELAY_DEPTH, default 10); hitting it means stop and get a human, not raise it yourself
 agent-bridge despawn <name>           # reclaim a bridge-spawned worker (manually registered agents are refused)
 agent-bridge idle                     # (orchestrator) worker-pool reclaim view: name/ready/disposable/idle_secs
 agent-bridge evict <name> [--timeout <secs>] [--from <sender>]

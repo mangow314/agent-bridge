@@ -47,6 +47,9 @@ SUCCESSOR_BRIEF="${AGENT_BRIDGE_SUCCESSOR_BRIEF:-$REPO_ROOT/share/successor-brie
 # cmd_spawn 而不必改它的簽章（set -u，故必須先初始化）
 RELAY_HANDOFF=""
 RELAY_PREV=""
+# 接力鏈深度：cmd_relay 算出「下一棒是第幾棒」，cmd_spawn 把它拼進 pane 的
+# 啟動環境往下傳（同一條全域傳遞的理由）
+RELAY_DEPTH_NEXT=0
 
 err()  { printf 'agent-bridge: %s\n' "$*" >&2; }
 die()  { err "$*"; exit 1; }
@@ -1126,7 +1129,29 @@ cmd_spawn() {
             HTTP_PROXY HTTPS_PROXY ALL_PROXY NO_PROXY; do
     [[ -n "${!pv+x}" ]] && proxy_env+="$pv=$(printf %q "${!pv}") "
   done
-  tagged_cmd="AGENT_BRIDGE_SPAWN_TAG=$tag ${proxy_env}exec $runtime_cmd $prompt_arg"
+  # 同一條穿透路徑的白名單延伸：呼叫端用 AGENT_BRIDGE_PASS_ENV（逗號分隔）指名
+  # 還要帶哪些變數過去。典型用途是 headless 姿態旗標（例如 CLAUDE_UNATTENDED）：
+  # 那類變數若留在呼叫者身上，接手者 pane 會靜默退回有人值守的寬鬆姿態——靜默
+  # 降級比明確失敗難察覺得多。只帶「已設」的變數（未設就跳過，不塞空值）；變數
+  # 名逐個驗格式，擋掉往啟動指令拼接的意外詞。用 read -ra 而非未引號展開，免得
+  # 變數名裡的 glob 字元被 cwd 的檔名撐開。
+  local pass_env="" pe
+  local -a pass_list=()
+  IFS=',' read -ra pass_list <<<"${AGENT_BRIDGE_PASS_ENV:-}"
+  for pe in "${pass_list[@]}"; do
+    [[ -n "$pe" ]] || continue
+    [[ "$pe" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] \
+      || die "AGENT_BRIDGE_PASS_ENV 含不合法的變數名：$pe"
+    [[ -n "${!pe+x}" ]] && pass_env+="$pe=$(printf %q "${!pe}") "
+  done
+  # 接力鏈深度只在 relay 路徑下傳：spawn 出來的 worker 不是接力鏈的一環。
+  # 用 if 而非 `[[ ]] &&`——後者作為函數體的獨立語句，條件不成立時會讓
+  # set -e 收掉整支（迴圈末句不觸發，獨立語句會）
+  local depth_env=""
+  if [[ -n "$RELAY_HANDOFF" ]]; then
+    depth_env="AGENT_BRIDGE_RELAY_DEPTH=$RELAY_DEPTH_NEXT "
+  fi
+  tagged_cmd="AGENT_BRIDGE_SPAWN_TAG=$tag ${proxy_env}${pass_env}${depth_env}exec $runtime_cmd $prompt_arg"
   # 回滾比對的是「env 前綴＋一個空白」，見 spawn_rollback
   SPAWN_RB_TAG="AGENT_BRIDGE_SPAWN_TAG=$tag"
   # per-owner worker window：同 owner 先前的 worker window 還活著就沿用（split
@@ -1299,8 +1324,32 @@ cmd_relay() {
   [[ -f "$handoff" && -r "$handoff" ]] \
     || die "交接檔不是可讀的普通檔案：$handoff"
 
+  # 接力鏈深度上限。這條鏈設計上鼓勵「context 吃緊就再交棒」（接手者守則末段），
+  # 沒有上界就是無界遞迴：無人值守時一路接下去，燒掉的額度沒有天花板。深度靠
+  # AGENT_BRIDGE_RELAY_DEPTH 在鏈上逐棒下傳（見 cmd_spawn 拼 tagged_cmd 處）——
+  # 人工起的第一棒沒有這個變數＝深度 0，其後每 relay 一次 +1。
+  # 檢查必須在建 pane 之前，理由同上面兩道交接檔檢查。
+  # 已知限制：pane 內可以自行改寫這個變數繞過（與 registry 同屬 worker 可寫面，
+  # 見 README 已知限制）。這道 cap 擋的是失控迴圈，不是蓄意繞過。
+  # 展開用 ${VAR-default} 而非 ${VAR:-default}：後者把「已設但為空」也吃成預設，
+  # 於是 AGENT_BRIDGE_RELAY_DEPTH='' 會在驗證前就變成 0——鏈深度被靜默重置，cap
+  # 形同虛設（獨立複核 2026-07-25 對抗重跑抓到）。用 `-` 則空值會落進下面的格式
+  # 檢查並被拒，未設才走預設。
+  local depth="${AGENT_BRIDGE_RELAY_DEPTH-0}"
+  [[ "$depth" =~ ^[0-9]{1,9}$ ]] \
+    || die "AGENT_BRIDGE_RELAY_DEPTH 需為非負整數（空值也不接受，避免靜默重置鏈深度）：$depth"
+  depth=$((10#$depth))
+  local max_depth="${AGENT_BRIDGE_MAX_RELAY_DEPTH-10}"
+  [[ "$max_depth" =~ ^[0-9]{1,9}$ ]] \
+    || die "AGENT_BRIDGE_MAX_RELAY_DEPTH 需為非負整數（空值也不接受）：$max_depth"
+  max_depth=$((10#$max_depth))
+  if (( max_depth > 0 )) && (( depth >= max_depth )); then
+    die "已達接力上限（AGENT_BRIDGE_MAX_RELAY_DEPTH=$max_depth，本 session 是第 $depth 棒）：這條鏈需要人介入確認後才該繼續。確認後可調高上限，或設 0 解除限制。"
+  fi
+
   RELAY_HANDOFF="$handoff"
   RELAY_PREV="$prev"
+  RELAY_DEPTH_NEXT=$((depth + 1))
 
   # 直接呼叫而非命令替換：cmd_spawn 的 die 必須終止整個 relay，包進 $( ) 會被
   # subshell 吃掉、外層照常往下跑

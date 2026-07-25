@@ -138,7 +138,24 @@ a fake completion). Panes you opened yourself can join via
   `gc` for old task files, and an append-only `agents.log` audit trail.
 - **Proxy passthrough** — standard proxy variables set in the orchestrator's
   environment are escaped into the worker's start command, so workers behave
-  the same behind restricted networks.
+  the same behind restricted networks. `AGENT_BRIDGE_PASS_ENV` (comma-separated
+  names) extends the same path to variables you name — typically a headless
+  posture flag such as `CLAUDE_UNATTENDED`, which would otherwise stay behind
+  and let the new pane silently fall back to the attended, more permissive mode.
+  Do not pass secrets this way: values land in the pane's start command, visible
+  to anyone on this tmux. The allowlist must be set by a trusted orchestrator —
+  `PATH`, `BASH_ENV`, `LD_PRELOAD`, `NODE_OPTIONS` and friends all change how the
+  runtime behaves.
+- **Relay depth cap** (`AGENT_BRIDGE_MAX_RELAY_DEPTH`, default 10, `0` disables)
+  — the successor brief encourages handing the baton on whenever context runs
+  tight, which without a bound is unbounded recursion: left unattended, a chain
+  keeps relaying with no ceiling on what it spends. Depth travels down the chain
+  in `AGENT_BRIDGE_RELAY_DEPTH` (a human-started first runner has no such
+  variable, i.e. depth 0) and the cap is enforced before the pane is created.
+  Both variables accept 1–9 decimal digits only (leading zeros fine); an empty
+  string is rejected rather than treated as the default, since that would
+  silently reset chain depth. Known limit: a pane can rewrite that variable to
+  get around it — this cap stops runaway loops, not deliberate evasion.
 
 ## Trust model & known limits
 
