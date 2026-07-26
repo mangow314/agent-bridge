@@ -5,7 +5,8 @@
 When dispatching any independent review (code-review, codex-rescue, subagent reviewers, or a pane worker), the prompt MUST include:
 
 - **Reject on hard conditions only**: test results, data checks, point-by-point spec comparison, reproducibility — signals that are machine-judgeable or independently re-runnable.
-- **NEVER reject for style, narrative, or opinion**: that feedback goes only into a "suggestions (non-blocking)" section of the report.
+- **A rubric carried in the brief is a hard condition**: its criteria are the spec for that dispatch, so the verifier judges them point by point and rejects on a miss, even when the subject is taste (API shape, doc quality, naming). This is how a "human judgment" plan gate becomes checkable. The verifier's only precondition is answerability, enforced per item: every criterion must be settleable yes/no from evidence, and any criterion that is not makes the rubric defective — the verifier blocks naming that criterion instead of dropping it and judging the rest. Rubric length is the plan author's call, never grounds for rejection.
+- **NEVER reject for style, narrative, or opinion *of its own***: unbriefed taste goes only into a "suggestions (non-blocking)" section of the report.
 - The maker's "done" is a claim, not proof: every verdict needs evidence (file:line, test output, re-run result).
 - The verifier judges but never edits (write/review separation); fixes belong to the maker / main thread.
 - **Security-sensitive escalation**: if the diff touches auth/permissions/crypto/secrets handling, hooks/safety chain, or agent definitions, the verifier dispatch MUST request maximum thoroughness (full adversarial re-run of the relevant checks), regardless of diff size.
