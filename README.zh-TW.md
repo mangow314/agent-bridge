@@ -84,17 +84,31 @@ context 管理都要自己來。agent-bridge 編排的是你平常手上在用�
      - `status`：裸狀態字（`queued` / `delivered` / `running` / `completed` /
        `failed` / `cancelled`）
      - `events.log`：append-only 事件流，每行 `<ISO8601Z> <event> [detail]`；
-       事件詞彙表固定為 `created`、`notified`、`notify-failed`、`delivered`、
-       `re-receive`、`started`、`replied`、`failed`、`cancelled`、`read`
+       事件詞彙表固定為 `created`、`notified`、`notify-deferred`、
+       `notify-failed`、`delivered`、`re-receive`、`started`、`replied`、
+       `failed`、`cancelled`、`read`（`notify-deferred`＝忙碌 worker 的
+       Stop hook 會接手取件；`notify-failed`＝送鍵本身沒送成，兩者分開記）
    - `locks/`：狀態轉換用的 mkdir 鎖
-3. **tmux send-keys 短通知**：send / reply 寫完檔案後，只向對方 pane 送一行
-   `agent-bridge receive <task-id>`（或 `read <task-id>`）加 Enter。訊息內容
-   永遠走檔案，絕不進 send-keys。文字與 Enter 拆成兩次 send-keys、中間隔
-   0.3 秒（可用 `AGENT_BRIDGE_NOTIFY_DELAY` 調整）：agent REPL 這類 TUI 會把
-   同批抵達的文字+Enter 當成貼上而吞掉 Enter，導致指令留在輸入框不送出。
-   送鍵前還會先 `capture-pane` 掃一眼對方 pane 有沒有停在權限確認對話框——有就
-   不送、降級成 notify-failed，避免那個 Enter 替一個正等人類決策的 worker 按下
-   批准（見「已知限制」）。
+3. **通知：runtime 原生 hook 為主通道，tmux send-keys 為輔（通知原生化
+   Phase 1/2）**：send / reply / cancel 寫完檔案後要通知對方有新任務，走
+   `notify_or_defer` 這道共用閘門。已注入 hooks 的 claude worker（見下）
+   若 `state/<name>.json` 顯示 `busy` 且未超過 `AGENT_BRIDGE_STATE_TTL`
+   （預設 1800 秒），完全不送鍵、只記一筆 `notify-deferred`：訊息已在
+   mailbox，對方自己的 Stop hook 會在 turn 結束時查到並自行 `receive`。
+   codex worker **尚未接線這條 hook 通道**（Phase 3 待補），與 claude
+   worker 的 state 檔缺失／解析失敗／過期一樣，一律落回下面的 send-keys
+   路徑——state 通道整體是「建議非權威」，任何讀不準都以退回 legacy 送鍵
+   收場，不會讓通知卡死。
+
+   **send-keys 路徑**（idle worker 的喚醒、無 hook worker 的 fallback）：
+   只向對方 pane 送一行 `agent-bridge receive <task-id>`（或
+   `read <task-id>`）加 Enter。訊息內容永遠走檔案，絕不進 send-keys。
+   文字與 Enter 拆成兩次 send-keys、中間隔 0.3 秒（可用
+   `AGENT_BRIDGE_NOTIFY_DELAY` 調整）：agent REPL 這類 TUI 會把同批抵達
+   的文字+Enter 當成貼上而吞掉 Enter，導致指令留在輸入框不送出。送鍵前
+   還會先 `capture-pane` 掃一眼對方 pane 有沒有停在權限確認對話框——有就
+   不送、降級成 notify-failed，避免那個 Enter 替一個正等人類決策的 worker
+   按下批准（見「已知限制」）。
 
 狀態機：
 
@@ -529,8 +543,35 @@ tests/run-tests.sh
 
 ## 已知限制
 
-- **agent 忙碌時通知會延後處理**：send-keys 打進去的指令要等對方 REPL 輪到
-  輸入時才會執行；狀態在 mailbox 裡不會遺失，但即時性沒有保證。
+- **agent 忙碌時通知會延後處理**：已接線 hook 的 claude worker 若 state 檔
+  顯示新鮮的 `busy`，`notify_or_defer` 現在完全不送鍵，訊息留在 mailbox，
+  改由對方自己的 Stop hook 在 turn 結束時查到並自行 `receive`（通知原生化
+  Phase 1/2）。殘餘限制仍要誠實列出：(1) **codex worker 尚未接線**這條 hook
+  通道（Phase 3 待補），仍是舊行為——send-keys 打進去的指令要等對方 REPL
+  輪到輸入時才會執行；(2) claude worker 的 hook 若中途掛掉（stdin 非
+  JSON、缺 `jq`、state 目錄寫不進去等），state 會停在舊的 `busy` 不動，
+  要等 `AGENT_BRIDGE_STATE_TTL`（預設 1800 秒）過期後才會退回 send-keys
+  通知，這段窗口內只能靠對方自己輪到輸入或人工介入；(3) state 通道語意
+  是「建議非權威」（同 `disposable`），不是保護機制——上面兩種情形都不會
+  遺失訊息，只是即時性沒有保證。
+- **通知原生化本身引入的脆弱面（Phase 1/2，2026-07-28，刻意不美化）**：
+  - **`notification_type` 欄位有已知可靠性缺口**：官方 Notification hook
+    payload 有時完全缺這個欄位（[issue #12048](https://github.com/anthropics/claude-code/issues/12048)，
+    關聯 [#11964](https://github.com/anthropics/claude-code/issues/11964)）。
+    本實作 fail-safe 為「缺欄位時不等於 `idle_prompt`、落入不動 state 的
+    分支」，而不是誤判成 idle——代價是 state 可能停在舊值，但 TTL 到期後
+    仍會退回 legacy 送鍵，不會永久卡住。
+  - **state 檔位在 worker 可寫的資料目錄**：`state/<name>.json` 與 registry
+    同屬同一個互信域，同 uid 下跑的任何 worker 都寫得到別人的 state 檔。
+    這條通道語意本來就是「建議非權威」，是建議不是保護。
+  - **hook 靠 `AGENT_BRIDGE_SPAWN_TAG` 析出「我是誰」**：`hook_agent_name`
+    讀不到這個環境變數就直接 no-op。人工 `register` 的 worker 環境裡沒有
+    這個變數，天然不參與狀態通道——不是被排除，是沒有身分可寫，一律走
+    既有 send-keys 路徑。
+  - **Stop hook 的續跑依賴 Claude Code 的 `decision: block` 語意**：本實作
+    靠這個協定讓 worker 在 turn 結束時自動 `receive` 下一個排隊任務。這個
+    語意若日後改變，失效方向是 worker 不再自動取件、退回既有 legacy 行為
+    （訊息仍在 mailbox，靠 send-keys 通知或人工介入取件），不會有資料遺失。
 - **tmux server 重啟後 pane_id 全部失效**，需要重新 `register`；spawn 出身的
   agent 用 `despawn` 清掉殘留 registry 再重新 spawn——重啟後新 pane 可能拿到
   同一個 `%N`，`despawn` 靠 `spawn_tag` 認得出來，不會誤殺（見上）。

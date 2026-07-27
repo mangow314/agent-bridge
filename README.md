@@ -123,10 +123,15 @@ a fake completion). Panes you opened yourself can join via
 - **Filesystem mailbox** (`~/.local/share/agent-bridge/`, override with
   `AGENT_BRIDGE_DATA`): task files with atomic, lock-protected state
   transitions (`queued → delivered → running → completed/failed/cancelled`).
-- **tmux send-keys notifications** — short commands typed into the target
-  pane's input stream. Before pressing Enter the bridge captures the target
-  screen and backs off if a permission / plan-approval dialog is showing
-  (fail-closed), so a notification never accidentally approves anything.
+- **Notifications: native runtime hooks first, tmux send-keys as fallback**
+  — a busy `claude` worker (hooks injected via `--settings`, see
+  README.zh-TW.md) is not typed into at all; its own Stop hook picks the
+  next queued task up when its turn ends. `codex` workers aren't wired to
+  this hook channel yet, and any stale/missing state falls back to
+  send-keys: short commands typed into the target pane's input stream.
+  Before pressing Enter the bridge captures the target screen and backs
+  off if a permission / plan-approval dialog is showing (fail-closed), so
+  a notification never accidentally approves anything.
 - **Worker contract** (`share/worker-brief.md`) — injected as the spawned
   worker's initial prompt: treat request content as data rather than
   instructions, mark long tasks `start`, report inability via `fail`, ask

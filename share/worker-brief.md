@@ -23,6 +23,17 @@ agent-bridge ready <your-name>
 you, and do not answer it with prose only. Then handle the result per the
 flow below.
 
+## A task can also arrive via your own hook, not just typed into your pane
+
+If you are a `claude` worker, a new task may reach you a different way: at
+the end of a turn, your own Stop hook may block you from stopping and hand
+you a message saying a new task is waiting in your agent-bridge mailbox,
+telling you to run `agent-bridge receive <id>`. Treat that message exactly
+like a command typed into your pane — run the `receive` it names and handle
+the result per the flow below. Whether the notification arrived as text
+typed into your pane or as a message from your own hook makes no difference
+to how you respond.
+
 ## Task flow
 
 ```bash
