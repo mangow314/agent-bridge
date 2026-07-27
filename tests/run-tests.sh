@@ -790,12 +790,15 @@ assert "pane_start_command 剝前導引號後以 spawn tag 前綴開頭（tmux �
 #     系統與憑證。（理由到此為止——bypass 並不停用 hooks，deny 與 explicit ask
 #     也仍適用；詳見 README.zh-TW.md，那段因果曾兩度寫錯）
 #   - 混進 -p/--print 會讓 pane 跑完即退，worker 根本不存在
-#   - 混進 --settings/--setting-sources 會讓 worker 脫離使用者的安全設定
+#   - 混進 --setting-sources 會讓 worker 脫離使用者的全域安全設定（--settings
+#     不算違反這條：hooks 分層是合併不是覆蓋，全域規則原樣生效，只是外加一份
+#     隨 repo 走的 worker 專屬 hooks 版本，理由見 bin/agent-bridge 的
+#     CLAUDE_HOOKS_SETTINGS 常數註解）
 # 關鍵是**精確的完整參數集合**而非子字串：獨立複核以 mutation 反例證明，
 # 只比對子字串時 `--permission-mode auto --permission-mode bypassPermissions
 # --setting-sources project <prompt>` 這種 argv 能讓所有斷言全綠——後面偷偷
-# 追加的旗標才是真正生效的那個。白名單式斷言（恰好三個參數）比逐條列黑名單
-# 更強：任何多餘旗標都會讓行數對不上。
+# 追加的旗標才是真正生效的那個。白名單式斷言（恰好五個參數，理由與更新見
+# 下方 16a2 白名單斷言的註解）比逐條列黑名單更強：任何多餘旗標都會讓行數對不上。
 # 測完立刻 despawn，避免佔用 DSPAWN 的 spawn cap 影響後續測例
 pane_wc="$(absp "$DSPAWN" 20 spawn wc1 --runtime claude 2>/dev/null)"; rc=$?
 assert "spawn --runtime claude：exit 0" test "$rc" -eq 0
@@ -809,12 +812,17 @@ assert "claude runtime 不帶 -p/--print（headless 會讓 pane 跑完即退）"
   bash -c "[[ -s '$TESTROOT/claude-args.txt' ]] && ! grep -qE -- '(^| )(-p|--print)( |\$)' '$TESTROOT/claude-args.txt'"
 assert "claude runtime 一樣注入 worker brief（走同一條 worker_prompt_arg）" \
   grep -q -- 'The above is your worker brief' "$TESTROOT/claude-args.txt"
-# 白名單：argv 必須「恰好」是 --permission-mode / auto / <prompt> 三個。
-# 這條才是真正擋住「追加旗標」的防線，上面幾條子字串斷言擋不住
-assert "claude runtime argv 恰好三個參數（追加任何旗標都該紅）" \
-  bash -c "mapfile -d '' -t A < '$TESTROOT/claude-argv.txt'; (( \${#A[@]} == 3 ))"
-assert "claude runtime argv 前兩個恰為 --permission-mode auto、第三個是 prompt 非旗標" \
-  bash -c "mapfile -d '' -t A < '$TESTROOT/claude-argv.txt'; [[ \${A[0]} == '--permission-mode' && \${A[1]} == 'auto' && \${A[2]} != -* ]]"
+# 白名單：argv 必須「恰好」是 --permission-mode / auto / --settings / <path> /
+# <prompt> 五個。這條才是真正擋住「追加旗標」的防線，上面幾條子字串斷言擋不住。
+# 數字從「恰好三個」變成「恰好五個」是通知原生化 Phase 2 的設計異動：claude
+# 分支無條件加上 `--settings <CLAUDE_HOOKS_SETTINGS>` 注入 worker hooks（見
+# bin/agent-bridge 的 CLAUDE_HOOKS_SETTINGS 常數註解）——這是白名單契約隨新
+# 旗標同步更新，不是放寬 exact-count 判準；仍是逐 index 比對＋恰好五個，任何
+# 「追加」旗標一樣會讓行數對不上
+assert "claude runtime argv 恰好五個參數（含 --settings；追加任何旗標都該紅）" \
+  bash -c "mapfile -d '' -t A < '$TESTROOT/claude-argv.txt'; (( \${#A[@]} == 5 ))"
+assert "claude runtime argv 前四個恰為 --permission-mode auto --settings <path>、第五個是 prompt 非旗標" \
+  bash -c "mapfile -d '' -t A < '$TESTROOT/claude-argv.txt'; [[ \${A[0]} == '--permission-mode' && \${A[1]} == 'auto' && \${A[2]} == '--settings' && \${A[3]} == '$ROOT/share/claude-worker-hooks.json' && \${A[4]} != -* ]]"
 assert "claude runtime 探針重送生效：ready == true" \
   jq -e '.ready == true' "$DSPAWN/agents/wc1.json"
 assert "agents.log 記 spawned wc1 … claude" \
@@ -824,14 +832,16 @@ assert "claude runtime worker 可正常 despawn" ab "$DSPAWN" despawn wc1
 # 16a3. spawn --model：模型下放。值會進 tagged_cmd（pane 啟動命令字串），
 # 與 brief 路徑同級暴露面，防線兩條：字元集擋 sh/tmux 分隔符（命令注入）、
 # 首字元強制英數（旗標走私——`--model --bare` 不擋的話就是往 worker 啟動
-# 旗標塞任意開關的後門）。argv 斷言沿用 16a2 的教訓走白名單：鎖「恰好五個
-# 參數」，子字串斷言擋不住偷偷追加的旗標
+# 旗標塞任意開關的後門）。argv 斷言沿用 16a2 的教訓走白名單：鎖「恰好七個
+# 參數」（16a2 的五個 ＋ --model <m> 兩個，--settings 同樣無條件在場），
+# 子字串斷言擋不住偷偷追加的旗標。數字從「恰好五個」變成「恰好七個」同樣是
+# Phase 2 新增 --settings 造成的契約更新，理由見 16a2 上方註解，不重複
 absp "$DSPAWN" 20 spawn wm1 --runtime claude --model sonnet-t.0 >/dev/null 2>&1; rc=$?
 assert "spawn --model：exit 0" test "$rc" -eq 0
-assert "claude argv 恰好五個參數（--permission-mode auto --model <m> <prompt>）" \
-  bash -c "mapfile -d '' -t A < '$TESTROOT/claude-argv.txt'; (( \${#A[@]} == 5 ))"
-assert "claude argv 的 --model 值就位、prompt 仍是最後一個非旗標參數" \
-  bash -c "mapfile -d '' -t A < '$TESTROOT/claude-argv.txt'; [[ \${A[2]} == '--model' && \${A[3]} == 'sonnet-t.0' && \${A[4]} != -* ]]"
+assert "claude argv 恰好七個參數（--permission-mode auto --settings <path> --model <m> <prompt>）" \
+  bash -c "mapfile -d '' -t A < '$TESTROOT/claude-argv.txt'; (( \${#A[@]} == 7 ))"
+assert "claude argv 的 --settings 與 --model 值皆就位、prompt 仍是最後一個非旗標參數" \
+  bash -c "mapfile -d '' -t A < '$TESTROOT/claude-argv.txt'; [[ \${A[2]} == '--settings' && \${A[3]} == '$ROOT/share/claude-worker-hooks.json' && \${A[4]} == '--model' && \${A[5]} == 'sonnet-t.0' && \${A[6]} != -* ]]"
 assert "registry 記下 model 欄位" \
   jq -e '.model == "sonnet-t.0"' "$DSPAWN/agents/wm1.json"
 assert "spawn --model 的 worker 可正常 despawn" ab "$DSPAWN" despawn wm1
@@ -844,7 +854,7 @@ assert "codex args 帶相鄰的 --model gpt-test" \
 assert "codex --model worker 可正常 despawn" ab "$DSPAWN" despawn wm2
 
 # 未指定 --model：model 欄為空字串＝沿用 runtime 預設；argv 形狀由 16a2 的
-# 「恰好三個參數」白名單鎖住，這裡不重複（w1 是 16a 留下的無 --model spawn）
+# 「恰好五個參數」白名單鎖住，這裡不重複（w1 是 16a 留下的無 --model spawn）
 assert "未指定 --model 時 registry model 欄為空字串" \
   jq -e '.model == ""' "$DSPAWN/agents/w1.json"
 
@@ -923,6 +933,77 @@ assert_fails "PASS_ENV 含不合法變數名被拒（擋往啟動指令拼接的
       AGENT_BRIDGE_PASS_ENV='OK_ONE,bad-name' \
     "$BRIDGE" spawn wp3 --runtime claude
 assert "PASS_ENV 被拒：不留 registry" test ! -e "$DSPAWN/agents/wp3.json"
+
+# 16a6. claude worker hooks settings 注入（通知原生化 Phase 2）：--settings
+# 無條件加在 claude 分支，讀不到就必須在建 pane 之前 die——同 WORKER_BRIEF 預檢
+# 的 fail-closed 理由，pane 落地後才死會留下一個佔 cap 的孤兒 worker。codex
+# 分支完全不受影響：它不吃這個旗標，不該被這份 claude 專屬檔案的缺失擋下。
+
+# 16a6-1：runtime=claude 的 pane_start_command 含 --settings 且路徑正確
+pane_hk1="$(absp "$DSPAWN" 20 spawn hk1 --runtime claude 2>/dev/null)"; rc=$?
+assert "spawn（hooks 快樂路徑）--runtime claude：exit 0" test "$rc" -eq 0
+hk1_cmd="$(tmx display -pt "$pane_hk1" '#{pane_start_command}')"
+assert "claude runtime pane_start_command 含 --settings 且路徑正確" \
+  bash -c "c=${hk1_cmd@Q}; [[ \"\$c\" == *'--settings '*'$ROOT/share/claude-worker-hooks.json'* ]]"
+assert "hooks 快樂路徑 worker 可正常 despawn" ab "$DSPAWN" despawn hk1
+
+# 16a6-2：runtime=codex 的 pane_start_command 不含 --settings（確認未誤植；
+# w1_cmd 是 §16a 留下的 codex pane，這裡直接複用不必再開一個 pane）
+assert "codex runtime pane_start_command 不含 --settings（確認未誤植）" \
+  bash -c "c=${w1_cmd@Q}; [[ \"\$c\" != *--settings* ]]"
+
+# 16a6-3：hooks 檔缺失＋runtime=claude → die，且建 pane 前就失敗（無孤兒、無 registry）
+DHKMISS="$TESTROOT/dhkmiss"
+mkdir -p "$DHKMISS/agents" "$DHKMISS/locks" "$DHKMISS/tasks"
+before_hkmiss="$(pane_count)"
+env AGENT_BRIDGE_DATA="$DHKMISS" AGENT_BRIDGE_READY_TIMEOUT=0 PATH="$SHIM:$PATH" \
+    AGENT_BRIDGE_CLAUDE_HOOKS="$TESTROOT/no-such-hooks.json" \
+  "$BRIDGE" spawn hkm --runtime claude >/dev/null 2>"$TESTROOT/hkmiss.err"; rc=$?
+assert "hooks 檔缺失：非零退出" test "$rc" -ne 0
+assert "hooks 檔缺失：訊息指出可用 AGENT_BRIDGE_CLAUDE_HOOKS 覆蓋" \
+  grep -q 'AGENT_BRIDGE_CLAUDE_HOOKS' "$TESTROOT/hkmiss.err"
+assert "hooks 檔缺失：不建 pane（建 pane 前就死，無孤兒）" \
+  test "$(pane_count)" -eq "$before_hkmiss"
+assert "hooks 檔缺失：不留 registry" test ! -e "$DHKMISS/agents/hkm.json"
+
+# 16a6-4：hooks 檔是目錄 → 同樣 die、無孤兒（理由同 brief 預檢：`[[ -r ]]` 對
+# 目錄一樣成立，只驗 -f 才擋得住）
+DHKDIR="$TESTROOT/dhkdir"
+mkdir -p "$DHKDIR/agents" "$DHKDIR/locks" "$DHKDIR/tasks" "$TESTROOT/hooks-as-dir"
+before_hkdir="$(pane_count)"
+env AGENT_BRIDGE_DATA="$DHKDIR" AGENT_BRIDGE_READY_TIMEOUT=0 PATH="$SHIM:$PATH" \
+    AGENT_BRIDGE_CLAUDE_HOOKS="$TESTROOT/hooks-as-dir" \
+  "$BRIDGE" spawn hkd --runtime claude >/dev/null 2>"$TESTROOT/hkdir.err"; rc=$?
+assert "hooks 檔是目錄：非零退出" test "$rc" -ne 0
+assert "hooks 檔是目錄：訊息指出不是普通檔案" \
+  grep -q '普通檔案' "$TESTROOT/hkdir.err"
+assert "hooks 檔是目錄：不建 pane" test "$(pane_count)" -eq "$before_hkdir"
+assert "hooks 檔是目錄：不留 registry" test ! -e "$DHKDIR/agents/hkd.json"
+
+# 16a6-5：hooks 檔缺失＋runtime=codex → spawn 仍成功（codex 不吃 --settings，
+# 不該被這份 claude 專屬檔案的缺失影響）
+env AGENT_BRIDGE_DATA="$DHKMISS" AGENT_BRIDGE_READY_TIMEOUT=0 PATH="$SHIM:$PATH" \
+    AGENT_BRIDGE_CLAUDE_HOOKS="$TESTROOT/no-such-hooks.json" \
+  "$BRIDGE" spawn hkc --runtime codex >/dev/null 2>&1; rc=$?
+assert "hooks 檔缺失＋runtime=codex：spawn 仍成功" test "$rc" -eq 0
+ab "$DHKMISS" despawn hkc >/dev/null 2>&1 || true
+
+# 16a6-6：share/claude-worker-hooks.json 本身合法且三事件的 command 皆為裸
+# `agent-bridge hook ...`——鎖住「不得寫死絕對路徑」這條不變量：PATH 上的
+# 裸指令，換機器／換 repo 位置都不用改這份檔
+HOOKS_JSON="$ROOT/share/claude-worker-hooks.json"
+assert "claude-worker-hooks.json 是合法 JSON" jq -e . "$HOOKS_JSON"
+assert "hooks 檔只含 hooks 一個 top-level key" \
+  jq -e '(keys | length) == 1 and (keys[0] == "hooks")' "$HOOKS_JSON"
+assert "Stop 對應裸指令 agent-bridge hook stop（無路徑寫死）" \
+  jq -e '.hooks.Stop[0].hooks[0].command == "agent-bridge hook stop" and .hooks.Stop[0].hooks[0].type == "command"' \
+  "$HOOKS_JSON"
+assert "UserPromptSubmit 對應裸指令 agent-bridge hook prompt-submit" \
+  jq -e '.hooks.UserPromptSubmit[0].hooks[0].command == "agent-bridge hook prompt-submit" and .hooks.UserPromptSubmit[0].hooks[0].type == "command"' \
+  "$HOOKS_JSON"
+assert "Notification 對應裸指令 agent-bridge hook notification" \
+  jq -e '.hooks.Notification[0].hooks[0].command == "agent-bridge hook notification" and .hooks.Notification[0].hooks[0].type == "command"' \
+  "$HOOKS_JSON"
 
 # 16b. 參數與名稱衝突拒絕
 assert_fails "spawn 已註冊（spawned）名稱被拒" absp "$DSPAWN" 0 spawn w1 --runtime codex
@@ -1770,6 +1851,22 @@ assert "被拒的 relay 不留 registry" \
   bash -c "[[ ! -e '$DRELAY/agents/r1x.json' ]]"
 assert "relay --model 的接手者可正常 despawn（不佔用後續 cap）" \
   env AGENT_BRIDGE_DATA="$DRELAY" PATH="$SHIM:$PATH" "$BRIDGE" despawn r1m
+
+# 23b3. relay 的接手者也是 claude session（通知原生化 Phase 2）：cmd_relay 全程
+# 共用 cmd_spawn，這裡驗的正是「不必另開分支」這件事本身——接手者同樣要收
+# hooks，才收得到下一棒任務的 Stop hook 通知，不該因為走的是 relay 而漏接
+pane_r1c="$(env AGENT_BRIDGE_DATA="$DRELAY" AGENT_BRIDGE_READY_TIMEOUT=0 \
+  PATH="$SHIM:$PATH" \
+  "$BRIDGE" relay r1c --runtime claude --handoff "$HANDOFF" --no-select 2>/dev/null)"; rc=$?
+assert "relay --runtime claude：exit 0" test "$rc" -eq 0
+assert "relay（claude 接手者）啟動參數含 --settings <path>（與 worker 共用同一份 hooks）" \
+  grep -qF -- "--settings $ROOT/share/claude-worker-hooks.json" "$TESTROOT/claude-args.txt"
+r1c_cmd="$(tmx display -pt "$pane_r1c" '#{pane_start_command}')"
+assert "relay（claude 接手者）pane_start_command 同樣含 --settings（非僅 argv 檔佐證）" \
+  bash -c "c=${r1c_cmd@Q}; [[ \"\$c\" == *'--settings '* ]]"
+assert "relay（claude）接手者可正常 despawn（不佔用後續 cap）" \
+  env AGENT_BRIDGE_DATA="$DRELAY" PATH="$SHIM:$PATH" "$BRIDGE" despawn r1c
+
 # 未指定 --self-exit 時不該憑空冒出回收指示。
 # 不能拿 'agent-bridge despawn' 當關鍵字——接手者 brief 內文本來就有那一段
 # （說明被拒是正常的），會恆綠。要鎖的是動態尾巴本身

@@ -49,6 +49,26 @@ WORKER_BRIEF="${AGENT_BRIDGE_WORKER_BRIEF:-$REPO_ROOT/share/worker-brief.md}"
 # 派工、接手者一開始就有交接檔要自己往下做，把 worker 守則注入接手者會讓它
 # 空等 receive
 SUCCESSOR_BRIEF="${AGENT_BRIDGE_SUCCESSOR_BRIEF:-$REPO_ROOT/share/successor-brief.md}"
+# claude worker 專屬 hooks settings（通知原生化 Phase 2）：只含 hooks 一個 key，
+# 把 Stop/UserPromptSubmit/Notification 接到 `agent-bridge hook …`（cmd_hook，
+# Phase 1 已實作）。用 `--settings <path>` 而非改使用者全域 ~/.claude/settings.json
+# 注入：這份設定只該對 worker pane 生效、版本隨 repo 走（改 hooks 邏輯不必手動
+# 同步到每台機器的全域設定），且不能因為一次 worker spawn 就讓主 session／人工
+# pane 也長出這些 hook。
+#
+# 這不推翻上面「刻意不加 --settings/--setting-sources」的取捨：hooks 分層是
+# 合併不是覆蓋（已於本機查證，見 plan 的「已驗證的外部事實」段）——`--settings`
+# 檔案裡的 hooks 與使用者全域 hooks 並存生效，全域安全規則原樣適用，取捨的
+# 代價（worker brief 與全域守則並存、可能被全域規則改寫命令形式）不受影響。
+# 沒有動、也不會動的是 --setting-sources：那才是真正會改變全域設定「繼承」
+# 本身的旗標，本次沒有理由碰它。
+#
+# --settings 無條件加在 claude 分支，不做開關旗標：多一個「要不要注入 hooks」
+# 的旗標面，就多一條要在 spawn 參數解析、注册、審計三處分別想清楚的分岔。
+# 要停用 hooks 的使用者把 AGENT_BRIDGE_CLAUDE_HOOKS 指向一份 `{"hooks":{}}`
+# 之類的合法空 JSON 即可——state/<name>.json 不會再被寫出，notify_or_defer
+# 讀不到新鮮 state 天然退回既有 legacy 送鍵，不需要另開一個功能旗標。
+CLAUDE_HOOKS_SETTINGS="${AGENT_BRIDGE_CLAUDE_HOOKS:-$REPO_ROOT/share/claude-worker-hooks.json}"
 # relay 模式旗標：非空＝cmd_spawn 走接手者路徑。用全域傳遞是為了讓 relay 共用
 # cmd_spawn 而不必改它的簽章（set -u，故必須先初始化）
 RELAY_HANDOFF=""
@@ -116,6 +136,8 @@ worker 活動狀態新鮮度 AGENT_BRIDGE_STATE_TTL（預設 1800 秒）：send/
 通知前若對方 state 檔顯示 busy 且未超過這個秒數，改為完全不送鍵（改由對方
 Stop hook 在 turn 結束時自行 receive）；state 檔缺失或已過期一律退回既有的
 tmux send-keys 通知路徑。
+claude worker 的 hooks settings 預設 share/claude-worker-hooks.json，可用
+AGENT_BRIDGE_CLAUDE_HOOKS 覆蓋；停用 hooks 就指向一份 hooks 為空的合法 JSON。
 EOF
 }
 
@@ -1079,15 +1101,17 @@ cmd_spawn() {
   #     核准。（注意：bypassPermissions 並不停用 hooks——停用 hooks 的是
   #     --bare；deny 與 explicit ask 規則在該模式下也仍然適用。早期版本的這段
   #     註解兩度寫錯這個因果，由獨立複核對照官方文件糾正）
-  #   - 刻意不加 --settings/--setting-sources：worker 繼承使用者全域設定，
-  #     與主 session 同一套安全規則。代價是 worker brief 與全域守則並存，
-  #     可能被全域規則改寫命令形式（實測見過 echo 重導向被換成 Write 工具）；
-  #     `agent-bridge` 是外部 CLI、沒有等價工具，故不受這條影響
+  #   - `--settings <CLAUDE_HOOKS_SETTINGS>`（通知原生化 Phase 2 新增）：worker
+  #     仍繼承使用者全域設定，與主 session 同一套安全規則——hooks 分層是合併
+  #     不是覆蓋，這條「不加 --setting-sources」的取捨沒被推翻。完整理由見
+  #     CLAUDE_HOOKS_SETTINGS 常數處的註解，不在此重複。代價（worker brief 與
+  #     全域守則並存、可能被全域規則改寫命令形式）與上一版一致，不受影響：
+  #     `agent-bridge` 是外部 CLI、沒有等價工具，不受那條影響
   #   - 不可用 -p/--print：那是 headless，跑完即退出，pane 不會留下來收探針
   local runtime_cmd
   case "$runtime" in
     codex) runtime_cmd="codex --profile agent-worker" ;;
-    claude) runtime_cmd="claude --permission-mode auto" ;;
+    claude) runtime_cmd="claude --permission-mode auto --settings $(printf %q "$CLAUDE_HOOKS_SETTINGS")" ;;
     *) die "不支援的 runtime：$runtime（支援 codex、claude）" ;;
   esac
   # --model：兩個 runtime 都吃 `--model` 長旗標（實測 claude --help 與
@@ -1098,6 +1122,19 @@ cmd_spawn() {
   command -v tmux >/dev/null 2>&1 || die "找不到 tmux，spawn 需要 tmux"
   command -v "${runtime_cmd%% *}" >/dev/null 2>&1 \
     || die "找不到 runtime 指令：${runtime_cmd%% *}"
+
+  # claude hooks settings 存在性預檢：只在 runtime=claude 檢查——codex 分支
+  # 不吃 --settings，不該因為這份 claude 專屬檔缺失而 spawn 失敗。理由同
+  # WORKER_BRIEF 的預檢（下面 brief_path 那段）：必須在建 pane 之前 die，
+  # pane 落地後才死會留下一個佔 cap 的孤兒 worker。讀不到這份檔不是 exec
+  # 階段才會發現的失敗——claude CLI 對指到不存在路徑的 --settings 如何反應
+  # 未經查證，寧可在 spawn 這層就把它當硬性前提擋下，不去賭 CLI 那端的容錯。
+  # 同樣要求普通檔案（-f）而非只驗可讀（-r）：理由與 brief 預檢一致，見那段
+  # 註解，不重複
+  if [[ "$runtime" == claude ]]; then
+    [[ -f "$CLAUDE_HOOKS_SETTINGS" && -r "$CLAUDE_HOOKS_SETTINGS" ]] \
+      || die "claude hooks settings 不是可讀的普通檔案：$CLAUDE_HOOKS_SETTINGS（可用 AGENT_BRIDGE_CLAUDE_HOOKS 指定）"
+  fi
 
   # owner 定位：worker 的落點跟著 orchestrator 走，不跟著使用者的眼睛走。
   # tmux 對不帶 -t 的 split/new-window 解析到「attached client 的 active

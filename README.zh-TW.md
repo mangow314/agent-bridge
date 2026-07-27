@@ -257,9 +257,16 @@ agent-bridge despawn worker-1                          # 任務收尾：kill pan
     ⚠️ 別把理由寫成「bypass 會繞過 hooks／讓 ask 消失」——**都不對**：停用 hooks 的
     是另一個旗標 `--bare`，而 deny 與 explicit ask 規則官方明載「apply in every mode,
     including `bypassPermissions`」。這段因果在本檔前後寫錯過兩次，都是獨立複核對照
-    官方文件抓出來的；**不加
-    `--settings`／`--setting-sources`**，worker 繼承使用者全域設定，與主 session
-    同一套安全規則。代價是 worker brief 與全域守則並存、可能被全域規則改寫命令
+    官方文件抓出來的；claude worker 會以 `--settings share/claude-worker-hooks.json`
+    （路徑可用 `AGENT_BRIDGE_CLAUDE_HOOKS` 覆蓋）注入 worker 專屬 hooks，把
+    Stop/UserPromptSubmit/Notification 接到 `agent-bridge hook …`（通知原生化
+    Phase 2），但仍**不加 `--setting-sources`**：hooks 分層是合併不是覆蓋，
+    使用者全域安全設定原樣繼承，「worker 與主 session 同一套安全規則」的
+    承諾不變，只是外加一份隨 repo 走、版本會隨 repo 更新的 worker 專屬 hooks。
+    要停用就把 `AGENT_BRIDGE_CLAUDE_HOOKS` 指向一份 `{"hooks":{}}` 之類的合法
+    空 JSON 即可——state 檔不再產生，`notify_or_defer` 讀不到新鮮 state 天然
+    退回既有 legacy 送鍵，不需要另開一個功能旗標。代價是 worker brief 與
+    全域守則並存、可能被全域規則改寫命令
     形式（實測見過 `echo` 重導向被換成 Write 工具），但 `agent-bridge` 是外部
     CLI、沒有等價工具可替換，故這條路徑不受影響。另外**不可用 `-p/--print`**：
     那是 headless，跑完即退出，pane 不會留下來收探針
