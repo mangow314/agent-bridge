@@ -10,6 +10,12 @@ DATA_DIR="${AGENT_BRIDGE_DATA:-$HOME/.local/share/agent-bridge}"
 AGENTS_DIR="$DATA_DIR/agents"
 TASKS_DIR="$DATA_DIR/tasks"
 LOCKS_DIR="$DATA_DIR/locks"
+# worker 活動狀態（idle/busy）快取，供 notify_or_defer 判斷是否要送鍵。刻意獨立
+# 於 agents/：registry 那條「for f in "$AGENTS_DIR"/*.json」的 glob 迴圈（is_spawned
+# 等處）看到副檔名 .json 就會嘗試當註冊檔解析，state 檔混進去會被誤讀。單一寫者
+# 是該 worker 自己的 hook（cmd_hook），走 atomic_write、不取 registry 鎖——
+# 狀態是「建議非權威」，寫壞了頂多退回 legacy 送鍵，不影響任何狀態機不變量
+STATE_DIR="$DATA_DIR/state"
 
 NAME_RE='^[A-Za-z0-9_-]+$'
 # task-id 首字元強制英數：純寬鬆字元集會放行 `.` 與 `..`，它們拼進
@@ -92,6 +98,12 @@ usage() {
   agent-bridge gc [--older-than <days>] [--apply] [--include-notes]
                                                 清掉夠舊的終態 task（預設 14 天）；未完成的與
                                                 evict 收尾筆記一律保留。預設只試算，--apply 才刪
+  agent-bridge hook <stop|prompt-submit|notification>
+                                                （由 Claude Code 呼叫，非人工手動用）落地 hook
+                                                協定：stdin 收事件 JSON，依 AGENT_BRIDGE_SPAWN_TAG
+                                                析出的 agent 名更新 state/<name>.json；stop 事件
+                                                查到 mailbox 有新任務時輸出 block JSON 續跑，
+                                                stdout 只在此時有內容。任何內部錯誤一律 exit 0。
 
 --message-file 用 `-` 表示讀 stdin。
 資料目錄預設 ~/.local/share/agent-bridge/，可用 AGENT_BRIDGE_DATA 覆蓋。
@@ -100,6 +112,10 @@ evict 的 --timeout 預設 300 秒、--from 預設 orchestrator；--timeout 0＝
 等於放棄「一定騰得出 cap」這個保證，只在確定 worker 還活著時才用。
 spawn 上限 AGENT_BRIDGE_MAX_SPAWN（預設 4）；就緒等待 AGENT_BRIDGE_READY_TIMEOUT
 秒（預設 30，0＝不等待），探針重送間隔 AGENT_BRIDGE_READY_PROBE_INTERVAL（預設 2）。
+worker 活動狀態新鮮度 AGENT_BRIDGE_STATE_TTL（預設 1800 秒）：send/reply/cancel
+通知前若對方 state 檔顯示 busy 且未超過這個秒數，改為完全不送鍵（改由對方
+Stop hook 在 turn 結束時自行 receive）；state 檔缺失或已過期一律退回既有的
+tmux send-keys 通知路徑。
 EOF
 }
 
@@ -107,7 +123,7 @@ now_iso() { date -u +%Y-%m-%dT%H:%M:%SZ; }
 
 rand_suffix() { head -c 2 /dev/urandom | od -An -tx1 | tr -d ' \n'; }
 
-ensure_dirs() { mkdir -p "$AGENTS_DIR" "$TASKS_DIR" "$LOCKS_DIR"; }
+ensure_dirs() { mkdir -p "$AGENTS_DIR" "$TASKS_DIR" "$LOCKS_DIR" "$STATE_DIR"; }
 
 # is_spawned <registry-file>：0＝spawn 出身，1＝不是，2＝無法判定（JSON 損壞／讀不到）
 # 直接用 `jq -e '.spawned == true'` 會把「條件為 false」與「檔案是壞的」壓成同一個
@@ -317,6 +333,68 @@ notify_pane() {
   tmux send-keys -t "$pane" Enter 2>/dev/null
 }
 
+# notify_or_defer <agent> <pane> <cmd-line> <task-id> <cmd-tag>：cmd_send／
+# respond_task／cmd_cancel 三個通知呼叫點共用的 gate，取代各自重複的
+# if notify_pane ... else ... fi。
+# state/<agent>.json 的語意是「建議非權威」（同 disposable 既有的用語）：讀不到、
+# 解析失敗、或 ts 已超過 AGENT_BRIDGE_STATE_TTL 秒都視為「未知」，直接落回現行
+# notify_pane 路徑、逐位元不變（既有 11 個通知測試即證據，測試 8/8a 全數不動）。
+# 只有明確讀到 state=busy 且新鮮，才完全不送鍵——queued 任務改由對方的 Stop
+# hook 在 turn 結束時自行 receive；hook 掛掉的失效方向是 state 停在 busy，
+# TTL 一到自動退回 legacy 送鍵，任務不會因此餓死超過 TTL。
+# state=idle 且新鮮時仍照送：idle 代表對方不在 turn 中，畫面上不可能停著權限
+# 確認框（框只在 turn 中才會出現），但 notify_pane 既有的雙掃描原樣保留，
+# 作為 belt-and-suspenders 與 stale-state 的第二道防線，不因為有了 state 通道
+# 就拿掉。
+notify_or_defer() {
+  local agent="$1" pane="$2" cmdline="$3" task_id="$4" tag="$5"
+  local state_file="$STATE_DIR/$agent.json"
+  local ttl st ts epoch now fresh_busy=0
+
+  ttl="${AGENT_BRIDGE_STATE_TTL:-1800}"
+  # 格式驗證比照 AGENT_BRIDGE_MAX_SPAWN：只認非負整數，其餘視為設定錯誤直接 die
+  [[ "$ttl" =~ ^[0-9]{1,9}$ ]] || die "AGENT_BRIDGE_STATE_TTL 需為非負整數：$ttl"
+  ttl=$((10#$ttl))
+
+  # ttl=0 比照本檔既有慣例（AGENT_BRIDGE_READY_TIMEOUT 0＝不等待）：0 代表
+  # 整條 state 通道關閉，一律當「未知」走 legacy 送鍵。不這樣做的話，沒有
+  # 下面的未來時間戳下界時 `now - epoch <= 0` 在 epoch 恰好等於 now 那個
+  # 窄縫仍會判成新鮮 busy，「TTL=0＝關閉」就名不符實
+  if (( ttl > 0 )) && [[ -f "$state_file" ]]; then
+    st="$(jq -r '.state // empty' "$state_file" 2>/dev/null)" || st=""
+    ts="$(jq -r '.ts // empty' "$state_file" 2>/dev/null)" || ts=""
+    if [[ -n "$st" && -n "$ts" ]]; then
+      # ts 是定長 ISO 8601 UTC，date -ud 直接轉 epoch；解析失敗（損壞／
+      # 格式不符）一律當無狀態處理，不讓一份壞掉的 state 檔擋住通知
+      epoch="$(date -ud "$ts" +%s 2>/dev/null)" || epoch=""
+      if [[ -n "$epoch" ]]; then
+        now="$(date -u +%s)"
+        # 下界：now - epoch 為負代表 ts 落在未來，無論是他 worker 惡意寫入
+        # 還是時鐘偏移都不可信——若不擋，未來時間戳會讓 busy 永遠判定為
+        # 新鮮，通知因此永久停擺，且沒有 TTL 能救回來。失效方向寧可選
+        # 「當作未知、多送一次鍵」（可復原），也不要「誤判成新鮮、餓死
+        # 到 TTL 之外」（不可復原）
+        if [[ "$st" == "busy" ]] && (( now - epoch >= 0 && now - epoch <= ttl )); then
+          fresh_busy=1
+        fi
+      fi
+    fi
+  fi
+
+  if (( fresh_busy )); then
+    log_event "$task_id" notify-deferred "pane=$pane cmd=$tag"
+    err "提示：$agent 目前忙碌中，通知延後——訊息已在 mailbox，對方 turn 結束時會由 hook 自行取件"
+    return 0
+  fi
+
+  if notify_pane "$pane" "$cmdline"; then
+    log_event "$task_id" notified "pane=$pane cmd=$tag"
+  else
+    log_event "$task_id" notify-failed "pane=$pane cmd=$tag"
+    err "警告：無法通知 $agent（pane $pane）；請手動在對方 session 執行：$cmdline"
+  fi
+}
+
 check_task_id() {
   local id="$1"
   [[ "$id" =~ $TASK_ID_RE ]] || die "task-id 不合法：$id"
@@ -518,12 +596,7 @@ cmd_send() {
   # notify_pane 的 PANE_RE 會擋下、走既有 notify-failed 降級
   pane="$(jq -r '.pane_id' "$agent_file" 2>/dev/null)" || pane=""
 
-  if notify_pane "$pane" "agent-bridge receive $task_id"; then
-    log_event "$task_id" notified "pane=$pane cmd=receive"
-  else
-    log_event "$task_id" notify-failed "pane=$pane cmd=receive"
-    err "警告：無法通知 $to（pane $pane）；請手動在對方 session 執行：agent-bridge receive $task_id"
-  fi
+  notify_or_defer "$to" "$pane" "agent-bridge receive $task_id" "$task_id" receive
 
   printf '%s\n' "$task_id"
 }
@@ -606,12 +679,7 @@ respond_task() {
   local from; from="$(jq -r '.from' "$dir/metadata.json")"
   if [[ -f "$AGENTS_DIR/$from.json" ]]; then
     local pane; pane="$(jq -r '.pane_id' "$AGENTS_DIR/$from.json")"
-    if notify_pane "$pane" "agent-bridge read $id"; then
-      log_event "$id" notified "pane=$pane cmd=read"
-    else
-      log_event "$id" notify-failed "pane=$pane cmd=read"
-      err "警告：無法通知 $from（pane $pane）；請手動在對方 session 執行：agent-bridge read $id"
-    fi
+    notify_or_defer "$from" "$pane" "agent-bridge read $id" "$id" read
   fi
 }
 
@@ -672,12 +740,7 @@ cmd_cancel() {
   local to; to="$(jq -r '.to' "$dir/metadata.json")"
   if [[ -f "$AGENTS_DIR/$to.json" ]]; then
     local pane; pane="$(jq -r '.pane_id' "$AGENTS_DIR/$to.json")"
-    if notify_pane "$pane" "agent-bridge status $id"; then
-      log_event "$id" notified "pane=$pane cmd=status"
-    else
-      log_event "$id" notify-failed "pane=$pane cmd=status"
-      err "警告：無法通知 $to（pane $pane）；對方查 status $id 時會看到 cancelled"
-    fi
+    notify_or_defer "$to" "$pane" "agent-bridge status $id" "$id" status
   fi
   info "已取消 task $id（cancelled）"
 }
@@ -1900,6 +1963,179 @@ EOF
   printf '%s\n' "$task_id"
 }
 
+# hook_agent_name：從 AGENT_BRIDGE_SPAWN_TAG 環境變數析出「我是誰」。
+# tag 格式見 cmd_spawn 的生成處：ab-spawn-<name>-<pid>-<12hex 隨機>。name 本身
+# 允許連字號與底線（NAME_RE），故不能用第一個 `-` 切；用錨定尾綴（-數字-12 hex）
+# 的正則反推、貪婪比對讓中間帶連字號的名字也能正確還原。
+# 無此變數、格式不符、或還原出的名字未過 NAME_RE 一律 return 1（呼叫端視為
+# 「不是 spawn 出身的 hook 呼叫」，靜默 no-op）——主 session／人工註冊 pane
+# 的環境本來就沒有這個變數，天然不受影響。
+hook_agent_name() {
+  local tag="${AGENT_BRIDGE_SPAWN_TAG:-}" rest name
+  [[ -n "$tag" ]] || return 1
+  rest="${tag#ab-spawn-}"
+  [[ "$rest" != "$tag" ]] || return 1
+  if [[ "$rest" =~ ^(.+)-[0-9]+-[0-9a-f]{12}$ ]]; then
+    name="${BASH_REMATCH[1]}"
+  else
+    return 1
+  fi
+  [[ "$name" =~ $NAME_RE ]] || return 1
+  printf '%s' "$name"
+}
+
+# hook_write_state <state-file> <state> <last_delivered|__KEEP__>：state 通道的
+# 單一寫者操作（呼叫者是 worker 自己的 hook，不取 registry 鎖，見 STATE_DIR
+# 註記）。__KEEP__ 表示保留既有 last_delivered 不動——prompt-submit 與
+# notification 的 idle 標記都不該動它：last_delivered 是 Stop hook 用來辨識
+# 「同一個仍待處理的任務是否已經被擋過一輪」的依據，若被其他事件中途沖掉，
+# 防無限迴圈的判斷就會失準（見 cmd_hook 的 stop 分支）。
+# 任何一步失敗（jq 壞、atomic_write 失敗）一律吞掉：hook 的失效方向是
+# state 停在舊值、TTL 到期後退回 legacy 送鍵，不是讓呼叫端跟著非零收場。
+hook_write_state() {
+  local file="$1" state="$2" ld="$3" ts
+  ts="$(now_iso)"
+  if [[ "$ld" == "__KEEP__" ]]; then
+    ld=""
+    if [[ -f "$file" ]]; then
+      ld="$(jq -r '.last_delivered // empty' "$file" 2>/dev/null)" || ld=""
+    fi
+  fi
+  jq -n --arg s "$state" --arg t "$ts" --arg ld "$ld" \
+    '{state: $s, ts: $t, last_delivered: $ld}' 2>/dev/null \
+    | atomic_write "$file" 2>/dev/null || true
+}
+
+# hook_oldest_queued <to>：查最舊一筆 to=<to> 且狀態為 queued 的 task-id，
+# 查無回空字串。task-id 以 UTC 時間戳起首（見 cmd_send），字典序即時間序，
+# 不必轉 epoch 排序。狀態一律讀裸 status 檔而非 metadata 的 status 欄——
+# status 檔是狀態機的權威（見 update_meta_status 的註記），兩者短暫不一致時
+# 這裡不能算錯。
+hook_oldest_queued() {
+  local to="$1" f dir id t st oldest=""
+  for f in "$TASKS_DIR"/*/metadata.json; do
+    [[ -e "$f" ]] || continue
+    dir="$(dirname "$f")"
+    id="$(basename "$dir")"
+    # tasks/ 是同互信域內每個 worker 都可寫的目錄，目錄名（basename）未經
+    # check_task_id 這道關卡就直接餵給下面 block reason 裡的
+    # "agent-bridge receive <id>"，會進到另一個 worker 模型看到的指令語意
+    # 空間。惡意或壞掉的目錄名（例如夾帶 shell metacharacter）在此就地跳過、
+    # 不得進入候選——與 check_task_id 同級把關，只是把關點挪到「取得 id 後
+    # 立刻擋」，不是 die：hook 鐵律是任何異常都不得中止，跳過這筆繼續掃下一筆
+    [[ "$id" =~ $TASK_ID_RE ]] || continue
+    t="$(jq -r '.to // empty' "$f" 2>/dev/null)" || continue
+    [[ "$t" == "$to" ]] || continue
+    st="$(cat "$dir/status" 2>/dev/null)" || continue
+    [[ "$st" == "queued" ]] || continue
+    if [[ -z "$oldest" || "$id" < "$oldest" ]]; then
+      oldest="$id"
+    fi
+  done
+  printf '%s' "$oldest"
+}
+
+# cmd_hook <stop|prompt-submit|notification>：Claude Code hook 協定的落地端
+# （stdin 收一份事件 JSON）。
+#
+# 失效方向鐵律：這支函式任何一步出錯（stdin 非 JSON、jq 失敗、state 寫入失敗、
+# 環境變數缺失或格式不符）一律以 exit 0 收場，絕不 exit 2、絕不非零——exit 2
+# 會被 Claude Code 當成「block」訊號，hook 故障不得干擾 worker 的正常運作。
+# 因此函式內每一步失敗路徑都走 if/||/case 顯式收斂，不讓 set -e 在函式中途把
+# 整支腳本帶出非零退出碼——那樣就繞過了每個分支末尾的 `exit 0`。
+# 只有 stop 事件確實要 block 續跑時才印 stdout；其餘路徑一律無 stdout 輸出。
+cmd_hook() {
+  local event="${1:-}"
+  case "$event" in
+    stop|prompt-submit|notification) ;;
+    *) exit 0 ;;  # 未知事件：靜默放行，避免 Claude Code 日後新增事件把 worker 卡住
+  esac
+
+  local name
+  name="$(hook_agent_name)" || exit 0
+  [[ -n "$name" ]] || exit 0
+
+  command -v jq >/dev/null 2>&1 || exit 0
+  mkdir -p "$STATE_DIR" 2>/dev/null || exit 0
+  local state_file="$STATE_DIR/$name.json"
+
+  # stdin 讀不到就當空字串；後續每個 jq 查詢都掛 || 保底，空字串／非 JSON
+  # 一律落到查詢失敗的分支，不會讓腳本中止。
+  # 讀取本身要設上限：裸 `cat` 沒有逾時，fd 0 已關閉或管線開著卻不送資料的
+  # 兩種情形實測都會讓程序卡住不返回（Claude Code 的 Stop hook 呼叫端因此
+  # 被無限期擋住，worker 的 turn 永遠結束不了）——這裡是「hook 故障不得干擾
+  # worker」這條鐵律唯一沒有 TTL 能救的一段，只能靠讀取本身設上限。
+  # 用 timeout 包，讀不到系統工具就退回原本裸 cat（不得因缺工具而讓 hook
+  # die）；逾時或讀不到一律當空字串繼續，維持 exit 0 鐵律
+  local stdin_json
+  if command -v timeout >/dev/null 2>&1; then
+    stdin_json="$(timeout 2 cat 2>/dev/null)" || stdin_json=""
+  else
+    stdin_json="$(cat 2>/dev/null)" || stdin_json=""
+  fi
+
+  case "$event" in
+    prompt-submit)
+      hook_write_state "$state_file" busy "__KEEP__"
+      ;;
+    notification)
+      # 判別欄位查證（本次 2026-07-28 WebFetch＋WebSearch 交叉比對）：
+      # - code.claude.com/docs/en/hooks：Notification 的 matcher 可選值含
+      #   idle_prompt（等輸入）／permission_prompt 等，但該頁 stdin JSON 範例
+      #   段落在擷取時被截斷，未直接給出對應的欄位名。
+      # - @anthropic-ai/claude-agent-sdk 的 NotificationHookInput 型別以
+      #   `notification_type` 承載這個值（實例見社群文章 alexop.dev/posts/
+      #   claude-code-notification-hooks，其 hook 腳本讀 input.notification_type
+      #   並 switch 比對 'idle_prompt'/'permission_prompt'，與官方 matcher 列舉
+      #   一致）。
+      # - 已知可靠性缺口：github.com/anthropics/claude-code issue #12048 回報
+      #   實際 payload 有時完全缺這個欄位（關聯 bug #11964）。本實作對此
+      #   fail-safe：缺欄位時 jq 回空字串、不等於 idle_prompt，落入「其他
+      #   型別不動 state」分支——不是誤判成 idle，代價可接受（state 停舊值，
+      #   TTL 到期後仍會退回 legacy 送鍵，不會永久卡住）。
+      local ntype
+      ntype="$(printf '%s' "$stdin_json" | jq -r '.notification_type // empty' 2>/dev/null)" || ntype=""
+      if [[ "$ntype" == "idle_prompt" ]]; then
+        hook_write_state "$state_file" idle "__KEEP__"
+      fi
+      ;;
+    stop)
+      # stop_hook_active 查證：code.claude.com/docs/en/hooks 官方文件與社群
+      # 引用的 hook JSON schema（gist.github.com/FrancisBourre/
+      # 50dca37124ecc43eaf08328cdcccdb34）一致列為 Stop 事件 stdin 的 boolean
+      # 欄位，供呼叫端防無限迴圈；本實作依此判斷。
+      local stop_active
+      stop_active="$(printf '%s' "$stdin_json" | jq -r '.stop_hook_active // false' 2>/dev/null)" || stop_active="false"
+
+      local pending
+      pending="$(hook_oldest_queued "$name")" || pending=""
+
+      if [[ -z "$pending" ]]; then
+        hook_write_state "$state_file" idle "__KEEP__"
+      else
+        local last_delivered=""
+        if [[ -f "$state_file" ]]; then
+          last_delivered="$(jq -r '.last_delivered // empty' "$state_file" 2>/dev/null)" || last_delivered=""
+        fi
+        if [[ "$stop_active" == "true" && "$pending" == "$last_delivered" ]]; then
+          # 同一個仍待處理的 task 已經被擋過一輪、模型還是選擇停下：這才是
+          # 真迴圈的訊號（模型不理會 reason），一輪就放行，不再無限擋。
+          # 多任務合法連鎖的情形下 pending 會是「下一個」不同 id，走 else
+          # 分支繼續擋，worker 可以一路把 mailbox 清空
+          hook_write_state "$state_file" idle "__KEEP__"
+        else
+          hook_write_state "$state_file" busy "$pending"
+          jq -n --arg id "$pending" \
+            '{decision: "block",
+              reason: ("New task " + $id + " is in your agent-bridge mailbox. Run: agent-bridge receive " + $id + " and handle it per your worker brief.")}' \
+            2>/dev/null || true
+        fi
+      fi
+      ;;
+  esac
+  exit 0
+}
+
 main() {
   if (( $# == 0 )); then
     usage
@@ -1917,12 +2153,16 @@ main() {
   # 嚴格只讀 sandbox 下查詢不該因 mkdir 失敗而死，資料目錄不存在時也不該
   # 無中生有（目錄缺失時 glob 走 nullglob 得空集、task 查詢以「找不到」收場，
   # 都是正確的唯讀行為）
+  # hook 自成一格：它必須「任何錯誤都 exit 0」（見 cmd_hook 開頭的鐵律註記），
+  # 借用 require_jq／ensure_dirs 的 die 語意會違反這條鐵律（缺 jq 或 mkdir 失敗
+  # 都會讓 die/errexit 把腳本帶出非零）。jq 存在性與 STATE_DIR 建立改由
+  # cmd_hook 自己做、失敗一律吞掉
   case "$cmd" in
-    status|await) ;;
+    status|await|hook) ;;
     *) require_jq ;;
   esac
   case "$cmd" in
-    status|await|idle|list) ;;
+    status|await|idle|list|hook) ;;
     *) ensure_dirs ;;
   esac
   case "$cmd" in
@@ -1938,6 +2178,7 @@ main() {
     status)     cmd_status "$@" ;;
     read)       cmd_read "$@" ;;
     await)      cmd_await "$@" ;;
+    hook)       cmd_hook "$@" ;;
     spawn)      cmd_spawn "$@" ;;
     relay)      cmd_relay "$@" ;;
     despawn)    cmd_despawn "$@" ;;

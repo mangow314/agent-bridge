@@ -136,6 +136,25 @@ ab_notmux() {
 # shellcheck disable=SC2329  # 經 assert/wait_for 的 "$@" 間接呼叫
 st_is() { [[ "$(ab "$1" status "$2" 2>/dev/null)" == "$3" ]]; }
 
+# state_field_is <state-file> <field> <expect>：讀 state/<name>.json 某欄位是否
+# 等於期望值（讀不到／解析失敗即回 false，天然涵蓋「state 檔還沒被 hook 寫出」）
+# shellcheck disable=SC2329  # 經 assert 的 "$@" 間接呼叫
+state_field_is() {
+  local file="$1" field="$2" expect="$3"
+  [[ "$(jq -r --arg f "$field" '.[$f] // empty' "$file" 2>/dev/null)" == "$expect" ]]
+}
+# now_iso_test：產生一個「現在」的 UTC ISO 8601 字串，供測試偽造新鮮的 state 檔
+# shellcheck disable=SC2329  # 經測試片段直接呼叫
+now_iso_test() { date -u +%Y-%m-%dT%H:%M:%SZ; }
+# hookcall <data-dir> <spawn-tag> <event> <stdin-json>：直接呼叫 hook 子命令，
+# 不經 tmux；stdin 走 heredoc 餵 fixture JSON，stdout/exit code 由呼叫端擷取
+# shellcheck disable=SC2329  # 經 assert 的 "$@" 間接呼叫
+hookcall() {
+  local data="$1" tag="$2" event="$3" json="$4"
+  printf '%s' "$json" | env AGENT_BRIDGE_DATA="$data" AGENT_BRIDGE_SPAWN_TAG="$tag" \
+    PATH="$SHIM:$PATH" "$BRIDGE" hook "$event"
+}
+
 # ---- spawn 測試 helper ----
 # absp <data-dir> <ready-timeout> <args...>：spawn 用短探針間隔執行 bridge
 absp() {
@@ -2859,6 +2878,267 @@ assert "32i 回滾：pane 數回到 spawn 前" test "$(pane_count)" -eq "$PANES_
 # 32f. 欄位安全不變量：agents.log 每行恰 6 個空白分隔欄（含 32h 的污染注入）
 assert "32f agents.log 每行恰 6 欄" \
   bash -c "! grep -qEv '^[^ ]+ [^ ]+ [^ ]+ [^ ]+ [^ ]+ [^ ]+\$' '$D32/agents.log'"
+
+# ---- 33. 通知原生化 Phase 1：hook 子命令＋notify_or_defer（declarative-juggling-lark）----
+
+# 33.1 hook stop：有 queued task → block JSON＋state busy/last_delivered
+D33="$TESTROOT/d33"
+ab "$D33" register zoe "$PANE_A" 2>/dev/null
+id33_1="$(ab "$D33" send zoe --from alice --message t1 2>/dev/null)"
+TAG33="ab-spawn-zoe-12345-0123456789ab"
+hookcall "$D33" "$TAG33" stop '{}' > "$TESTROOT/h1.out" 2>"$TESTROOT/h1.err"; rc=$?
+assert "33.1 hook stop：exit 0" test "$rc" -eq 0
+assert "33.1 hook stop：stdout 是合法 JSON" jq -e . "$TESTROOT/h1.out"
+assert "33.1 hook stop：decision=block" \
+  bash -c "test \"\$(jq -r .decision '$TESTROOT/h1.out')\" = block"
+assert "33.1 hook stop：reason 含 receive <id>" grep -q "receive $id33_1" "$TESTROOT/h1.out"
+assert "33.1 hook stop：state 檔 state=busy" state_field_is "$D33/state/zoe.json" state busy
+assert "33.1 hook stop：state 檔 last_delivered 正確" \
+  state_field_is "$D33/state/zoe.json" last_delivered "$id33_1"
+
+# 33.2 hook stop：stop_hook_active=true＋同 last_delivered id → 無 stdout、放行、state=idle
+hookcall "$D33" "$TAG33" stop '{"stop_hook_active":true}' > "$TESTROOT/h2.out" 2>"$TESTROOT/h2.err"; rc=$?
+assert "33.2 hook stop 同 id 放行：exit 0" test "$rc" -eq 0
+assert "33.2 hook stop 同 id 放行：無 stdout" test ! -s "$TESTROOT/h2.out"
+assert "33.2 hook stop 同 id 放行：state=idle" state_field_is "$D33/state/zoe.json" state idle
+
+# 33.3 hook stop：stop_hook_active=true＋不同 pending id → 照樣 block（連鎖合法）
+D33c="$TESTROOT/d33c"
+ab "$D33c" register zed "$PANE_A" 2>/dev/null
+id33c="$(ab "$D33c" send zed --from alice --message a 2>/dev/null)"
+TAGZED="ab-spawn-zed-777-aaaaaaaaaaaa"
+mkdir -p "$D33c/state"
+jq -n --arg s idle --arg t "2020-01-01T00:00:00Z" --arg ld "prev-fake-id" \
+  '{state: $s, ts: $t, last_delivered: $ld}' > "$D33c/state/zed.json"
+hookcall "$D33c" "$TAGZED" stop '{"stop_hook_active":true}' > "$TESTROOT/h3.out" 2>/dev/null
+assert "33.3 hook stop 連鎖：不同 pending id 仍 block" grep -q "receive $id33c" "$TESTROOT/h3.out"
+assert "33.3 hook stop 連鎖：last_delivered 更新為新 id" \
+  state_field_is "$D33c/state/zed.json" last_delivered "$id33c"
+
+# 33.4 hook：無 AGENT_BRIDGE_SPAWN_TAG → exit 0、無輸出、不產生 state 目錄
+D33d="$TESTROOT/d33d"
+printf '{}' | env AGENT_BRIDGE_DATA="$D33d" PATH="$SHIM:$PATH" "$BRIDGE" hook stop \
+  > "$TESTROOT/h4.out" 2>"$TESTROOT/h4.err"; rc=$?
+assert "33.4 hook 無 tag：exit 0" test "$rc" -eq 0
+assert "33.4 hook 無 tag：無 stdout" test ! -s "$TESTROOT/h4.out"
+assert "33.4 hook 無 tag：不產生 state 目錄" bash -c "! test -e '$D33d/state'"
+
+# 33.5 tag 析名：name 含連字號正確派對到 state 檔
+D33e="$TESTROOT/d33e"
+ab "$D33e" register my-worker-2 "$PANE_A" 2>/dev/null
+id33e="$(ab "$D33e" send my-worker-2 --from alice --message e 2>/dev/null)"
+TAGE="ab-spawn-my-worker-2-12345-0123456789ab"
+hookcall "$D33e" "$TAGE" stop '{}' > "$TESTROOT/h5.out" 2>/dev/null
+assert "33.5 tag 析名：連字號名稱派對到正確 state 檔" test -f "$D33e/state/my-worker-2.json"
+assert "33.5 tag 析名：block JSON 含正確 id" grep -q "receive $id33e" "$TESTROOT/h5.out"
+
+# 33.6 hook prompt-submit → busy；notification（idle 型）→ idle；其他型別 → state 不變
+D33f="$TESTROOT/d33f"
+ab "$D33f" register fin "$PANE_A" 2>/dev/null
+TAGF="ab-spawn-fin-1-aaaaaaaaaaaa"
+hookcall "$D33f" "$TAGF" prompt-submit '{}' >/dev/null 2>&1
+assert "33.6 hook prompt-submit：state=busy" state_field_is "$D33f/state/fin.json" state busy
+hookcall "$D33f" "$TAGF" notification '{"notification_type":"idle_prompt"}' >/dev/null 2>&1
+assert "33.6 hook notification(idle_prompt)：state=idle" state_field_is "$D33f/state/fin.json" state idle
+hookcall "$D33f" "$TAGF" prompt-submit '{}' >/dev/null 2>&1
+hookcall "$D33f" "$TAGF" notification '{"notification_type":"permission_prompt"}' >/dev/null 2>&1
+assert "33.6 hook notification(其他型別)：state 不變（仍 busy）" \
+  state_field_is "$D33f/state/fin.json" state busy
+
+# 33.7 send：state=busy 且新鮮 → send-keys 零次＋notify-deferred＋task 照建 queued
+D33g="$TESTROOT/d33g"
+p33g="$(tmx split-window -dP -F '#{pane_id}' -t it "$pane_cmd")"
+ab "$D33g" register gina "$p33g" 2>/dev/null
+mkdir -p "$D33g/state"
+jq -n --arg s busy --arg t "$(now_iso_test)" --arg ld "" \
+  '{state: $s, ts: $t, last_delivered: $ld}' > "$D33g/state/gina.json"
+tmx send-keys -t "$p33g" \
+  "touch $TESTROOT/g-ready ; while IFS= read -r l ; do printf '%s\n' \"\$l\" >> $TESTROOT/g-got.txt ; done" Enter
+wait_for 10 test -f "$TESTROOT/g-ready"
+id33g="$(ab "$D33g" send gina --from alice --message hi 2>/dev/null)"
+tmx send-keys -t "$p33g" 'SENTINEL-g' Enter
+assert "33.7 state=busy 新鮮：記錄機制活著" wait_for 10 grep -q 'SENTINEL-g' "$TESTROOT/g-got.txt"
+# shellcheck disable=SC2016  # $1/$2 由內層 bash 展開，刻意單引號
+assert "33.7 state=busy 新鮮：got 只有哨兵一行（零次 send-keys 通知）" \
+  bash -c 'test "$(wc -l < "$1")" -eq 1 && grep -Fxq "$2" "$1"' _ "$TESTROOT/g-got.txt" 'SENTINEL-g'
+assert "33.7 state=busy 新鮮：events.log 記 notify-deferred" \
+  evt_grep "$D33g/tasks/$id33g/events.log" notify-deferred
+assert "33.7 state=busy 新鮮：task 仍建立為 queued" st_is "$D33g" "$id33g" queued
+tmx kill-pane -t "$p33g" 2>/dev/null || true
+
+# 33.8 send：state=idle 且新鮮 → 通知照送
+D33h="$TESTROOT/d33h"
+p33h="$(tmx split-window -dP -F '#{pane_id}' -t it "$pane_cmd")"
+ab "$D33h" register hana "$p33h" 2>/dev/null
+mkdir -p "$D33h/state"
+jq -n --arg s idle --arg t "$(now_iso_test)" --arg ld "" \
+  '{state: $s, ts: $t, last_delivered: $ld}' > "$D33h/state/hana.json"
+tmx send-keys -t "$p33h" \
+  "touch $TESTROOT/h-ready ; while IFS= read -r l ; do printf '%s\n' \"\$l\" >> $TESTROOT/h-got.txt ; done" Enter
+wait_for 10 test -f "$TESTROOT/h-ready"
+id33h="$(ab "$D33h" send hana --from alice --message hi 2>/dev/null)"
+assert "33.8 state=idle 新鮮：pane 收到通知文字（照送）" wait_for 10 grep -q "$id33h" "$TESTROOT/h-got.txt"
+assert "33.8 state=idle 新鮮：events.log 記 notified" evt_grep "$D33h/tasks/$id33h/events.log" notified
+tmx kill-pane -t "$p33h" 2>/dev/null || true
+
+# 33.9 send：state=busy 但 ts 過期 → 走 legacy 送鍵
+D33i="$TESTROOT/d33i"
+p33i="$(tmx split-window -dP -F '#{pane_id}' -t it "$pane_cmd")"
+ab "$D33i" register ivy "$p33i" 2>/dev/null
+mkdir -p "$D33i/state"
+jq -n --arg s busy --arg t "2000-01-01T00:00:00Z" --arg ld "" \
+  '{state: $s, ts: $t, last_delivered: $ld}' > "$D33i/state/ivy.json"
+tmx send-keys -t "$p33i" \
+  "touch $TESTROOT/i-ready ; while IFS= read -r l ; do printf '%s\n' \"\$l\" >> $TESTROOT/i-got.txt ; done" Enter
+wait_for 10 test -f "$TESTROOT/i-ready"
+id33i="$(ab "$D33i" send ivy --from alice --message hi 2>/dev/null)"
+assert "33.9 state=busy 但過期：走 legacy 送鍵（pane 收到通知文字）" \
+  wait_for 10 grep -q "$id33i" "$TESTROOT/i-got.txt"
+assert "33.9 state=busy 但過期：events.log 記 notified" evt_grep "$D33i/tasks/$id33i/events.log" notified
+tmx kill-pane -t "$p33i" 2>/dev/null || true
+
+# 33.10 send：state 檔損壞（非 JSON）→ legacy 路徑
+D33j="$TESTROOT/d33j"
+p33j="$(tmx split-window -dP -F '#{pane_id}' -t it "$pane_cmd")"
+ab "$D33j" register jojo "$p33j" 2>/dev/null
+mkdir -p "$D33j/state"
+printf 'not json{{{' > "$D33j/state/jojo.json"
+tmx send-keys -t "$p33j" \
+  "touch $TESTROOT/j-ready ; while IFS= read -r l ; do printf '%s\n' \"\$l\" >> $TESTROOT/j-got.txt ; done" Enter
+wait_for 10 test -f "$TESTROOT/j-ready"
+id33j="$(ab "$D33j" send jojo --from alice --message hi 2>/dev/null)"
+assert "33.10 state 損壞：走 legacy 送鍵（pane 收到通知文字）" \
+  wait_for 10 grep -q "$id33j" "$TESTROOT/j-got.txt"
+assert "33.10 state 損壞：events.log 記 notified" evt_grep "$D33j/tasks/$id33j/events.log" notified
+tmx kill-pane -t "$p33j" 2>/dev/null || true
+
+# 33.11a respond_task（reply）通知 sender：busy→deferred
+D33k="$TESTROOT/d33k"
+p33k="$(tmx split-window -dP -F '#{pane_id}' -t it "$pane_cmd")"
+ab "$D33k" register kiwi "$p33k" 2>/dev/null
+ab "$D33k" register lulu "$PANE_B" 2>/dev/null
+id33k="$(ab "$D33k" send lulu --from kiwi --message hi 2>/dev/null)"
+ab "$D33k" receive "$id33k" >/dev/null 2>&1
+mkdir -p "$D33k/state"
+jq -n --arg s busy --arg t "$(now_iso_test)" --arg ld "" \
+  '{state: $s, ts: $t, last_delivered: $ld}' > "$D33k/state/kiwi.json"
+tmx send-keys -t "$p33k" \
+  "touch $TESTROOT/k-ready ; while IFS= read -r l ; do printf '%s\n' \"\$l\" >> $TESTROOT/k-got.txt ; done" Enter
+wait_for 10 test -f "$TESTROOT/k-ready"
+ab "$D33k" reply "$id33k" --message task-done 2>/dev/null
+tmx send-keys -t "$p33k" 'SENTINEL-k' Enter
+assert "33.11a reply 通知 sender busy→deferred：記錄機制活著" \
+  wait_for 10 grep -q 'SENTINEL-k' "$TESTROOT/k-got.txt"
+# shellcheck disable=SC2016  # $1/$2 由內層 bash 展開，刻意單引號
+assert "33.11a reply 通知 sender busy→deferred：got 只有哨兵一行" \
+  bash -c 'test "$(wc -l < "$1")" -eq 1 && grep -Fxq "$2" "$1"' _ "$TESTROOT/k-got.txt" 'SENTINEL-k'
+assert "33.11a reply 通知 sender busy→deferred：events.log 記 notify-deferred" \
+  evt_grep "$D33k/tasks/$id33k/events.log" notify-deferred
+tmx kill-pane -t "$p33k" 2>/dev/null || true
+
+# 33.11b cancel 通知 to：busy→deferred
+D33l="$TESTROOT/d33l"
+p33l="$(tmx split-window -dP -F '#{pane_id}' -t it "$pane_cmd")"
+ab "$D33l" register momo2 "$p33l" 2>/dev/null
+id33l="$(ab "$D33l" send momo2 --from alice --message hi 2>/dev/null)"
+mkdir -p "$D33l/state"
+jq -n --arg s busy --arg t "$(now_iso_test)" --arg ld "" \
+  '{state: $s, ts: $t, last_delivered: $ld}' > "$D33l/state/momo2.json"
+tmx send-keys -t "$p33l" \
+  "touch $TESTROOT/l-ready ; while IFS= read -r l ; do printf '%s\n' \"\$l\" >> $TESTROOT/l-got.txt ; done" Enter
+wait_for 10 test -f "$TESTROOT/l-ready"
+ab "$D33l" cancel "$id33l" 2>/dev/null
+tmx send-keys -t "$p33l" 'SENTINEL-l' Enter
+assert "33.11b cancel 通知 to busy→deferred：記錄機制活著" \
+  wait_for 10 grep -q 'SENTINEL-l' "$TESTROOT/l-got.txt"
+# shellcheck disable=SC2016  # $1/$2 由內層 bash 展開，刻意單引號
+assert "33.11b cancel 通知 to busy→deferred：got 只有哨兵一行" \
+  bash -c 'test "$(wc -l < "$1")" -eq 1 && grep -Fxq "$2" "$1"' _ "$TESTROOT/l-got.txt" 'SENTINEL-l'
+assert "33.11b cancel 通知 to busy→deferred：events.log 記 notify-deferred" \
+  evt_grep "$D33l/tasks/$id33l/events.log" notify-deferred
+tmx kill-pane -t "$p33l" 2>/dev/null || true
+
+# ---- 34. 獨立複核 blocker 修補（2026-07-28）----
+
+# 34.1a B1 反例：tasks/ 目錄名含 shell metacharacter，混在合法 queued task
+# 之間 → hook stop 的 reason 只能含合法 id，惡意目錄名片段不得出現
+D34a="$TESTROOT/d34a"
+ab "$D34a" register quinn "$PANE_A" 2>/dev/null
+id34a="$(ab "$D34a" send quinn --from alice --message t1 2>/dev/null)"
+# shellcheck disable=SC2016  # 刻意單引號：$(id) 只是字面目錄名，不要展開
+mal_name='EVIL$(id)-x; echo OWNED'
+mkdir -p "$D34a/tasks/$mal_name"
+jq -n --arg to quinn '{version: 1, to: $to, status: "queued"}' \
+  > "$D34a/tasks/$mal_name/metadata.json"
+printf 'queued\n' > "$D34a/tasks/$mal_name/status"
+TAG34A="ab-spawn-quinn-1-aaaaaaaaaaaa"
+hookcall "$D34a" "$TAG34A" stop '{}' > "$TESTROOT/h34a.out" 2>/dev/null
+assert "34.1a B1：reason 含合法 id" grep -q "receive $id34a" "$TESTROOT/h34a.out"
+# shellcheck disable=SC2016  # $1 由內層 bash 展開，刻意單引號
+assert "34.1a B1：reason 不含惡意目錄名片段" \
+  bash -c '! grep -qF "OWNED" "$1"' _ "$TESTROOT/h34a.out"
+# shellcheck disable=SC2016  # $1 由內層 bash 展開，刻意單引號
+assert "34.1a B1：reason 不含惡意目錄名片段（EVIL）" \
+  bash -c '! grep -qF "EVIL" "$1"' _ "$TESTROOT/h34a.out"
+
+# 34.1b B1 反例：只有惡意目錄、無合法 task → 不 block（無 stdout）、exit 0
+D34b="$TESTROOT/d34b"
+ab "$D34b" register quinn2 "$PANE_A" 2>/dev/null
+# shellcheck disable=SC2016  # 刻意單引號：$(id) 只是字面目錄名，不要展開
+mal_name2='EVIL$(id)-y; echo OWNED'
+mkdir -p "$D34b/tasks/$mal_name2"
+jq -n --arg to quinn2 '{version: 1, to: $to, status: "queued"}' \
+  > "$D34b/tasks/$mal_name2/metadata.json"
+printf 'queued\n' > "$D34b/tasks/$mal_name2/status"
+TAG34B="ab-spawn-quinn2-1-aaaaaaaaaaaa"
+hookcall "$D34b" "$TAG34B" stop '{}' > "$TESTROOT/h34b.out" 2>"$TESTROOT/h34b.err"; rc=$?
+assert "34.1b B1：只有惡意目錄，exit 0" test "$rc" -eq 0
+assert "34.1b B1：只有惡意目錄，無 stdout（不 block）" test ! -s "$TESTROOT/h34b.out"
+
+# 34.2 B2 反例：state=busy 且 ts 在未來（2099）→ 不得永久新鮮，走 legacy 送鍵
+D34c="$TESTROOT/d34c"
+p34c="$(tmx split-window -dP -F '#{pane_id}' -t it "$pane_cmd")"
+ab "$D34c" register kay "$p34c" 2>/dev/null
+mkdir -p "$D34c/state"
+jq -n --arg s busy --arg t "2099-01-01T00:00:00Z" --arg ld "" \
+  '{state: $s, ts: $t, last_delivered: $ld}' > "$D34c/state/kay.json"
+tmx send-keys -t "$p34c" \
+  "touch $TESTROOT/kay-ready ; while IFS= read -r l ; do printf '%s\n' \"\$l\" >> $TESTROOT/kay-got.txt ; done" Enter
+wait_for 10 test -f "$TESTROOT/kay-ready"
+id34c="$(ab "$D34c" send kay --from alice --message hi 2>/dev/null)"
+assert "34.2 B2 反例：未來 ts 走 legacy 送鍵（pane 收到通知文字）" \
+  wait_for 10 grep -q "$id34c" "$TESTROOT/kay-got.txt"
+assert "34.2 B2 反例：events.log 記 notified" \
+  evt_grep "$D34c/tasks/$id34c/events.log" notified
+tmx kill-pane -t "$p34c" 2>/dev/null || true
+
+# 34.3 B3 反例：hook stop 讀 stdin 不得無限期掛起
+D34d="$TESTROOT/d34d"
+TAG34D="ab-spawn-mo-1-aaaaaaaaaaaa"
+timeout 10 env AGENT_BRIDGE_DATA="$D34d" AGENT_BRIDGE_SPAWN_TAG="$TAG34D" \
+  PATH="$SHIM:$PATH" "$BRIDGE" hook stop <&- ; rc=$?
+assert "34.3 B3 反例：fd 0 已關閉不掛起（rc=0，非 timeout 的 124）" test "$rc" -eq 0
+timeout 10 env AGENT_BRIDGE_DATA="$D34d" AGENT_BRIDGE_SPAWN_TAG="$TAG34D" \
+  PATH="$SHIM:$PATH" "$BRIDGE" hook stop < <(sleep 30) ; rc=$?
+assert "34.3 B3 反例：管線開著不送資料不掛起（rc=0，非 timeout 的 124）" test "$rc" -eq 0
+
+# 34.4 附帶：AGENT_BRIDGE_STATE_TTL=0 視為 state 通道關閉，一律走 legacy
+D34e="$TESTROOT/d34e"
+p34e="$(tmx split-window -dP -F '#{pane_id}' -t it "$pane_cmd")"
+ab "$D34e" register nia "$p34e" 2>/dev/null
+mkdir -p "$D34e/state"
+jq -n --arg s busy --arg t "$(now_iso_test)" --arg ld "" \
+  '{state: $s, ts: $t, last_delivered: $ld}' > "$D34e/state/nia.json"
+tmx send-keys -t "$p34e" \
+  "touch $TESTROOT/nia-ready ; while IFS= read -r l ; do printf '%s\n' \"\$l\" >> $TESTROOT/nia-got.txt ; done" Enter
+wait_for 10 test -f "$TESTROOT/nia-ready"
+id34e="$(env AGENT_BRIDGE_STATE_TTL=0 AGENT_BRIDGE_DATA="$D34e" PATH="$SHIM:$PATH" \
+  "$BRIDGE" send nia --from alice --message hi 2>/dev/null)"
+assert "34.4 TTL=0：視為通道關閉，走 legacy 送鍵（pane 收到通知文字）" \
+  wait_for 10 grep -q "$id34e" "$TESTROOT/nia-got.txt"
+assert "34.4 TTL=0：events.log 記 notified" \
+  evt_grep "$D34e/tasks/$id34e/events.log" notified
+tmx kill-pane -t "$p34e" 2>/dev/null || true
 
 # ---- 總結 ----
 printf '\n共 %d PASS、%d FAIL\n' "$PASS" "$FAIL"
