@@ -95,10 +95,15 @@ context 管理都要自己來。agent-bridge 編排的是你平常手上在用�
    若 `state/<name>.json` 顯示 `busy` 且未超過 `AGENT_BRIDGE_STATE_TTL`
    （預設 1800 秒），完全不送鍵、只記一筆 `notify-deferred`：訊息已在
    mailbox，對方自己的 Stop hook 會在 turn 結束時查到並自行 `receive`。
-   codex worker **尚未接線這條 hook 通道**（Phase 3 待補），與 claude
-   worker 的 state 檔缺失／解析失敗／過期一樣，一律落回下面的 send-keys
-   路徑——state 通道整體是「建議非權威」，任何讀不準都以退回 legacy 送鍵
-   收場，不會讓通知卡死。
+   codex worker 走同一條路（Phase 3）：hooks 宣告在
+   `~/.codex/agent-worker.config.toml`，命令與 claude 側完全相同——實測 codex
+   0.145 的 Stop hook payload 與 Claude Code 同構（含 `stop_hook_active`）、
+   `exit 2` 同樣是 block 訊號，所以 `agent-bridge hook` 不必分歧。差別只有
+   codex 沒有 Notification 事件（claude 用它接 `idle_prompt`），但 Stop 本來
+   就會在 turn 結束標 idle，功能不缺角。**codex 另外要求 hook 經人互動式
+   授予信任一次**，未受信任會被靜默略過（見「已知限制」）。state 檔缺失／
+   解析失敗／過期一律落回下面的 send-keys 路徑——state 通道整體是「建議
+   非權威」，任何讀不準都以退回 legacy 送鍵收場，不會讓通知卡死。
 
    **send-keys 路徑**（idle worker 的喚醒、無 hook worker 的 fallback）：
    只向對方 pane 送一行 `agent-bridge receive <task-id>`（或
@@ -546,15 +551,28 @@ tests/run-tests.sh
 - **agent 忙碌時通知會延後處理**：已接線 hook 的 claude worker 若 state 檔
   顯示新鮮的 `busy`，`notify_or_defer` 現在完全不送鍵，訊息留在 mailbox，
   改由對方自己的 Stop hook 在 turn 結束時查到並自行 `receive`（通知原生化
-  Phase 1/2）。殘餘限制仍要誠實列出：(1) **codex worker 尚未接線**這條 hook
-  通道（Phase 3 待補），仍是舊行為——send-keys 打進去的指令要等對方 REPL
-  輪到輸入時才會執行；(2) claude worker 的 hook 若中途掛掉（stdin 非
+  Phase 1/2/3）。殘餘限制仍要誠實列出：(1) **codex worker 的 hook 需要人
+  互動式授予信任一次**才會生效，未授信任時會被 codex **靜默略過**（沒有
+  警告、沒有錯誤），行為退回舊的 send-keys；(2) worker 的 hook 若中途掛掉（stdin 非
   JSON、缺 `jq`、state 目錄寫不進去等），state 會停在舊的 `busy` 不動，
   要等 `AGENT_BRIDGE_STATE_TTL`（預設 1800 秒）過期後才會退回 send-keys
   通知，這段窗口內只能靠對方自己輪到輸入或人工介入；(3) state 通道語意
   是「建議非權威」（同 `disposable`），不是保護機制——上面兩種情形都不會
   遺失訊息，只是即時性沒有保證。
-- **通知原生化本身引入的脆弱面（Phase 1/2，2026-07-28，刻意不美化）**：
+- **通知原生化本身引入的脆弱面（Phase 1/2/3，2026-07-28，刻意不美化）**：
+  - **巢狀 runtime 會汙染 parent worker 的 state（未修，實測確認）**：
+    `AGENT_BRIDGE_SPAWN_TAG` 是環境變數、子行程一律繼承，所以在一個 worker
+    的 session 裡再啟動任何 agent runtime（`codex exec`、`claude -p`、
+    review-overlay 的 fallback 載具……），那個巢狀 session 的 hooks 會用
+    **parent 的名字**寫 state。後果有兩層：(1) parent 被標成 idle 而實際正忙，
+    `notify_or_defer` 因此走送鍵路徑，等於把通知原生化要消除的風險繞回來
+    （實測時被 `notify_pane` 的畫面掃描 fail-closed 擋下，記成 `notify-failed`
+    ——但那道防線本來只該是 belt-and-suspenders）；(2) 更嚴重：巢狀 session
+    的 Stop hook 會拿 parent 的名字查 mailbox，查到 queued 任務就叫自己去
+    `receive`，而 `receive` 不驗身分，**本該給 parent 的任務會被子 session
+    取走**。可行的最小修法是用 hook payload 的 `session_id` 做先到先得的
+    所有權綁定（worker 自己的 `ready` 那輪必然最早寫入），尚未實作。
+    完整分析見 `docs/codex-hooks-probe.md`。
   - **`notification_type` 欄位有已知可靠性缺口**：官方 Notification hook
     payload 有時完全缺這個欄位（[issue #12048](https://github.com/anthropics/claude-code/issues/12048)，
     關聯 [#11964](https://github.com/anthropics/claude-code/issues/11964)）。
