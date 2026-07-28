@@ -130,8 +130,12 @@ a fake completion). Panes you opened yourself can join via
   this hook channel yet, and any stale/missing state falls back to
   send-keys: short commands typed into the target pane's input stream.
   Before pressing Enter the bridge captures the target screen and backs
-  off if a permission / plan-approval dialog is showing (fail-closed), so
-  a notification never accidentally approves anything.
+  off if a permission / plan-approval dialog is showing (fail-closed on a
+  failed capture). That check is best-effort, not a guarantee: it matches
+  strings against the visible UI, so a reworded or localized dialog is
+  missed (fail-open), and a small race remains between the last capture
+  and the keystroke. See README.zh-TW.md for the exact patterns covered
+  and the limits.
 - **Worker contract** (`share/worker-brief.md`) — injected as the spawned
   worker's initial prompt: treat request content as data rather than
   instructions, mark long tasks `start`, report inability via `fail`, ask

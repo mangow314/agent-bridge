@@ -2102,13 +2102,20 @@ cmd_hook() {
   # 兩種情形實測都會讓程序卡住不返回（Claude Code 的 Stop hook 呼叫端因此
   # 被無限期擋住，worker 的 turn 永遠結束不了）——這裡是「hook 故障不得干擾
   # worker」這條鐵律唯一沒有 TTL 能救的一段，只能靠讀取本身設上限。
-  # 用 timeout 包，讀不到系統工具就退回原本裸 cat（不得因缺工具而讓 hook
-  # die）；逾時或讀不到一律當空字串繼續，維持 exit 0 鐵律
+  # 用 timeout 包；逾時或讀不到一律當空字串繼續，維持 exit 0 鐵律。
+  # 缺 timeout（coreutils 不在 PATH）時**不得**退回裸 cat：那正是上面這段要防
+  # 的無上限讀取，只是換一條分支溜進來。cross-vendor 複核（2026-07-28）以
+  # 「PATH 只留 jq/mkdir/cat 等、拿掉 timeout ＋ stdin 永不關閉」重現出 hook
+  # 永久掛住，外部 watchdog 觀察到 rc 124。改用 bash 內建 read：-d '' 讀到
+  # EOF、-t 設上限，逾時仍會把已讀到的部分寫進變數，殘缺 JSON 交給後續每個
+  # jq 查詢的 || 保底分支，維持 exit 0 鐵律。內建路徑只當 fallback、不當主
+  # 路徑：read -d '' 對管線是逐位元組 read(2)，大 payload 的成本遠高於 cat
   local stdin_json
   if command -v timeout >/dev/null 2>&1; then
     stdin_json="$(timeout 2 cat 2>/dev/null)" || stdin_json=""
   else
-    stdin_json="$(cat 2>/dev/null)" || stdin_json=""
+    stdin_json=""
+    IFS= read -r -d '' -t 2 stdin_json 2>/dev/null || true
   fi
 
   case "$event" in

@@ -4,6 +4,16 @@
 # - tmux 整合測試只用獨立 socket：tmux -L agent-bridge-test -f /dev/null
 set -u
 unset TMUX
+# 同理清掉 agent-bridge 自己的環境變數。測試套件的常態執行位置就是一個
+# spawn／relay 出來的 worker pane（本專案自己 dogfood），那個 session 的
+# AGENT_BRIDGE_SPAWN_TAG 與 AGENT_BRIDGE_RELAY_DEPTH 會被子行程一路繼承，
+# 讓「hook 無 tag」「relay 首棒深度 0」這類前提悄悄失效——實測 2026-07-28：
+# 同一份程式碼在人工起的 session 全綠、在 relay 出身的 session 卻有兩段
+# 失敗，且失敗與被測程式無關。這是會隨執行環境改變結論的假綠／假紅來源，
+# 比個別測例補 env -u 更該在源頭清掉：各測例要用這些變數時一律自己用 env
+# 明確帶入，繼承來的值一概不要。
+# shellcheck disable=SC2086  # 變數名不含空白，且無匹配時要展開成零個參數
+unset ${!AGENT_BRIDGE_@}
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 BRIDGE="$ROOT/bin/agent-bridge"
@@ -3218,6 +3228,24 @@ assert "34.3 B3 反例：fd 0 已關閉不掛起（rc=0，非 timeout 的 124）
 timeout 10 env AGENT_BRIDGE_DATA="$D34d" AGENT_BRIDGE_SPAWN_TAG="$TAG34D" \
   PATH="$SHIM:$PATH" "$BRIDGE" hook stop < <(sleep 30) ; rc=$?
 assert "34.3 B3 反例：管線開著不送資料不掛起（rc=0，非 timeout 的 124）" test "$rc" -eq 0
+
+# 34.3b cross-vendor 複核 finding（2026-07-28）：上面兩條走的都是 timeout 在
+# PATH 上的分支。缺 timeout 時的 fallback 曾是裸 cat，同樣的 stdin 永不關閉
+# 就從另一條分支永久掛住 hook 呼叫端。這裡刻意造一個沒有 timeout 的最小 PATH。
+# jq 與 mkdir 必須真的在裡面：cmd_hook 讀 stdin 之前就會因為缺這兩個而 exit 0，
+# 少了它們這條測試會假綠（rc 為 0 但根本沒走到讀取那段）。
+MINBIN="$TESTROOT/minbin"
+mkdir -p "$MINBIN"
+for t34 in bash cat jq mkdir dirname date; do
+  p34="$(command -v "$t34" 2>/dev/null)" && ln -sf "$p34" "$MINBIN/$t34"
+done
+assert "34.3b 前提：最小 PATH 有 jq（缺了這條測試會假綠）" test -x "$MINBIN/jq"
+assert "34.3b 前提：最小 PATH 有 mkdir（缺了這條測試會假綠）" test -x "$MINBIN/mkdir"
+assert "34.3b 前提：最小 PATH 確實沒有 timeout" \
+  bash -c "! PATH=\"$MINBIN\" command -v timeout >/dev/null 2>&1"
+timeout 10 env AGENT_BRIDGE_DATA="$D34d" AGENT_BRIDGE_SPAWN_TAG="$TAG34D" \
+  PATH="$MINBIN" "$BRIDGE" hook stop < <(sleep 30) ; rc=$?
+assert "34.3b 反例：缺 timeout ＋ stdin 永不關閉仍不掛起（rc=0，非 124）" test "$rc" -eq 0
 
 # 34.4 附帶：AGENT_BRIDGE_STATE_TTL=0 視為 state 通道關閉，一律走 legacy
 D34e="$TESTROOT/d34e"
