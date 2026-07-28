@@ -117,10 +117,13 @@ claude 側用 Notification 的 `idle_prompt` 標記閒置；codex 沒這個事�
    一切正常，只是通知永遠不會由 hook 送達。所幸 agent-bridge 這側的失效方向是
    安全的：state 檔不會被寫出 → `notify_or_defer` 判定「未知」→ 退回 legacy 送鍵。
    也就是說**信任沒設好只會退回今天的行為，不會讓任務餓死**。
-3. 信任記錄寫在 `~/.codex/config.toml`，而該檔是 **chezmoi 管理**的；信任項若不
-   進 chezmoi source，下一次 `chezmoi apply` 就會被抹掉。
+3. 信任記錄寫在**宣告該 hook 的那個檔案自己**——本例是
+   `~/.codex/agent-worker.config.toml` 的檔尾，不是基底 `config.toml`（下一節
+   有實測輸出）。立案時我原本以為會落在基底檔，是錯的。該檔是 **chezmoi 管理**
+   的；信任項若不進 chezmoi source，下一次 `chezmoi apply` 就會被抹掉。
 4. hook 宣告字串改變會使雜湊失效，需重新授予。所幸這裡的宣告是穩定的
-   `agent-bridge hook stop`，不隨版本變動。
+   `agent-bridge hook stop`，不隨版本變動；實測改動同檔的**註解**不會使雜湊失效
+   （雜湊算的是宣告本身）。
 
 ## 接線後的實測（2026-07-28，同日稍後）
 
@@ -144,9 +147,17 @@ claude 側用 Notification 的 `idle_prompt` 標記閒置；codex 沒這個事�
 在這次 probe 過程中被撞出來。
 
 `AGENT_BRIDGE_SPAWN_TAG` 是環境變數，**子行程一律繼承**。所以在一個 worker 的
-session 裡再啟動任何 agent runtime（`codex exec`、`claude -p`、review-overlay
-的 fallback 載具 codex-rescue／codex MCP……），那個巢狀 session 的 hooks 會用
-**parent worker 的名字**去寫 state。
+session 裡再啟動一個**自己也載入了 agent-bridge hooks** 的 agent runtime，那個
+巢狀 session 的 hooks 會用 **parent worker 的名字**去寫 state。
+
+**觸發的必要條件是「child 也載入這組 hooks」，不是「child 是個 agent runtime」**
+（cross-vendor 複核第二輪的 finding，我原本的寫法過度宣稱）。具體來說：
+
+- 會觸發：`codex exec --profile agent-worker`、`claude -p --settings
+  <share/claude-worker-hooks.json>`——也就是把 worker 那組設定帶進去的呼叫。
+- **不會**觸發：不帶 profile 的普通 `codex exec`、不帶 `--settings` 的普通
+  `claude -p`。它們同樣繼承了那個環境變數，但沒有任何 hook 會去讀它，
+  `cmd_hook` 根本不會被呼叫。
 
 實測（本 session 自己就是受害者，pane `%87`、agent `notify-native-2`）：主 session
 從頭到尾沒有結束過 turn，state 檔的時間戳卻兩度前進並被標成 `idle`，時間點與

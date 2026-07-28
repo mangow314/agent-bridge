@@ -562,9 +562,11 @@ tests/run-tests.sh
 - **通知原生化本身引入的脆弱面（Phase 1/2/3，2026-07-28，刻意不美化）**：
   - **巢狀 runtime 會汙染 parent worker 的 state（未修，實測確認）**：
     `AGENT_BRIDGE_SPAWN_TAG` 是環境變數、子行程一律繼承，所以在一個 worker
-    的 session 裡再啟動任何 agent runtime（`codex exec`、`claude -p`、
-    review-overlay 的 fallback 載具……），那個巢狀 session 的 hooks 會用
-    **parent 的名字**寫 state。後果有兩層：(1) parent 被標成 idle 而實際正忙，
+    的 session 裡再啟動一個**自己也載入了這組 hooks** 的 agent runtime
+    （`codex exec --profile agent-worker`、`claude -p --settings
+    share/claude-worker-hooks.json`），那個巢狀 session 的 hooks 會用
+    **parent 的名字**寫 state。不帶 profile／`--settings` 的普通呼叫不會觸發
+    ——環境變數雖然照樣繼承，但沒有 hook 去讀它。後果有兩層：(1) parent 被標成 idle 而實際正忙，
     `notify_or_defer` 因此走送鍵路徑，等於把通知原生化要消除的風險繞回來
     （實測時被 `notify_pane` 的畫面掃描 fail-closed 擋下，記成 `notify-failed`
     ——但那道防線本來只該是 belt-and-suspenders）；(2) 更嚴重：巢狀 session
