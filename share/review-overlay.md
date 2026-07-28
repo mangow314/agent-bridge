@@ -13,7 +13,7 @@ When dispatching any independent review (code-review, codex-rescue, subagent rev
 
 ## Review vehicle (which codex to call)
 
-- **Default vehicle: an agent-bridge pane worker** (`--runtime codex`). Mechanics — the spawn/send/await/read sequence, retention vs evict/despawn — follow the agent-bridge skill and its `share/orchestrator-brief.md`; do not restate them here. Review-specific overlay: verifier rounds get a high `--model` tier unless the runtime default is confirmed sufficient. Residual context stays in a live pane for follow-up questioning, and every round dogfoods the bridge.
+- **Default vehicle: an agent-bridge pane worker** (`--runtime codex`). Mechanics — the spawn/send/await/read sequence, retention vs evict/despawn — follow the agent-bridge skill and its `share/orchestrator-brief.md`; do not restate them here. Review-specific overlay: first-pass review rounds run at the runtime's default tier/effort — review precision holds at lower effort on current frontier models; escalate tier/effort only for security-sensitive diffs or a round that failed to converge, and name the escalation reason in the dispatch. Residual context stays in a live pane for follow-up questioning, and every round dogfoods the bridge.
 - **Fall back to codex-rescue subagent / codex MCP only when agent-bridge is unavailable**: `agent-bridge` not on PATH, no tmux server running, the current sandbox blocks the tmux socket, or the spawn cap is full and no existing worker can be safely reclaimed. State the fallback reason in the report.
 - **"獨立 worker" in a user instruction means an agent-bridge spawned worker** — a subagent or MCP call does NOT satisfy it. When unsure which vehicle the user meant, the pane worker is the default reading.
 
