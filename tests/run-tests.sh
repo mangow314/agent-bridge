@@ -197,6 +197,7 @@ if ! wait_for 10 test -f "$TESTROOT/ready-a" || ! wait_for 10 test -f "$TESTROOT
 fi
 
 # ---- 1. register / list（含同名覆蓋） ----
+# spec: CLI-REGISTER-1 CLI-LIST-1 STATE-AGENT-1 STATE-AGENT-3 STATE-GEN-1 ENV-DATA-1
 D1="$TESTROOT/d1"
 ab "$D1" register alice "$PANE_A" 2>/dev/null
 assert "register+list：alice 對應 pane id（人工註冊 ready 欄為 -）" \
@@ -217,6 +218,7 @@ assert_fails "register：tmux 不可用時報錯" \
   ab_notmux "$D1" register carol "$PANE_A"
 
 # ---- 2. send 錯誤路徑 ----
+# spec: CLI-SEND-2 CLI-SEND-3 CLI-GEN-1 STATE-GEN-3
 out="$(ab "$D1" send nobody --from alice --message hi 2>/dev/null)"; rc=$?
 assert "send 未註冊 agent：非零退出" test "$rc" -ne 0
 assert "send 未註冊 agent：stdout 為空" test -z "$out"
@@ -226,11 +228,13 @@ assert_fails "send：--from 名稱不合法被拒" \
   ab "$D1" send alice --from "bad name" --message hi
 
 # ---- 3. 未知 task 的 receive / status / read ----
+# spec: CLI-GEN-1 CLI-GEN-3 CLI-RECEIVE-1 CLI-STATUS-1
 assert_fails "receive 未知 task 報錯" ab "$D1" receive 20990101T000000Z-dead
 assert_fails "status 未知 task 報錯"  ab "$D1" status  20990101T000000Z-dead
 assert_fails "read 未知 task 報錯"    ab "$D1" read    20990101T000000Z-dead
 
 # ---- 4. send 快樂路徑 + read 於未 completed ----
+# spec: CLI-SEND-1 CLI-GEN-2 CLI-RECEIVE-1 STATE-TASK-1 STATE-TASK-2 STATE-TASK-3
 # 註：pane 的 AGENT_BRIDGE_DATA 指向 DATA_IT，收到本組（D2）通知後其 receive 會
 # 找不到 task 而失敗，不影響 D2 的狀態——正好隔離出 queued 狀態供測試。
 D2="$TESTROOT/d2"
@@ -256,6 +260,7 @@ assert "read 於尚未 completed：stderr 提示尚未回覆" \
   grep -q '尚未回覆' "$TESTROOT/d2-read.err"
 
 # ---- 5. reply 非法轉換：queued 未 receive 直接 reply ----
+# spec: CLI-REPLY-1 STATE-TASK-4
 ab "$D2" reply "$id2" --message "premature" >/dev/null 2>&1; rc=$?
 assert "reply 於 queued（未 receive）：非零退出" test "$rc" -ne 0
 assert "reply 於 queued：狀態檔不變（仍 queued）" st_is "$D2" "$id2" queued
@@ -263,6 +268,7 @@ assert "reply 於 queued：不產生 response.md" \
   test ! -e "$D2/tasks/$id2/response.md"
 
 # ---- 6. 特殊字元 byte-for-byte 保真（--message-file 與 stdin） ----
+# spec: CLI-SEND-1
 D3="$TESTROOT/d3"
 ab "$D3" register bob "$PANE_B" 2>/dev/null
 TRICKY="$TESTROOT/tricky.txt"
@@ -290,6 +296,7 @@ ab "$D3" receive "$id3s" > "$TESTROOT/got3s.out" 2>/dev/null
 assert "send --message-file - （stdin）保真" diff -q "$TRICKY" "$TESTROOT/got3s.out"
 
 # ---- 7. reply / read / 對 completed 重複 reply ----
+# spec: CLI-REPLY-1 CLI-READ-1 STATE-TASK-4
 TRICKY2="$TESTROOT/tricky2.txt"
 # shellcheck disable=SC2016  # 刻意保留字面 $x/`y`，測試保真
 printf 'reply "with" quotes\n多行回覆 $x `y`\nend' > "$TRICKY2"
@@ -309,6 +316,7 @@ assert "對 completed 重複 reply：狀態檔內容不變" \
   diff -q "$TESTROOT/status-before" "$D3/tasks/$id3/status"
 
 # ---- 8. 通知失敗路徑（pane 已死） ----
+# spec: CLI-SEND-3
 D5="$TESTROOT/d5"
 p3="$(tmx split-window -dP -F '#{pane_id}' -t it "$pane_cmd")"
 ab "$D5" register carol "$p3" 2>/dev/null
@@ -323,6 +331,7 @@ assert "通知失敗：events.log 記 notify-failed" \
   evt_grep "$D5/tasks/$id5/events.log" notify-failed
 
 # ---- 8a. 盲點 1：worker 停在權限對話框時，通知的按鍵不得送進去 ----
+# spec: HOOK-NOTIFY-2 ENV-NOTIFY-1
 # notify_pane 送鍵前 capture-pane 掃 Claude Code 權限對話框特徵，掃到就降級。這裡
 # 直接鎖住核心不變量「攔截時一個按鍵都沒送進 pane」——而非只驗 return code：假 pane
 # 印出對話框特徵後進 `while read` 迴圈、把收到的每一行記進 got 檔。攔截生效＝got 不
@@ -540,6 +549,7 @@ assert_fails "半特徵畫面(片段一)：通知未降級（events.log 不記 n
 tmx kill-pane -t "$p_half1" 2>/dev/null || true
 
 # ---- 8b. 鎖失敗路徑：權限失敗 vs 真正鎖佔用 ----
+# spec: STATE-LOCK-1
 D6="$TESTROOT/d6"
 ab "$D6" register bob "$PANE_B" 2>/dev/null
 id6="$(ab "$D6" send bob --from alice --message hi 2>/dev/null)"
@@ -557,6 +567,7 @@ assert "鎖被佔用：重試後非零退出" test "$rc" -ne 0
 assert "鎖被佔用：報佔用中" grep -q '佔用中' "$TESTROOT/d6-lock.err"
 
 # ---- 9. unregister ----
+# spec: CLI-UNREGISTER-1
 D7="$TESTROOT/d7"
 ab "$D7" register dave "$PANE_A" 2>/dev/null
 ab "$D7" unregister dave 2>/dev/null; rc=$?
@@ -569,6 +580,7 @@ assert_fails "unregister 後 send 該 agent 報錯" \
   ab "$D7" send dave --from alice --message hi
 
 # ---- 10. start：delivered → running ----
+# spec: CLI-START-1
 D8="$TESTROOT/d8"
 ab "$D8" register bob "$PANE_B" 2>/dev/null
 id8="$(ab "$D8" send bob --from alice --message "work" 2>/dev/null)"
@@ -588,6 +600,7 @@ ab "$D8" reply "$id8" --message "done from running" 2>/dev/null
 assert "running 可 reply → completed" st_is "$D8" "$id8" completed
 
 # ---- 11. fail：delivered/running → failed，read 可讀失敗原因 ----
+# spec: CLI-FAIL-1
 D9="$TESTROOT/d9"
 ab "$D9" register bob "$PANE_B" 2>/dev/null
 id9="$(ab "$D9" send bob --from alice --message "doomed" 2>/dev/null)"
@@ -610,6 +623,7 @@ assert_fails "重複 fail 報錯（終態）" ab "$D9" fail "$id9" --message aga
 assert "終態後狀態仍 failed" st_is "$D9" "$id9" failed
 
 # ---- 12. cancel：queued/delivered/running → cancelled ----
+# spec: CLI-CANCEL-1
 D10="$TESTROOT/d10"
 ab "$D10" register bob "$PANE_B" 2>/dev/null
 idc1="$(ab "$D10" send bob --from alice --message "c1" 2>/dev/null)"
@@ -650,6 +664,7 @@ assert_fails "cancel 於 delivered 後 reply 報錯" \
   ab "$D10" reply "$idc4" --message late
 
 # ---- 13. await：等待終態 ----
+# spec: CLI-AWAIT-1 CLI-AWAIT-2 ENV-POLL-1
 assert "await 於 completed：立即印 completed" \
   test "$(ab "$D3" await "$id3" 2>/dev/null)" = completed
 assert "await 於 failed：印 failed" \
@@ -684,6 +699,7 @@ assert "背景 await：印出 completed" \
   test "$(cat "$TESTROOT/await-bg.out")" = completed
 
 # ---- 14. tmux 整合：完整 round-trip ----
+# spec: CLI-SEND-1 CLI-RECEIVE-1 CLI-REPLY-1
 ab "$DATA_IT" register agent-a "$PANE_A" 2>/dev/null
 ab "$DATA_IT" register agent-b "$PANE_B" 2>/dev/null
 REQ_IT="$TESTROOT/req-it.md"
@@ -701,6 +717,7 @@ assert "round-trip：sender pane 收到並執行 read 通知" \
   wait_for 15 grep -q 'Z read$' "$DATA_IT/tasks/$idIT/events.log"
 
 # ---- 15. 併發壓測：衝突轉換 + 大量平行 send ----
+# spec: STATE-TASK-1
 
 # 15a. 同一 task 於 delivered 狀態並行射出 3 reply + 3 fail + 3 cancel：
 # 鎖序列化下應恰有一者得手，其餘全被狀態檢查擋下；驗證無雙終態、無殘鎖
@@ -765,6 +782,7 @@ all_ids13_ok() {
 assert "併發 send：10 個 task 目錄皆存在且狀態合法" all_ids13_ok
 
 # ---- 16. spawn：核心＋cap＋原子回滾（Phase 1） ----
+# spec: CLI-SPAWN-1 CLI-SPAWN-2 CLI-SPAWN-3 CLI-SPAWN-4 ENV-SPAWN-1 ENV-HOOKS-1 ENV-PASS-1 ENV-TAG-1 HOOK-BIND-1 STATE-AGENT-1
 
 # 16a. 快樂路徑：假 codex 啟動期吃輸入 2 秒，首發探針必被吃，
 # ready 仍翻 true ＝ 探針重送機制生效（Phase 2 gate 一併覆蓋）
@@ -1102,6 +1120,7 @@ assert "spawn --window：與既有 pane 不同 window" bash -c \
 ab "$DSPAWN" despawn ww >/dev/null 2>&1
 
 # ---- 17. ready／探針（Phase 2） ----
+# spec: CLI-READY-1 ENV-READY-1 ENV-READY-2
 pane_w5="$(absp "$DSPAWN" 0 spawn w5 --runtime codex 2>/dev/null)"
 assert "READY_TIMEOUT=0：spawn 立即返回、ready 仍 false" \
   jq -e '.ready == false' "$DSPAWN/agents/w5.json"
@@ -1130,6 +1149,7 @@ assert "就緒逾時：pane 留用供診斷" pane_alive "$pane_w6"
 assert "就緒逾時：registry 仍在、ready false" jq -e '.ready == false' "$DSPAWN/agents/w6.json"
 
 # ---- 18. despawn＋出身防護（Phase 3） ----
+# spec: CLI-DESPAWN-1
 assert_fails "despawn 人工 agent 被拒" ab "$DSPAWN" despawn manual-x
 assert "despawn 被拒：registry 檔仍在" test -f "$DSPAWN/agents/manual-x.json"
 ab "$DSPAWN" despawn w1 2>/dev/null; rc=$?
@@ -1153,6 +1173,7 @@ assert "死 pane despawn：agents.log 記下這次回收（未宣告 disposable 
   grep -qE "Z despawned-unsaved w7 " "$DSPAWN/agents.log"
 
 # ---- 18b. despawn 的出身證據＝pane 啟動指令的 tag（codex 第三輪 FAIL 1） ----
+# spec: CLI-DESPAWN-2 ENV-TAG-1
 # pane id 會被 tmux 重用（不同 server／server 重啟後計數器歸零），registry 也
 # 可能被有資料目錄寫入權的 worker 偽造。只憑 pane_id 相符就殺，會殺到人工 pane。
 DTAG="$TESTROOT/dtag"
@@ -1273,6 +1294,7 @@ assert "server 中途替換：stderr 說明無法關閉 pane" \
 tmx kill-pane -t "$pane_s" 2>/dev/null
 
 # ---- 18c. despawn 不得把 tmux 失敗當成「pane 已消失」（codex 第三輪 FAIL 2） ----
+# spec: CLI-DESPAWN-3
 DDSP="$TESTROOT/ddsp"
 pane_k="$(absp "$DDSP" 0 spawn kx --runtime codex 2>/dev/null)"
 
@@ -1315,6 +1337,7 @@ assert "spawn/despawn 全程後 locks 無殘留" \
   test -z "$(ls -A "$DSPAWN/locks" 2>/dev/null)"
 
 # ---- 19. codex 複核回歸：出身防護的 TOCTOU 與回滾漏洞 ----
+# spec: CLI-SPAWN-2 CLI-DESPAWN-2 STATE-TASK-5
 
 # 19a. provenance race（codex FAIL 1）：出身檢查若在鎖外，despawn 可能先驗過
 # 舊的 spawned 紀錄、再殺到同名人工註冊的 pane。兩道防線分開驗。
@@ -1616,6 +1639,7 @@ assert "目錄型 registry 路徑：無殘鎖" \
   test ! -d "$DDIR/locks/agents-registry.lock"
 
 # ---- 20. 損壞 registry 的出身判斷必須 fail-closed（codex 第七輪 FAIL 1） ----
+# spec: STATE-AGENT-2 CLI-SPAWN-3
 # `jq -e '.spawned == true'` 會把「條件 false」與「JSON 壞掉」壓成同一個非零，
 # 於是損壞的 registry 被當成人工註冊：可被 register 覆寫、被 unregister 除名
 # （pane 變孤兒）、也不計入 cap
@@ -1649,6 +1673,7 @@ rm -f "$DBAD/agents/bad1.json"
 tmx kill-pane -t "$pane_bad" 2>/dev/null
 
 # ---- 20b. readiness 參數在建 pane 前就要驗（codex 第八輪 FAIL） ----
+# spec: CLI-SPAWN-2 ENV-READY-1 ENV-READY-2
 # 非法值若留到 spawn_wait_ready 才 die，pane 與 registry 都已落地、回滾也已
 # 解除，呼叫端只看到非零退出，卻多了一個佔 cap 的 worker
 DRO="$TESTROOT/dro"
@@ -1676,6 +1701,7 @@ assert "stdout 已關閉：registry 確實寫入" test -f "$DSO/agents/so.json"
 ab "$DSO" despawn so >/dev/null 2>&1 || true
 
 # ---- 21. 解鎖失敗不得靜默（codex 第七輪 FAIL 3） ----
+# spec: STATE-LOCK-2
 # 鎖目錄被塞進檔案時 rmdir 會 Directory not empty，吞掉的話鎖就永久殘留、
 # 而且沒有任何人知道
 DLK="$TESTROOT/dlk"
@@ -1699,6 +1725,7 @@ rm -rf "$DLK/locks/agents-registry.lock"
 ab "$DLK" despawn lk >/dev/null 2>&1 || true
 
 # ---- 22. worker brief 注入（真 codex 實測 gate 失敗的成因） ----
+# spec: ENV-BRIEF-1 CLI-SPAWN-7
 # spawn 出來的 runtime 是零脈絡 session：不注入守則的話，它不知道 pane 裡
 # 收到的 `agent-bridge ready <name>` 是要執行的命令，會當成對話回覆而永遠
 # 不 ready（實測 codex 0.145）。
@@ -1806,6 +1833,7 @@ for kw in 'agent-bridge receive' 'agent-bridge reply' 'agent-bridge fail' \
 done
 
 # ---- 23. relay：交棒給接手者 ----
+# spec: CLI-RELAY-1 CLI-RELAY-2 CLI-RELAY-3 ENV-DEPTH-1 ENV-DEPTH-2 ENV-BRIEF-2
 # relay 與 spawn 共用整條 pane 生命週期（cap／tag／回滾／夭折偵測／registry），
 # 差別只有注入哪份 brief、切不切焦點、以及要不要請接手者回收前一棒。
 # 故這裡只測那三處差異＋交接檔路徑的防線，不重測 spawn 已覆蓋的部分。
@@ -2063,6 +2091,7 @@ for rdn in rd1 rd2 rd5 rd12; do
 done
 
 # ---- 24. disposable：worker 自報脈絡無殘值（orchestrator Phase 1） ----
+# spec: CLI-DISPOSABLE-1
 # 語意刻意是單向宣告而非雙向旗標：預設保留，沒宣告過的一律視為仍有殘值。
 # 失效方向因此是「多留一個佔 cap」而不是「把還有用的脈絡殺掉」
 DDISP="$TESTROOT/ddisp"
@@ -2109,6 +2138,7 @@ assert "disposable：非 object registry 被拒後內容未被覆寫" \
   test "$(tr -d '[:space:]' < "$DDISP/agents/dp1.json")" = null
 
 # ---- 25. idle：worker 池回收決策視圖（orchestrator Phase 2） ----
+# spec: CLI-IDLE-1 CLI-IDLE-2
 DIDLE="$TESTROOT/didle"
 
 # idle_field <data-dir> <agent> <欄位序號 1-4>
@@ -2209,6 +2239,7 @@ assert "idle：不取鎖——執行後 locks/ 為空" \
 assert_fails "idle：多給參數被拒" ab "$DIDLE" idle extra
 
 # ---- 26. evict：驅逐前強制落地筆記（orchestrator Phase 3） ----
+# spec: CLI-EVICT-1 CLI-EVICT-2 CLI-EVICT-3
 # 三步 send → await → despawn。核心不變量：**pane 沒被收掉之前，筆記一定先
 # 落地**；唯一的例外是逾時，而逾時必須在審計線上看得出來（否則「筆記沒落地」
 # 這件事會混進正常回收裡，事後查不出來）
@@ -2397,6 +2428,7 @@ assert "evict：出身不明被拒時 registry 未被清掉（留給人工處理
   test -e "$DEV/agents/ev4.json"
 
 # ---- 27. brief 正本的策略不變量（Phase 4）----
+# spec: CLI-SPAWN-7
 # 兩份 brief 是策略層的正本，機制對它們一無所知，所以只有這裡守得住：
 # 條款被刪或被改回舊語意時要在測試就紅，而不是等某個 worker 真的把自己
 # /clear 掉、脈絡連同 pane 一起消失才發現
@@ -2428,6 +2460,7 @@ for kw in 'agent-bridge idle' 'agent-bridge evict' 'evicted-timeout' \
 done
 
 # ---- 28. gc：清舊 task，但三道保留線都不能破 ----
+# spec: CLI-GC-1 CLI-GC-2 CLI-GC-3 STATE-TASK-5
 # tasks/ 只增不減不只是磁碟問題：idle 的回收決策直接掃這個目錄，資料越髒決策
 # 越不可信（名稱重用那個 bug 的根因就是這裡）。但這是唯一會刪東西的命令，
 # 失效方向必須一律偏向「留著」。
@@ -2527,6 +2560,7 @@ assert "gc：一般 send 不帶 pinned（否則 gc 等於失效）" \
   test "$(jq -r '.pinned // false' "$DGP/tasks/$tid_pl/metadata.json")" = false
 
 # ---- 29. 第二輪獨立複核的修補（2026-07-23）----
+# spec: CLI-GC-3 CLI-EVICT-3
 DR2="$TESTROOT/drev2"
 mkdir -p "$DR2"/{agents,tasks,locks}
 
@@ -2628,6 +2662,7 @@ assert "I5：不是 send 生成的目錄名不刪（唯一會 rm 的路徑要保
   test -d "$DR3/tasks/foo"
 
 # ---- 30. CC 權限框特徵 canary：安裝中的 claude 仍含防線依賴的字串 ----
+# spec: HOOK-NOTIFY-2
 # screen_has_prompt 的特徵是對 Claude Code UI 文案的字串比對（bin 內註明以
 # 2.1.218 可執行檔 strings 佐證）。CC 改版改文案時，防線靜默退回 fail-open
 # （通知的 Enter 誤觸權限框會重現），沒有任何訊號——這組 canary 把「靜默
@@ -2659,6 +2694,7 @@ else
 fi
 
 # ---- 31. 第三輪獨立複核的修補（2026-07-24）----
+# spec: CLI-STATUS-1 CLI-READ-1 CLI-AWAIT-2 CLI-DESPAWN-3 CLI-EVICT-2 CLI-RO-1 ENV-POLL-1 CLI-GEN-3 CLI-SEND-3 STATE-TASK-4 STATE-TASK-5
 # 複核輪抓出的缺口，各自鎖一個回歸；編號對應複核報告的 finding
 
 D31="$TESTROOT/d31"
@@ -2810,6 +2846,7 @@ assert "寫入階段失敗仍零殘留（EXIT trap 回滾）" \
 chmod 600 "$BAD31"
 
 # ---- 32. spawn 落點：per-owner worker window＋owner/actor 審計（2026-07-25）----
+# spec: CLI-SPAWN-5 CLI-SPAWN-6
 # 前面所有測例都在 tmux 外呼叫 spawn（TMUX 已 unset）→ 舊行為（目前視窗
 # split），上面已覆蓋。本節驗「orchestrator 本身在 pane 內」的新路徑：
 # worker 落進 owner 的 worker window（不交給 tmux 的 client 焦點解析）、
@@ -2987,6 +3024,7 @@ assert "32f agents.log 每行恰 6 欄" \
   bash -c "! grep -qEv '^[^ ]+ [^ ]+ [^ ]+ [^ ]+ [^ ]+ [^ ]+\$' '$D32/agents.log'"
 
 # ---- 33. 通知原生化 Phase 1：hook 子命令＋notify_or_defer（declarative-juggling-lark）----
+# spec: CLI-HOOK-1 HOOK-ID-1 HOOK-ID-2 HOOK-EVT-1 HOOK-EVT-2 HOOK-EVT-3 HOOK-EVT-4 HOOK-NOTIFY-1 STATE-CHAN-1 STATE-CHAN-2 STATE-CHAN-3 ENV-TTL-1
 
 # 33.1 hook stop：有 queued task → block JSON＋state busy/last_delivered
 D33="$TESTROOT/d33"
@@ -3167,6 +3205,7 @@ assert "33.11b cancel 通知 to busy→deferred：events.log 記 notify-deferred
 tmx kill-pane -t "$p33l" 2>/dev/null || true
 
 # ---- 34. 獨立複核 blocker 修補（2026-07-28）----
+# spec: HOOK-ID-3 HOOK-EVT-3 HOOK-NOTIFY-1 ENV-TTL-1
 
 # 34.1a B1 反例：tasks/ 目錄名含 shell metacharacter，混在合法 queued task
 # 之間 → hook stop 的 reason 只能含合法 id，惡意目錄名片段不得出現
@@ -3267,6 +3306,7 @@ assert "34.4 TTL=0：events.log 記 notified" \
 tmx kill-pane -t "$p34e" 2>/dev/null || true
 
 # ---- 34.5+ 巢狀 runtime 冒名缺陷（owner/session_id 所有權閘門）----
+# spec: HOOK-OWNER-1 HOOK-OWNER-2 HOOK-OWNER-3 HOOK-OWNER-4 HOOK-EVT-4 ENV-TTL-3 STATE-CHAN-2
 # 缺陷紀錄：docs/codex-hooks-probe.md「巢狀 runtime 會汙染 parent 的 state」。
 # SPAWN_TAG 被子行程繼承，僅靠 tag 分不出本尊與巢狀 session；閘門以 hook
 # payload 的 session_id 先到先得認領 state 檔，異主且 state 新鮮一律靜默擋下
