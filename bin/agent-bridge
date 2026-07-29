@@ -2021,16 +2021,19 @@ hook_agent_name() {
   printf '%s' "$name"
 }
 
-# hook_write_state <state-file> <state> <last_delivered|__KEEP__>：state 通道的
-# 單一寫者操作（呼叫者是 worker 自己的 hook，不取 registry 鎖，見 STATE_DIR
+# hook_write_state <state-file> <state> <last_delivered|__KEEP__> <owner>：state
+# 通道的單一寫者操作（呼叫者是 worker 自己的 hook，不取 registry 鎖，見 STATE_DIR
 # 註記）。__KEEP__ 表示保留既有 last_delivered 不動——prompt-submit 與
 # notification 的 idle 標記都不該動它：last_delivered 是 Stop hook 用來辨識
 # 「同一個仍待處理的任務是否已經被擋過一輪」的依據，若被其他事件中途沖掉，
 # 防無限迴圈的判斷就會失準（見 cmd_hook 的 stop 分支）。
+# owner 是本次寫入者的 session_id，由 cmd_hook 逐次明傳、不設 __KEEP__ 語意：
+# hook_owner_gate 已保證能走到這裡的寫入者就是正主（或合法接管者），直接覆寫
+# 即可；從舊檔撈反而會在接管當下把舊主的 id 又抄回來。
 # 任何一步失敗（jq 壞、atomic_write 失敗）一律吞掉：hook 的失效方向是
 # state 停在舊值、TTL 到期後退回 legacy 送鍵，不是讓呼叫端跟著非零收場。
 hook_write_state() {
-  local file="$1" state="$2" ld="$3" ts
+  local file="$1" state="$2" ld="$3" owner="$4" ts
   ts="$(now_iso)"
   if [[ "$ld" == "__KEEP__" ]]; then
     ld=""
@@ -2038,9 +2041,53 @@ hook_write_state() {
       ld="$(jq -r '.last_delivered // empty' "$file" 2>/dev/null)" || ld=""
     fi
   fi
-  jq -n --arg s "$state" --arg t "$ts" --arg ld "$ld" \
-    '{state: $s, ts: $t, last_delivered: $ld}' 2>/dev/null \
+  jq -n --arg s "$state" --arg t "$ts" --arg ld "$ld" --arg o "$owner" \
+    '{state: $s, ts: $t, last_delivered: $ld, owner: $o}' 2>/dev/null \
     | atomic_write "$file" 2>/dev/null || true
+}
+
+# hook_owner_gate <state-file> <session_id>：state 檔所有權閘門，堵「巢狀 runtime
+# 冒用 parent 身分」（docs/codex-hooks-probe.md 的缺陷紀錄）。SPAWN_TAG 是環境
+# 變數、子行程一律繼承，光憑 tag 分不出「worker 本尊」與「worker 裡再啟動的
+# 巢狀 runtime」；hook payload 的 session_id 可以——第一個帶 id 寫入 state 的
+# session 認領所有權（worker 自己的第一個事件必然最早，先到先得選中正主），
+# 之後 id 不符的呼叫一律被擋，呼叫端須靜默 exit 0 且無 stdout（stop 分支不發
+# block JSON，巢狀 session 就不會被指使去 receive parent 的任務）。
+# return 0＝放行（無檔／無主舊格式／本人／可接管）；return 1＝異主且 state 新鮮。
+#
+# 接管條件：state ts 超過 TTL 或落在未來（未來 ts 不可信，比照 notify_or_defer
+# 的下界論證）。理由：ts 過期時 notify_or_defer 本來就把這份 state 當「未知」
+# 走 legacy——通道此刻已降級，把所有權交出去零損失；這同時是 /clear 後 parent
+# 換新 session_id 的自癒路徑，自癒上限＝TTL。hook 端「parent 的新 session」與
+# 「巢狀 session」不可區分（環境與 payload 面完全相同；PPID 祖先鏈方案因 shell
+# wrapper 層數不定、codex exec 每次都是新行程、/proc 依賴三點被否決），只能靠
+# 時間窗交還，不能靠身分判別。
+# TTL 取 AGENT_BRIDGE_STATE_TTL，但壞值或 0 一律退預設 1800、不得 die（hook
+# 鐵律）：TTL=0 時通知端通道雖關，stop 的 block 輸出仍活著（冒名攻擊面仍在），
+# gate 必須繼續用預設窗運作——「永遠可接管」等於沒有 gate，「永不接管」則讓
+# parent /clear 後 block 功能永久死掉。
+hook_owner_gate() {
+  local file="$1" sid="$2" owner ttl ts epoch now
+  [[ -f "$file" ]] || return 0
+  owner="$(jq -r '.owner // empty' "$file" 2>/dev/null)" || owner=""
+  [[ -n "$owner" && "$owner" != "$sid" ]] || return 0
+  ttl="${AGENT_BRIDGE_STATE_TTL:-1800}"
+  if ! [[ "$ttl" =~ ^[0-9]{1,9}$ ]] || (( 10#$ttl == 0 )); then
+    ttl=1800
+  fi
+  ttl=$((10#$ttl))
+  ts="$(jq -r '.ts // empty' "$file" 2>/dev/null)" || ts=""
+  # ts 壞掉／缺欄位：這份 state 已不可信，視同過期、允許接管（與 notify_or_defer
+  # 把解析失敗當「未知」同向）。空字串要在 date 之前擋：GNU date -d '' 不是
+  # 解析失敗，會回今天零點，讓「缺 ts」在當日誤判成新鮮而擋住接管。
+  [[ -n "$ts" ]] || return 0
+  epoch="$(date -ud "$ts" +%s 2>/dev/null)" || return 0
+  [[ -n "$epoch" ]] || return 0
+  now="$(date -u +%s)"
+  if (( now - epoch >= 0 && now - epoch <= ttl )); then
+    return 1
+  fi
+  return 0
 }
 
 # hook_oldest_queued <to>：查最舊一筆 to=<to> 且狀態為 queued 的 task-id，
@@ -2118,9 +2165,20 @@ cmd_hook() {
     IFS= read -r -d '' -t 2 stdin_json 2>/dev/null || true
   fi
 
+  # 所有權閘門（三事件一體適用，必須在 stop 分支查 mailbox／發 block 之前）：
+  # 缺 session_id 的 payload 不參與 state 通道——「無身分者不寫、不 block」，
+  # 與無 SPAWN_TAG 的 no-op 同構；失效方向就是既有降級鏈（state 停更 → TTL →
+  # 退回 legacy 送鍵）。若改成「不驗照舊寫」，任何缺欄位的巢狀呼叫會把冒名
+  # 攻擊面原樣打開，堵洞就白堵了。claude 與 codex 的 payload 實測都帶
+  # session_id（docs/codex-hooks-probe.md），缺欄位是異常而非常態。
+  local sid
+  sid="$(printf '%s' "$stdin_json" | jq -r '.session_id // empty' 2>/dev/null)" || sid=""
+  [[ -n "$sid" ]] || exit 0
+  hook_owner_gate "$state_file" "$sid" || exit 0
+
   case "$event" in
     prompt-submit)
-      hook_write_state "$state_file" busy "__KEEP__"
+      hook_write_state "$state_file" busy "__KEEP__" "$sid"
       ;;
     notification)
       # 判別欄位查證（本次 2026-07-28 WebFetch＋WebSearch 交叉比對）：
@@ -2140,7 +2198,7 @@ cmd_hook() {
       local ntype
       ntype="$(printf '%s' "$stdin_json" | jq -r '.notification_type // empty' 2>/dev/null)" || ntype=""
       if [[ "$ntype" == "idle_prompt" ]]; then
-        hook_write_state "$state_file" idle "__KEEP__"
+        hook_write_state "$state_file" idle "__KEEP__" "$sid"
       fi
       ;;
     stop)
@@ -2155,7 +2213,7 @@ cmd_hook() {
       pending="$(hook_oldest_queued "$name")" || pending=""
 
       if [[ -z "$pending" ]]; then
-        hook_write_state "$state_file" idle "__KEEP__"
+        hook_write_state "$state_file" idle "__KEEP__" "$sid"
       else
         local last_delivered=""
         if [[ -f "$state_file" ]]; then
@@ -2166,9 +2224,9 @@ cmd_hook() {
           # 真迴圈的訊號（模型不理會 reason），一輪就放行，不再無限擋。
           # 多任務合法連鎖的情形下 pending 會是「下一個」不同 id，走 else
           # 分支繼續擋，worker 可以一路把 mailbox 清空
-          hook_write_state "$state_file" idle "__KEEP__"
+          hook_write_state "$state_file" idle "__KEEP__" "$sid"
         else
-          hook_write_state "$state_file" busy "$pending"
+          hook_write_state "$state_file" busy "$pending" "$sid"
           jq -n --arg id "$pending" \
             '{decision: "block",
               reason: ("New task " + $id + " is in your agent-bridge mailbox. Run: agent-bridge receive " + $id + " and handle it per your worker brief.")}' \

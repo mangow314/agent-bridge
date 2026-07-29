@@ -2993,7 +2993,7 @@ D33="$TESTROOT/d33"
 ab "$D33" register zoe "$PANE_A" 2>/dev/null
 id33_1="$(ab "$D33" send zoe --from alice --message t1 2>/dev/null)"
 TAG33="ab-spawn-zoe-12345-0123456789ab"
-hookcall "$D33" "$TAG33" stop '{}' > "$TESTROOT/h1.out" 2>"$TESTROOT/h1.err"; rc=$?
+hookcall "$D33" "$TAG33" stop '{"session_id":"s33"}' > "$TESTROOT/h1.out" 2>"$TESTROOT/h1.err"; rc=$?
 assert "33.1 hook stop：exit 0" test "$rc" -eq 0
 assert "33.1 hook stop：stdout 是合法 JSON" jq -e . "$TESTROOT/h1.out"
 assert "33.1 hook stop：decision=block" \
@@ -3004,10 +3004,11 @@ assert "33.1 hook stop：state 檔 last_delivered 正確" \
   state_field_is "$D33/state/zoe.json" last_delivered "$id33_1"
 
 # 33.2 hook stop：stop_hook_active=true＋同 last_delivered id → 無 stdout、放行、state=idle
-hookcall "$D33" "$TAG33" stop '{"stop_hook_active":true}' > "$TESTROOT/h2.out" 2>"$TESTROOT/h2.err"; rc=$?
+hookcall "$D33" "$TAG33" stop '{"stop_hook_active":true,"session_id":"s33"}' > "$TESTROOT/h2.out" 2>"$TESTROOT/h2.err"; rc=$?
 assert "33.2 hook stop 同 id 放行：exit 0" test "$rc" -eq 0
 assert "33.2 hook stop 同 id 放行：無 stdout" test ! -s "$TESTROOT/h2.out"
 assert "33.2 hook stop 同 id 放行：state=idle" state_field_is "$D33/state/zoe.json" state idle
+assert "33.2 hook stop：owner 欄記錄 session_id" state_field_is "$D33/state/zoe.json" owner s33
 
 # 33.3 hook stop：stop_hook_active=true＋不同 pending id → 照樣 block（連鎖合法）
 D33c="$TESTROOT/d33c"
@@ -3017,7 +3018,7 @@ TAGZED="ab-spawn-zed-777-aaaaaaaaaaaa"
 mkdir -p "$D33c/state"
 jq -n --arg s idle --arg t "2020-01-01T00:00:00Z" --arg ld "prev-fake-id" \
   '{state: $s, ts: $t, last_delivered: $ld}' > "$D33c/state/zed.json"
-hookcall "$D33c" "$TAGZED" stop '{"stop_hook_active":true}' > "$TESTROOT/h3.out" 2>/dev/null
+hookcall "$D33c" "$TAGZED" stop '{"stop_hook_active":true,"session_id":"s33c"}' > "$TESTROOT/h3.out" 2>/dev/null
 assert "33.3 hook stop 連鎖：不同 pending id 仍 block" grep -q "receive $id33c" "$TESTROOT/h3.out"
 assert "33.3 hook stop 連鎖：last_delivered 更新為新 id" \
   state_field_is "$D33c/state/zed.json" last_delivered "$id33c"
@@ -3035,7 +3036,7 @@ D33e="$TESTROOT/d33e"
 ab "$D33e" register my-worker-2 "$PANE_A" 2>/dev/null
 id33e="$(ab "$D33e" send my-worker-2 --from alice --message e 2>/dev/null)"
 TAGE="ab-spawn-my-worker-2-12345-0123456789ab"
-hookcall "$D33e" "$TAGE" stop '{}' > "$TESTROOT/h5.out" 2>/dev/null
+hookcall "$D33e" "$TAGE" stop '{"session_id":"s33e"}' > "$TESTROOT/h5.out" 2>/dev/null
 assert "33.5 tag 析名：連字號名稱派對到正確 state 檔" test -f "$D33e/state/my-worker-2.json"
 assert "33.5 tag 析名：block JSON 含正確 id" grep -q "receive $id33e" "$TESTROOT/h5.out"
 
@@ -3043,12 +3044,12 @@ assert "33.5 tag 析名：block JSON 含正確 id" grep -q "receive $id33e" "$TE
 D33f="$TESTROOT/d33f"
 ab "$D33f" register fin "$PANE_A" 2>/dev/null
 TAGF="ab-spawn-fin-1-aaaaaaaaaaaa"
-hookcall "$D33f" "$TAGF" prompt-submit '{}' >/dev/null 2>&1
+hookcall "$D33f" "$TAGF" prompt-submit '{"session_id":"s33f"}' >/dev/null 2>&1
 assert "33.6 hook prompt-submit：state=busy" state_field_is "$D33f/state/fin.json" state busy
-hookcall "$D33f" "$TAGF" notification '{"notification_type":"idle_prompt"}' >/dev/null 2>&1
+hookcall "$D33f" "$TAGF" notification '{"notification_type":"idle_prompt","session_id":"s33f"}' >/dev/null 2>&1
 assert "33.6 hook notification(idle_prompt)：state=idle" state_field_is "$D33f/state/fin.json" state idle
-hookcall "$D33f" "$TAGF" prompt-submit '{}' >/dev/null 2>&1
-hookcall "$D33f" "$TAGF" notification '{"notification_type":"permission_prompt"}' >/dev/null 2>&1
+hookcall "$D33f" "$TAGF" prompt-submit '{"session_id":"s33f"}' >/dev/null 2>&1
+hookcall "$D33f" "$TAGF" notification '{"notification_type":"permission_prompt","session_id":"s33f"}' >/dev/null 2>&1
 assert "33.6 hook notification(其他型別)：state 不變（仍 busy）" \
   state_field_is "$D33f/state/fin.json" state busy
 
@@ -3179,7 +3180,7 @@ jq -n --arg to quinn '{version: 1, to: $to, status: "queued"}' \
   > "$D34a/tasks/$mal_name/metadata.json"
 printf 'queued\n' > "$D34a/tasks/$mal_name/status"
 TAG34A="ab-spawn-quinn-1-aaaaaaaaaaaa"
-hookcall "$D34a" "$TAG34A" stop '{}' > "$TESTROOT/h34a.out" 2>/dev/null
+hookcall "$D34a" "$TAG34A" stop '{"session_id":"s34a"}' > "$TESTROOT/h34a.out" 2>/dev/null
 assert "34.1a B1：reason 含合法 id" grep -q "receive $id34a" "$TESTROOT/h34a.out"
 # shellcheck disable=SC2016  # $1 由內層 bash 展開，刻意單引號
 assert "34.1a B1：reason 不含惡意目錄名片段" \
@@ -3198,7 +3199,7 @@ jq -n --arg to quinn2 '{version: 1, to: $to, status: "queued"}' \
   > "$D34b/tasks/$mal_name2/metadata.json"
 printf 'queued\n' > "$D34b/tasks/$mal_name2/status"
 TAG34B="ab-spawn-quinn2-1-aaaaaaaaaaaa"
-hookcall "$D34b" "$TAG34B" stop '{}' > "$TESTROOT/h34b.out" 2>"$TESTROOT/h34b.err"; rc=$?
+hookcall "$D34b" "$TAG34B" stop '{"session_id":"s34b"}' > "$TESTROOT/h34b.out" 2>"$TESTROOT/h34b.err"; rc=$?
 assert "34.1b B1：只有惡意目錄，exit 0" test "$rc" -eq 0
 assert "34.1b B1：只有惡意目錄，無 stdout（不 block）" test ! -s "$TESTROOT/h34b.out"
 
@@ -3264,6 +3265,149 @@ assert "34.4 TTL=0：視為通道關閉，走 legacy 送鍵（pane 收到通知�
 assert "34.4 TTL=0：events.log 記 notified" \
   evt_grep "$D34e/tasks/$id34e/events.log" notified
 tmx kill-pane -t "$p34e" 2>/dev/null || true
+
+# ---- 34.5+ 巢狀 runtime 冒名缺陷（owner/session_id 所有權閘門）----
+# 缺陷紀錄：docs/codex-hooks-probe.md「巢狀 runtime 會汙染 parent 的 state」。
+# SPAWN_TAG 被子行程繼承，僅靠 tag 分不出本尊與巢狀 session；閘門以 hook
+# payload 的 session_id 先到先得認領 state 檔，異主且 state 新鮮一律靜默擋下
+# （不寫 state、stop 不發 block），ts 過期或落在未來才允許接管（/clear 自癒）。
+
+# 34.5 首次認領：空目錄第一個帶 session_id 的事件寫入 state 並記 owner
+D34f="$TESTROOT/d34f"
+ab "$D34f" register ora "$PANE_A" 2>/dev/null
+TAG34F="ab-spawn-ora-1-aaaaaaaaaaaa"
+hookcall "$D34f" "$TAG34F" prompt-submit '{"session_id":"sP"}' >/dev/null 2>&1
+assert "34.5 首次認領：state=busy" state_field_is "$D34f/state/ora.json" state busy
+assert "34.5 首次認領：owner=寫入者 session_id" state_field_is "$D34f/state/ora.json" owner sP
+
+# 34.6 異主 notification：state 新鮮 → 靜默擋下，檔案逐位元不變
+# 逐位元比對用 cmp 對事前副本，不用欄位比對——ts 只有秒級解析度，同秒內被
+# 改寫再讀欄位會假綠
+D34g="$TESTROOT/d34g"
+ab "$D34g" register pia "$PANE_A" 2>/dev/null
+TAG34G="ab-spawn-pia-1-aaaaaaaaaaaa"
+mkdir -p "$D34g/state"
+jq -n --arg s busy --arg t "$(now_iso_test)" --arg ld "" --arg o sP \
+  '{state: $s, ts: $t, last_delivered: $ld, owner: $o}' > "$D34g/state/pia.json"
+cp "$D34g/state/pia.json" "$TESTROOT/pia-before.json"
+hookcall "$D34g" "$TAG34G" notification '{"notification_type":"idle_prompt","session_id":"sC"}' \
+  > "$TESTROOT/h34g.out" 2>/dev/null; rc=$?
+assert "34.6 異主 notification：exit 0" test "$rc" -eq 0
+assert "34.6 異主 notification：無 stdout" test ! -s "$TESTROOT/h34g.out"
+assert "34.6 異主 notification：state 檔逐位元不變" \
+  cmp -s "$D34g/state/pia.json" "$TESTROOT/pia-before.json"
+
+# 34.7 異主 stop：mailbox 有 queued task 也不得發 block（缺陷後果 2 的核心反證：
+# 巢狀 session 不再被指使去 receive parent 的任務）
+D34h="$TESTROOT/d34h"
+ab "$D34h" register rex "$PANE_A" 2>/dev/null
+id34h="$(ab "$D34h" send rex --from alice --message t1 2>/dev/null)"
+TAG34H="ab-spawn-rex-1-aaaaaaaaaaaa"
+mkdir -p "$D34h/state"
+jq -n --arg s idle --arg t "$(now_iso_test)" --arg ld "" --arg o sP \
+  '{state: $s, ts: $t, last_delivered: $ld, owner: $o}' > "$D34h/state/rex.json"
+cp "$D34h/state/rex.json" "$TESTROOT/rex-before.json"
+hookcall "$D34h" "$TAG34H" stop '{"session_id":"sC"}' > "$TESTROOT/h34h.out" 2>/dev/null; rc=$?
+assert "34.7 異主 stop：exit 0" test "$rc" -eq 0
+assert "34.7 異主 stop：無 stdout（不發 block）" test ! -s "$TESTROOT/h34h.out"
+assert "34.7 異主 stop：task 仍 queued" st_is "$D34h" "$id34h" queued
+assert "34.7 異主 stop：state 檔逐位元不變" \
+  cmp -s "$D34h/state/rex.json" "$TESTROOT/rex-before.json"
+
+# 34.8 本人 stop：同一目錄、owner 本人 → 照常 block 取件（gate 不誤擋正主）
+hookcall "$D34h" "$TAG34H" stop '{"session_id":"sP"}' > "$TESTROOT/h34h2.out" 2>/dev/null
+assert "34.8 本人 stop：block reason 含 receive <id>" grep -q "receive $id34h" "$TESTROOT/h34h2.out"
+assert "34.8 本人 stop：last_delivered 更新" \
+  state_field_is "$D34h/state/rex.json" last_delivered "$id34h"
+assert "34.8 本人 stop：owner 維持本人" state_field_is "$D34h/state/rex.json" owner sP
+
+# 34.9 過期接管：ts 超過 TTL 後新 session_id 可接管（/clear 換 id 的自癒路徑）
+D34i="$TESTROOT/d34i"
+ab "$D34i" register sol "$PANE_A" 2>/dev/null
+TAG34I="ab-spawn-sol-1-aaaaaaaaaaaa"
+mkdir -p "$D34i/state"
+jq -n --arg s busy --arg t "2020-01-01T00:00:00Z" --arg ld "" --arg o sOld \
+  '{state: $s, ts: $t, last_delivered: $ld, owner: $o}' > "$D34i/state/sol.json"
+hookcall "$D34i" "$TAG34I" prompt-submit '{"session_id":"sNew"}' >/dev/null 2>&1
+assert "34.9 過期接管：owner 換新 session_id" state_field_is "$D34i/state/sol.json" owner sNew
+assert "34.9 過期接管：state=busy" state_field_is "$D34i/state/sol.json" state busy
+
+# 34.10 未來 ts 接管：異主但 ts 在未來（2099）→ 不可信，允許接管（比照 34.2
+# 的下界哲學：未來時間戳不得造成永久鎖死）
+D34j="$TESTROOT/d34j"
+ab "$D34j" register tam "$PANE_A" 2>/dev/null
+TAG34J="ab-spawn-tam-1-aaaaaaaaaaaa"
+mkdir -p "$D34j/state"
+jq -n --arg s busy --arg t "2099-01-01T00:00:00Z" --arg ld "" --arg o sOld \
+  '{state: $s, ts: $t, last_delivered: $ld, owner: $o}' > "$D34j/state/tam.json"
+hookcall "$D34j" "$TAG34J" prompt-submit '{"session_id":"sNew"}' >/dev/null 2>&1
+assert "34.10 未來 ts 接管：owner 換新 session_id" state_field_is "$D34j/state/tam.json" owner sNew
+
+# 34.11 舊格式升級：無 owner 欄的三欄 state 檔視為無主，第一個帶 id 的事件認領
+D34k="$TESTROOT/d34k"
+ab "$D34k" register uma "$PANE_A" 2>/dev/null
+TAG34K="ab-spawn-uma-1-aaaaaaaaaaaa"
+mkdir -p "$D34k/state"
+jq -n --arg s busy --arg t "$(now_iso_test)" --arg ld "" \
+  '{state: $s, ts: $t, last_delivered: $ld}' > "$D34k/state/uma.json"
+hookcall "$D34k" "$TAG34K" notification '{"notification_type":"idle_prompt","session_id":"sS"}' >/dev/null 2>&1
+assert "34.11 舊格式無主：認領成功 state=idle" state_field_is "$D34k/state/uma.json" state idle
+assert "34.11 舊格式無主：owner 記錄認領者" state_field_is "$D34k/state/uma.json" owner sS
+
+# 34.12 異主不消耗防迴圈額度：stop 的「同 id 已擋過一輪」一次性放行只屬正主；
+# 異主帶 stop_hook_active=true 也碰不到 last_delivered
+D34l="$TESTROOT/d34l"
+ab "$D34l" register vic "$PANE_A" 2>/dev/null
+id34l="$(ab "$D34l" send vic --from alice --message t1 2>/dev/null)"
+TAG34L="ab-spawn-vic-1-aaaaaaaaaaaa"
+hookcall "$D34l" "$TAG34L" stop '{"session_id":"sP"}' > "$TESTROOT/h34l1.out" 2>/dev/null
+assert "34.12 前置：正主首輪 block" grep -q "receive $id34l" "$TESTROOT/h34l1.out"
+cp "$D34l/state/vic.json" "$TESTROOT/vic-mid.json"
+hookcall "$D34l" "$TAG34L" stop '{"stop_hook_active":true,"session_id":"sC"}' \
+  > "$TESTROOT/h34l2.out" 2>/dev/null
+assert "34.12 異主 stop_hook_active：無 stdout" test ! -s "$TESTROOT/h34l2.out"
+assert "34.12 異主 stop_hook_active：state 檔逐位元不變（額度未被消耗）" \
+  cmp -s "$D34l/state/vic.json" "$TESTROOT/vic-mid.json"
+hookcall "$D34l" "$TAG34L" stop '{"stop_hook_active":true,"session_id":"sP"}' \
+  > "$TESTROOT/h34l3.out" 2>/dev/null
+assert "34.12 正主同 id 放行：無 stdout" test ! -s "$TESTROOT/h34l3.out"
+assert "34.12 正主同 id 放行：state=idle" state_field_is "$D34l/state/vic.json" state idle
+
+# 34.14 gate 的 TTL 韌性（hook 鐵律）：TTL 壞值或 0 不得 die、不得變成
+# 「無條件接管」——gate 內部退預設 1800 繼續運作，fresh 異主仍被靜默擋下
+# （cross-vendor 複核 2026-07-29 suggestion 1，鎖住 R4）
+D34n="$TESTROOT/d34n"
+ab "$D34n" register xan "$PANE_A" 2>/dev/null
+TAG34N="ab-spawn-xan-1-aaaaaaaaaaaa"
+mkdir -p "$D34n/state"
+jq -n --arg s busy --arg t "$(now_iso_test)" --arg ld "" --arg o sP \
+  '{state: $s, ts: $t, last_delivered: $ld, owner: $o}' > "$D34n/state/xan.json"
+cp "$D34n/state/xan.json" "$TESTROOT/xan-before.json"
+printf '%s' '{"session_id":"sC"}' | env AGENT_BRIDGE_STATE_TTL=bad \
+  AGENT_BRIDGE_DATA="$D34n" AGENT_BRIDGE_SPAWN_TAG="$TAG34N" PATH="$SHIM:$PATH" \
+  "$BRIDGE" hook prompt-submit > "$TESTROOT/h34n1.out" 2>/dev/null; rc=$?
+assert "34.14 TTL 壞值：exit 0（不 die）" test "$rc" -eq 0
+assert "34.14 TTL 壞值：無 stdout" test ! -s "$TESTROOT/h34n1.out"
+assert "34.14 TTL 壞值：fresh 異主仍被擋（state 逐位元不變）" \
+  cmp -s "$D34n/state/xan.json" "$TESTROOT/xan-before.json"
+printf '%s' '{"session_id":"sC"}' | env AGENT_BRIDGE_STATE_TTL=0 \
+  AGENT_BRIDGE_DATA="$D34n" AGENT_BRIDGE_SPAWN_TAG="$TAG34N" PATH="$SHIM:$PATH" \
+  "$BRIDGE" hook prompt-submit > "$TESTROOT/h34n2.out" 2>/dev/null; rc=$?
+assert "34.14 TTL=0：exit 0（不 die）" test "$rc" -eq 0
+assert "34.14 TTL=0：無 stdout" test ! -s "$TESTROOT/h34n2.out"
+assert "34.14 TTL=0：不得變成無條件接管（state 逐位元不變）" \
+  cmp -s "$D34n/state/xan.json" "$TESTROOT/xan-before.json"
+
+# 34.13 缺 session_id：無身分者不參與 state 通道——不寫 state、不 block
+# （失效方向＝既有降級鏈：state 停更 → TTL → legacy 送鍵）
+D34m="$TESTROOT/d34m"
+ab "$D34m" register wes "$PANE_A" 2>/dev/null
+ab "$D34m" send wes --from alice --message t1 >/dev/null 2>&1
+TAG34M="ab-spawn-wes-1-aaaaaaaaaaaa"
+hookcall "$D34m" "$TAG34M" stop '{}' > "$TESTROOT/h34m.out" 2>/dev/null; rc=$?
+assert "34.13 缺 sid：exit 0" test "$rc" -eq 0
+assert "34.13 缺 sid：無 stdout（不 block）" test ! -s "$TESTROOT/h34m.out"
+assert "34.13 缺 sid：不產生 state 檔" bash -c "! test -e '$D34m/state/wes.json'"
 
 # ---- 總結 ----
 printf '\n共 %d PASS、%d FAIL\n' "$PASS" "$FAIL"
