@@ -130,6 +130,12 @@ a fake completion). Panes you opened yourself can join via
   needs a one-time interactive trust grant, or codex silently skips the
   hooks). Any stale/missing state falls back to send-keys: short commands
   typed into the target pane's input stream.
+  The state file is owned by the worker's own session (first hook payload
+  `session_id` wins): a nested runtime launched inside the worker inherits
+  the env tag but cannot overwrite the parent's state or intercept its
+  tasks while ownership is fresh; stale ownership hands over after the
+  state TTL (also the `/clear` self-heal path). See README.zh-TW.md for
+  the residual boundaries.
   Before pressing Enter the bridge captures the target screen and backs
   off if a permission / plan-approval dialog is showing (fail-closed on a
   failed capture). That check is best-effort, not a guarantee: it matches

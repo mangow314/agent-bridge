@@ -560,21 +560,25 @@ tests/run-tests.sh
   是「建議非權威」（同 `disposable`），不是保護機制——上面兩種情形都不會
   遺失訊息，只是即時性沒有保證。
 - **通知原生化本身引入的脆弱面（Phase 1/2/3，2026-07-28，刻意不美化）**：
-  - **巢狀 runtime 會汙染 parent worker 的 state（未修，實測確認）**：
+  - **巢狀 runtime 冒用 parent 身分（已修：owner/session_id 所有權閘門）**：
     `AGENT_BRIDGE_SPAWN_TAG` 是環境變數、子行程一律繼承，所以在一個 worker
     的 session 裡再啟動一個**自己也載入了這組 hooks** 的 agent runtime
     （`codex exec --profile agent-worker`、`claude -p --settings
-    share/claude-worker-hooks.json`），那個巢狀 session 的 hooks 會用
-    **parent 的名字**寫 state。不帶 profile／`--settings` 的普通呼叫不會觸發
-    ——環境變數雖然照樣繼承，但沒有 hook 去讀它。後果有兩層：(1) parent 被標成 idle 而實際正忙，
-    `notify_or_defer` 因此走送鍵路徑，等於把通知原生化要消除的風險繞回來
-    （實測時被 `notify_pane` 的畫面掃描 fail-closed 擋下，記成 `notify-failed`
-    ——但那道防線本來只該是 belt-and-suspenders）；(2) 更嚴重：巢狀 session
-    的 Stop hook 會拿 parent 的名字查 mailbox，查到 queued 任務就叫自己去
-    `receive`，而 `receive` 不驗身分，**本該給 parent 的任務會被子 session
-    取走**。可行的最小修法是用 hook payload 的 `session_id` 做先到先得的
-    所有權綁定（worker 自己的 `ready` 那輪必然最早寫入），尚未實作。
-    完整分析見 `docs/codex-hooks-probe.md`。
+    share/claude-worker-hooks.json`），那個巢狀 session 的 hooks 曾會用
+    **parent 的名字**寫 state、甚至替 parent 發 block 取件指令把任務攔走。
+    現行修法：state 檔記 `owner`（hook payload 的 `session_id`），第一個帶
+    id 寫入者先到先得認領（worker 本尊的第一個事件必然最早；認領是無鎖的
+    read-then-write，極端併發下以最後完成寫入者為準，且只發生在無主／過期
+    窗內）；之後 id 不符的呼叫一律靜默擋下——不寫 state，stop 也不發 block。owner 交還走時間窗：
+    state ts 超過 `AGENT_BRIDGE_STATE_TTL` 或落在未來才允許新 id 接管（這也
+    是 `/clear` 換 session id 後的自癒路徑）。殘餘邊界（刻意不美化）：
+    (1) `/clear` 後最長一個 TTL（預設 1800 秒）內 parent 的 hooks 被舊 owner
+    鎖住，state 凍結、stop 不 block，deferred 任務最壞要等 TTL 過期後 parent
+    的下一次 turn 結束才被取件；(2) 長壽巢狀 session 若存活超過 TTL 且期間
+    parent 零 hook 事件，仍可能奪走所有權；(3) 缺 `session_id` 的 payload
+    不參與 state 通道（不寫、不 block），行為退回 legacy 送鍵；(4) `owner`
+    欄與 state 檔同屬 worker 可寫互信域，防的是**意外汙染**不是蓄意偽造
+    （與下方「建議非權威」一致）。完整分析見 `docs/codex-hooks-probe.md`。
   - **`notification_type` 欄位有已知可靠性缺口**：官方 Notification hook
     payload 有時完全缺這個欄位（[issue #12048](https://github.com/anthropics/claude-code/issues/12048)，
     關聯 [#11964](https://github.com/anthropics/claude-code/issues/11964)）。

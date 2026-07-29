@@ -174,11 +174,15 @@ session 裡再啟動一個**自己也載入了 agent-bridge hooks** 的 agent ru
    `receive` 不驗身分，於是**本該給 parent 的任務被子 session 取走**，parent 永遠
    等不到。本次沒有觸發，只是因為當下 mailbox 恰好沒有排隊中的任務。
 
-尚未修。可行的最小修法（未經核准、未實作）：hook payload 有 `session_id`，可以
-讓第一次寫入的 session 把 id 記進 state 檔，之後 id 不符的一律忽略——worker 自己
-的 `ready` 那一輪必然最早寫入，所以先到先得剛好選中正主；巢狀 session 的 id 不同
-會被擋掉。失效方向安全（被擋 → state 停更 → TTL 過期 → 退回 legacy 送鍵）。需要
-處理的邊界是 worker 自身 session id 變動（例如 `/clear`）後如何交還所有權。
+**已修（2026-07-29）**：state 檔加 `owner` 欄記 hook payload 的 `session_id`，
+第一個帶 id 寫入者先到先得認領（worker 自己的第一個事件必然最早）；之後 id 不符
+的呼叫一律靜默擋下——不寫 state，stop 也不發 block（兩層後果同時堵住）。接管
+條件：state `ts` 超過 `AGENT_BRIDGE_STATE_TTL` 或落在未來——這同時是 worker
+自身 session id 變動（例如 `/clear`）後的所有權交還路徑，自癒上限＝TTL。缺
+`session_id` 的 payload 不參與 state 通道（不寫、不 block），失效方向仍是安全的
+降級鏈（state 停更 → TTL 過期 → 退回 legacy 送鍵）。殘餘邊界（/clear 後最長一個
+TTL 的降級窗、長壽巢狀 session 越過 TTL 的奪權可能）詳見 README.zh-TW.md
+已知限制節。回歸測試：run-tests.sh 34.5–34.13。
 
 ## 未驗的部分
 
