@@ -28,6 +28,30 @@ pub fn str_field<'a>(fields: &'a Map<String, Value>, key: &str) -> Option<&'a st
     fields.get(key).and_then(|v| v.as_str())
 }
 
+/// `jq -r '.<key> // empty'` 的逐字語意，供 hook 那組「bash 拿 jq 讀什麼、
+/// Rust 就得拿到什麼」的欄位使用（codex 複核 2026-07-31 的 parity finding）。
+///
+/// 與 `str_field` 的差別是**非字串值不回 `None`**：`jq -r` 會把它們印成文字，
+/// bash 端於是拿到一個非空字串並據以判斷。兩者混用正是那輪抓到的洞——例如
+/// state 檔的 `owner: 1`，bash 視為「有主」而擋下異主寫入，`str_field` 卻當
+/// 成「無主」直接放行。
+///
+/// 對映規則（`//` 的 alternative operator 對 `null` **與 `false`** 都觸發）：
+/// - 缺欄位／`null`／`false`／空字串 → `None`
+/// - 字串 → 原樣
+/// - `true`／數字 → 其 JSON 文字
+/// - 陣列／物件 → `render_pretty`（jq 預設輸出即 pretty，非 compact）
+pub fn jq_raw_field(fields: &Map<String, Value>, key: &str) -> Option<String> {
+    let out = match fields.get(key)? {
+        Value::Null | Value::Bool(false) => return None,
+        Value::String(s) => s.clone(),
+        Value::Bool(true) => "true".to_string(),
+        Value::Number(n) => n.to_string(),
+        v => render_pretty(v),
+    };
+    if out.is_empty() { None } else { Some(out) }
+}
+
 /// 讀取 object 內某個布林欄位是否「明確為 true」；缺欄位／型別不符都回
 /// `false`（對映 `jq -e '.spawned == true'` 的比較語意——`null`、字串、數字
 /// 一律不算 true）。
@@ -234,6 +258,34 @@ mod tests {
     /// 2a：重複鍵取最後一個值（jq 語意）。`{"spawned": false, "spawned": true}`
     /// bash／jq 判定為 spawned；取第一個會誤判成 manual，破壞 fail-closed。
     /// 換 serde_json 後這是**依賴方的行為**，故留作回歸測試。
+    /// `jq -r '.x // empty'` 的對照表。`str_field` 對非字串一律 `None`，
+    /// 這裡不是——差別本身就是那輪 parity finding 的內容。
+    #[test]
+    fn jq_raw_field_matches_jq_r_alternative_semantics() {
+        let Ok(Value::Object(m)) = parse(
+            r#"{"s":"x","empty":"","n":42,"f":1.5,"t":true,"no":false,
+                "nil":null,"arr":[1],"obj":{"k":"v"}}"#,
+        ) else {
+            panic!("fixture 應為 object");
+        };
+        assert_eq!(jq_raw_field(&m, "s").as_deref(), Some("x"));
+        assert_eq!(jq_raw_field(&m, "n").as_deref(), Some("42"));
+        assert_eq!(jq_raw_field(&m, "f").as_deref(), Some("1.5"));
+        assert_eq!(jq_raw_field(&m, "t").as_deref(), Some("true"));
+        // `//` 對 null 與 false 都觸發 alternative → empty
+        assert_eq!(jq_raw_field(&m, "no"), None);
+        assert_eq!(jq_raw_field(&m, "nil"), None);
+        // 空字串在 `// empty` 之後仍是空字串，bash 端 `[[ -n ]]` 判為無值
+        assert_eq!(jq_raw_field(&m, "empty"), None);
+        assert_eq!(jq_raw_field(&m, "missing"), None);
+        // 複合值：jq 預設輸出即 pretty
+        assert_eq!(jq_raw_field(&m, "arr").as_deref(), Some("[\n  1\n]"));
+        assert_eq!(
+            jq_raw_field(&m, "obj").as_deref(),
+            Some("{\n  \"k\": \"v\"\n}")
+        );
+    }
+
     #[test]
     fn duplicate_key_takes_last_value() {
         assert!(bool_field_is_true(

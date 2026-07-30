@@ -18,7 +18,7 @@ impl Paths {
     /// `~/.local/share/agent-bridge`（比照 bash `${AGENT_BRIDGE_DATA:-...}`，
     /// `:-` 對空字串同樣觸發預設值）。
     pub fn resolve() -> Self {
-        let data_dir = match env::var("AGENT_BRIDGE_DATA") {
+        let data_dir = match env::var(crate::config::ENV_DATA) {
             Ok(v) if !v.is_empty() => PathBuf::from(v),
             _ => {
                 let home = env::var("HOME").unwrap_or_default();

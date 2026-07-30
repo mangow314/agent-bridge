@@ -1,11 +1,13 @@
 //! `ab` — agent-bridge CLI binary。argv 手寫解析＋dispatch＋stderr/exit code
-//! （架構 §1／§4）。M1 範圍：register/unregister/list/send/receive/start/
-//! reply/fail/cancel/status/read/await/gc。spawn 生命週期群與 hook 屬 M2／M3，
+//! （架構 §1／§4）。M2 範圍：register/unregister/list/send/receive/start/
+//! reply/fail/cancel/status/read/await/gc/hook。spawn 生命週期群屬 M3，
 //! 未實作前一律走「未知指令」分支（不虛構半成品行為）。
 
 use std::process::ExitCode;
 
+use ab_core::config;
 use ab_core::error::{Error, Result};
+use ab_core::hook::{self, HookOutcome};
 use ab_core::lock::acquire_lock;
 use ab_core::notify;
 use ab_core::paths::Paths;
@@ -82,8 +84,8 @@ fn err_line(msg: &str) {
 
 // 隱藏內省（非 spec 契約面）：一行一個「已完整實作」的契約子指令。
 // 用途：里程碑 gate 的 capability 核對，堵「純 assert_fails 分組靠
-// unknown-command fallback 假綠」。M1 命令集全數就位；spawn 生命週期群
-// （spawn/relay/despawn/ready/disposable/idle/evict）與 hook 屬 M2/M3，
+// unknown-command fallback 假綠」。M2 起 hook 就位；spawn 生命週期群
+// （spawn/relay/despawn/ready/disposable/idle/evict）屬 M3，
 // 未實作前不列——列入等於宣稱可用。
 fn print_implemented_commands() {
     for cmd in [
@@ -91,6 +93,7 @@ fn print_implemented_commands() {
         "cancel",
         "fail",
         "gc",
+        "hook",
         "list",
         "read",
         "receive",
@@ -105,13 +108,81 @@ fn print_implemented_commands() {
     }
 }
 
+/// 架構 §5：Rust 預設把 SIGPIPE 設成 `SIG_IGN`，寫端因此拿到 `EPIPE` 錯誤而
+/// 不是隨管線死。bash 正本的行為是後者——`ab read <id> | head -1` 這類用法下，
+/// 讀端關閉時整個行程應以 SIGPIPE 收場（呼叫端看到 141），而不是印一行寫入
+/// 失敗再非零退出。
+///
+/// std 沒有 signal API，為此引入 `libc`（零傳遞依賴）。另一條路是在每個
+/// stdout 寫出點攔 `EPIPE` 再自行 `exit(141)`：碼更多、每新增一個輸出點就多
+/// 一個漏接的機會，而且被訊號殺死與自行退出對呼叫端的 `WIFSIGNALED` 仍不等
+/// 價。這一行換掉那一整類問題。
+///
+/// **hook 不套用這條**：`hook` 的鐵律是任何情況都 exit 0，而 SIG_DFL 之下
+/// stdout 是已關閉管線時整個行程會被訊號殺死（141）。bash 那邊 `jq … || true`
+/// 把寫出失敗吞掉、照樣 `exit 0`，所以 hook 分支維持 Rust 預設的忽略
+/// （codex 複核 2026-07-31 finding 1）。
+///
+/// **驗證缺口（誠實記錄）**：測試套件目前沒有任何一組斷言 SIGPIPE 行為
+/// （分組 8 是「通知失敗路徑」，與此無關），所以這條沒有機器 gate 護著。
+fn restore_sigpipe_default() {
+    // SAFETY: `signal(2)` 在單執行緒的行程起手處呼叫；SIG_DFL 是恢復預設
+    // 處置，不涉及自訂 handler 的可重入性問題。
+    unsafe {
+        libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+    }
+}
+
+/// hook 的 block JSON 寫出：**不能用 `println!`**——它遇寫入失敗會 panic
+/// （stdout 指向 `/dev/full`、或已關閉的管線），退出碼變 101，違反 exit 0
+/// 鐵律。bash 那邊是 `jq … 2>/dev/null || true`：寫不出去就算了，照樣 exit 0
+/// （codex 複核 2026-07-31 finding 1）。
+fn write_stdout_lossy(s: &str) {
+    use std::io::Write;
+    let mut out = std::io::stdout().lock();
+    let _ = out.write_all(s.as_bytes());
+    let _ = out.write_all(b"\n");
+    let _ = out.flush();
+}
+
 fn main() -> ExitCode {
-    let args: Vec<String> = std::env::args().skip(1).collect();
-    if args.is_empty() {
+    // argv 走 `args_os`：`std::env::args()` 對非 UTF-8 參數是 **panic**，而
+    // hook 的鐵律不允許任何非零退出（`ab hook <0xff>` 在 bash 是 rc=0，改前
+    // 的 Rust 是 101——panic 發生在 catch_unwind 之外）。指令名本身無法轉成
+    // UTF-8 時視為未知指令，與 bash 的 `*) die "未知指令"` 同向。
+    //
+    // 遺留缺口（誠實記錄）：非指令名的參數在此走 lossy 轉換，`--message` 帶
+    // 非 UTF-8 位元組時內容會被換成 U+FFFD，bash 則原樣保真。要真正對齊得把
+    // 訊息路徑整條改走 `OsStr`/bytes，屬 M3 的 argv 面工作；至少不再 panic。
+    let raw: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();
+    if raw.is_empty() {
         print_usage();
         return ExitCode::from(1);
     }
-    let cmd = args[0].clone();
+    let cmd = raw[0].to_str().unwrap_or("").to_string();
+    let args: Vec<String> = raw
+        .iter()
+        .map(|s| s.to_string_lossy().into_owned())
+        .collect();
+
+    // hook 最先分流，且**在恢復 SIGPIPE 之前**：見 restore_sigpipe_default。
+    if cmd == "hook" {
+        let paths = Paths::resolve();
+        // 唯讀豁免（CLI-RO-1）：hook 不建資料目錄
+        //
+        // 兜底放在 dispatch 而不是 hook 模組內，是為了讓「exit 0」在這一眼就
+        // 看得到，不必追進去確認。panic 也一併吃掉：預設 hook 仍會把訊息印上
+        // stderr（同 bash 出錯時也會有輸出），但退出碼不得因此變成 101。
+        let rest = &args[1..];
+        let outcome =
+            std::panic::catch_unwind(|| hook::run(&paths, rest)).unwrap_or(HookOutcome::Silent);
+        if let HookOutcome::Block(doc) = outcome {
+            write_stdout_lossy(&doc);
+        }
+        return ExitCode::from(0);
+    }
+
+    restore_sigpipe_default();
     if matches!(cmd.as_str(), "-h" | "--help" | "help") {
         print_usage();
         return ExitCode::from(0);
@@ -126,7 +197,7 @@ fn main() -> ExitCode {
     // 唯讀豁免（main dispatch:2262-2269／CLI-RO-1）：status/await/idle/list/
     // hook 不建目錄。本切片只實作 list 屬於這個豁免表；其餘四個尚未實作，
     // 一律落入下面的「未知指令」分支（不建目錄與否對它們無意義）。
-    let readonly = matches!(cmd.as_str(), "status" | "await" | "idle" | "list" | "hook");
+    let readonly = matches!(cmd.as_str(), "status" | "await" | "idle" | "list");
     if !readonly && let Err(e) = paths.ensure_dirs() {
         err_line(&e.message);
         return ExitCode::from(1);
@@ -613,7 +684,9 @@ fn cmd_await(paths: &Paths, args: &[String]) -> Result<()> {
     // 輪詢間隔在進迴圈前就驗：壞值在 bash 會讓 sleep 立刻報錯、await 毫秒級
     // 非零退出，呼叫端若把這種操作性失敗當成逾時（evict 曾如此）就會殺掉還
     // 活著的 worker。此處同樣先驗後跑，維持「124 只等於真逾時」的契約。
-    let raw = std::env::var("AGENT_BRIDGE_POLL_INTERVAL").unwrap_or_default();
+    // 名字取 config 的常數（集中處），解析與錯誤文案留在 CLI 層——那兩句
+    // die 訊息是 await 的契約面，不是設定讀取的一部分。
+    let raw = std::env::var(config::ENV_POLL_INTERVAL).unwrap_or_default();
     let interval: f64 = if raw.is_empty() {
         1.0
     } else {

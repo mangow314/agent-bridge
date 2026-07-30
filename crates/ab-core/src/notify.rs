@@ -6,7 +6,8 @@
 //! 先例）：它們是流程中的提示而非指令失敗，回不到 `ab` 的 `Err` 收斂層——
 //! 那條路徑會把整個指令變成非零退出，而 bash 這裡是 `err` + 繼續。
 
-use crate::error::{Error, Result};
+use crate::config;
+use crate::error::Result;
 use crate::json;
 use crate::paths::Paths;
 use crate::task::log_event;
@@ -91,16 +92,9 @@ pub fn notify_pane(tmux: &dyn TmuxClient, pane: &str, cmd: &str) -> bool {
 /// `if` 包住呼叫的（errexit 在該語境抑制），失敗後**繼續往下執行**。此處
 /// 對齊該終態：解析不出正數就不睡，直接進第二次掃描。
 fn sleep_notify_delay() {
-    let raw = std::env::var("AGENT_BRIDGE_NOTIFY_DELAY").unwrap_or_default();
-    let secs = if raw.is_empty() {
-        0.3
-    } else {
-        match raw.parse::<f64>() {
-            Ok(v) if v.is_finite() && v > 0.0 => v,
-            _ => return,
-        }
-    };
-    std::thread::sleep(std::time::Duration::from_secs_f64(secs));
+    if let Some(secs) = config::notify_delay_secs() {
+        std::thread::sleep(std::time::Duration::from_secs_f64(secs));
+    }
 }
 
 /// notify_or_defer:371 — send／respond_task／cancel 三個通知呼叫點共用的 gate。
@@ -117,7 +111,7 @@ pub fn notify_or_defer(
     task_id: &str,
     tag: &str,
 ) -> Result<()> {
-    let ttl = resolve_state_ttl()?;
+    let ttl = config::state_ttl_strict()?;
     let mut fresh_busy = false;
 
     // ttl=0＝整條 state 通道關閉（比照 AGENT_BRIDGE_READY_TIMEOUT 的 0 語意），
@@ -174,24 +168,6 @@ pub fn notify_or_defer(
         );
     }
     Ok(())
-}
-
-/// ENV-TTL-1/2：`AGENT_BRIDGE_STATE_TTL` 只認非負整數（至多 9 位），其餘視為
-/// 設定錯誤直接 die——**通知端的壞值 MUST 致命**，不得靜默退回預設。
-fn resolve_state_ttl() -> Result<i64> {
-    let raw = std::env::var("AGENT_BRIDGE_STATE_TTL").unwrap_or_default();
-    if raw.is_empty() {
-        return Ok(1800);
-    }
-    let ok = raw.len() <= 9 && raw.bytes().all(|b| b.is_ascii_digit());
-    if !ok {
-        return Err(Error::new(format!(
-            "AGENT_BRIDGE_STATE_TTL 需為非負整數：{raw}"
-        )));
-    }
-    // 前導零比照 bash `10#$ttl` 強制十進位
-    raw.parse::<i64>()
-        .map_err(|_| Error::new(format!("AGENT_BRIDGE_STATE_TTL 需為非負整數：{raw}")))
 }
 
 #[cfg(test)]

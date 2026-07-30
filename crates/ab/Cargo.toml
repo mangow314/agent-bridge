@@ -7,3 +7,5 @@ repository.workspace = true
 
 [dependencies]
 ab-core = { path = "../ab-core" }
+# 只為 main 起手的 signal(SIGPIPE, SIG_DFL) 一行（架構 §5）；零傳遞依賴
+libc = "0.2"
