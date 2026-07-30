@@ -50,7 +50,7 @@ Source: notify_pane
 過期（原生通知通道關閉）。
 Source: notify_or_defer
 
-### ENV-TTL-2 [untested]
+### ENV-TTL-2 [tested: 34]
 通知端（send/reply/cancel 等 CLI 路徑）：值非 0–9 位純數字時 MUST 以錯誤
 終止（die），不得靜默採用預設。
 Source: notify_or_defer

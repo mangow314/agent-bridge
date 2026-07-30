@@ -3,7 +3,7 @@
 - 對映粒度：**分組級**（不逐條 assert；parity 判定單位是分組全綠）。
 - 本表是對映正本；`tests/run-tests.sh` 各分組標頭下的 `# spec:` 註解是
   唯讀鏡像，漂移時以本表為準。
-- untested 計數：3（缺口處置見文末）。
+- untested 計數：2（缺口處置見文末）。
 - 機器核對：`tests/check-contract.sh 4`。
 
 | 分組 | 主題 | 條款 |
@@ -46,7 +46,7 @@
 | 31 | 第三輪複核修補 | CLI-STATUS-1, CLI-READ-1, CLI-AWAIT-2, CLI-DESPAWN-3, CLI-EVICT-2, CLI-RO-1, ENV-POLL-1, CLI-GEN-3, CLI-SEND-3, STATE-TASK-4, STATE-TASK-5 |
 | 32 | spawn 落點＋owner/actor 審計 | CLI-SPAWN-5, CLI-SPAWN-6 |
 | 33 | 通知原生化 Phase 1 | CLI-HOOK-1, HOOK-ID-1, HOOK-ID-2, HOOK-EVT-1, HOOK-EVT-2, HOOK-EVT-3, HOOK-EVT-4, HOOK-NOTIFY-1, STATE-CHAN-1, STATE-CHAN-2, STATE-CHAN-3, ENV-TTL-1 |
-| 34 | 獨立複核 blocker 修補 | HOOK-ID-3, HOOK-EVT-3, HOOK-NOTIFY-1, ENV-TTL-1 |
+| 34 | 獨立複核 blocker 修補 | HOOK-ID-3, HOOK-EVT-3, HOOK-NOTIFY-1, ENV-TTL-1, ENV-TTL-2 |
 | 34.5+ | 巢狀 runtime 冒名（owner gate） | HOOK-OWNER-1, HOOK-OWNER-2, HOOK-OWNER-3, HOOK-OWNER-4, HOOK-EVT-4, ENV-TTL-3, STATE-CHAN-2 |
 
 ## `[untested]` 缺口處置（本輪只記錄，不補測）
@@ -54,7 +54,6 @@
 | 條款 | 缺口 | 處置 |
 |---|---|---|
 | ENV-GEN-1 | 「未列變數不影響行為」無測試枚舉 | 認列不測：負面全稱句無法窮舉；由 check-contract.sh 第 1 項的集合 diff 守住新增變數必入 spec 的方向 |
-| ENV-TTL-2 | 通知端 STATE_TTL 壞值 die 無直接測試（僅 hook 端壞值退預設有測，34.5+） | 建議補測：單一 assert_fails 即可，成本極低；列入下輪或 Rust parity 前置 |
 | STATE-GEN-2 | 原子寫入（暫存檔＋rename）無直接斷言 | 認列不測：黑箱難以斷言中間態不可見；分組 15 併發壓測為間接證據；Rust 遷移時以實作審查＋同款壓測守住 |
 
 已知「有行為無測試」的既有缺口（繼承自 notify-native 交接，非本輪新增）：

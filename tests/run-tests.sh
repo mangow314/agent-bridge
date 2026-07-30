@@ -3205,7 +3205,7 @@ assert "33.11b cancel 通知 to busy→deferred：events.log 記 notify-deferred
 tmx kill-pane -t "$p33l" 2>/dev/null || true
 
 # ---- 34. 獨立複核 blocker 修補（2026-07-28）----
-# spec: HOOK-ID-3 HOOK-EVT-3 HOOK-NOTIFY-1 ENV-TTL-1
+# spec: HOOK-ID-3 HOOK-EVT-3 HOOK-NOTIFY-1 ENV-TTL-1 ENV-TTL-2
 
 # 34.1a B1 反例：tasks/ 目錄名含 shell metacharacter，混在合法 queued task
 # 之間 → hook stop 的 reason 只能含合法 id，惡意目錄名片段不得出現
@@ -3304,6 +3304,17 @@ assert "34.4 TTL=0：視為通道關閉，走 legacy 送鍵（pane 收到通知�
 assert "34.4 TTL=0：events.log 記 notified" \
   evt_grep "$D34e/tasks/$id34e/events.log" notified
 tmx kill-pane -t "$p34e" 2>/dev/null || true
+
+# 34.4b ENV-TTL-2：通知端 STATE_TTL 壞值（非 0–9 位純數字）MUST die，
+# 不得靜默採預設——hook 端壞值退預設是 ENV-TTL-3（34.5+），方向相反勿混。
+# die 發生在 notify_or_defer 開頭、任何送鍵之前，PANE_A 不會收到雜訊
+D34g="$TESTROOT/d34g"
+ab "$D34g" register pia "$PANE_A" 2>/dev/null
+env AGENT_BRIDGE_STATE_TTL=bad AGENT_BRIDGE_DATA="$D34g" PATH="$SHIM:$PATH" \
+  "$BRIDGE" send pia --from alice --message hi >/dev/null 2>"$TESTROOT/h34g.err"; rc=$?
+assert "34.4b ENV-TTL-2：send 於 TTL 壞值以錯誤終止" test "$rc" -ne 0
+assert "34.4b ENV-TTL-2：錯誤訊息指向 STATE_TTL（排除其他死因）" \
+  grep -q "AGENT_BRIDGE_STATE_TTL" "$TESTROOT/h34g.err"
 
 # ---- 34.5+ 巢狀 runtime 冒名缺陷（owner/session_id 所有權閘門）----
 # spec: HOOK-OWNER-1 HOOK-OWNER-2 HOOK-OWNER-3 HOOK-OWNER-4 HOOK-EVT-4 ENV-TTL-3 STATE-CHAN-2
