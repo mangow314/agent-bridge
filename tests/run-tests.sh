@@ -16,7 +16,7 @@ unset TMUX
 unset ${!AGENT_BRIDGE_@}
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-BRIDGE="$ROOT/bin/agent-bridge"
+BRIDGE="${BRIDGE:-$ROOT/bin/agent-bridge}"
 SOCK="agent-bridge-test"
 
 if ! REAL_TMUX="$(command -v tmux)"; then

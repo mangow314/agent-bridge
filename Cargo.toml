@@ -1,0 +1,11 @@
+# Rust 遷移 workspace（計畫：~/.claude/plans/cheeky-waddling-meadow.md）
+# M4 cutover 前 bin/agent-bridge（bash）為正本，本 workspace 對其完全惰性；
+# parity gate＝BRIDGE 指向 target/release/ab 跑 tests/run-tests.sh 分組全綠。
+[workspace]
+resolver = "3"
+members = ["crates/ab-core", "crates/ab", "crates/ab-tui"]
+
+[workspace.package]
+edition = "2024"
+license = "MIT"
+repository = "https://github.com/mangow314/agent-bridge"
