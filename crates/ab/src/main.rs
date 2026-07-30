@@ -1,13 +1,16 @@
 //! `ab` — agent-bridge CLI binary。argv 手寫解析＋dispatch＋stderr/exit code
-//! （架構 §1／§4）。M0.5 spike 範圍：`register`／`list`／`send`（錯誤路徑，
-//! 見 ab-core::registry 文件）；其餘子指令一律走「未知指令」分支，留給後續
-//! 階段實作（不在本切片虛構半成品行為）。
+//! （架構 §1／§4）。M1 範圍：register/unregister/list/send/receive/start/
+//! reply/fail/cancel/status/read/await/gc。spawn 生命週期群與 hook 屬 M2／M3，
+//! 未實作前一律走「未知指令」分支（不虛構半成品行為）。
 
 use std::process::ExitCode;
 
-use ab_core::error::Error;
+use ab_core::error::{Error, Result};
+use ab_core::lock::acquire_lock;
+use ab_core::notify;
 use ab_core::paths::Paths;
 use ab_core::registry;
+use ab_core::task::{self, MessageSource, TaskState};
 use ab_core::tmux::SubprocessTmux;
 use ab_core::validate::is_valid_name;
 
@@ -79,10 +82,25 @@ fn err_line(msg: &str) {
 
 // 隱藏內省（非 spec 契約面）：一行一個「已完整實作」的契約子指令。
 // 用途：里程碑 gate 的 capability 核對，堵「純 assert_fails 分組靠
-// unknown-command fallback 假綠」。send 尚停在錯誤路徑（未建 task、未通知），
-// 列入等於宣稱可用，故不列；補完快樂路徑時再加入。
+// unknown-command fallback 假綠」。M1 命令集全數就位；spawn 生命週期群
+// （spawn/relay/despawn/ready/disposable/idle/evict）與 hook 屬 M2/M3，
+// 未實作前不列——列入等於宣稱可用。
 fn print_implemented_commands() {
-    for cmd in ["register", "list"] {
+    for cmd in [
+        "await",
+        "cancel",
+        "fail",
+        "gc",
+        "list",
+        "read",
+        "receive",
+        "register",
+        "reply",
+        "send",
+        "start",
+        "status",
+        "unregister",
+    ] {
         println!("{cmd}");
     }
 }
@@ -109,17 +127,25 @@ fn main() -> ExitCode {
     // hook 不建目錄。本切片只實作 list 屬於這個豁免表；其餘四個尚未實作，
     // 一律落入下面的「未知指令」分支（不建目錄與否對它們無意義）。
     let readonly = matches!(cmd.as_str(), "status" | "await" | "idle" | "list" | "hook");
-    if !readonly
-        && let Err(e) = paths.ensure_dirs()
-    {
+    if !readonly && let Err(e) = paths.ensure_dirs() {
         err_line(&e.message);
         return ExitCode::from(1);
     }
 
     let result = match cmd.as_str() {
         "register" => cmd_register(&paths, rest),
+        "unregister" => cmd_unregister(&paths, rest),
         "list" => cmd_list(&paths, rest),
         "send" => cmd_send(&paths, rest),
+        "receive" => cmd_receive(&paths, rest),
+        "start" => cmd_start(&paths, rest),
+        "reply" => cmd_reply(&paths, rest),
+        "fail" => cmd_fail(&paths, rest),
+        "cancel" => cmd_cancel(&paths, rest),
+        "status" => cmd_status(&paths, rest),
+        "read" => cmd_read(&paths, rest),
+        "await" => cmd_await(&paths, rest),
+        "gc" => cmd_gc(&paths, rest),
         _ => {
             print_usage();
             Err(Error::new(format!("未知指令：{cmd}")))
@@ -136,9 +162,11 @@ fn main() -> ExitCode {
 }
 
 /// cmd_register:476
-fn cmd_register(paths: &Paths, args: &[String]) -> ab_core::error::Result<()> {
+fn cmd_register(paths: &Paths, args: &[String]) -> Result<()> {
     if args.len() != 2 {
-        return Err(Error::new("用法：agent-bridge register <agent> <tmux-target>"));
+        return Err(Error::new(
+            "用法：agent-bridge register <agent> <tmux-target>",
+        ));
     }
     let name = &args[0];
     let target = &args[1];
@@ -151,7 +179,7 @@ fn cmd_register(paths: &Paths, args: &[String]) -> ab_core::error::Result<()> {
 /// cmd_list:522 — 無參數檢查，忽略多餘參數（比照 bash 未檢查 $#）。
 /// 損壞 registry 檔 MUST NOT 靜默略過（見 registry::list 文件）：`?` 把
 /// `Err` 上拋給 main() 的統一收斂層，印訊息＋非零退出。
-fn cmd_list(paths: &Paths, _args: &[String]) -> ab_core::error::Result<()> {
+fn cmd_list(paths: &Paths, _args: &[String]) -> Result<()> {
     for (name, pane, ready) in registry::list(paths)? {
         println!("{name}\t{pane}\t{ready}");
     }
@@ -164,7 +192,7 @@ fn cmd_list(paths: &Paths, _args: &[String]) -> ab_core::error::Result<()> {
 /// request/metadata/status、通知）留給下一階段，見 ab-core::registry
 /// 與架構文件的 task/notify 模組對映——尚未實作，命中時明確回錯而非
 /// 產生半成品任務。
-fn cmd_send(paths: &Paths, args: &[String]) -> ab_core::error::Result<()> {
+fn cmd_send(paths: &Paths, args: &[String]) -> Result<()> {
     if args.is_empty() {
         return Err(Error::new(
             "用法：agent-bridge send <agent> --from <sender> (--message <text> | --message-file <path>)",
@@ -183,9 +211,7 @@ fn cmd_send(paths: &Paths, args: &[String]) -> ab_core::error::Result<()> {
                 from = v.clone();
             }
             "--message" => {
-                let v = it
-                    .next()
-                    .ok_or_else(|| Error::new("--message 需要參數"))?;
+                let v = it.next().ok_or_else(|| Error::new("--message 需要參數"))?;
                 if !mode.is_empty() {
                     return Err(Error::new("--message 與 --message-file 只能擇一"));
                 }
@@ -231,8 +257,499 @@ fn cmd_send(paths: &Paths, args: &[String]) -> ab_core::error::Result<()> {
             "未註冊的 agent：{to}（先用 agent-bridge register）"
         )));
     }
+    if registry::is_spawned_not_ready(&agent_file) {
+        err_line(&format!(
+            "警告：agent '{to}' 尚未回報就緒（starting），通知可能延後；訊息已入 mailbox 不會遺失"
+        ));
+    }
 
-    Err(Error::new(
-        "尚未實作：send 成功路徑（M0.5 spike 範圍僅涵蓋分組 2 錯誤路徑，task 建立見 CLI-SEND-1，留待下一階段）",
-    ))
+    let src = message_source(&mode, &val);
+    let task_id = task::create_task(paths, &from, &to, &src, false)?;
+
+    // 通知前重讀 pane（cmd_send:613-619）：從參數檢查到這裡隔著建目錄＋三次
+    // 寫檔，期間同名 agent 可能被 unregister＋register 換到別的 pane——舊 pane
+    // 若已屬別人的 session，這行 command＋Enter 就打進無辜視窗。重讀把窗口縮到
+    // 次毫秒級；徹底關閉需要「讀 registry 與 send-keys」原子化，tmux 給不了。
+    let pane = registry::read_pane(&agent_file);
+    let tmux = SubprocessTmux;
+    notify::notify_or_defer(
+        paths,
+        &tmux,
+        &to,
+        &pane,
+        &format!("agent-bridge receive {task_id}"),
+        &task_id,
+        "receive",
+    )?;
+
+    println!("{task_id}");
+    Ok(())
+}
+
+/// write_message 的 mode/val 二元組 → `MessageSource`（`--message-file -`＝stdin）。
+fn message_source(mode: &str, val: &str) -> MessageSource {
+    if mode == "text" {
+        MessageSource::Text(val.to_string())
+    } else if val == "-" {
+        MessageSource::Stdin
+    } else {
+        MessageSource::File(std::path::PathBuf::from(val))
+    }
+}
+
+/// parse_message_opts:664 — reply／fail 共用的 `--message`／`--message-file`
+/// 解析。`cmdname` 只用在「需要訊息」那句 die 的措辭裡，逐字對齊 bash。
+fn parse_message_opts(cmdname: &str, args: &[String]) -> Result<MessageSource> {
+    let mut mode = String::new();
+    let mut val = String::new();
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        match a.as_str() {
+            "--message" => {
+                let v = it.next().ok_or_else(|| Error::new("--message 需要參數"))?;
+                if !mode.is_empty() {
+                    return Err(Error::new("--message 與 --message-file 只能擇一"));
+                }
+                mode = "text".to_string();
+                val = v.clone();
+            }
+            "--message-file" => {
+                let v = it
+                    .next()
+                    .ok_or_else(|| Error::new("--message-file 需要參數"))?;
+                if !mode.is_empty() {
+                    return Err(Error::new("--message 與 --message-file 只能擇一"));
+                }
+                mode = "file".to_string();
+                val = v.clone();
+            }
+            other => return Err(Error::new(format!("未知參數：{other}"))),
+        }
+    }
+    if mode.is_empty() {
+        return Err(Error::new(format!(
+            "{cmdname} 需要 --message 或 --message-file"
+        )));
+    }
+    Ok(message_source(&mode, &val))
+}
+
+/// cmd_unregister:503
+fn cmd_unregister(paths: &Paths, args: &[String]) -> Result<()> {
+    if args.len() != 1 {
+        return Err(Error::new("用法：agent-bridge unregister <agent>"));
+    }
+    registry::unregister(paths, &args[0])?;
+    eprintln!("已移除 agent '{}' 的註冊", args[0]);
+    Ok(())
+}
+
+/// cmd_receive:626 — queued→delivered；delivered/running 可重複取件（re-receive）。
+/// 標頭走 stderr、request 原文走 stdout（byte 原樣，CLI-RECEIVE-1）。
+fn cmd_receive(paths: &Paths, args: &[String]) -> Result<()> {
+    if args.len() != 1 {
+        return Err(Error::new("用法：agent-bridge receive <task-id>"));
+    }
+    let id = &args[0];
+    task::check_task_id(id)?;
+    let dir = task::require_task_dir(paths, id)?;
+
+    let guard = acquire_lock(paths, id)?;
+    let outcome = (|| -> Result<()> {
+        match task::read_status(&dir)?.as_str() {
+            "queued" => {
+                task::update_meta_status(&dir, TaskState::Delivered)?;
+                task::log_event(paths, id, "delivered", "")
+            }
+            "delivered" | "running" => task::log_event(paths, id, "re-receive", ""),
+            st => Err(Error::new(format!(
+                "task 狀態為 {st}，無法 receive（僅 queued/delivered/running 可）"
+            ))),
+        }
+    })();
+    guard.release();
+    outcome?;
+
+    eprintln!("task-id: {id}");
+    eprintln!("from: {}", task::meta_str(&dir, "from")?);
+    eprintln!(
+        "working_directory: {}",
+        task::meta_str(&dir, "working_directory")?
+    );
+    write_payload(&dir.join("request.md"))
+}
+
+/// cmd_start:726 — 僅 delivered 可開工。
+fn cmd_start(paths: &Paths, args: &[String]) -> Result<()> {
+    if args.len() != 1 {
+        return Err(Error::new("用法：agent-bridge start <task-id>"));
+    }
+    let id = &args[0];
+    task::check_task_id(id)?;
+    let dir = task::require_task_dir(paths, id)?;
+
+    let guard = acquire_lock(paths, id)?;
+    let outcome = (|| -> Result<()> {
+        let st = task::read_status(&dir)?;
+        if st != "delivered" {
+            return Err(Error::new(format!(
+                "task 狀態為 {st}，僅 delivered 可 start（queued 請先 receive）"
+            )));
+        }
+        task::update_meta_status(&dir, TaskState::Running)?;
+        task::log_event(paths, id, "started", "")
+    })();
+    guard.release();
+    outcome?;
+    eprintln!("task {id} 開工（running）");
+    Ok(())
+}
+
+/// respond_task:686 — reply／fail 的共用主體：寫 response.md、轉終態、
+/// 通知 sender 讀回覆。
+fn respond_task(
+    paths: &Paths,
+    id: &str,
+    final_state: TaskState,
+    event: &str,
+    cmdname: &str,
+    src: &MessageSource,
+) -> Result<()> {
+    let dir = task::require_task_dir(paths, id)?;
+
+    let guard = acquire_lock(paths, id)?;
+    let outcome = (|| -> Result<()> {
+        let st = task::read_status(&dir)?;
+        if st != "delivered" && st != "running" {
+            return Err(Error::new(format!(
+                "task 狀態為 {st}，僅 delivered/running 可 {cmdname}（queued 請先 receive；終態不可再變更）"
+            )));
+        }
+        task::write_message(&dir.join("response.md"), src)?;
+        task::update_meta_status(&dir, final_state)?;
+        task::log_event(paths, id, event, "")
+    })();
+    guard.release();
+    outcome?;
+
+    // 通知 sender 來讀回覆；sender 未註冊（或已除名）就只是不通知，不是錯誤。
+    let from = task::meta_str(&dir, "from")?;
+    let agent_file = paths.agents_dir.join(format!("{from}.json"));
+    if agent_file.is_file() {
+        let pane = registry::read_pane(&agent_file);
+        let tmux = SubprocessTmux;
+        notify::notify_or_defer(
+            paths,
+            &tmux,
+            &from,
+            &pane,
+            &format!("agent-bridge read {id}"),
+            id,
+            "read",
+        )?;
+    }
+    Ok(())
+}
+
+/// cmd_reply:708
+fn cmd_reply(paths: &Paths, args: &[String]) -> Result<()> {
+    if args.is_empty() {
+        return Err(Error::new(
+            "用法：agent-bridge reply <task-id> (--message <text> | --message-file <path>)",
+        ));
+    }
+    let id = &args[0];
+    task::check_task_id(id)?;
+    let src = parse_message_opts("reply", &args[1..])?;
+    respond_task(paths, id, TaskState::Completed, "replied", "reply", &src)?;
+    eprintln!("已回覆 task {id}（completed）");
+    Ok(())
+}
+
+/// cmd_fail:717
+fn cmd_fail(paths: &Paths, args: &[String]) -> Result<()> {
+    if args.is_empty() {
+        return Err(Error::new(
+            "用法：agent-bridge fail <task-id> (--message <text> | --message-file <path>)",
+        ));
+    }
+    let id = &args[0];
+    task::check_task_id(id)?;
+    let src = parse_message_opts("fail", &args[1..])?;
+    respond_task(paths, id, TaskState::Failed, "failed", "fail", &src)?;
+    eprintln!("已回報 task {id} 失敗（failed）");
+    Ok(())
+}
+
+/// cmd_cancel:744 — queued/delivered/running 皆可取消；通知失敗不影響取消本身。
+fn cmd_cancel(paths: &Paths, args: &[String]) -> Result<()> {
+    if args.len() != 1 {
+        return Err(Error::new("用法：agent-bridge cancel <task-id>"));
+    }
+    let id = &args[0];
+    task::check_task_id(id)?;
+    let dir = task::require_task_dir(paths, id)?;
+
+    let guard = acquire_lock(paths, id)?;
+    let outcome = (|| -> Result<()> {
+        let st = task::read_status(&dir)?;
+        if !matches!(st.as_str(), "queued" | "delivered" | "running") {
+            return Err(Error::new(format!(
+                "task 狀態為 {st}，無法 cancel（僅 queued/delivered/running 可）"
+            )));
+        }
+        task::update_meta_status(&dir, TaskState::Cancelled)?;
+        task::log_event(paths, id, "cancelled", "")
+    })();
+    guard.release();
+    outcome?;
+
+    // 通知 worker 查狀態（會看到 cancelled）
+    let to = task::meta_str(&dir, "to")?;
+    let agent_file = paths.agents_dir.join(format!("{to}.json"));
+    if agent_file.is_file() {
+        let pane = registry::read_pane(&agent_file);
+        let tmux = SubprocessTmux;
+        notify::notify_or_defer(
+            paths,
+            &tmux,
+            &to,
+            &pane,
+            &format!("agent-bridge status {id}"),
+            id,
+            "status",
+        )?;
+    }
+    eprintln!("已取消 task {id}（cancelled）");
+    Ok(())
+}
+
+/// cmd_status:770 — 印裸狀態字。唯讀（不建目錄、不取鎖、不寫 events）。
+/// status 檔讀取失敗 MUST 以非零收場，不得以 rc=0＋空輸出蒙混（cmd_status:776-780）。
+fn cmd_status(paths: &Paths, args: &[String]) -> Result<()> {
+    if args.len() != 1 {
+        return Err(Error::new("用法：agent-bridge status <task-id>"));
+    }
+    let id = &args[0];
+    task::check_task_id(id)?;
+    let dir = task::require_task_dir(paths, id)?;
+    let st = task::read_status(&dir).map_err(|_| {
+        Error::new(format!(
+            "task {id} 的 status 檔讀取失敗（資料損壞），請檢查 {}",
+            dir.display()
+        ))
+    })?;
+    println!("{st}");
+    Ok(())
+}
+
+/// cmd_read:784 — 讀回覆（completed/failed 可）。
+/// **取 task 鎖到輸出完為止**：gc --apply 刪目錄前取的就是這把鎖，不取的話
+/// 從驗完狀態到讀 response 之間目錄可被整個抽走（cmd_read:791-794）。
+fn cmd_read(paths: &Paths, args: &[String]) -> Result<()> {
+    if args.len() != 1 {
+        return Err(Error::new("用法：agent-bridge read <task-id>"));
+    }
+    let id = &args[0];
+    task::check_task_id(id)?;
+    let dir = task::require_task_dir(paths, id)?;
+
+    let guard = acquire_lock(paths, id)?;
+    let outcome = (|| -> Result<()> {
+        match task::read_status(&dir)?.as_str() {
+            "completed" | "failed" => {}
+            "cancelled" => {
+                return Err(Error::new(format!(
+                    "task {id} 已取消（cancelled），沒有回覆可讀"
+                )));
+            }
+            st => {
+                return Err(Error::new(format!(
+                    "task {id} 尚未回覆（狀態：{st}）；查詢進度請用 agent-bridge status {id}"
+                )));
+            }
+        }
+        eprintln!("task-id: {id}");
+        eprintln!("from: {}", task::meta_str(&dir, "from")?);
+        eprintln!("to: {}", task::meta_str(&dir, "to")?);
+        task::log_event(paths, id, "read", "")?;
+        write_payload(&dir.join("response.md"))
+    })();
+    guard.release();
+    outcome
+}
+
+/// cmd_await:822 — 唯讀輪詢 status 檔（不寫 events、不取鎖），在只讀 sandbox
+/// 內也能用。**逾時以專屬 exit 124 退出**，其他錯誤一律非 124——呼叫端要能把
+/// 「等到期限」與「await 自己壞掉」分開處置（cmd_await:866-871）。
+fn cmd_await(paths: &Paths, args: &[String]) -> Result<()> {
+    if args.is_empty() {
+        return Err(Error::new(
+            "用法：agent-bridge await <task-id> [--timeout <secs>]",
+        ));
+    }
+    let id = &args[0];
+    task::check_task_id(id)?;
+    let mut timeout: u64 = 0;
+    let mut it = args[1..].iter();
+    while let Some(a) = it.next() {
+        match a.as_str() {
+            "--timeout" => {
+                let v = it.next().ok_or_else(|| Error::new("--timeout 需要參數"))?;
+                let ok = !v.is_empty() && v.len() <= 9 && v.bytes().all(|b| b.is_ascii_digit());
+                if !ok {
+                    return Err(Error::new(format!(
+                        "--timeout 需為非負整數（秒，至多 9 位），0＝不逾時：{v}"
+                    )));
+                }
+                // 前導零比照 bash `10#$1` 強制十進位
+                timeout = v.parse().unwrap_or(0);
+            }
+            other => return Err(Error::new(format!("未知參數：{other}"))),
+        }
+    }
+    let dir = task::require_task_dir(paths, id)?;
+
+    // 輪詢間隔在進迴圈前就驗：壞值在 bash 會讓 sleep 立刻報錯、await 毫秒級
+    // 非零退出，呼叫端若把這種操作性失敗當成逾時（evict 曾如此）就會殺掉還
+    // 活著的 worker。此處同樣先驗後跑，維持「124 只等於真逾時」的契約。
+    let raw = std::env::var("AGENT_BRIDGE_POLL_INTERVAL").unwrap_or_default();
+    let interval: f64 = if raw.is_empty() {
+        1.0
+    } else {
+        let parsed = if poll_interval_shape_ok(&raw) {
+            raw.parse::<f64>().ok()
+        } else {
+            None
+        };
+        match parsed {
+            Some(v) if v.is_finite() && v > 0.0 => v,
+            Some(_) => {
+                return Err(Error::new(format!(
+                    "AGENT_BRIDGE_POLL_INTERVAL 需大於 0（否則輪詢忙迴圈）：{raw}"
+                )));
+            }
+            None => {
+                return Err(Error::new(format!(
+                    "AGENT_BRIDGE_POLL_INTERVAL 需為正數（秒）：{raw}"
+                )));
+            }
+        }
+    };
+
+    let started = std::time::Instant::now();
+    loop {
+        let st = task::read_status(&dir).map_err(|_| {
+            Error::new(format!(
+                "await 無法讀取 task {id} 的 status 檔（任務目錄被移走？）"
+            ))
+        })?;
+        if matches!(st.as_str(), "completed" | "failed" | "cancelled") {
+            println!("{st}");
+            return Ok(());
+        }
+        if timeout > 0 && started.elapsed().as_secs() >= timeout {
+            err_line(&format!(
+                "await 逾時（{timeout}s）：task {id} 目前狀態 {st}"
+            ));
+            // 專屬退出碼：不走 main 的統一收斂層（那裡一律 1）
+            std::process::exit(124);
+        }
+        std::thread::sleep(std::time::Duration::from_secs_f64(interval));
+    }
+}
+
+/// cmd_gc:1683 — 預設只試算，`--apply` 才刪。核心在 `ab_core::task::gc`，
+/// 這裡只負責參數解析與報表輸出。
+fn cmd_gc(paths: &Paths, args: &[String]) -> Result<()> {
+    let mut days: u64 = 14;
+    let mut apply = false;
+    let mut include_notes = false;
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        match a.as_str() {
+            "--older-than" => {
+                let v = it
+                    .next()
+                    .ok_or_else(|| Error::new("--older-than 需要參數"))?;
+                let ok = !v.is_empty() && v.len() <= 5 && v.bytes().all(|b| b.is_ascii_digit());
+                if !ok {
+                    return Err(Error::new(format!(
+                        "--older-than 需為 0-99999 的整數天：{v}"
+                    )));
+                }
+                days = v.parse().unwrap_or(14);
+            }
+            "--apply" => apply = true,
+            "--include-notes" => include_notes = true,
+            other => return Err(Error::new(format!("未知參數：{other}"))),
+        }
+    }
+
+    let s = task::gc(paths, days, apply, include_notes)?;
+    for (id, st, ts) in &s.candidates {
+        println!("{id}\t{st}\t{ts}");
+    }
+    let kept = format!(
+        "保留 未完成 {}／收尾筆記 {}／宣告失效證據 {}／未滿 {days} 天 {}",
+        s.kept_live, s.kept_pin, s.kept_proof, s.kept_young
+    );
+    if apply {
+        eprintln!("gc：已刪 {} 個；{kept}", s.removed);
+        if s.failed > 0 {
+            err_line(&format!(
+                "警告：{} 個目錄未能刪除（鎖被佔用或權限問題），下次再試",
+                s.failed
+            ));
+        }
+    } else {
+        eprintln!("gc（試算）：可刪 {} 個；{kept}", s.removed);
+        eprintln!("確認無誤後加 --apply 才會真的刪除");
+    }
+    Ok(())
+}
+
+/// 精確翻譯 bash `^([0-9]+|[0-9]*\.[0-9]+)$`（bin/agent-bridge:847-848）：
+/// 小數點後**至少一位數字**。`1.` 在 bash 被拒，Rust 的 `parse::<f64>` 卻
+/// 收得下——不特別擋就會多接受一種 bash 判為設定錯誤的值。
+fn poll_interval_shape_ok(raw: &str) -> bool {
+    match raw.split_once('.') {
+        None => !raw.is_empty() && raw.bytes().all(|b| b.is_ascii_digit()),
+        Some((int_part, frac)) => {
+            int_part.bytes().all(|b| b.is_ascii_digit())
+                && !frac.is_empty()
+                && frac.bytes().all(|b| b.is_ascii_digit())
+        }
+    }
+}
+
+/// payload 輸出：request/response 原文以 byte 原樣寫進 stdout，
+/// 不經 `String`／lossy 轉換（分組 6 驗 byte-for-byte 保真，架構 §3）。
+fn write_payload(path: &std::path::Path) -> Result<()> {
+    use std::io::Write;
+    let bytes =
+        std::fs::read(path).map_err(|e| Error::new(format!("無法讀取 {}：{e}", path.display())))?;
+    let stdout = std::io::stdout();
+    let mut lock = stdout.lock();
+    lock.write_all(&bytes)
+        .map_err(|e| Error::new(format!("無法寫入 stdout：{e}")))?;
+    lock.flush()
+        .map_err(|e| Error::new(format!("無法寫入 stdout：{e}")))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// bash regex 的接受集合，逐點對齊（含 `1.` 這個 Rust `parse::<f64>`
+    /// 會放行、bash 會拒的形狀）。
+    #[test]
+    fn poll_interval_shape_matches_bash_regex() {
+        for good in ["1", "0", "05", "0.5", ".5", "10.25", "000"] {
+            assert!(poll_interval_shape_ok(good), "應接受：{good}");
+        }
+        for bad in ["1.", "", ".", "1.2.3", "-1", "1e3", "abc", " 1", "1 "] {
+            assert!(!poll_interval_shape_ok(bad), "應拒絕：{bad}");
+        }
+    }
 }

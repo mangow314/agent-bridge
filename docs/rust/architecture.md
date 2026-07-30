@@ -11,7 +11,7 @@
 
 | crate | 角色 | 依賴 |
 |---|---|---|
-| `ab-core` | 領域邏輯庫：狀態、儲存、hook 核心、tmux client | std only（M1 起視需要 `serde_json`） |
+| `ab-core` | 領域邏輯庫：狀態、儲存、hook 核心、tmux client | `serde_json`（`preserve_order`，M1 起；使用者裁決 2026-07-31）外不引入依賴 |
 | `ab` | CLI binary：argv 解析、輸出格式化、dispatch | `ab-core` |
 | `ab-tui` | 佔位；M5 後、fzf/tmux popup 原型驗證有價值才動工 | `ab-core` |
 
@@ -24,10 +24,10 @@
 | `fsio` | `atomic_write`（tmp＋rename 同目錄）、payload byte 流原樣搬運 | state.md STATE-GEN-2 | `atomic_write`:172、`write_message`:276 |
 | `lock` | mkdir 鎖：佔用重試＋「非佔用即權限」die 分流；RAII guard 只是便利層，**語意不依賴 Drop**（SIGKILL 殘鎖行為＝bash 現況；stale 回收是 M5 行為變更，parity 期禁做） | state.md STATE-LOCK-* | `acquire_lock`:227、`release_lock`:217 |
 | `registry` | agent 註冊表 CRUD、pane 解析、owner/actor 審計欄位 | state.md STATE-AGENT-* | `cmd_register`:476 核心、`is_spawned`:153、`caller_owner`:884、`log_agent_event`:898 |
-| `task` | task 目錄結構、id 生成/驗證、狀態機轉換（queued→delivered→running→終態）、events.log、殘缺 task 目錄清理 | state.md STATE-TASK-*、cli.md 轉換條款 | `write_message`:276、`log_event`:251、`update_meta_status`:261、`check_task_id`:420、`last_task_at`:457、`send_rollback`:202（清 metadata/status 未寫齊的殘缺 task 目錄，屬 task 寫入交易邊界；交易背景註解始於 :195） |
+| `task` | task 目錄結構、id 生成/驗證、狀態機轉換（queued→delivered→running→終態）、events.log、殘缺 task 目錄清理、**gc（終態 task 清理）** | state.md STATE-TASK-*、cli.md 轉換條款 | `write_message`:276、`log_event`:251、`update_meta_status`:261、`check_task_id`:420、`last_task_at`:457、`send_rollback`:202（清 metadata/status 未寫齊的殘缺 task 目錄，屬 task 寫入交易邊界；交易背景註解始於 :195）、`cmd_gc`:1683 |
 | `notify` | 送鍵通知：權限框雙掃、失敗語意（notify-failed 可復原）、`notify_or_defer` 的 TTL/state 新鮮度 gate | hooks.md HOOK-NOTIFY-*、env.md ENV-TTL-1/2、ENV-NOTIFY-1 | `notify_pane`:330、`screen_has_prompt`:318、`notify_or_defer`:371 |
 | `hook` | hook 三事件核心：身分解析、state 單一寫者、owner gate（session_id 所有權）、oldest-queued；**任何錯誤收斂 exit 0 的鐵律在 `ab` dispatch 層兜底、此處以 Result 上拋** | hooks.md 14 條、state.md STATE-CHAN-* | `hook_agent_name`:2010、`hook_write_state`:2035、`hook_owner_gate`:2069、`hook_oldest_queued`:2098、`cmd_hook`:2131 |
-| `spawn` | worker 生命週期：cap、pane 建立、brief 注入、ready 探針、原子回滾、出身防護（tag）、evict/idle/disposable/gc | cli.md spawn 群、env.md ENV-SPAWN/READY/TAG | `cmd_spawn`:1063、`spawn_rollback`:940、`rb_kill_tagged`:928、`spawn_wait_ready`:1038、`worker_prompt_arg`:1007、`relay_prompt_arg`:1024、`cmd_despawn`:1476、`cmd_evict`:1866、`cmd_gc`:1683、`disposable_effective`:444 |
+| `spawn` | worker 生命週期：cap、pane 建立、brief 注入、ready 探針、原子回滾、出身防護（tag）、evict/idle/disposable | cli.md spawn 群、env.md ENV-SPAWN/READY/TAG | `cmd_spawn`:1063、`spawn_rollback`:940、`rb_kill_tagged`:928、`spawn_wait_ready`:1038、`worker_prompt_arg`:1007、`relay_prompt_arg`:1024、`cmd_despawn`:1476、`cmd_evict`:1866、`disposable_effective`:444 |
 | `tmux` | `TmuxClient` trait＋`SubprocessTmux` 實作；**以裸名 `tmux` 經 PATH spawn**（測試 shim 攔截前提，tests/run-tests.sh:91-93）；argv 陣列傳參 | （載具，無獨立 spec 域） | `tmux` token 91 次（command-shaped 呼叫約 65；分佈於 notify/spawn/despawn/registry 各函式群） |
 | `time` | ISO 8601 UTC 時戳（`now_iso`）、epoch 換算、TTL 新鮮度；顯式 UTC、不受 locale/TZ | state.md ts 格式 | `now_iso`:144、TTL epoch 比對段 |
 
@@ -68,8 +68,11 @@ ab-core 對應模組）、`err/die/info/usage` 屬 `ab` 輸出層、其餘 helpe
 
 ## 5. 子行程／signal 政策
 
-- **SIGPIPE**：Rust 預設忽略（寫端得 `EPIPE` Err）；`ab` main 起手顯式恢復
-  `SIG_DFL`，行為對齊 bash「隨管線死」。M1 落實後以分組 8 通知失敗路徑驗。
+- **SIGPIPE**：Rust 預設忽略（寫端得 `EPIPE` Err）；`ab` main 起手要顯式恢復
+  `SIG_DFL`，行為對齊 bash「隨管線死」。**M1 尚未落地**——驗證錨點是分組 8
+  （通知失敗路徑），屬 M2 集，且 std 無 signal API、須先裁決是否為此引入
+  `libc`（M2 起手決定）。在那之前 payload 輸出路徑的 `EPIPE` 走一般 `Err`
+  收斂（非零退出），與 bash 的「隨管線死」在退出碼上不等價，是已知缺口。
 - **pipe 排空**：子行程（tmux capture 等）輸出一律先讀盡 stdout/stderr 再
   `wait()`，防 OS pipe buffer 滿載互等死鎖。
 - **繼承環境**：子行程 spawn 不清洗環境（bash 同款）；`AGENT_BRIDGE_PASS_ENV`
@@ -88,11 +91,17 @@ bin/agent-bridge:227 起的錯誤訊息。stale-lock 偵測／回收＝行為變
 ## 7. 輸出 parity 策略（jq 對拍）
 
 - bash 以 jq 產生的 JSON（metadata.json、state/*.json、list 輸出）逐測例
-  fixture 對拍：M1 起手先用 bash 版產 fixture（`jq` 實際輸出存檔），serde
-  序列化結果 `diff` 零差異才進 gate。
-- `serde_json` 欄位序採 insertion order（`preserve_order`）比對 jq 產物；
-  縮排/空白形狀以 fixture 為準，必要時手寫 serializer helper，不遷就
-  serde 預設。
+  fixture 對拍：先用 bash 版產 fixture（`jq` 實際輸出存檔），Rust 序列化結果
+  `diff` 零差異才進 gate。
+- **解析端走 `serde_json`（`preserve_order`）**（M1 裁決，使用者 2026-07-31）：
+  欄位序＝插入序，重複鍵取後值，與 jq 一致；`Map::insert` 對既有鍵保留原
+  位置，正是 `update_meta_status`（jq `.status = $s`）要的賦值語意。
+- **輸出形狀仍由 `json::render_pretty` 掌控**，不用 `to_string_pretty`：要對齊
+  的是 jq 的形狀而非某個 pretty printer 的預設（該預設隨版本可變）。自家
+  render 讓形狀成為本 repo 測得到、改得動的東西；jq fixture 對拍是 gate。
+- 換 parser 時，M0.5 的邊界測試（重複鍵、裸控制字元、落單 surrogate、非
+  object 根）全數留下改為斷言 serde_json 的行為——它們守的是本專案依賴的
+  JSON 語意，不是某一個實作。
 
 ## 8. 流程圖
 
