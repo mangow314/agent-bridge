@@ -279,13 +279,29 @@ legacy，不算致命）；停在**新鮮的 `busy`** 時通知端不送鍵、�
 hook 又被擋著不發 block，**任務會卡在 mailbox 直到 TTL 過期**——那才是這個窗
 真正的代價。
 
+## canary（同日稍後）：launcher 形擴充落地後的復量
+
+上一節的窗已由 launcher 形擴充收掉（HOOK-OWNER-5 現行文、architecture
+§11.7；落地時「有界祖先鏈＋中間不夾 runtime」的草案規則被收窄成逐 runtime
+白名單形狀——草案版對本檔 m5-proposal §1 的實測巢狀鏈會誤放行）。落地後
+以同一支 shim 探針復量（worker `m6canary`，事件只記 PPID 不碰 stdin）：
+
+```
+/new 前  owner=019fb6da-64ff-…  ts=06:26:50（新鮮）  hook ppid=1999985
+/new 後  owner=019fb6da-dcb4-…  ts=06:27:43          hook ppid=1999985
+registry：worker_pid=1999927（launcher）  runtime=codex
+```
+
+`/new` 後第一個 turn 的 hook 事件**當場**把 owner 換成新 sid——舊 ts 距當下
+僅 51 秒、遠小於 TTL，M4 行為下必被時間窗擋住。PPID 前後不變（1999985＝原生
+執行檔），其父即 registry 記的 launcher（1999927）：身分閘門以 launcher 形
+**確認成功，非落回**。codex 的窗 1 就此關閉。
+
 ## 尚未收的
 
-- **codex worker 拿不到 M5 的即時自癒，且上述 gate 已確認這個窗對 codex 真的
-  存在**。要收有兩條路：改記錄的對象（spawn/ready 時找到原生執行檔），或改
-  比對的條件（hook 側走有界祖先鏈，要求中間不得夾著另一個 runtime 形狀的
-  行程）。後者不動 registry 與信任根，是目前偏好的方向。**未立案**——它第一次
-  讓誤判可能比 M4 更糟（巢狀被誤認＝立即奪權，而非等 TTL），驗收重心必須放在
-  巢狀反例上。
 - 只量了 npm 全域安裝這一種佈署形狀。若哪天 codex 改成單一原生執行檔直接
-  上 PATH，行程樹會與 claude 同形，屆時要重量。
+  上 PATH，行程樹會與 claude 同形（直接形命中、launcher 形不再需要），屆時
+  要重量確認。
+- launcher 形釘在「恰好一層」：codex 若改成多層 fork（launcher → broker →
+  原生），比對會失敗、全面落回 M4 行為——安全但窗回來，屆時按新實測形狀擴充
+  白名單。

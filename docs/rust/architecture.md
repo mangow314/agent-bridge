@@ -324,7 +324,8 @@ PPID** 就是啟動它的那個 runtime，因此 PPID 一旦等於記錄的 work
 降級路徑——而那條路一走，兩個窗就都回來了。
 
 被否決過的是 PPID **祖先鏈**（HOOK-OWNER-4 Note）：巢狀的祖先鏈必然包含本尊，
-鏈式比對區分不出來。直接父行程沒有這個問題。
+鏈式比對區分不出來。直接父行程沒有這個問題。後續的 codex 擴充（§11.7）維持
+同一界線：按 runtime 白名單啟動鏈**形狀**，仍不是泛用祖先鏈。
 
 ### 11.2 兩段判別與失效方向
 
@@ -332,8 +333,9 @@ PPID** 就是啟動它的那個 runtime，因此 PPID 一旦等於記錄的 work
 
 | 情形 | 裁決 | 理由 |
 |---|---|---|
-| 兩欄齊備、PPID == pid、該 pid 的 starttime 相符 | 放行，不看 sid/ts | `/clear` 換 session_id 但行程沒變＝身分沒變，自癒即時 |
-| 其餘一切（PPID 不符、欄位缺、pid 已死、starttime 不符、無 `/proc`） | 落回 sid＋TTL＝M4 行為 | 確認不了就什麼都不主張 |
+| 兩欄齊備、PPID == pid、該 pid 的 starttime 相符（直接形） | 放行，不看 sid/ts | `/clear` 換 session_id 但行程沒變＝身分沒變，自癒即時 |
+| `runtime=codex`：PPID 的父行程 == pid（starttime 相符）且 PPID 命中 codex argv 形（launcher 形，§11.7） | 放行，不看 sid/ts | launcher fork 原生執行檔、原生執行檔才 fork hook——一層之隔仍是本尊自有啟動鏈 |
+| 其餘一切（鏈更長、中介不命中、PPID 不符、欄位缺、pid 已死、starttime 不符、無 `/proc`） | 落回 sid＋TTL＝M4 行為 | 確認不了就什麼都不主張 |
 
 **只有相符是結論**。原本第二列寫的是「PPID 不符 → 擋，且 ts 過期也不得接管」，
 2026-07-31 的 codex 複核推翻了它：PPID 不符推不出冒名，合法中介一樣不符——
@@ -375,9 +377,9 @@ cmdline 與 starttime 必須取自同一份快照（`starttime → cmdline → s
 
 ### 11.4 bash 正本凍結
 
-分組 35 只對 Rust 執行，`SRC_KIND=bash` 時顯式印 SKIP。bash 正本自 M4 起是
-rollback 基準——它代表「回到 M4 的行為」，不該再長新功能。因此 parity 的形狀
-從「兩邊同數字」變成「Rust 773／bash 756＋顯式 SKIP」。
+分組 35、36 只對 Rust 執行，`SRC_KIND=bash` 時顯式印 SKIP。bash 正本自 M4
+起是 rollback 基準——它代表「回到 M4 的行為」，不該再長新功能。因此 parity
+的形狀從「兩邊同數字」變成「Rust 784／bash 756＋顯式 SKIP」。
 
 ### 11.5 自檢
 
@@ -401,19 +403,66 @@ rollback 基準——它代表「回到 M4 的行為」，不該再長新功能�
   下任何結論，因此不提供「冒名者過 TTL 仍擋」的保證。要真正分辨「合法新主」
   與「巢狀同 runtime」，得有 runtime 提供的、非繼承的身分（禁讀 environ 的
   前提下，pid/starttime/argv 三者都做不到，祖先鏈也已知無解）。
-- **codex worker 拿不到自癒**（2026-07-31 已量測，`docs/codex-hooks-probe.md`
+- ~~**codex worker 拿不到自癒**~~（2026-07-31 已量測，`docs/codex-hooks-probe.md`
   補測節）：codex 經 npm 安裝，`bin/codex` 是一支 **node launcher**，tmux exec
   的是它（＝`pane_pid`），它不 exec 取代自己而是 fork 出平台原生執行檔，再由
   原生執行檔 fork hook。中間多一層，hook 的直接 PPID 因此**永遠不等於**
-  `pane_pid`，M5 對 codex 一律確認不了、全面落回 M4 行為。
+  `pane_pid`，M5 落地當下對 codex 一律確認不了、全面落回 M4 行為。
   attestation 仍對所有 runtime 啟用：argv 規則對 launcher 正確命中，寫入的兩欄
   也確實指向 pane 行程，只是後續比對不會成立。**這無害，因為 11.2 收斂後誤判
   的後果就是「該放行卻落回」**——反過來說，這次量測正是那次收斂的實證：把實測
   值代進首版邏輯（pid 活著、starttime 相符、PPID 不符），每一個 codex worker
   的每一個 hook 都會被永久擋死。
-  要讓 codex 也吃到自癒，得記到原生執行檔那個行程，但它在 spawn 當下未必存在，
-  且「pane_pid 的哪個子行程才是它」需要新規則——另案，不在 M5 範圍。
+  「記到原生執行檔那個行程」（改記錄對象）已否決：原生行程在 spawn 當下未必
+  存在，等 ready 又把身分產生時機移進互信域。**已另案立案改走「改比對條件」
+  ——見 §11.7**。
 - **`pane_pid` == runtime 本尊依賴 tmux 直接 exec**：本機實測成立，但那是 tmux
   的行為不是承諾。分組 35f 鎖住了「記到的 pid 等於 pane_pid 且 starttime 相符」，
   若哪天中間多一層 shell，argv 比對會失敗、兩欄留空、全面落回（安全但窗回來）。
 - **窗 2**：仍在，仍只有 daemon 一條路，仍是獨立的一件事。
+
+### 11.7 codex 自癒擴充：launcher 形
+
+已落地：`hook::launcher_hop_reaches`＋`proc::ppid_and_starttime`、分組 36
+（11 條斷言）、mutation 自檢（見下）、真 codex canary（`docs/
+codex-hooks-probe.md` canary 節：`/new` 後 51 秒新鮮的 state 被當場接管，
+確認成功非落回）。
+
+讓 codex 也吃到 M5 自癒。路線是**改比對條件**（放寬「相符」的定義），不是
+改記錄對象（§11.6 已否決）；「不符 → 落回、不得當冒名」的裁決（§11.2）原封
+不動——本案動的只有「相符」那一列。
+
+**規則：逐 runtime 白名單啟動鏈形狀。**
+
+- 直接形（所有 runtime 的基本形；claude 實測）：PPID == `worker_pid`。
+- launcher 形（僅 `runtime=codex` 嘗試；實測）：PPID 的父行程 ==
+  `worker_pid`，且 PPID 本身依 STATE-AGENT-4 argv 規則命中 `codex`——它是
+  launcher fork 出的同產品原生執行檔。恰好一層。
+- 其餘一律落回。
+
+**為什麼不是「祖先鏈走得到本尊、中間沒夾 runtime 形狀就確認」**（立案時的
+草案規則）：那條規則對本專案自己量過的巢狀鏈是錯的。`m5-proposal.md` §1 的
+實測巢狀鏈是 `hook → 巢狀 claude → bash → 本尊`——巢狀 runtime 正是 hook 的
+直接 PPID（任何「中間」檢查天然豁免它），其餘中介只有 bash（不是 runtime
+形狀）。草案規則會把它**確認成本尊**。而本案第一次讓誤判可以比 M4 更糟：
+巢狀被誤認＝**立即奪權**（不經 TTL）。所以界線不能畫在「鏈上有沒有夾別的
+runtime」，只能畫在「鏈是否精確等於該 runtime 實測的自有啟動形狀」——
+claude 零層、codex 恰好一層同產品原生執行檔。巢狀鏈在兩個 runtime 下都更長
+（意外巢狀必經 worker 的 shell 工具，至少多一層），一律落回。與
+HOOK-OWNER-4 否決的界線也因此更清楚：我們從不把「鏈上找得到本尊」當證據，
+只認「你是被本尊自己的啟動鏈 fork 的」。
+
+TOCTOU 方向安全：走鏈途中任何行程退出，子代被 reparent，鏈就走不到
+`worker_pid` 或 starttime 對不上 → 落回。中介的 cmdline/starttime 依
+STATE-AGENT-4 同快照夾讀。
+
+驗收重心跟著風險方向換：主要斷言是**「巢狀（含 claude 巢狀、codex 巢狀）
+不被誤放行」**，不是「codex 本尊會綠」。分組 36 的反例全部用真實形狀的
+行程鏈構造（argv 形狀由 script 名決定，不是 registry 捏的假資料；36f 的
+「上游已死」用真行程死亡＋等 reparent 構造）。mutation 自檢：
+
+| mutation | 預期 | 實測 |
+|---|---|---|
+| 取消白名單、按記錄的 runtime 名認中介（＝草案方向） | 36c（claude 巢狀）紅 | 相符（783／1） |
+| 刪 launcher 分支、只比直接 PPID | 36a（codex launcher 本尊）紅 | 相符（783／1） |
+| 不驗中介之父（「恰好一層」上界拆掉） | 36d（鏈更長）紅 | 相符（783／1） |

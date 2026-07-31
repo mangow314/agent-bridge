@@ -72,37 +72,55 @@ Note: 在**沒有**行程身分可用時（HOOK-OWNER-5 的落回路徑），hoo
 不發 block（cross-vendor 複核確認此裁定）。
 Source: hook_write_state / cmd_hook
 
-### HOOK-OWNER-5 [tested: 35]
+### HOOK-OWNER-5 [tested: 35, 36]
 **行程身分優先於時間窗**。registry 同時具備 `worker_pid` 與
-`worker_starttime`（STATE-AGENT-4）時，閘門 MUST 先比對本 hook 行程的**直接
-父行程**：
+`worker_starttime`（STATE-AGENT-4）時，閘門 MUST 先確認「本 hook 是記錄的
+worker runtime 自己（含其自有啟動鏈）fork 的」。確認形狀按 registry 的
+`runtime` 欄位逐 runtime 白名單，每一形狀都是實測值、不是介面承諾：
 
-- 直接 PPID 等於 `worker_pid` 且該 pid 的 starttime 等於 `worker_starttime`
-  → MUST 放行，且 MUST NOT 再看 `session_id` 或 `ts`。這是 parent `/clear`
-  換新 session_id 的即時自癒路徑（行程沒變，身分就沒變），取代 HOOK-OWNER-2
-  的 TTL 等待。
-- 直接 PPID 不等於 `worker_pid`（不論該 pid 是否仍活著）、欄位缺其一、該 pid
-  已不存在、其 starttime 與記錄不符（pid 已被重用，記錄過期）、或執行環境無
-  此能力 → MUST 落回 HOOK-OWNER-2 的 session_id＋TTL 判別，行為與未實作本條
-  時完全相同。
+- **直接形**（claude 實測；同時是所有 runtime 的基本形）：hook 的直接 PPID
+  等於 `worker_pid` 且該 pid 的 starttime 等於 `worker_starttime` → MUST
+  放行，且 MUST NOT 再看 `session_id` 或 `ts`。這是 parent `/clear` 換新
+  session_id 的即時自癒路徑（行程沒變，身分就沒變），取代 HOOK-OWNER-2 的
+  TTL 等待。
+- **launcher 形**（`runtime` 為 `codex` 時另 MUST 嘗試；實測見
+  `docs/codex-hooks-probe.md` 補測節）：hook 的直接 PPID 不等於
+  `worker_pid`，但該直接 PPID 的**父行程**等於 `worker_pid`（starttime 驗法
+  同上），**且**該直接 PPID 依 STATE-AGENT-4 的 argv 前兩項規則命中本
+  runtime 名——即它是 `worker_pid` 這個 launcher fork 出的同產品原生執行檔
+  → MUST 放行。恰好一層、不多不少；中介行程的 cmdline 與 starttime MUST
+  依 STATE-AGENT-4 的同快照夾讀規則取得（防走訪期間 pid 重用）。
+- 其餘一切（鏈更長、中介不命中本 runtime 形、`runtime` 欄缺或不在形狀表、
+  兩欄缺其一、行程已不存在、starttime 不符、或執行環境無此能力）→ MUST
+  落回 HOOK-OWNER-2 的 session_id＋TTL 判別，行為與未實作本條時完全相同。
 
-判別 MUST 只在「明確相符」時放行，其餘一律落回；**MUST NOT 把 PPID 不符當成
-「確認為冒名」而擋**。失效方向因此收斂到現狀，最壞等於未實作。
-Note: PPID 不符不足以推出冒名——合法中介一樣不符：runtime fork 出新的主行程
-而舊主仍活著、或使用者經 `AGENT_BRIDGE_CLAUDE_HOOKS`（公開覆蓋面）指定 hook
-wrapper。當成冒名的話本尊會被**永久**擋死，連 TTL 自癒都到不了，比未實作更糟
-（codex 複核 2026-07-31）。代價是本條不提供「冒名者過 TTL 仍擋」這種保證：
-巢狀 runtime 的暴露面維持 HOOK-OWNER-2 的原狀。
-Note: 「直接 fork」是 2026-07-31 對本機這版 claude 的實測（`docs/rust/
-m5-proposal.md` §1），不是介面承諾。故本條的價值只在相符時的即時自癒，落回
-路徑是常態而非例外處置。**codex 已實測為落回**：npm 安裝的 `bin/codex` 是
-node launcher，tmux exec 的是它，它再 fork 原生執行檔、原生執行檔才 fork
-hook，PPID 永遠對不上（`docs/codex-hooks-probe.md` 補測節）。
-Note: 取樣順序 MUST 是先讀自身 PPID、再驗該 pid 的 starttime。反過來的話父
-行程若在兩次讀取之間退出，hook 會被 reparent，於是前一步證實了記錄中的行程、
-後一步卻拿到新的 PPID。registry 對同互信域的 worker 可寫，本條防的是**巢狀
-runtime 意外冒用**，不是防具寫入權的惡意行為者——後者早已在信任模型之外
-（STATE-AGENT-4 Note）。
+判別 MUST 只在「明確命中白名單形狀」時放行，其餘一律落回；**MUST NOT 把
+不符當成「確認為冒名」而擋**。失效方向因此收斂到現狀，最壞等於未實作。
+Note: **MUST NOT 一般化成「祖先鏈走得到 `worker_pid` 即確認」**——巢狀
+runtime 的祖先鏈必然包含本尊（HOOK-OWNER-4 Note 的否決理由，該否決仍然
+有效）。本條與該否決的界線：這裡確認的是 runtime **自有啟動鏈的實測形狀**
+（hook 是被 worker 自己的啟動鏈 fork 的），不是「鏈上找不找得到本尊」。
+同理 MUST NOT 放寬成「鏈上沒有夾另一個 runtime 形狀的行程即可」或「直接
+PPID 豁免檢查」：實測的巢狀鏈（`docs/rust/m5-proposal.md` §1）是
+hook → 巢狀 claude → bash → 本尊——巢狀 runtime 正是 hook 的直接 PPID、
+其餘中介只有 bash，上述兩種寫法都會把它誤認成本尊。誤認在本條的代價是
+**立即奪權**（不經 TTL），是唯一比未實作更糟的失效方向，故形狀表 MUST
+逐 runtime 白名單、寧可誤落回。
+Note: PPID／鏈形不符不足以推出冒名——合法中介一樣不符：runtime fork 出新的
+主行程而舊主仍活著、或使用者經 `AGENT_BRIDGE_CLAUDE_HOOKS`（公開覆蓋面）
+指定 hook wrapper。當成冒名的話本尊會被**永久**擋死，連 TTL 自癒都到不了，
+比未實作更糟（codex 複核 2026-07-31）。代價是本條不提供「冒名者過 TTL 仍
+擋」這種保證：巢狀 runtime 的暴露面維持 HOOK-OWNER-2 的原狀。
+Note: 兩個形狀都是 2026-07-31 本機實測（claude 直接 fork：`docs/rust/
+m5-proposal.md` §1；codex 為 npm node launcher fork 原生執行檔、原生執行檔
+才 fork hook：`docs/codex-hooks-probe.md` 補測節），不是介面承諾。故本條的
+價值只在命中時的即時自癒，落回路徑是常態而非例外處置。
+Note: 取樣順序 MUST 是先讀自身 PPID、再走中介（如有）、最後驗 `worker_pid`
+的 starttime。反過來的話父行程若在兩次讀取之間退出，hook 會被 reparent，
+於是前一步證實了記錄中的行程、後一步卻拿到新的 PPID。走訪途中任何行程退出
+只會讓後續讀取失敗或 starttime 對不上 → 落回（TOCTOU 的失效方向安全）。
+registry 對同互信域的 worker 可寫，本條防的是**巢狀 runtime 意外冒用**，
+不是防具寫入權的惡意行為者——後者早已在信任模型之外（STATE-AGENT-4 Note）。
 Source: hook_owner_gate
 
 ## 三事件語意

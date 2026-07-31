@@ -172,8 +172,17 @@ pub fn owner_gate(file: &Path, sid: &str, reg_file: &Path) -> bool {
 }
 
 /// HOOK-OWNER-5 的行程身分裁決：`true`＝已確認本 hook 是 registry 記下的那個
-/// worker runtime 直接 fork 的；`false`＝**確認不了**（呼叫端落回 session_id
-/// ＋TTL），不是「確認為冒名」。
+/// worker runtime 自己（含其自有啟動鏈）fork 的；`false`＝**確認不了**（呼叫
+/// 端落回 session_id＋TTL），不是「確認為冒名」。
+///
+/// 確認形狀**逐 runtime 白名單**，不是泛用祖先鏈：直接形（PPID ==
+/// `worker_pid`，claude 實測）對所有 runtime 都試；launcher 形（PPID 的父行程
+/// == `worker_pid` 且 PPID 命中 codex argv 形，恰好一層）只在 registry
+/// `runtime=codex` 時試。MUST NOT 放寬成「祖先鏈走得到 worker_pid」或「鏈上
+/// 沒夾別的 runtime 形狀」：實測巢狀鏈（m5-proposal §1）是 hook → 巢狀
+/// claude → bash → 本尊——巢狀正是 hook 的直接 PPID、其餘中介只有 bash，兩種
+/// 放寬都會把它確認成本尊，而誤認在本函式的代價是**立即奪權**（不經 TTL），
+/// 是唯一比 M4 更糟的失效方向（architecture §11.7）。
 ///
 /// **只有 exact match 是安全的 positive**。PPID 與記錄的 pid 不符不能當成冒名
 /// ——合法的中介一樣會不符：runtime fork 出新的主行程而舊主還活著、或使用者經
@@ -184,10 +193,11 @@ pub fn owner_gate(file: &Path, sid: &str, reg_file: &Path) -> bool {
 /// 代價是放棄「冒名者過了 TTL 仍永遠擋」這個收緊：M5 收斂成純粹的本尊即時
 /// 自癒，其餘一律等於 M4 行為，失效方向這才真正對稱。
 ///
-/// 取樣順序是 **PPID 先、starttime 後**：反過來的話父行程若在兩次讀取之間退出，
-/// hook 會被 reparent，於是前一步證實了 recorded process、後一步卻拿到新的
-/// PPID（codex 複核 §2 blocker 2）。先讀 PPID 則任何後續變動只會讓
-/// starttime 對不上而落回。
+/// 取樣順序是 **PPID 先、中介次之、`worker_pid` 的 starttime 最後**：反過來
+/// 的話父行程若在兩次讀取之間退出，hook 會被 reparent，於是前一步證實了
+/// recorded process、後一步卻拿到新的 PPID（codex 複核 §2 blocker 2）。先讀
+/// PPID 則走訪途中任何行程退出只會讓後續讀取失敗或 starttime 對不上而落回
+/// ——TOCTOU 的失效方向安全。
 fn proc_identity_confirms_self(reg_file: &Path) -> bool {
     if !crate::proc::available() {
         return false;
@@ -201,12 +211,36 @@ fn proc_identity_confirms_self(reg_file: &Path) -> bool {
     if pid.is_empty() || recorded_start.is_empty() {
         return false;
     }
-    // 誰 fork 了這個 hook。不是記下的那個 pid 就什麼都不主張
-    if crate::proc::self_ppid().as_deref() != Some(pid.as_str()) {
+    // 誰 fork 了這個 hook。讀不到就什麼都不主張
+    let Some(p1) = crate::proc::self_ppid() else {
+        return false;
+    };
+    if p1 != pid && !launcher_hop_reaches(&p1, &pid, reg_file) {
         return false;
     }
-    // pid 會被回收重用：父行程得是記錄當下的那一次行程生命，才算本尊
+    // pid 會被回收重用：worker 得是記錄當下的那一次行程生命，才算本尊
     crate::proc::starttime(&pid).as_deref() == Some(recorded_start.as_str())
+}
+
+/// launcher 形（HOOK-OWNER-5）：`p1`（hook 的直接 PPID）是不是 `worker_pid`
+/// fork 出的同產品原生執行檔——恰好一層，只在 registry `runtime=codex` 時嘗試
+/// （實測形狀：`docs/codex-hooks-probe.md` 補測節）。
+///
+/// 對 p1 的三個讀取（cmdline、父 pid、starttime）必須釘在同一次行程生命：
+/// attest 以 starttime 夾住 cmdline，父 pid 與 starttime 出自同一次 stat 讀取，
+/// 再要求兩邊 starttime 相等。缺了這一環，p1 在兩讀之間退出且 pid 被重用時，
+/// argv 驗的是舊行程、父 pid 記的是新行程。
+fn launcher_hop_reaches(p1: &str, worker_pid: &str, reg_file: &Path) -> bool {
+    if read_json_field(reg_file, "runtime").as_deref() != Some("codex") {
+        return false;
+    }
+    let Some(attested_start) = crate::proc::attest_runtime(p1, "codex") else {
+        return false;
+    };
+    let Some((gp, start_now)) = crate::proc::ppid_and_starttime(p1) else {
+        return false;
+    };
+    start_now == attested_start && gp == worker_pid
 }
 
 /// hook_oldest_queued:2098 — 最舊一筆 `to == agent` 且狀態為 queued 的 task-id。
@@ -579,6 +613,28 @@ mod tests {
             assert!(owner_gate(&state, "other", &reg), "doc={doc} 應落回");
         }
         assert!(owner_gate(&state, "other", &dir.join("nope.json")));
+
+        // launcher 形的落回面：worker_pid 指向**祖父**行程（差一層，形狀上
+        // 等同 launcher 情境），但——
+        // ① registry 無 runtime 欄／runtime 不是 codex（含 claude）：一層之
+        //    隔不得確認。這是防「巢狀 claude 直接掛在本尊下」誤放行的錨：
+        //    launcher 形只准 codex 白名單啟用（architecture §11.7）
+        // ② runtime=codex 但中介（本測試的真實父行程）argv 不命中 codex 形：
+        //    同樣不得確認
+        // state 回到新鮮異主，落回時間窗＝擋
+        write_state(&state, "busy", Some("t1"), "s1");
+        let (gp, gp_start) = crate::proc::ppid_and_starttime(&ppid).expect("祖父行程應可讀");
+        for runtime_json in ["", r#","runtime":"claude""#, r#","runtime":"codex""#] {
+            std::fs::write(
+                &reg,
+                format!(r#"{{"worker_pid":"{gp}","worker_starttime":"{gp_start}"{runtime_json}}}"#),
+            )
+            .unwrap();
+            assert!(
+                !owner_gate(&state, "nested", &reg),
+                "runtime_json={runtime_json:?} 隔一層不得確認，應落回時間窗而擋"
+            );
+        }
 
         let _ = std::fs::remove_dir_all(&dir);
     }

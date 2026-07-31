@@ -3714,6 +3714,166 @@ else
   printf 'SKIP: 35 行程身分閘門（SRC_KIND=bash：bash 正本凍結在 M4 行為，不含 M5）\n'
 fi
 
+# ---- 36. codex launcher 形（HOOK-OWNER-5 自癒擴充）----
+# spec: HOOK-OWNER-5
+# codex 是 node launcher：pane_pid fork 原生執行檔、原生執行檔才 fork hook，
+# 直接形永遠對不上。擴充：registry `runtime=codex` 時另試 launcher 形——hook
+# 的直接 PPID 命中 codex argv 形、且其父行程即 worker_pid，恰好一層。
+#
+# **本組的主要斷言是「巢狀不被誤放行」，不是「codex 本尊會綠」**：誤放行＝
+# 立即奪權（不經 TTL），是身分閘門唯一比 M4 更糟的失效方向。實測巢狀鏈
+# （m5-proposal §1）是 hook → 巢狀 claude → bash → 本尊——巢狀正是 hook 的
+# 直接 PPID，任何「祖先鏈走得到本尊」「鏈上沒夾別的 runtime」式的放寬都會
+# 把它確認成本尊（architecture §11.7）。中介一律用**真的行程**構造（argv 形
+# 狀由 script 名決定），不是 registry 捏的假資料。
+#
+# 與 35 同理只對 Rust 執行；bash 正本凍結、顯式 SKIP。
+if [[ "$SRC_KIND" == rust ]]; then
+
+# 假 runtime 中介：bash script，argv 為 ["/bin/bash", "…/rtbin36/<名>"]，依
+# STATE-AGENT-4 前兩項規則命中 <名>。hook 呼叫後接 exit 0——非最後命令，防
+# bash 把唯一命令 exec 合併掉（那樣中介行程就不存在了，同 35g）
+RTBIN36="$TESTROOT/rtbin36"
+mkdir -p "$RTBIN36"
+for rt36 in codex claude; do
+  # shellcheck disable=SC2016  # 寫的是字面 script 內容，展開發生在中介行程裡
+  printf '%s\n' '#!/bin/bash' '"$AB_BRIDGE" hook prompt-submit' 'exit 0' \
+    > "$RTBIN36/$rt36"
+  chmod +x "$RTBIN36/$rt36"
+done
+
+# 經一層假 runtime 中介呼叫 hook。pipeline 右段由本 shell fork 後 exec，故
+# 中介的父行程是本 shell（$ME_PID）——正是 launcher 形的「worker fork 中介、
+# 中介 fork hook」形狀
+hookcall_via_rt36() {
+  local rt="$1" data="$2" tag="$3" json="$4"
+  printf '%s' "$json" | env AGENT_BRIDGE_DATA="$data" AGENT_BRIDGE_SPAWN_TAG="$tag" \
+    PATH="$SHIM:$PATH" AB_BRIDGE="$BRIDGE" "$RTBIN36/$rt"
+}
+
+# registry 含 runtime 欄的身分三欄版
+write_ident_reg_rt36() {
+  local dir="$1" name="$2" pid="$3" start="$4" rt="$5"
+  mkdir -p "$dir/agents"
+  jq -n --arg p "$pid" --arg s "$start" --arg r "$rt" \
+    '{name: "x", pane_id: "%1", worker_pid: $p, worker_starttime: $s, runtime: $r}' \
+    > "$dir/agents/$name.json"
+}
+
+# 36a launcher 形本尊：runtime=codex、中介命中 codex 形、中介的父行程＝記錄
+# 的 worker_pid → 放行，無視異主的新鮮 state（即時自癒）
+D36A="$TESTROOT/d36a"
+seed_fresh_foreign_state "$D36A" ija
+write_ident_reg_rt36 "$D36A" ija "$ME_PID" "$ME_START" codex
+hookcall_via_rt36 codex "$D36A" "ab-spawn-ija-1-aaaaaaaaaaaa" '{"session_id":"sNEW"}' \
+  >/dev/null 2>&1
+assert "36a codex launcher 形本尊：異主 sid 仍放行（state 被寫入）" \
+  state_field_is "$D36A/state/ija.json" state busy
+assert "36a codex launcher 形本尊：owner 換成本次 session_id" \
+  state_field_is "$D36A/state/ija.json" owner sNEW
+
+# 36b 直接形對 codex 照樣成立：launcher 形是「另試」，不是取代
+D36B="$TESTROOT/d36b"
+seed_fresh_foreign_state "$D36B" ijb
+write_ident_reg_rt36 "$D36B" ijb "$ME_PID" "$ME_START" codex
+hookcall "$D36B" "ab-spawn-ijb-1-aaaaaaaaaaaa" prompt-submit '{"session_id":"sNEW"}' \
+  >/dev/null 2>&1
+assert "36b codex 直接形本尊：照樣放行" \
+  state_field_is "$D36B/state/ijb.json" owner sNEW
+
+# 36c **巢狀反例（本組最重要）**：claude worker 下掛一層真的 claude 形狀行程
+# （hook → 巢狀 claude → 本尊），launcher 形 MUST NOT 對 claude 啟用。放寬成
+# 「攀鏈到本尊即確認」或「按記錄的 runtime 名認中介」的退化版本，這條會紅
+D36C="$TESTROOT/d36c"
+seed_fresh_foreign_state "$D36C" ijc
+write_ident_reg_rt36 "$D36C" ijc "$ME_PID" "$ME_START" claude
+cp "$D36C/state/ijc.json" "$TESTROOT/ijc-before.json"
+hookcall_via_rt36 claude "$D36C" "ab-spawn-ijc-1-aaaaaaaaaaaa" '{"session_id":"sNEST"}' \
+  > "$TESTROOT/h36c.out" 2>/dev/null; rc=$?
+assert "36c claude 巢狀：exit 0" test "$rc" -eq 0
+assert "36c claude 巢狀：無 stdout" test ! -s "$TESTROOT/h36c.out"
+assert "36c claude 巢狀：不得確認（state 逐位元不變）" \
+  cmp -s "$D36C/state/ijc.json" "$TESTROOT/ijc-before.json"
+
+# 36c2 同構但 ts 過期：落回的是時間窗，不是「確認為冒名」——過期仍可接管
+D36C2="$TESTROOT/d36c2"
+mkdir -p "$D36C2/state"
+jq -n '{state: "busy", ts: "2020-01-01T00:00:00Z", last_delivered: "", owner: "sP"}' \
+  > "$D36C2/state/ijc.json"
+write_ident_reg_rt36 "$D36C2" ijc "$ME_PID" "$ME_START" claude
+hookcall_via_rt36 claude "$D36C2" "ab-spawn-ijc-1-aaaaaaaaaaaa" '{"session_id":"sMID"}' \
+  >/dev/null 2>&1
+assert "36c2 claude 巢狀＋ts 過期：落回時間窗，可接管" \
+  state_field_is "$D36C2/state/ijc.json" owner sMID
+
+# 36d 鏈更長（巢狀 codex 的形狀）：中介命中 codex 形，但其父行程是多出來的
+# bash 夾層而非 worker_pid——「恰好一層」的上界。巢狀 codex 的真實鏈至少長
+# 這樣（hook → 原生 → launcher → shell → …），一律落回
+D36D="$TESTROOT/d36d"
+seed_fresh_foreign_state "$D36D" ijd
+write_ident_reg_rt36 "$D36D" ijd "$ME_PID" "$ME_START" codex
+cp "$D36D/state/ijd.json" "$TESTROOT/ijd-before.json"
+# shellcheck disable=SC2016  # '"$1"' 由夾層 bash 展開，正是要多出來的那層
+printf '%s' '{"session_id":"sDEEP"}' | env AGENT_BRIDGE_DATA="$D36D" \
+  AGENT_BRIDGE_SPAWN_TAG="ab-spawn-ijd-1-aaaaaaaaaaaa" PATH="$SHIM:$PATH" \
+  AB_BRIDGE="$BRIDGE" bash --norc --noprofile -c '"$1"; exit 0' _ "$RTBIN36/codex" \
+  >/dev/null 2>&1
+assert "36d 鏈更長（codex 中介隔著 bash 夾層）：不得確認" \
+  cmp -s "$D36D/state/ijd.json" "$TESTROOT/ijd-before.json"
+
+# 36e 中介不命中本 runtime 形：codex worker 下的 claude 形中介（巢狀 claude
+# 掛在 codex worker 裡）→ 落回
+D36E="$TESTROOT/d36e"
+seed_fresh_foreign_state "$D36E" ije
+write_ident_reg_rt36 "$D36E" ije "$ME_PID" "$ME_START" codex
+cp "$D36E/state/ije.json" "$TESTROOT/ije-before.json"
+hookcall_via_rt36 claude "$D36E" "ab-spawn-ije-1-aaaaaaaaaaaa" '{"session_id":"sX"}' \
+  >/dev/null 2>&1
+assert "36e codex worker 下的 claude 形中介：不得確認" \
+  cmp -s "$D36E/state/ije.json" "$TESTROOT/ije-before.json"
+
+# 36f 鏈中斷：中介活著、但記錄的 worker（中介之父）已死——hook 執行時中介已
+# 被 reparent，攀不回 worker_pid。用真的行程死亡構造，不靠推論：subshell 寫完
+# registry（記自己為 worker）、背景起 codex 形中介後立即退出；中介等 subshell
+# 死透才跑 hook，完成後落 done 標記
+D36F="$TESTROOT/d36f"
+seed_fresh_foreign_state "$D36F" ijf
+cp "$D36F/state/ijf.json" "$TESTROOT/ijf-before.json"
+printf '%s' '{"session_id":"sORPH"}' > "$TESTROOT/ijf.json"
+# 中介必須命中 codex 形（argv[0]=bash、argv[1] basename=codex），讓「上游已
+# 死」成為唯一的落回原因——與 36e 的 attest 不命中路徑分開
+RTBIN36O="$TESTROOT/rtbin36o"
+mkdir -p "$RTBIN36O"
+# 等 reparent 不能用 `kill -0 舊父`：父行程死後可能殘留 zombie（視 reaper
+# 而定），kill -0 對 zombie 照樣成功。改輪詢**自己的 ppid 是否已不是舊父**
+# ——reparent 正是「上游已死」的直接可觀察形狀。有界輪詢，逾時放棄（無 done
+# 標記，前置斷言會紅）
+# shellcheck disable=SC2016  # 寫的是字面 script 內容，展開發生在中介行程裡
+printf '%s\n' '#!/bin/bash' \
+  'n=0' \
+  'while raw=$(</proc/self/stat); raw=${raw##*") "}; set -- $raw; [[ "$2" == "$AB_DEAD_PPID" ]]; do' \
+  '  sleep 0.02; n=$((n+1)); [[ $n -gt 500 ]] && exit 1' \
+  'done' \
+  '"$AB_BRIDGE" hook prompt-submit < "$AB_JSON_FILE"' \
+  ': > "$AB_DONE_FILE"' 'exit 0' > "$RTBIN36O/codex"
+chmod +x "$RTBIN36O/codex"
+(
+  write_ident_reg_rt36 "$D36F" ijf "$BASHPID" "$(proc_starttime "$BASHPID")" codex
+  env AGENT_BRIDGE_DATA="$D36F" AGENT_BRIDGE_SPAWN_TAG="ab-spawn-ijf-1-aaaaaaaaaaaa" \
+    PATH="$SHIM:$PATH" AB_BRIDGE="$BRIDGE" AB_DEAD_PPID="$BASHPID" \
+    AB_JSON_FILE="$TESTROOT/ijf.json" AB_DONE_FILE="$TESTROOT/ijf.done" \
+    bash "$RTBIN36O/codex" >/dev/null 2>&1 &
+)
+# 等中介跑完 hook（有界輪詢，不靠猜時序）
+for _ in $(seq 1 200); do [[ -e "$TESTROOT/ijf.done" ]] && break; sleep 0.05; done
+assert "36f 鏈中斷前置：中介確實完成了 hook 呼叫" test -e "$TESTROOT/ijf.done"
+assert "36f 鏈中斷（worker 已死、中介被 reparent）：不得確認" \
+  cmp -s "$D36F/state/ijf.json" "$TESTROOT/ijf-before.json"
+
+else
+  printf 'SKIP: 36 codex launcher 形（SRC_KIND=bash：bash 正本凍結在 M4 行為，不含 M5）\n'
+fi
+
 # ---- 總結 ----
 printf '\n共 %d PASS、%d FAIL\n' "$PASS" "$FAIL"
 if (( FAIL > 0 )); then

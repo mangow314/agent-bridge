@@ -114,6 +114,9 @@ sleep 重試）直接違反 hook 的 exit 0 鐵律與延遲要求。
   落地版仍對所有 runtime 啟用 attestation：第 2 條刪掉之後，猜錯不會擋死誰，
   只是拿不到自癒。反過來說，這次量測正是第 2 條該刪的實證——不刪的話每個
   codex worker 的每個 hook 都會被永久擋死。
+  **後續已另案擴充**（`docs/rust/architecture.md` §11.7、HOOK-OWNER-5
+  現行文）：對 `runtime=codex` 增列 launcher 形（PPID 的父行程 == `pane_pid`
+  且 PPID 命中 codex argv 形）。本文件所述為 M5 落地當下的行為。
 - **`pane_pid` 等於 runtime 本尊，依賴 tmux 直接 exec**。本機實測成立，但
   這是 tmux 的行為不是承諾；若哪天中間多一層 shell，spawn 記到的會是 shell
   的 pid，判別會全面落回第 3 條（安全，但窗又回來了）。值得在 gate 裡加一條

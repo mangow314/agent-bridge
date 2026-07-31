@@ -111,6 +111,19 @@ pub fn attest_runtime(pid: &str, name: &str) -> Option<String> {
     (after == before).then_some(before)
 }
 
+/// 指定 pid 的（直接父 pid, starttime），取自**同一次** stat 讀取，兩值必屬
+/// 同一次行程生命。launcher 形（HOOK-OWNER-5）走訪中介時用：分兩次讀的話，
+/// 中介可能在兩讀之間退出且 pid 被重用，父 pid 與 starttime 會各屬一個行程。
+pub fn ppid_and_starttime(pid: &str) -> Option<(String, String)> {
+    if !is_plain_pid(pid) {
+        return None;
+    }
+    let fields = stat_fields_after_comm(pid)?;
+    let ppid = fields.get(1)?;
+    let st = fields.get(19)?;
+    (!ppid.is_empty() && !st.is_empty()).then(|| (ppid.clone(), st.clone()))
+}
+
 /// pid 字串只收純數字：它會被拼進 `/proc/<pid>/…` 路徑，`..` 之類的值
 /// 會讓讀取指向別的地方。空字串（＝欄位留空的落回情形）同樣拒絕。
 fn is_plain_pid(pid: &str) -> bool {
@@ -154,7 +167,16 @@ mod tests {
             assert!(!is_plain_pid(bad), "應拒絕 {bad:?}");
             assert_eq!(starttime(bad), None, "應拒絕 {bad:?}");
             assert_eq!(attest_runtime(bad, "x"), None, "應拒絕 {bad:?}");
+            assert_eq!(ppid_and_starttime(bad), None, "應拒絕 {bad:?}");
         }
+    }
+
+    #[test]
+    fn ppid_and_starttime_agree_with_single_field_reads() {
+        let me = std::process::id().to_string();
+        let (ppid, st) = ppid_and_starttime(&me).expect("自身 stat 應可讀");
+        assert_eq!(Some(ppid), self_ppid());
+        assert_eq!(Some(st), starttime(&me));
     }
 
     /// cmdline 判定的五種形狀。這條是 STATE-AGENT-4 的行為錨：規則一旦放寬回
