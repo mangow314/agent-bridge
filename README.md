@@ -4,7 +4,8 @@ Task delegation bridge between AI agent CLIs running in tmux panes.
 
 Multiple `claude` / `codex` CLI sessions running in different tmux panes can
 delegate tasks to each other and reply — splitting work into chunks so every
-agent keeps its context short and clean. Pure bash + filesystem, no daemon.
+agent keeps its context short and clean. A single Rust binary plus the local
+filesystem — no daemon, no network service.
 
 > 完整文件（正典，含設計取捨與已知限制）：[README.zh-TW.md](README.zh-TW.md)
 > — the Traditional Chinese README is the canonical, in-depth documentation;

@@ -20,12 +20,31 @@ BRIDGE="${BRIDGE:-$ROOT/bin/agent-bridge}"
 # 源碼耦合檢查（§30 canary、§31i 寫入順序）抽取函式本體的對象。不跟著 $BRIDGE
 # 走——$BRIDGE 是黑箱受測體，這兩處要的是**源碼**。M4 cutover 後正本是 Rust，
 # 故預設 rust；`SRC_KIND=bash` 可切回 bash 正本（rollback 期與雙實作對照用）。
-# 顯式的 kind＋path 是 M3 codex 複核的建議形（source-kind／source-path）：
-# 兩者不匹配時抽取結果為空，套件會紅在「函式本體可抽出」那條，不會靜默空轉。
+# 顯式的 kind＋path 是 M3 codex 複核的建議形（source-kind／source-path）。
+# 光有 kind 還不夠：$BRIDGE（黑箱受測體）與 SRC_KIND（源碼抽取對象）若各指
+# 一套實作，兩邊各自全綠、整套照樣綠，等於沒驗到對應關係（獨立複核
+# 2026-07-31 實證）。故 kind 先驗 enum，再與載具實測結果交叉比對。
 SRC_KIND="${SRC_KIND:-rust}"
+case "$SRC_KIND" in
+  rust|bash) ;;
+  *) echo "SRC_KIND 需為 rust 或 bash：$SRC_KIND" >&2; exit 1 ;;
+esac
 SRC_BASH="$ROOT/bin/agent-bridge.bash"
 SRC_NOTIFY_RS="$ROOT/crates/ab-core/src/notify.rs"
 SRC_TASK_RS="$ROOT/crates/ab-core/src/task.rs"
+# 載具是哪套實作：Rust 認得 `__implemented-commands`（rc 0）、bash 正本當成
+# 未知指令（rc 1）——用既有介面判別，不為了自報身分再開一個。探針的 DATA
+# 指到不可建立的路徑，免得 bash 分支順手建到使用者真實的資料目錄
+if AGENT_BRIDGE_DATA=/dev/null/probe "$BRIDGE" __implemented-commands \
+    >/dev/null 2>&1; then
+  BRIDGE_KIND=rust
+else
+  BRIDGE_KIND=bash
+fi
+if [[ "$BRIDGE_KIND" != "$SRC_KIND" ]]; then
+  echo "SRC_KIND=$SRC_KIND 與 BRIDGE 不匹配（載具偵測為 $BRIDGE_KIND）：$BRIDGE" >&2
+  exit 1
+fi
 SOCK="agent-bridge-test"
 
 if ! REAL_TMUX="$(command -v tmux)"; then
@@ -2708,10 +2727,16 @@ if [[ -n "$REAL_CLAUDE" ]] && CANARY_REAL="$(readlink -f "$REAL_CLAUDE" 2>/dev/n
   # 抽取對象是**源碼正本**而非 $BRIDGE（M3 改、M4 改綁 Rust）：這是源碼耦合
   # 檢查，與 check-contract 1–2 同一類，不是黑箱行為斷言。$BRIDGE 是編譯後的
   # 執行檔，sed 抽不出函式本體，硬綁它只會退化成「換實作就全紅」。
+  # 抽出後**剝掉註解行**再比對：光 grep -F 的話，把 matcher 換成新字串、
+  # 同時在函式內留一段含舊字串的註解，四個斷言仍全綠（獨立複核 2026-07-31）。
+  # 剝註解把蒙混面壓到「函式內未使用的字面值／死分支」，那層由
+  # notify.rs 的 matcher_uses_the_canary_feature_strings 單元測試鎖
   if [[ "$SRC_KIND" == bash ]]; then
-    sed -n '/^screen_has_prompt() {/,/^}/p' "$SRC_BASH" > "$TESTROOT/canary-fn"
+    sed -n '/^screen_has_prompt() {/,/^}/p' "$SRC_BASH" \
+      | grep -v '^[[:space:]]*#' > "$TESTROOT/canary-fn"
   else
-    sed -n '/^pub fn screen_has_prompt/,/^}/p' "$SRC_NOTIFY_RS" > "$TESTROOT/canary-fn"
+    sed -n '/^pub fn screen_has_prompt/,/^}/p' "$SRC_NOTIFY_RS" \
+      | grep -v '^[[:space:]]*//' > "$TESTROOT/canary-fn"
   fi
   assert "CC canary：screen_has_prompt 函式本體可抽出" test -s "$TESTROOT/canary-fn"
   for kw in 'Do you want to ' 'Esc to cancel' \
@@ -2828,25 +2853,31 @@ assert "唯讀查詢不建資料目錄" test ! -d "$D31E"
 # 反向殘留的是「終態轉換可被重放」的 split-brain 方向）。源碼順序不變量，
 # 比照 §30 的函式本體抽取
 UMS_FN="$TESTROOT/ums-fn"
-# 抽取對象是源碼正本，理由同 §30 的 canary-fn（源碼耦合檢查，M4 已改綁 Rust）
+# 抽取對象是源碼正本，理由同 §30 的 canary-fn（源碼耦合檢查，M4 已改綁 Rust）。
+# 註解行同樣先剝掉
 if [[ "$SRC_KIND" == bash ]]; then
-  sed -n '/^update_meta_status() {/,/^}/p' "$SRC_BASH" > "$UMS_FN"
+  sed -n '/^update_meta_status() {/,/^}/p' "$SRC_BASH" \
+    | grep -v '^[[:space:]]*#' > "$UMS_FN"
   # shellcheck disable=SC2016  # $dir 是源碼字面值，刻意不展開
   SL_PAT='atomic_write "$dir/status"'
   # shellcheck disable=SC2016  # 同上
   ML_PAT='atomic_write "$dir/metadata.json"'
 else
-  sed -n '/^pub fn update_meta_status/,/^}/p' "$SRC_TASK_RS" > "$UMS_FN"
-  # 兩次 atomic_write 的引數：status 那次跨行寫（`&dir.join("status"),` 自成
-  # 一行），故各鎖引數字面值而非整個呼叫頭
-  SL_PAT='dir.join("status")'
+  sed -n '/^pub fn update_meta_status/,/^}/p' "$SRC_TASK_RS" \
+    | grep -v '^[[:space:]]*//' > "$UMS_FN"
+  # 各鎖**完整的呼叫頭＋第一引數**，不是單抽路徑字面值：後者可被
+  # `let p = dir.join("status");` 這種 decoy 先命中，實際寫入順序反轉了斷言
+  # 照樣綠（獨立複核 2026-07-31 給的反例）
+  SL_PAT='atomic_write(&dir.join("status")'
   ML_PAT='atomic_write(&meta_path'
 fi
 assert "update_meta_status 函式本體可抽出" test -s "$UMS_FN"
-sl="$(grep -nF "$SL_PAT" "$UMS_FN" | cut -d: -f1 | head -1)"
-ml="$(grep -nF "$ML_PAT" "$UMS_FN" | cut -d: -f1 | head -1)"
+# 比對前把空白全部去掉：呼叫跨幾行是 rustfmt 的事，不該讓它決定斷言成敗
+UMS_FLAT="$(tr -d '[:space:]' < "$UMS_FN")"
+sl="$(awk -v s="$UMS_FLAT" -v p="${SL_PAT// /}" 'BEGIN{print index(s,p)}')"
+ml="$(awk -v s="$UMS_FLAT" -v p="${ML_PAT// /}" 'BEGIN{print index(s,p)}')"
 assert "先寫 status 再寫 metadata（split-brain 方向鎖定）" \
-  test -n "$sl" -a -n "$ml" -a "$sl" -lt "$ml"
+  test "$sl" -gt 0 -a "$ml" -gt 0 -a "$sl" -lt "$ml"
 
 # 31j. F1 第二輪：await 迴圈內 status 消失＝操作性失敗。evict 以 `||` 呼叫端
 # 包住 cmd_await，該語境抑制 errexit——修補前裸讀取失敗被靜靜輪詢到期限、

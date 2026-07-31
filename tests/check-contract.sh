@@ -17,6 +17,11 @@ set -u
 cd "$(dirname "${BASH_SOURCE[0]}")/.." || exit 1
 
 SRC_KIND="${SRC_KIND:-rust}"
+case "$SRC_KIND" in
+  rust|bash) ;;
+  # 未知值不得靜默落進某個分支：拼錯的 SRC_KIND 會讓人以為驗了 A 其實驗了 B
+  *) printf 'SRC_KIND 需為 rust 或 bash：%s\n' "$SRC_KIND" >&2; exit 2 ;;
+esac
 BIN_BASH=bin/agent-bridge.bash
 SRC_RUST=crates
 # 內省指令的載具：預設走 shim（＝套件的 BRIDGE 預設），可用 BRIDGE 指別的執行檔
@@ -24,6 +29,19 @@ BRIDGE="${BRIDGE:-$PWD/bin/agent-bridge}"
 SPEC=spec
 TESTS=tests/run-tests.sh
 FAIL=0
+
+# 載具是哪套實作。判別式用既有的 `__implemented-commands`：Rust 認得（rc 0）、
+# bash 正本當成未知指令（rc 1），不必為了自報身分再開一個介面。
+# 探針的 DATA 指到不可建立的路徑：bash 分支若走到建目錄，不能讓它動到
+# 使用者真實的 ~/.local/share/agent-bridge（失敗照樣是非零，判別結果不變）。
+bridge_kind() {
+  if AGENT_BRIDGE_DATA=/dev/null/probe "$BRIDGE" __implemented-commands \
+      >/dev/null 2>&1; then
+    printf 'rust\n'
+  else
+    printf 'bash\n'
+  fi
+}
 
 fail() { printf 'FAIL %s\n' "$1"; FAIL=1; }
 ok()   { printf 'ok   %s\n' "$1"; }
@@ -46,23 +64,34 @@ check_1() {
 }
 
 check_2() {
-  local missing=0 c cmds n
+  local cmds spec_cmds kind n
   if [[ "$SRC_KIND" == bash ]]; then
-    cmds="$(grep -o '^cmd_[a-z_]*()' "$BIN_BASH" | sed 's/^cmd_//; s/()$//')"
+    cmds="$(grep -o '^cmd_[a-z_]*()' "$BIN_BASH" | sed 's/^cmd_//; s/()$//' | sort -u)"
   else
-    # 執行檔宣稱的實作集合。空輸出＝載具壞了，別讓迴圈零圈通過而假綠
-    cmds="$("$BRIDGE" __implemented-commands 2>/dev/null)" || cmds=""
+    # 載具必須真的是 Rust：SRC_KIND=rust 配上 bash 正本會驗錯對象
+    kind="$(bridge_kind)"
+    if [[ "$kind" != rust ]]; then
+      fail "2 SRC_KIND=rust 但載具偵測為 $kind：$BRIDGE"
+      return
+    fi
+    # 執行檔宣稱的實作集合。空輸出＝載具壞了，別讓集合比對以「兩邊都空」收場
+    cmds="$("$BRIDGE" __implemented-commands 2>/dev/null | sort -u)" || cmds=""
     if [[ -z "$cmds" ]]; then
       fail "2 取不到 __implemented-commands（載具：$BRIDGE）"
       return
     fi
   fi
-  while IFS= read -r c; do
-    [[ -n "$c" ]] || continue
-    grep -q "^## \`$c\`" "$SPEC/cli.md" 2>/dev/null || { fail "2 cli.md 缺章節：$c"; missing=1; }
-  done <<<"$cmds"
+  # **雙向**集合相等，不是單向包含：單向只驗「宣稱的都在 spec」，一個退化成
+  # 只印一個命令的載具照樣印 ok（獨立複核 2026-07-31 的 mutation 實證）。
+  # 反向那半（spec 有章節、實作沒有）本來就是 cutover 後最該紅的形狀
+  spec_cmds="$(grep -o '^## `[a-z-]*`$' "$SPEC/cli.md" | tr -d '#` ' | sort -u)"
+  if [[ "$cmds" != "$spec_cmds" ]]; then
+    fail "2 子指令集合與 cli.md 章節不一致（源：$SRC_KIND）："
+    diff <(printf '%s\n' "$cmds") <(printf '%s\n' "$spec_cmds") | sed 's/^/     /'
+    return
+  fi
   n="$(grep -c . <<<"$cmds")"
-  (( missing )) || ok "2 cli.md 涵蓋全部 $n 個子指令（源：$SRC_KIND）"
+  ok "2 子指令集合與 cli.md 章節完全一致（$n 個，源：$SRC_KIND）"
 }
 
 # check 3 不受 cutover 影響：名單是硬編的，比對對象只有 spec/hooks.md，

@@ -274,6 +274,29 @@ check 3 之所以不動：它的比對對象只有 spec。`hook_*` 這四個名�
 於 `ab-core/src/hook.rs` 每個函式的對映註解，spec 的 `Source:` 標記仍指得到
 實作（`spec/README.md` 的錨點規則已同步改寫）。
 
+### 10.2.1 kind 必須與載具綁定（M4 codex 複核的兩個 blocker）
+
+`SRC_KIND` 一開始只是「選哪個源碼路徑」，與 `$BRIDGE`（黑箱受測體）各走各的。
+複核實證：`SRC_KIND=bash BRIDGE=<Rust>` 兩邊各自全綠、整套照樣綠——等於沒驗到
+對應關係；`SRC_KIND` 拼錯還會靜默落進 Rust 分支。處置：
+
+- kind 先驗 enum（非 `rust`／`bash` 直接非零退出）
+- 再**實測載具身分**與 kind 交叉比對。判別式用既有的
+  `__implemented-commands`：Rust 認得（rc 0）、bash 正本當未知指令（rc 1）。
+  這是刻意不新增 `__implementation-kind` 的理由——既有介面已經足以自報身分。
+  探針的 `AGENT_BRIDGE_DATA` 指到不可建立的路徑，免得 bash 分支順手建到
+  使用者真實的資料目錄。
+
+同一輪的另一個 blocker 在 check 2：它只驗「載具宣稱的命令都在 spec」（單向）。
+一個退化成只印 `list` 的載具實測會印 `ok`。改成**雙向集合相等**（`sort -u`
+兩邊比 diff），反向那半正是 cutover 後最該紅的形狀。
+
+兩處源碼抽取的蒙混面也一併收窄：抽出後先剝註解行（否則「改 matcher＋留舊字串
+註解」全綠），§31i 改鎖**完整呼叫頭＋第一引數**並在比對前去空白（否則
+`let p = dir.join("status");` 這種 decoy 先命中，寫入順序反轉了斷言照樣綠；
+去空白讓斷言不受 rustfmt 換行影響）。剩下的暴露面是「函式內未使用的字面值／
+死分支」，由 `notify.rs`、`task.rs` 的兩個單元測試鎖。
+
 ### 10.3 刻意未在 M4 收的兩項
 
 - **SIGPIPE 仍無機器 gate**（§9.6）：要補得在套件新增一組分組，是行為錨擴充，

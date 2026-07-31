@@ -536,7 +536,8 @@ agent-bridge gc --older-than 30 --apply
 tests/run-tests.sh
 ```
 
-純 bash、零額外依賴。整合測試使用獨立 socket
+測試驅動腳本是 bash，需要 `tmux` 與 `jq`——受測的 Rust 執行檔本身只用到
+`tmux`，不依賴 jq。整合測試使用獨立 socket
 `tmux -L agent-bridge-test -f /dev/null`，不碰使用者真實 tmux server。
 
 ## 開發慣例

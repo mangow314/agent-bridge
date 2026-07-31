@@ -1,8 +1,9 @@
 # agent-bridge 介面契約規格
 
-本目錄是 agent-bridge 的**介面契約正本**，同時是未來 Rust 遷移
-（ab-core/ab/ab-tui）的 parity 基準：任何重寫實作必須逐條滿足這裡的條款，
-並以既有測試套件（`tests/run-tests.sh`）全綠作為黑箱驗收。
+本目錄是 agent-bridge 的**介面契約正本**，也是 Rust 實作
+（ab-core/ab/ab-tui，M4 起為正本）與 bash 正本（`bin/agent-bridge.bash`，
+rollback 基準）之間的 parity 判準：兩邊都必須逐條滿足這裡的條款，並以同一套
+測試套件（`tests/run-tests.sh`）全綠作為黑箱驗收。
 
 ## 檔案
 
@@ -22,9 +23,10 @@
   檔案效果），MUST / MUST NOT 語氣。實作細節（jq、flock、bash 慣用法）
   不入條款；必要背景放 `Note:`。判準：Rust 重寫後這句話仍逐字成立。
 - **Source 錨點**：引 bash 正本的**函式名**，不用行號（行號會漂移）。M4
-  cutover 後 bash 正本改名為 `bin/agent-bridge.bash`；這些名字仍是有效錨點，
-  Rust 側每個模組頂端標了它對應哪些 bash 函式（如 `ab-core/src/hook.rs`），
-  兩邊由那層對映相接，故條款不隨實作語言重寫。
+  cutover 後 bash 正本改名為 `bin/agent-bridge.bash`；這些名字仍是有效錨點：
+  Rust 側的對映集中在 `docs/rust/architecture.md` §2（模組 ↔ spec 域 ↔ bash
+  函式群），行為模組另在 doc comment 標了局部錨點（如 `ab-core/src/hook.rs`、
+  `notify.rs`）。條款因此不隨實作語言重寫。
 - **測試對映**：每條標 `[tested: <分組號>]`（分組級，非逐條 assert）或
   `[untested]`（缺口清單與處置見 traceability.md）。新增條款先標 `[tbd]`，
   在 traceability 盤點時定案。traceability 表「條款」欄的語意是**完整列舉
