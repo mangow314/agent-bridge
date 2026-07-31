@@ -22,7 +22,8 @@ use ab_core::validate::is_valid_name;
 const USAGE: &str = r#"用法：
   agent-bridge register <agent> <tmux-target>   註冊 agent 與其 tmux pane
   agent-bridge unregister <agent>               移除 agent 註冊
-  agent-bridge list                             列出已註冊 agent（name<TAB>pane_id<TAB>ready）
+  agent-bridge list [--long]                    列出已註冊 agent（name<TAB>pane_id<TAB>ready）
+                                                --long：加 origin/位置/owner/disposable/idle 的介入視圖（首行為欄名）
   agent-bridge send <agent> --from <sender> (--message <text> | --message-file <path>)
                                                 委派任務；stdout 只印 task-id
   agent-bridge receive <task-id>                取出任務（標頭走 stderr、request 原文走 stdout）
@@ -266,12 +267,38 @@ fn cmd_register(paths: &Paths, args: &[String]) -> Result<()> {
     Ok(())
 }
 
-/// cmd_list:522 — 無參數檢查，忽略多餘參數（比照 bash 未檢查 $#）。
+/// cmd_list:522 — 裸形無參數；`--long`／`-l` 走介入視圖（CLI-LIST-2）。
+/// bash 未檢查 `$#`（多餘參數靜默忽略），Rust 這裡改為顯式拒絕：`--long`
+/// 讓參數面有了意義，靜默忽略會把打錯的旗標變成「看起來成功的裸 list」。
 /// 損壞 registry 檔 MUST NOT 靜默略過（見 registry::list 文件）：`?` 把
 /// `Err` 上拋給 main() 的統一收斂層，印訊息＋非零退出。
-fn cmd_list(paths: &Paths, _args: &[String]) -> Result<()> {
-    for (name, pane, ready) in registry::list(paths)? {
-        println!("{name}\t{pane}\t{ready}");
+fn cmd_list(paths: &Paths, args: &[String]) -> Result<()> {
+    // 裸 `list` 是既有腳本的介面：`--long` 走完全獨立的分支，三欄輸出一個
+    // 位元組都不動（CLI-LIST-1）
+    match args.len() {
+        0 => {
+            for (name, pane, ready) in registry::list(paths)? {
+                println!("{name}\t{pane}\t{ready}");
+            }
+        }
+        1 if args[0] == "--long" || args[0] == "-l" => {
+            let tmux = SubprocessTmux;
+            println!("{}", spawn::LIST_LONG_HEADER);
+            for r in spawn::list_long(paths, &tmux) {
+                println!(
+                    "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+                    r.name,
+                    r.pane,
+                    r.ready,
+                    r.origin,
+                    r.location,
+                    r.owner,
+                    r.disposable,
+                    r.idle_secs
+                );
+            }
+        }
+        _ => return Err(Error::new("用法：agent-bridge list [--long]")),
     }
     Ok(())
 }

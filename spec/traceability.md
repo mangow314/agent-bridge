@@ -51,6 +51,7 @@
 | 35 | 行程身分閘門（M5 窗 1） | HOOK-OWNER-5, STATE-AGENT-4 |
 | 36 | codex launcher 形（HOOK-OWNER-5 自癒擴充） | HOOK-OWNER-5 |
 | 37 | agy runtime（Antigravity CLI） | CLI-SPAWN-1, HOOK-NOTIFY-2 |
+| 38 | list --long 介入視圖 | CLI-LIST-1, CLI-LIST-2 |
 
 ## `[untested]` 缺口處置（本輪只記錄，不補測）
 

@@ -21,6 +21,9 @@ mechanics. Read the section for the role you are playing.
 
 ```bash
 agent-bridge list                     # delegable agents (name<TAB>pane_id<TAB>ready column: -/starting/ready)
+agent-bridge list --long              # human-intervention view: header row + name/pane/ready/origin/where/owner/disposable/idle
+                                      # where+owner resolved live to <session>:<window>; dead / owner-dead / ? (not queryable) are distinct
+                                      # read-only: signals, not a "safe to delete" verdict — reclaiming stays despawn/evict
 agent-bridge register <name> <tmux-target>
                                       # manually register an existing pane as an agent (unregister to remove)
 agent-bridge spawn <name> --runtime <codex|claude|agy> [--model <model>] [--window]

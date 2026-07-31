@@ -41,7 +41,46 @@ Source: cmd_unregister
 ### CLI-LIST-1 [tested: 1]
 `list`：stdout 每 agent 一行、TAB 分隔三欄 `<name>\t<pane_id>\t<ready>`；
 ready 欄：人工註冊 `-`、spawned 未就緒 `starting`、已就緒 `ready`。
-無 agent 時輸出為空、exit 0。
+無 agent 時輸出為空、exit 0。裸 `list` 的輸出是既有腳本的介面，
+MUST NOT 因 `--long` 的加入而改變一個位元組。
+Source: cmd_list
+
+### CLI-LIST-2 [tested: 38]
+`list --long`（`-l` 為等價別名）：人可讀的介入視圖。首行 MUST 為欄名標頭
+`NAME\tPANE\tREADY\tORIGIN\tWHERE\tOWNER\tDISPOSABLE\tIDLE`，其後每 agent
+一行、TAB 分隔恰八欄。欄值 MUST NOT 含 TAB／換行／控制字元（`name`、
+session 名等來自 registry 與 tmux，是可被塞入怪字元的外部資料；一個 TAB 就
+能把一列變成九欄）——輸出前 MUST 逐欄代換。
+
+各欄允許值域（可機器判定）：
+
+- `ORIGIN` ∈ `spawned|manual|?`——**provenance 與 liveness 分開呈現**，人工
+  註冊者 despawn 恆被拒（CLI-DESPAWN-*），這一欄是那條規則的可見形。
+- `READY` ∈ `ready|starting|-|?`；`DISPOSABLE` ∈ `yes|expired|-|?`；
+  `IDLE` ∈ 非負整數｜`-`。語意同 `idle` 指令。
+- `WHERE`／`OWNER`：以 tmux 即時反查，顯示人看得懂的 `<session>:<window>`；
+  registry 存的 `%id`／`@id` 是判定的根（不可變），名稱與 index 只是當下的
+  人類標籤，MUST NOT 反過來當判定依據。失效 MUST 顯式降級為固定字面值、
+  MUST NOT 沿用看似仍在的舊值：查不到 `dead`／`owner-dead`、tmux 沒得查
+  `?`、registry 的 id 形狀不合法 `invalid`、manual 無 owner 概念 `-`。
+  三者是不同的事：「查不到」是東西沒了、「沒得查」是無從得知、「不合法」
+  是資料損壞。
+- **一個 id 可以對到多個位置**：tmux 的 window 可同時 linked 到多個 session
+  （`man tmux`「Windows may be linked to multiple sessions」），該 window 與
+  其 panes 因此在 `-a` 列表出現多次。MUST NOT 任選一筆（那是隨列序給答案）：
+  能以 registry 記的 session 標籤配出唯一一筆時取之，否則 MUST 全部列出、
+  以 `,` 分隔並排序去重，讓歧義顯形。
+- **唯讀**：MUST NOT 取鎖、MUST NOT 寫任何檔案、MUST NOT 因為判定 `dead`
+  就順手清 registry（回收一律是 despawn／evict 的顯式動作）。因為不取鎖，
+  tmux 索引、idle 訊號與 registry 是分次讀取的 best-effort snapshot，
+  本指令**不承諾**列內或列間的原子一致。
+- registry 損壞 MUST NOT 讓整份報表終止：該列以 `?` 呈現後繼續（它照樣佔
+  著 cap，必須看得見）。
+
+設計原則（非規範，不可機器判定，故不寫成 MUST）：本視圖給的是**訊號不是
+結論**——`IDLE` 只說多久沒動、`DISPOSABLE` 只是 worker 自己留下的建議，
+兩者都不等於「可以安全刪除」。是否回收由人判斷；上面的值域限制是這條原則
+可機器守住的部分。
 Source: cmd_list
 
 ## `send`

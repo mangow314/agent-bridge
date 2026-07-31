@@ -9,6 +9,7 @@
 //! evict 的三段式編排（send → await → despawn）留在 `ab` CLI 層：它由三個
 //! 既有子指令組成，核心邏輯分別已在 `task`／`spawn` 就位。
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use crate::config;
@@ -1315,6 +1316,229 @@ pub fn idle(paths: &Paths) -> Vec<IdleRow> {
     rows
 }
 
+/// `list --long` 的一列（CLI-LIST-2）。
+pub struct LongRow {
+    pub name: String,
+    pub pane: String,
+    pub ready: String,
+    pub origin: String,
+    pub location: String,
+    pub owner: String,
+    pub disposable: String,
+    pub idle_secs: String,
+}
+
+/// `list --long` 的欄名標頭。消費端跳過第一行（CLI-LIST-2）。
+pub const LIST_LONG_HEADER: &str = "NAME\tPANE\tREADY\tORIGIN\tWHERE\tOWNER\tDISPOSABLE\tIDLE";
+
+/// 索引查得到 → 位置字面值；查了但不在 → `dead_label`；沒得查 → `?`；
+/// id 形狀不合法 → `invalid`。
+///
+/// **「查不到」與「沒得查」不可混為一談**：tmux 不可用時全池標 `?`（未知），
+/// 誤標成 dead 會讓人以為整池該回收；反過來把真的死掉的標成未知，則讓
+/// stale registry 看起來還活著。壞掉的 registry id（`@garbage`）是第三種事：
+/// 那是資料損壞，標成 dead 會讓人以為「東西曾經在、現在沒了」。
+///
+/// **一個 id 可以對到多個位置**：tmux 的 window 可同時 linked 到多個 session
+/// （`man tmux`「Windows may be linked to multiple sessions」），該 window 與
+/// 其 panes 因此在 `-a` 列表出現多次。取最後一筆等於隨列序給答案——而使用者
+/// 問的正是「跟哪個主 session 關聯」（跨廠複核 2026-07-31 的 major）。
+/// `prefer_session` 給得出唯一配對時取那筆，否則全列出、逗號分隔，讓歧義
+/// 顯形而不是被藏起來。
+fn live_label(
+    index: Option<&HashMap<String, Vec<String>>>,
+    id: &str,
+    dead_label: &str,
+    prefer_session: Option<&str>,
+) -> String {
+    if !is_valid_pane(id) && !is_valid_window_id(id) {
+        return "invalid".to_string();
+    }
+    let map = match index {
+        None => return "?".to_string(),
+        Some(m) => m,
+    };
+    let locs: Vec<&String> = match map.get(id) {
+        Some(v) => v.iter().filter(|l| !l.is_empty()).collect(),
+        None => return dead_label.to_string(),
+    };
+    match locs.len() {
+        0 => dead_label.to_string(),
+        1 => locs[0].clone(),
+        _ => {
+            // linked window：先用 registry 記的 session 名消歧義；配不出唯一
+            // 的一筆就全列出（`a:1,b:1`），MUST NOT 任選一個
+            if let Some(sess) = prefer_session {
+                let matched: Vec<&&String> = locs
+                    .iter()
+                    .filter(|l| l.split(':').next() == Some(sess))
+                    .collect();
+                if matched.len() == 1 {
+                    return matched[0].to_string();
+                }
+            }
+            locs.iter()
+                .map(|s| s.as_str())
+                .collect::<Vec<_>>()
+                .join(",")
+        }
+    }
+}
+
+/// `@<n>` 的形狀檢查，對映 `is_valid_pane` 的 `%<n>`。registry 的 id 是不可信
+/// 輸入（人可手改），形狀不對就不該被當成「查得到／查不到」的問題。
+fn is_valid_window_id(id: &str) -> bool {
+    let mut bytes = id.bytes();
+    bytes.next() == Some(b'@') && {
+        let rest: Vec<u8> = bytes.collect();
+        !rest.is_empty() && rest.iter().all(|b| b.is_ascii_digit())
+    }
+}
+
+/// registry 的 `owner` 欄形如 `<session>:@<winid>`，拆成（session 標籤,
+/// window id）。**判定錨在不可變的 `@id`**；session 名可被 rename，只拿來在
+/// linked window 多重位置時消歧義（CLI-LIST-2）。
+fn owner_parts(owner: &str) -> Option<(&str, &str)> {
+    let (sess, win) = owner.rsplit_once(':')?;
+    if win.starts_with('@') && win.len() > 1 {
+        Some((sess, win))
+    } else {
+        None
+    }
+}
+
+/// 欄值不得含 TAB／換行／控制字元：輸出是「一 agent 一行、恰八欄」的 TSV，
+/// 而 name／session 名等來自 registry 與 tmux，都是可被塞進怪字元的外部資料。
+/// 合法 JSON string 帶一個 TAB 就能把一列變兩欄（跨廠複核 2026-07-31）。
+fn sanitize_field(s: &str) -> String {
+    s.chars()
+        .map(|c| if c.is_control() || c == '\t' { '_' } else { c })
+        .collect()
+}
+
+/// 一次性索引：tmux 內部 id → 人看得懂的 `<session>:<window>`。
+///
+/// **不能用 `display -p -t <id>` 逐列查存在性**：tmux 對不存在的 window id
+/// 會靜靜回 `:` 且 exit 0（實測 3.7b），單看 exit code 判不出死活，死掉的
+/// owner 會被顯示成一個空位置。改用整行相等比對的列表（同 `pane_exists` 的
+/// 既有作法），存在與否是決定性的；順帶把 N 次 exec 壓成一次。
+///
+/// 回傳 `None` ＝ tmux 沒得查（不可用／指令失敗），與「查了但不在」不同。
+/// 值是 **`Vec`** 不是單值：linked window 讓同一 id 出現多次，用 map 覆寫會
+/// 靜靜丟掉 cardinality（見 `live_label` 的說明）。排序去重讓輸出穩定。
+fn tmux_index(
+    tmux: &dyn TmuxClient,
+    list_cmd: &str,
+    id_fmt: &str,
+) -> Option<HashMap<String, Vec<String>>> {
+    let fmt = format!("{id_fmt}\t#{{session_name}}:#{{window_index}}");
+    let out = tmux.exec(&[list_cmd, "-a", "-F", &fmt])?.ok_stdout()?;
+    let mut map: HashMap<String, Vec<String>> = HashMap::new();
+    for line in out.lines() {
+        if let Some((id, loc)) = line.split_once('\t') {
+            map.entry(id.to_string())
+                .or_default()
+                .push(sanitize_field(loc));
+        }
+    }
+    for v in map.values_mut() {
+        v.sort();
+        v.dedup();
+    }
+    Some(map)
+}
+
+/// `cmd_list --long`:CLI-LIST-2 — 人可介入的池視圖。**唯讀**：不取鎖、不寫檔、
+/// 判定 dead 也不順手清 registry（回收一律走 despawn／evict 的顯式動作）。
+///
+/// 訊號與結論刻意分離：`origin` 是 provenance（manual 者 despawn 恆被拒），
+/// `location`／`owner` 是 liveness，`disposable`／`idle_secs` 是 worker 自己
+/// 留下的建議與閒置時間。沒有任何一欄是「可以安全刪除」——那是人的判斷。
+pub fn list_long(paths: &Paths, tmux: &dyn TmuxClient) -> Vec<LongRow> {
+    let panes = tmux_index(tmux, "list-panes", "#{pane_id}");
+    let windows = tmux_index(tmux, "list-windows", "#{window_id}");
+    let idle_rows: HashMap<String, IdleRow> = idle(paths)
+        .into_iter()
+        .map(|r| (r.name.clone(), r))
+        .collect();
+
+    let mut rows = Vec::new();
+    for f in registry_files(paths) {
+        let base_name = f
+            .file_stem()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        // 損壞的 registry 照樣佔著 cap，必須看得見——整列 `?` 後繼續，
+        // 不讓一個壞檔終止整份報表（同 idle 的既有處置）
+        let fields = match std::fs::read_to_string(&f).ok().map(|c| json::parse(&c)) {
+            Some(Ok(Value::Object(m))) => m,
+            _ => {
+                rows.push(LongRow {
+                    name: base_name,
+                    pane: "?".into(),
+                    ready: "?".into(),
+                    origin: "?".into(),
+                    location: "?".into(),
+                    owner: "?".into(),
+                    disposable: "?".into(),
+                    idle_secs: "-".into(),
+                });
+                continue;
+            }
+        };
+        let mut name = json::jq_raw_field(&fields, "name").unwrap_or_default();
+        if name.is_empty() {
+            name = base_name;
+        }
+        let name = sanitize_field(&name);
+        let pane = json::jq_raw_field(&fields, "pane_id").unwrap_or_default();
+        let spawned = json::bool_field_is_true(&fields, "spawned");
+
+        // owner 欄同時給出消歧義用的 session 標籤與判定用的 window id
+        let owner_field = json::jq_raw_field(&fields, "owner").unwrap_or_default();
+        let owner_bits = owner_parts(&owner_field);
+
+        // WHERE 不用 owner 的 session 消歧義：pane 自己在哪、與誰派它出來是
+        // 兩件事，registry 並沒有記 worker 自己的 session。linked window 下
+        // 誠實的答案是「這兩個地方都是它」，全列出而不是挑一個看起來合理的
+        let location = if pane.is_empty() {
+            "?".to_string()
+        } else {
+            live_label(panes.as_ref(), &pane, "dead", None)
+        };
+        // 人工註冊者沒有 owner 概念：那個 pane 不歸 bridge 管生命週期
+        let owner = match owner_bits {
+            _ if !spawned => "-".to_string(),
+            Some((sess, win)) => live_label(windows.as_ref(), win, "owner-dead", Some(sess)),
+            None => "?".to_string(),
+        };
+
+        let (ready, disposable, idle_secs) = match idle_rows.get(&name) {
+            Some(r) => (r.ready.clone(), r.disposable.clone(), r.idle_secs.clone()),
+            None => ("?".to_string(), "?".to_string(), "-".to_string()),
+        };
+        rows.push(LongRow {
+            name,
+            pane: if pane.is_empty() {
+                "-".into()
+            } else {
+                sanitize_field(&pane)
+            },
+            ready,
+            origin: if spawned {
+                "spawned".into()
+            } else {
+                "manual".into()
+            },
+            location,
+            owner,
+            disposable,
+            idle_secs,
+        });
+    }
+    rows
+}
+
 /// `for f in "$AGENTS_DIR"/*.json`（nullglob）：目錄缺失＝空集；排序對齊
 /// bash glob 的字典序。
 fn registry_files(paths: &Paths) -> Vec<PathBuf> {
@@ -1360,6 +1584,82 @@ fn writeln_stdout(s: &str) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// CLI-LIST-2 的三態：查得到／查了不在／沒得查。三者混淆的代價不對稱——
+    /// 把死的標成未知會讓 stale registry 看起來還活著，把未知標成死的會讓
+    /// tmux 一不可用就整池看似該回收。
+    #[test]
+    fn live_label_separates_missing_from_unqueryable() {
+        let m = HashMap::from([("%1".to_string(), vec!["scratch:3".to_string()])]);
+        assert_eq!(live_label(Some(&m), "%1", "dead", None), "scratch:3");
+        // 查了但不在 → dead 字面值
+        assert_eq!(live_label(Some(&m), "%9", "dead", None), "dead");
+        assert_eq!(live_label(Some(&m), "@9", "owner-dead", None), "owner-dead");
+        // 沒得查（tmux 不可用／指令失敗）→ 未知，不是 dead
+        assert_eq!(live_label(None, "%1", "dead", None), "?");
+        // 索引裡存在但值為空不得當成活著
+        let empty = HashMap::from([("%2".to_string(), vec![String::new()])]);
+        assert_eq!(live_label(Some(&empty), "%2", "dead", None), "dead");
+        // registry id 形狀壞掉是第三種事：資料損壞，不是「曾經在、現在沒了」
+        assert_eq!(
+            live_label(Some(&m), "@garbage", "owner-dead", None),
+            "invalid"
+        );
+        assert_eq!(
+            live_label(None, "%1 ; kill-server", "dead", None),
+            "invalid"
+        );
+    }
+
+    /// linked window：同一 id 對到多個 `<session>:<window>`。取最後一筆等於
+    /// 隨列序給答案——而使用者問的正是「跟哪個主 session 關聯」
+    /// （跨廠複核 2026-07-31 的 major）。
+    #[test]
+    fn live_label_never_picks_one_linked_location_arbitrarily() {
+        let m = HashMap::from([(
+            "@7".to_string(),
+            vec!["alpha:1".to_string(), "beta:3".to_string()],
+        )]);
+        // 有 registry 記的 session 可消歧義 → 取那一筆
+        assert_eq!(
+            live_label(Some(&m), "@7", "owner-dead", Some("beta")),
+            "beta:3"
+        );
+        // 配不出唯一的一筆 → 全列出，讓歧義顯形，MUST NOT 任選
+        assert_eq!(
+            live_label(Some(&m), "@7", "owner-dead", None),
+            "alpha:1,beta:3"
+        );
+        assert_eq!(
+            live_label(Some(&m), "@7", "owner-dead", Some("nosuch")),
+            "alpha:1,beta:3"
+        );
+    }
+
+    /// owner 欄形如 `<session>:@<winid>`；判定錨在不可變的 `@id`，
+    /// session 名只用於 linked window 的消歧義（CLI-LIST-2）。
+    #[test]
+    fn owner_parts_split_label_from_immutable_id() {
+        assert_eq!(owner_parts("scratch:@92"), Some(("scratch", "@92")));
+        // session 名本身含冒號時取最後一個分隔點
+        assert_eq!(owner_parts("a:b:@7"), Some(("a:b", "@7")));
+        // 形狀不對一律不猜
+        assert_eq!(owner_parts(""), None);
+        assert_eq!(owner_parts("scratch"), None);
+        assert_eq!(owner_parts("scratch:16"), None);
+        assert_eq!(owner_parts("scratch:@"), None);
+    }
+
+    /// 欄值不得含 TAB／換行／控制字元：一個 TAB 就能把一列變成九欄。
+    #[test]
+    fn sanitize_field_protects_the_column_contract() {
+        assert_eq!(sanitize_field("plain-name"), "plain-name");
+        assert_eq!(sanitize_field("a\tb"), "a_b");
+        assert_eq!(sanitize_field("a\nb\r\n"), "a_b__");
+        assert_eq!(sanitize_field("bell\x07"), "bell_");
+        // 空白與多位元組字元原樣保留（它們不破壞欄位邊界）
+        assert_eq!(sanitize_field("有 空白"), "有 空白");
+    }
 
     /// worker window 名不得逐代累積 `ab:` 前綴（使用者實測回報：現場堆到
     /// `ab:ab:ab:ab:ab:ab:ab:claude`）。累積來自 orchestrator 自己坐在

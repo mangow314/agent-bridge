@@ -168,6 +168,11 @@ ln -s ~/projects/agent-bridge ~/.claude/skills/agent-bridge
 agent-bridge register <agent> <tmux-target>   # 註冊 agent（target 會正規化成 %pane_id）
 agent-bridge unregister <agent>               # 移除註冊（未註冊者報錯）
 agent-bridge list                             # 每行 name<TAB>pane_id<TAB>ready 欄（人工註冊 -；spawned 為 starting/ready）
+agent-bridge list --long                      # 人要介入時的視圖：首行欄名，八欄
+                                              # name/pane/ready/origin/where/owner/disposable/idle
+                                              # where/owner 即時反查 tmux 譯成 <session>:<window>；
+                                              # 查不到 dead / owner-dead，tmux 沒得查 ?（兩者不同）
+                                              # 唯讀：判定 dead 也不清 registry，回收一律走 despawn/evict
 agent-bridge send <agent> --from <sender> (--message <text> | --message-file <path>)
 agent-bridge receive <task-id>                # 標頭走 stderr、request 原文走 stdout
 agent-bridge start <task-id>                  # （worker，可選）delivered → running

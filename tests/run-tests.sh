@@ -4023,6 +4023,165 @@ else
   printf 'SKIP: 37 agy runtime（SRC_KIND=bash：bash 正本凍結在 M4，不支援 agy）\n'
 fi
 
+# ---- 38. list --long 介入視圖 ----
+# spec: CLI-LIST-1 CLI-LIST-2
+# 使用者痛點：`list` 只給 name/pane/ready，人要介入時看不出「pane 在哪、誰派的、
+# 哪個能刪」。資料本來就在 registry，只是沒有指令一次講完。
+#
+# 本組鎖三件事：① 裸 `list` 一個位元組都沒變（既有腳本的介面）；② --long 的
+# 失效降級是**顯式字面值**且三態分明（活著／查了不在／沒得查）；③ 唯讀——判定
+# dead 不得順手清 registry。第 ② 條是這個功能唯一會騙人的地方：把 owner 已死
+# 顯示成一個空位置，比不顯示更糟。
+#
+# 與 35–37 同理只對 Rust 執行；bash 正本自 M4 凍結，顯式 SKIP。
+if [[ "$SRC_KIND" == rust ]]; then
+
+D38="$TESTROOT/d38"
+mkdir -p "$D38/agents"
+# 38a 裸 list 不因 --long 的加入而改變：與改動前的三欄形逐字比對
+p38="$(tmx split-window -dP -F '#{pane_id}' -t it "$pane_cmd")"
+ab "$D38" register w38 "$p38" >/dev/null 2>&1
+ab "$D38" list > "$TESTROOT/l38-bare.txt" 2>/dev/null
+# 精確比對整份輸出而非 grep 一條期望列：grep 擋不住「多一列／多一欄／插入
+# 其他文字」，那些照樣是裸介面的行為變更（跨廠複核 2026-07-31 指出的假綠）
+printf 'w38\t%s\t-\n' "$p38" > "$TESTROOT/l38-bare-want.txt"
+assert "38a 裸 list 輸出與期望逐位元組相同（不只是含某一列）" \
+  cmp -s "$TESTROOT/l38-bare-want.txt" "$TESTROOT/l38-bare.txt"
+
+# 38b --long：標頭在第一行、欄數恰八
+ab "$D38" list --long > "$TESTROOT/l38-long.txt" 2>/dev/null
+assert "38b --long 首行為欄名標頭" \
+  bash -c "head -1 '$TESTROOT/l38-long.txt' | grep -qFx 'NAME	PANE	READY	ORIGIN	WHERE	OWNER	DISPOSABLE	IDLE'"
+assert "38b --long 每列恰八個 TAB 分隔欄" \
+  bash -c "awk -F'\t' 'NF != 8 { bad = 1 } END { exit bad }' '$TESTROOT/l38-long.txt'"
+ab "$D38" list -l > "$TESTROOT/l38-short.txt" 2>/dev/null
+# 比 IDLE 以外的七欄：IDLE 是牆鐘秒數，兩次呼叫本來就可能差一秒——
+# 拿它比對會做出一條會隨機紅的斷言（flake 比漏測更糟）
+cut -f1-7 "$TESTROOT/l38-long.txt" > "$TESTROOT/l38-long7.txt"
+cut -f1-7 "$TESTROOT/l38-short.txt" > "$TESTROOT/l38-short7.txt"
+assert "38b -l 是 --long 的別名（除 IDLE 秒數外輸出相同）" \
+  cmp -s "$TESTROOT/l38-long7.txt" "$TESTROOT/l38-short7.txt"
+
+# 38c 人工註冊：origin=manual、owner 欄為 `-`（沒有 owner 概念，不是死了）
+row38c="$(grep '^w38	' "$TESTROOT/l38-long.txt")"
+assert "38c 人工註冊 origin 為 manual" \
+  bash -c "printf '%s' '$row38c' | awk -F'\t' '\$4 == \"manual\" { exit 0 } { exit 1 }'"
+assert "38c 人工註冊 owner 為 -（無 owner 概念，非 owner-dead）" \
+  bash -c "printf '%s' '$row38c' | awk -F'\t' '\$6 == \"-\" { exit 0 } { exit 1 }'"
+assert "38c 活著的 pane 位置解析為 <session>:<window>，非裸 %%id" \
+  bash -c "printf '%s' '$row38c' | awk -F'\t' '\$5 ~ /^[^:]+:[0-9]+\$/ { exit 0 } { exit 1 }'"
+
+# 38d pane 已死 → `dead`；且**唯讀**：registry 不得被順手清掉
+tmx kill-pane -t "$p38" 2>/dev/null || true
+# kill-pane 是同步的（tmux 回來時 pane 已不在 list-panes），不需等待
+ab "$D38" list --long > "$TESTROOT/l38-dead.txt" 2>/dev/null
+assert "38d pane 已死 → WHERE 欄為 dead" \
+  bash -c "grep '^w38	' '$TESTROOT/l38-dead.txt' | awk -F'\t' '\$5 == \"dead\" { exit 0 } { exit 1 }'"
+assert "38d 唯讀：判定 dead 不得清掉 registry 檔" test -f "$D38/agents/w38.json"
+
+# 38e owner window 已死 → `owner-dead`。tmux 對不存在的 window id 會靜靜回
+# `:` 且 exit 0（實測 3.7b），所以這條同時是「別用 exit code 判存在性」的回歸
+D38E="$TESTROOT/d38e"
+mkdir -p "$D38E/agents"
+jq -n --arg p "$(tmx list-panes -t it -F '#{pane_id}' | head -1)" \
+  '{name:"w38e", pane_id:$p, spawned:true, ready:true, owner:"nosuch:@99999", runtime:"claude"}' \
+  > "$D38E/agents/w38e.json"
+ab "$D38E" list --long > "$TESTROOT/l38-owner.txt" 2>/dev/null
+assert "38e owner window 不存在 → OWNER 欄為 owner-dead（不是空位置）" \
+  bash -c "grep '^w38e	' '$TESTROOT/l38-owner.txt' | awk -F'\t' '\$6 == \"owner-dead\" { exit 0 } { exit 1 }'"
+
+# 38f tmux 不可用 → `?`（未知），**不得**標成 dead：那會讓整池看似該回收
+env AGENT_BRIDGE_DATA="$D38E" PATH="$FAILSHIM:$PATH" "$BRIDGE" list --long \
+  > "$TESTROOT/l38-notmux.txt" 2>/dev/null
+assert "38f tmux 不可用 → WHERE 為 ?（未知，不是 dead）" \
+  bash -c "grep '^w38e	' '$TESTROOT/l38-notmux.txt' | awk -F'\t' '\$5 == \"?\" { exit 0 } { exit 1 }'"
+assert "38f tmux 不可用 → OWNER 為 ?（未知，不是 owner-dead）" \
+  bash -c "grep '^w38e	' '$TESTROOT/l38-notmux.txt' | awk -F'\t' '\$6 == \"?\" { exit 0 } { exit 1 }'"
+
+# 38g 損壞的 registry 不得終止整份報表：該列以 ? 呈現後繼續（它照樣佔著 cap）
+printf 'not json at all\n' > "$D38E/agents/w38bad.json"
+ab "$D38E" list --long > "$TESTROOT/l38-bad.txt" 2>/dev/null; rc=$?
+assert "38g 損壞 registry：exit 仍 0" test "$rc" -eq 0
+assert "38g 損壞 registry：整列七個狀態欄全為 ?、idle 為 -（不是只看兩欄）" \
+  bash -c "grep '^w38bad	' '$TESTROOT/l38-bad.txt' | grep -qFx \"\$(printf 'w38bad\t?\t?\t?\t?\t?\t?\t-')\""
+assert "38g 損壞 registry：其餘列照常輸出（沒有一壞全倒）" \
+  grep -q '^w38e	' "$TESTROOT/l38-bad.txt"
+
+# 38h 值域：「不得暗示可以安全刪除」是設計原則，不可機器判定全稱句——
+# 用黑名單 regex 掃字面值是形式主義（RECLAIMABLE／SAFE／其他語言全繞得過，
+# 跨廠複核 2026-07-31 指出）。可機器守的是**精確標頭＋各欄允許值域**：
+# 任何新欄位或新狀態字都必須先改這裡，那才是真正的閘門
+assert "38h 標頭逐字固定（新增欄位必須先改契約）" \
+  bash -c "head -1 '$TESTROOT/l38-long.txt' | grep -qFx 'NAME	PANE	READY	ORIGIN	WHERE	OWNER	DISPOSABLE	IDLE'"
+assert "38h READY 值域 ready|starting|-|?" \
+  bash -c "tail -n +2 '$TESTROOT/l38-long.txt' | awk -F'\t' '\$3 !~ /^(ready|starting|-|\\?)\$/ { bad=1 } END { exit bad }'"
+assert "38h ORIGIN 值域 spawned|manual|?" \
+  bash -c "tail -n +2 '$TESTROOT/l38-long.txt' | awk -F'\t' '\$4 !~ /^(spawned|manual|\\?)\$/ { bad=1 } END { exit bad }'"
+assert "38h DISPOSABLE 值域 yes|expired|-|?" \
+  bash -c "tail -n +2 '$TESTROOT/l38-long.txt' | awk -F'\t' '\$7 !~ /^(yes|expired|-|\\?)\$/ { bad=1 } END { exit bad }'"
+assert "38h IDLE 值域 非負整數|-" \
+  bash -c "tail -n +2 '$TESTROOT/l38-long.txt' | awk -F'\t' '\$8 !~ /^([0-9]+|-)\$/ { bad=1 } END { exit bad }'"
+
+# 38j registry 的 id 形狀壞掉 → invalid，**不是** dead：後者會讓人以為
+# 「東西曾經在、現在沒了」，前者才是實情（資料損壞）
+D38J="$TESTROOT/d38j"
+mkdir -p "$D38J/agents"
+jq -n '{name:"w38j", pane_id:"@garbage", spawned:true, ready:true, owner:"s:@nope", runtime:"claude"}' \
+  > "$D38J/agents/w38j.json"
+ab "$D38J" list --long > "$TESTROOT/l38-invalid.txt" 2>/dev/null
+assert "38j pane_id 形狀不合法 → WHERE 為 invalid（非 dead）" \
+  bash -c "grep '^w38j	' '$TESTROOT/l38-invalid.txt' | awk -F'\t' '\$5 == \"invalid\" { exit 0 } { exit 1 }'"
+assert "38j owner 的 @id 形狀不合法 → OWNER 為 invalid（非 owner-dead）" \
+  bash -c "grep '^w38j	' '$TESTROOT/l38-invalid.txt' | awk -F'\t' '\$6 == \"invalid\" { exit 0 } { exit 1 }'"
+
+# 38k 欄值含 TAB／換行：合法 JSON string 塞一個 TAB 就能把一列變九欄，
+# 破壞「一 agent 一行、恰八欄」的承諾
+D38K="$TESTROOT/d38k"
+mkdir -p "$D38K/agents"
+jq -n '{name:"w38k\tINJECTED\tCOLS", pane_id:"%1", spawned:false}' > "$D38K/agents/w38k.json"
+ab "$D38K" list --long > "$TESTROOT/l38-tab.txt" 2>/dev/null
+assert "38k 欄值含 TAB 時每列仍恰八欄" \
+  bash -c "awk -F'\t' 'NF != 8 { bad = 1 } END { exit bad }' '$TESTROOT/l38-tab.txt'"
+assert "38k 註冊名裡的 TAB 被代換掉（不得原樣輸出）" \
+  bash -c "! printf '%s' \"\$(tail -n +2 '$TESTROOT/l38-tab.txt')\" | grep -q 'w38k	INJECTED'"
+
+# 38l linked window：tmux 的 window 可同時掛在多個 session，`-a` 列表因此
+# 同 id 出現多次。取最後一筆＝隨列序給答案，而使用者問的正是「跟哪個主
+# session 關聯」（跨廠複核 2026-07-31 的 major；用 HashMap 覆寫的版本這裡必紅）
+D38L="$TESTROOT/d38l"
+mkdir -p "$D38L/agents"
+tmx new-session -d -s linkA -x 200 -y 100 "$pane_cmd"
+w38l="$(tmx list-windows -t linkA -F '#{window_id}' | head -1)"
+p38l="$(tmx list-panes -t "$w38l" -F '#{pane_id}' | head -1)"
+tmx new-session -d -s linkB -x 200 -y 100 "$pane_cmd"
+tmx link-window -s "$w38l" -t linkB: 2>"$TESTROOT/l38-link.err"
+assert "38l 前置：link-window 成功（錯誤不得被吞）" \
+  bash -c "test ! -s '$TESTROOT/l38-link.err'"
+# 先把清單落檔再斷言：`tmx` 是本殼的 function，`bash -c` 子殼裡不存在，
+# 直接寫進 assert 會讓前置永遠紅（同 37e 的教訓）
+tmx list-panes -a -F '#{pane_id}' > "$TESTROOT/l38-panes.txt"
+assert "38l 前置：同一 window 確實掛在兩個 session" \
+  bash -c "test \"\$(grep -cx -- '$p38l' '$TESTROOT/l38-panes.txt')\" -eq 2"
+# owner 記的是 linkB → 消歧義後 OWNER 應恰為 linkB 那一筆
+jq -n --arg p "$p38l" --arg w "$w38l" \
+  '{name:"w38l", pane_id:$p, spawned:true, ready:true, owner:("linkB:" + $w), runtime:"claude"}' \
+  > "$D38L/agents/w38l.json"
+ab "$D38L" list --long > "$TESTROOT/l38-linked.txt" 2>/dev/null
+assert "38l WHERE 列出全部 live 位置（逗號分隔，不任選一個）" \
+  bash -c "grep '^w38l	' '$TESTROOT/l38-linked.txt' | awk -F'\t' '\$5 ~ /^linkA:[0-9]+,linkB:[0-9]+\$/ { exit 0 } { exit 1 }'"
+assert "38l OWNER 以 registry 的 session 標籤消歧義（恰為 linkB 那一筆）" \
+  bash -c "grep '^w38l	' '$TESTROOT/l38-linked.txt' | awk -F'\t' '\$6 ~ /^linkB:[0-9]+\$/ { exit 0 } { exit 1 }'"
+tmx kill-session -t linkA 2>/dev/null || true
+tmx kill-session -t linkB 2>/dev/null || true
+
+# 38i 參數面：未知參數要拒，不得靜默當成裸 list
+assert_fails "38i list 未知參數應拒" ab "$D38" list --bogus
+assert_fails "38i list 多餘參數應拒" ab "$D38" list --long extra
+
+else
+  printf 'SKIP: 38 list --long（SRC_KIND=bash：bash 正本凍結在 M4）\n'
+fi
+
 # ---- 總結 ----
 printf '\n共 %d PASS、%d FAIL\n' "$PASS" "$FAIL"
 if (( FAIL > 0 )); then
