@@ -35,8 +35,9 @@ pub trait TmuxClient {
     /// 長成 trait 方法只會讓這層變成 tmux CLI 的鏡像；語意留在 `spawn`
     /// 模組、這裡只負責「把 argv 送出去、把輸出讀回來」。
     ///
-    /// 回 `None`＝子行程根本起不來（PATH 沒有 tmux、fork 失敗），與
-    /// 「tmux 跑了但回非零」是兩件事——後者呼叫端要看得到 stderr。
+    /// 回 `None`＝子行程根本起不來（PATH 沒有 tmux、fork 失敗）**或逾時被殺**
+    /// （ENV-TMUX-1），與「tmux 跑了但回非零」是兩件事——後者呼叫端要看得到
+    /// stderr。
     ///
     /// 架構 §5：先讀盡 stdout/stderr 再 `wait()`（`Command::output` 內建
     /// 如此），避免 pipe buffer 滿載互等。
@@ -82,32 +83,22 @@ impl TmuxClient for SubprocessTmux {
     }
 
     fn exec(&self, args: &[&str]) -> Option<TmuxOutput> {
-        let out = Command::new("tmux")
-            .args(args)
-            .stdin(Stdio::null())
-            .output()
-            .ok()?;
+        // 逾時與起不來同一終態 `None`：TUI read model（tui-design §4 bounded-read
+        // 硬條款）與 spawn 生命週期共用這條路，卡住的 tmux 不得凍結呼叫端。
+        let out = run_bounded(args)?;
         Some(TmuxOutput {
-            status_ok: out.status.success(),
-            // tmux 的輸出是 pane id／視窗清單／選項值這類受控文字，非 payload
-            // 路徑，lossy 轉換不觸及架構 §3 的 byte 保真紅線。
-            stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
-            stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
+            status_ok: out.status_ok,
+            stdout: out.stdout,
+            stderr: out.stderr,
         })
     }
 
     fn resolve_pane(&self, target: &str) -> Option<String> {
-        let out = Command::new("tmux")
-            .args(["display", "-pt", target, "#{pane_id}"])
-            .stdin(Stdio::null())
-            .stderr(Stdio::null())
-            .output()
-            .ok()?;
-        if !out.status.success() {
+        let out = run_bounded(&["display", "-pt", target, "#{pane_id}"])?;
+        if !out.status_ok {
             return None;
         }
-        let s = String::from_utf8_lossy(&out.stdout);
-        let s = s.trim_end_matches('\n');
+        let s = out.stdout.trim_end_matches('\n');
         if s.is_empty() {
             None
         } else {
@@ -155,13 +146,17 @@ impl TmuxClient for SubprocessTmux {
     }
 }
 
-/// `run_bounded` 的結果；`exec` 的 `TmuxOutput` 不含 stderr 需求時的精簡版。
+/// `run_bounded` 的結果。stderr 只有 `exec` 的呼叫端會看（despawn 把它併進
+/// die 訊息），其餘路徑忽略。
 struct BoundedOutput {
     status_ok: bool,
     stdout: String,
+    stderr: String,
 }
 
-/// 有逾時上限的 tmux 呼叫，**通知熱路徑（`notify_pane`）全部走這裡**。
+/// 有逾時上限的 tmux 呼叫，**本模組所有 tmux 子行程一律走這裡**（原先只涵蓋
+/// 通知熱路徑；TUI 動工前依 tui-design §4 bounded-read 硬條款補齊 `exec`／
+/// `resolve_pane`——任何一條無界查詢都足以凍結整個 UI 刷新迴圈）。
 ///
 /// 只把逾時加在 `send-keys` 不夠（跨廠複核 2026-07-31 finding 1）：那只擋掉實測
 /// 到的那一個卡點，而 `notify_pane` 在送鍵之前還會跑 `list-panes`、`display`、
@@ -169,9 +164,9 @@ struct BoundedOutput {
 /// 等待，`AGENT_BRIDGE_TMUX_TIMEOUT` 形同不存在。契約（hooks.md
 /// HOOK-NOTIFY-3）承諾的是「整條通知路徑不被 tmux 鎖死」，故上限套在這一層。
 ///
-/// stdout 以獨立執行緒讀取而非等子行程結束後再讀：輸出量超過 pipe buffer 時，
-/// 子行程會卡在寫入、父行程卡在等待，兩邊互等——那正是這個函式要消滅的終態。
-/// stderr 導向 `/dev/null`（此層呼叫端都不看 stderr），少一條要照顧的 pipe。
+/// stdout／stderr 各以獨立執行緒讀取而非等子行程結束後再讀：輸出量超過 pipe
+/// buffer 時，子行程會卡在寫入、父行程卡在等待，兩邊互等——那正是這個函式要
+/// 消滅的終態。
 ///
 /// 逾時回 `None`：與「tmux 起不來」同一個終態，呼叫端一律 fail-closed。
 fn run_bounded(args: &[&str]) -> Option<BoundedOutput> {
@@ -179,23 +174,41 @@ fn run_bounded(args: &[&str]) -> Option<BoundedOutput> {
         .args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
+        .stderr(Stdio::piped())
         .spawn()
         .ok()?;
-    let reader = child.stdout.take().map(|mut out| {
-        std::thread::spawn(move || {
-            let mut buf = Vec::new();
-            let _ = std::io::Read::read_to_end(&mut out, &mut buf);
-            buf
+    let spawn_reader = |pipe: Option<Box<dyn std::io::Read + Send>>| {
+        pipe.map(|mut out| {
+            std::thread::spawn(move || {
+                let mut buf = Vec::new();
+                let _ = std::io::Read::read_to_end(&mut out, &mut buf);
+                buf
+            })
         })
-    });
+    };
+    let out_reader = spawn_reader(
+        child
+            .stdout
+            .take()
+            .map(|p| Box::new(p) as Box<dyn std::io::Read + Send>),
+    );
+    let err_reader = spawn_reader(
+        child
+            .stderr
+            .take()
+            .map(|p| Box::new(p) as Box<dyn std::io::Read + Send>),
+    );
     let status = wait_with_timeout(&mut child, config::tmux_timeout());
     // 子行程已結束或已被殺，pipe 因此 EOF，讀取緒必定收斂——join 不會卡住。
-    let buf = reader.and_then(|h| h.join().ok()).unwrap_or_default();
+    let out_buf = out_reader.and_then(|h| h.join().ok()).unwrap_or_default();
+    let err_buf = err_reader.and_then(|h| h.join().ok()).unwrap_or_default();
     let status = status?;
     Some(BoundedOutput {
         status_ok: status.success(),
-        stdout: String::from_utf8_lossy(&buf).into_owned(),
+        // tmux 的輸出是 pane id／視窗清單／選項值這類受控文字，非 payload
+        // 路徑，lossy 轉換不觸及架構 §3 的 byte 保真紅線。
+        stdout: String::from_utf8_lossy(&out_buf).into_owned(),
+        stderr: String::from_utf8_lossy(&err_buf).into_owned(),
     })
 }
 

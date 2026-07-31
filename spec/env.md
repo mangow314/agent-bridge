@@ -44,7 +44,9 @@ Source: cmd_await
 Source: notify_pane
 
 ### ENV-TMUX-1 [tested: 39]
-`AGENT_BRIDGE_TMUX_TIMEOUT`：通知路徑上單次 tmux 子行程的逾時秒數。預設 `5`，
+`AGENT_BRIDGE_TMUX_TIMEOUT`：單次 tmux 子行程的逾時秒數，涵蓋**所有** tmux
+呼叫（通知路徑、spawn 生命週期、TUI read model——tui-design §4 bounded-read
+硬條款：任何一條無界查詢都足以凍結 UI）。預設 `5`，
 `0` 等同不設限。逾時 MUST 殺掉子行程並視同該次呼叫失敗（走 notify-failed
 降級）。壞值 MUST 退預設而非終止：這是防止整個指令被鎖死的安全網（見
 hooks.md HOOK-NOTIFY-3），拼錯一個變數名不該把安全網拆掉。
