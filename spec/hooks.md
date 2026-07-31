@@ -81,21 +81,24 @@ Source: hook_write_state / cmd_hook
   → MUST 放行，且 MUST NOT 再看 `session_id` 或 `ts`。這是 parent `/clear`
   換新 session_id 的即時自癒路徑（行程沒變，身分就沒變），取代 HOOK-OWNER-2
   的 TTL 等待。
-- 兩欄齊備、`worker_pid` 現存、且其當下 starttime 等於 `worker_starttime`
-  （＝記錄仍指向同一個活著的行程），而直接 PPID 不等於 `worker_pid`
-  → MUST 擋（靜默 exit 0、無 stdout、stop 不發 block），且 MUST NOT 因 `ts`
-  過期而取得接管資格——冒名者不會因為等得夠久就變成正主。這是相對
-  HOOK-OWNER-2 的**收緊**。
-- 欄位缺其一、該 pid 已不存在、其 starttime 與記錄不符（pid 已被重用，記錄
-  過期）、或執行環境無此能力 → MUST 落回 HOOK-OWNER-2 的 session_id＋TTL
-  判別，行為與未實作本條時完全相同。**記錄過期時不得擋**：那代表本尊已不在，
-  擋下所有人只會讓通道永久死掉。
+- 直接 PPID 不等於 `worker_pid`（不論該 pid 是否仍活著）、欄位缺其一、該 pid
+  已不存在、其 starttime 與記錄不符（pid 已被重用，記錄過期）、或執行環境無
+  此能力 → MUST 落回 HOOK-OWNER-2 的 session_id＋TTL 判別，行為與未實作本條
+  時完全相同。
 
-判別 MUST 只在「明確相符」時放行、「兩欄齊備且明確不符」時擋，其餘一律落回。
-失效方向因此收斂到現狀，不會比未實作更糟。
-Note: 前提是 runtime 直接 fork hook 行程（2026-07-31 實測 claude 如此，
-`docs/rust/m5-proposal.md` §1）。這是實測結果不是介面承諾，故落回路徑是本條
-的一部分而非例外處置。registry 對同互信域的 worker 可寫，本條防的是**巢狀
+判別 MUST 只在「明確相符」時放行，其餘一律落回；**MUST NOT 把 PPID 不符當成
+「確認為冒名」而擋**。失效方向因此收斂到現狀，最壞等於未實作。
+Note: PPID 不符不足以推出冒名——合法中介一樣不符：runtime fork 出新的主行程
+而舊主仍活著、或使用者經 `AGENT_BRIDGE_CLAUDE_HOOKS`（公開覆蓋面）指定 hook
+wrapper。當成冒名的話本尊會被**永久**擋死，連 TTL 自癒都到不了，比未實作更糟
+（codex 複核 2026-07-31）。代價是本條不提供「冒名者過 TTL 仍擋」這種保證：
+巢狀 runtime 的暴露面維持 HOOK-OWNER-2 的原狀。
+Note: 「直接 fork」是 2026-07-31 對本機這版 claude 的實測（`docs/rust/
+m5-proposal.md` §1），不是介面承諾。故本條的價值只在相符時的即時自癒，落回
+路徑是常態而非例外處置。
+Note: 取樣順序 MUST 是先讀自身 PPID、再驗該 pid 的 starttime。反過來的話父
+行程若在兩次讀取之間退出，hook 會被 reparent，於是前一步證實了記錄中的行程、
+後一步卻拿到新的 PPID。registry 對同互信域的 worker 可寫，本條防的是**巢狀
 runtime 意外冒用**，不是防具寫入權的惡意行為者——後者早已在信任模型之外
 （STATE-AGENT-4 Note）。
 Source: hook_owner_gate

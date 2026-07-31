@@ -1,6 +1,8 @@
 # M5 提案：兩個殘餘窗的關閉手段
 
-狀態：**可行性已驗證，實作未開工**，等使用者裁決路線。
+狀態：**已實作**（A 路線，2026-07-31）。經 codex 複核後第 2 條被推翻，收斂
+成「只有相符是結論」——落地形狀以 `docs/rust/architecture.md` §11 為準，本文
+保留當時的量測數據與決策脈絡。
 前段：`docs/owner-gate-boundary-assessment.md`（2026-07-29 的兩窗評估，
 結論是 bash 期維持現狀、真正的關閉手段留給 Rust 期）。
 
@@ -78,10 +80,11 @@ sleep 重試）直接違反 hook 的 exit 0 鐵律與延遲要求。
 
 1. registry 有 `worker_pid`＋`worker_starttime`，且本行程的 PPID 與之相符
    → **放行**（不看 session_id、不看 ts）。這條吃掉 `/clear` 自癒。
-2. 相符欄位存在但 PPID 不符 → **擋**（這是巢狀冒名的正解，不再受 TTL 上限
-   約束，也就是說冒名者不會因為等久了就取得資格）。
-3. 欄位缺、`/proc` 讀不到、runtime 不是 claude → **退回現行的
-   session_id + TTL 判別**，行為與今天完全相同。
+2. ~~相符欄位存在但 PPID 不符 → **擋**~~ —— **這條在複核後刪掉**。PPID 不符
+   推不出冒名：合法中介（runtime fork 新主行程、使用者指定 hook wrapper）
+   一樣不符，當成冒名會把本尊永久擋死。落地版把它併進第 3 條。
+3. 其餘一切（PPID 不符、欄位缺、`/proc` 讀不到、starttime 不符）→ **退回
+   現行的 session_id + TTL 判別**，行為與今天完全相同。
 
 ### 失效方向
 
@@ -92,19 +95,23 @@ sleep 重試）直接違反 hook 的 exit 0 鐵律與延遲要求。
 
 ### Gate（可機器判定）
 
-1. 新增分組：本尊 PPID 相符放行、巢狀 PPID 不符被擋、欄位缺退回時間窗、
-   starttime 不符（模擬 pid 重用）被擋 —— 四條 hermetic 斷言，用假的
-   `/proc` 視圖或注入點餵資料，不需要真的起巢狀 session。
-2. 既有 756 不退。
+1. 新增分組：本尊 PPID 相符放行、PPID 不符退回時間窗、欄位缺退回時間窗、
+   starttime 不符（模擬 pid 重用）退回時間窗、合法中介經 wrapper 呼叫仍可
+   在過期後接管 —— hermetic 斷言，用假的 `/proc` 視圖或注入點餵資料，不需
+   要真的起巢狀 session。**落地為分組 35 的 17 條。**
+2. 既有 756 不退。**落地：bash 756／0，分組 35 顯式 SKIP。**
 3. `check-contract` 4/4；新條款編號只增（`HOOK-OWNER-5`、`STATE-CHAN-4`
-   或類似），`traceability.md` 同步。
-4. 真實 canary 一次：重跑本文件第 1 節的量測流程，確認本尊放行、巢狀被擋。
+   或類似），`traceability.md` 同步。**落地：4/4，條款為 HOOK-OWNER-5 與
+   STATE-AGENT-4。**
+4. 真實 canary 一次：重跑本文件第 1 節的量測流程，確認本尊放行。
 
 ## 4. 未量測 / 殘餘風險
 
 - **codex runtime 沒量**。codex 的 hook 走 profile overlay，行程樹未必相同。
-  A 路線對 codex 的效果目前是未知，保守假設是落回第 3 條（退回時間窗），
-  也就是 codex worker 維持現狀。要收就得補一次同樣的量測。
+  A 路線對 codex 的效果目前是未知；未知的後果就是落回第 3 條（退回時間窗）
+  ＝ codex worker 維持現狀。**因此落地版對所有 runtime 一律啟用 attestation**
+  ——第 2 條刪掉之後，猜錯不會擋死誰，只是拿不到自癒。要確認 codex 也吃得到
+  自癒，補一次同樣的量測。
 - **`pane_pid` 等於 runtime 本尊，依賴 tmux 直接 exec**。本機實測成立，但
   這是 tmux 的行為不是承諾；若哪天中間多一層 shell，spawn 記到的會是 shell
   的 pid，判別會全面落回第 3 條（安全，但窗又回來了）。值得在 gate 裡加一條

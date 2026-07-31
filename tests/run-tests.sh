@@ -3534,9 +3534,14 @@ assert "34.13 缺 sid：不產生 state 檔" bash -c "! test -e '$D34m/state/wes
 
 # ---- 35. 行程身分閘門（M5 窗 1）----
 # spec: HOOK-OWNER-5 STATE-AGENT-4
-# registry 帶得動 worker 的 (pid, starttime) 時，閘門先比對 hook 行程的**直接**
-# 父行程，比對得出結論就不看 session_id／ts。這關掉的是「parent /clear 換新
-# session_id 後被自己的閘門擋住、要等 TTL 才自癒」那個窗——行程沒變＝身分沒變。
+# registry 帶得動 worker 的 (pid, starttime) 時，閘門比對 hook 行程的**直接**
+# 父行程：確認得出是本尊就放行、不看 session_id／ts。這關掉的是「parent
+# /clear 換新 session_id 後被自己的閘門擋住、要等 TTL 才自癒」那個窗——行程
+# 沒變＝身分沒變。
+#
+# **只有相符是結論**。PPID 不符不代表冒名——合法中介（runtime fork 新主行程、
+# 或使用者用 AGENT_BRIDGE_CLAUDE_HOOKS 指定 wrapper）一樣不符，當成冒名會把
+# 本尊永久擋死，連 TTL 自癒都到不了。故不符一律落回 M4 的 session_id＋TTL。
 # 設計依據與實測：docs/rust/m5-proposal.md。
 #
 # 這一組只對 Rust 正本執行：bash 正本凍結在 M4 的行為（rollback 基準），
@@ -3590,7 +3595,8 @@ assert "35a 本尊：異主 sid 仍放行（state 被寫入）" \
 assert "35a 本尊：owner 換成本次 session_id" \
   state_field_is "$D35A/state/ida.json" owner sNEW
 
-# 35b 冒名：pid 指向一個活著、但不是本 hook 父行程的行程 → 擋
+# 35b PPID 不符（pid 指向一個活著、但不是本 hook 父行程的行程）→ 落回時間窗。
+# state 新鮮且異主，落回後照樣擋——擋的是時間窗，不是身分。
 # 用 tmux server 當那個「別人」：它一定活著且必然不是測試 shell 的子行程
 OTHER_PID="$(tmux -L "$SOCK" display -p '#{pid}' 2>/dev/null || echo 1)"
 OTHER_START="$(proc_starttime "$OTHER_PID")"
@@ -3600,24 +3606,23 @@ write_ident_reg "$D35B" idb "$OTHER_PID" "$OTHER_START"
 cp "$D35B/state/idb.json" "$TESTROOT/idb-before.json"
 hookcall "$D35B" "ab-spawn-idb-1-aaaaaaaaaaaa" prompt-submit '{"session_id":"sC"}' \
   > "$TESTROOT/h35b.out" 2>/dev/null; rc=$?
-assert "35b 冒名：exit 0" test "$rc" -eq 0
-assert "35b 冒名：無 stdout" test ! -s "$TESTROOT/h35b.out"
-assert "35b 冒名：state 檔逐位元不變" \
+assert "35b PPID 不符：exit 0" test "$rc" -eq 0
+assert "35b PPID 不符：無 stdout" test ! -s "$TESTROOT/h35b.out"
+assert "35b PPID 不符＋state 新鮮：仍擋（state 檔逐位元不變）" \
   cmp -s "$D35B/state/idb.json" "$TESTROOT/idb-before.json"
 
-# 35c **收緊**：身分明確不符時，ts 過期也不得取得接管資格。
-# 這是 HOOK-OWNER-5 相對 HOOK-OWNER-2 的行為差異，也是本組最該紅的一條——
-# 少了它，冒名者只要等過 TTL 就能變成正主
+# 35c **失效方向**：PPID 不符只是「確認不了」，不是「確認為冒名」。落回時間窗
+# 後，ts 過期就該能接管。這是本組最該紅的一條——少了它，把不符當成確定冒名的
+# 退化版本（本尊經合法中介呼叫時被永久擋死）會全綠通過
 D35C="$TESTROOT/d35c"
 mkdir -p "$D35C/state"
 jq -n '{state: "busy", ts: "2020-01-01T00:00:00Z", last_delivered: "", owner: "sP"}' \
   > "$D35C/state/idc.json"
 write_ident_reg "$D35C" idc "$OTHER_PID" "$OTHER_START"
-cp "$D35C/state/idc.json" "$TESTROOT/idc-before.json"
 hookcall "$D35C" "ab-spawn-idc-1-aaaaaaaaaaaa" prompt-submit '{"session_id":"sC"}' \
   >/dev/null 2>&1
-assert "35c 冒名＋ts 過期：仍不得接管（state 逐位元不變）" \
-  cmp -s "$D35C/state/idc.json" "$TESTROOT/idc-before.json"
+assert "35c PPID 不符＋ts 過期：落回時間窗，可接管" \
+  state_field_is "$D35C/state/idc.json" owner sC
 
 # 35d 記錄過期（pid 還在但 starttime 對不上＝pid 被重用）→ 落回時間窗。
 # 落回之後 ts 過期，於是可接管——證明「無法裁決」與「裁決為冒名」不同路
@@ -3649,6 +3654,39 @@ for reg_doc in '{"worker_pid":"'"$ME_PID"'"}' '{"worker_pid":"","worker_starttim
     state_field_is "$DE/state/ide.json" owner sFB
 done
 
+# 35g 合法中介：registry 記的 pid 是本尊（本 shell）且它還活著，但 hook 經一層
+# 合法 wrapper 呼叫，於是直接 PPID 是那層 wrapper。這是本輪修復的行為錨——
+# 把不符當成確定的冒名，本尊會被永久擋死，連 TTL 都救不回來。
+#
+# `; exit 0` 是必要的：bash -c 對「唯一且最後一個」命令會直接 exec 取代自己，
+# 那樣就沒有中介行程了。兩條斷言合起來才成立——第一條證明中介真的存在（PPID
+# 確實不符，否則會被當本尊放行），第二條證明不符只是落回而非擋死
+hookcall_via_wrapper() {
+  local data="$1" tag="$2" json="$3"
+  printf '%s' "$json" | bash --norc --noprofile -c \
+    'env AGENT_BRIDGE_DATA="$1" AGENT_BRIDGE_SPAWN_TAG="$2" PATH="$3" "$4" hook prompt-submit
+     exit 0' _ "$data" "$tag" "$SHIM:$PATH" "$BRIDGE"
+}
+
+D35G="$TESTROOT/d35g"
+seed_fresh_foreign_state "$D35G" idg
+write_ident_reg "$D35G" idg "$ME_PID" "$ME_START"
+cp "$D35G/state/idg.json" "$TESTROOT/idg-before.json"
+hookcall_via_wrapper "$D35G" "ab-spawn-idg-1-aaaaaaaaaaaa" '{"session_id":"sMID"}' \
+  >/dev/null 2>&1
+assert "35g 合法中介：PPID 確實不符（state 新鮮異主，故擋）" \
+  cmp -s "$D35G/state/idg.json" "$TESTROOT/idg-before.json"
+
+D35G2="$TESTROOT/d35g2"
+mkdir -p "$D35G2/state"
+jq -n '{state: "busy", ts: "2020-01-01T00:00:00Z", last_delivered: "", owner: "sP"}' \
+  > "$D35G2/state/idg.json"
+write_ident_reg "$D35G2" idg "$ME_PID" "$ME_START"
+hookcall_via_wrapper "$D35G2" "ab-spawn-idg-1-aaaaaaaaaaaa" '{"session_id":"sMID"}' \
+  >/dev/null 2>&1
+assert "35g 合法中介＋ts 過期：不得永久擋死本尊（可接管）" \
+  state_field_is "$D35G2/state/idg.json" owner sMID
+
 # 35f STATE-AGENT-4：spawn 真的把身分兩欄寫進 registry，且 worker_pid 指向的
 # 行程確實是本次 runtime。少了這條，上面幾條驗的都只是自己捏的 registry，
 # 「spawn 會不會寫」完全沒被鎖住
@@ -3662,7 +3700,9 @@ assert "35f spawn 寫入 worker_starttime（純數字）" \
 # **刻意不在這裡事後比對 argv**：runtime stub 收工前會 `exec bash` 換掉自己的
 # argv（pid 不變、starttime 不變）——這正好示範了為什麼持續判別要綁 starttime
 # 而不是綁 argv。argv 只在 spawn 當下用來確認「pane_pid 是 runtime 不是中介
-# shell」，那一層由 proc::argv_has_basename 的單元測試守
+# shell」，那一層由 spawn::tests::worker_identity_requires_runtime_attestation
+# 守——它錨在 caller 上，把 resolve_worker_identity 裡的 attestation 拿掉會紅
+# （只驗 helper 的單元測試擋不住那個退化，codex 複核 2026-07-31 §4）
 wid_pid="$(jq -r '.worker_pid' "$D35F/agents/wid.json")"
 assert "35f worker_pid 等於 tmux 回報的 pane_pid" \
   test "$wid_pid" = "$(tmx display -pt "$pane_35f" '#{pane_pid}')"

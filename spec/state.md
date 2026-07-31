@@ -49,13 +49,25 @@ pid 重用）。取不到任一項時 MUST 寫入空字串而非讓 spawn 失敗
 HOOK-OWNER-5 的最佳化輸入，缺了只是落回時間窗判別，不影響 spawn 是否成立。
 Note: `pane_pid` 之所以就是 runtime 本尊，是因為 tmux 直接 exec 啟動命令、
 中間無 shell 層（2026-07-31 實測）。若該前提在某環境不成立，記到的會是中介
-行程的 pid，而本尊 hook 的 PPID 會與之不符、反被 HOOK-OWNER-5 擋掉——比不做
-更糟。**故 spawn MUST 在寫入前確認該 pid 的 `argv[0]` basename 等於本次
-runtime 名**，不符則兩欄留空走落回路徑。只看 `argv[0]` 是刻意的：夾了 shell
-時整串 cmdline 找得到 runtime 名（在 `sh -c` 的引數裡），argv[0] 則是 `sh`。
+行程的 pid，而本尊 hook 的 PPID 永遠與之不符，HOOK-OWNER-5 的自癒整條失效。
+**故 spawn MUST 在寫入前確認該 pid 的 cmdline 形狀是本次 runtime**，不符則
+兩欄留空走落回路徑。形狀規則 MUST 只看前兩項 argv：argv[0] 的 basename 等於
+runtime 名（直接執行檔），或 argv[0] 是直譯器時 argv[1] 的 basename 等於
+runtime 名（`bash /path/to/claude`、`env codex`；argv[1] 以 `-` 起首者為選項，
+不看）。
+MUST NOT 放寬成「任一 argv 項」：那會把完全不是 runtime 的行程認成 runtime
+（實測 `python -c 'sleep' codex` 誤命中）。夾了 shell 的 `sh -c "…exec
+claude…"` 其 argv[1] 是 `-c`，依本規則正確不命中。
+Note: cmdline 與 starttime MUST 取自同一份行程快照——`starttime → cmdline →
+starttime` 夾住，兩次相同才採用。分兩次讀的話行程可能在中間退出而 pid 被
+重用，於是用舊 runtime 的 argv 驗證成功、卻記下新行程的 starttime。
 Note: 身分確認 MUST NOT 讀 `/proc/<pid>/environ`（行程完整環境，含憑證，屬
 本專案安全邊界的絕對禁區）。spawn tag 存在環境而非 argv，因此確認手段只能
-是 argv[0] 這條較弱的線索；不足之處由「不確定就留空、留空就落回」吸收。
+是 argv 這條較弱的線索；不足之處由「不確定就留空、留空就落回」吸收。
+Note: 分組 35 驗的是「spawn 確實寫入兩欄、且指向該 pane 的同一次行程生命」；
+argv 形狀那一層的錨在 Rust 端——`proc::tests::cmdline_shapes`（規則本體）與
+`spawn::tests::worker_identity_requires_runtime_attestation`（caller 真的有
+呼叫它，把 attestation 拿掉會紅）。
 Note: 本檔對同互信域的 worker 可寫，這兩欄與 `spawn_tag` 同級——是身分**線索**
 不是憑證，防的是巢狀 runtime 的意外冒用而非具寫入權的惡意行為者。
 Source: cmd_spawn

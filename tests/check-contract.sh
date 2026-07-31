@@ -84,6 +84,7 @@ check_2() {
   # **雙向**集合相等，不是單向包含：單向只驗「宣稱的都在 spec」，一個退化成
   # 只印一個命令的載具照樣印 ok（獨立複核 2026-07-31 的 mutation 實證）。
   # 反向那半（spec 有章節、實作沒有）本來就是 cutover 後最該紅的形狀
+  # shellcheck disable=SC2016  # 單引號是刻意的：pattern 裡的反引號是字面值
   spec_cmds="$(grep -o '^## `[a-z-]*`$' "$SPEC/cli.md" | tr -d '#` ' | sort -u)"
   if [[ "$cmds" != "$spec_cmds" ]]; then
     fail "2 子指令集合與 cli.md 章節不一致（源：$SRC_KIND）："

@@ -722,9 +722,9 @@ fn new_window(tmux: &dyn TmuxClient, opts: &[&str], cmd: &str) -> Result<String>
 /// 皆空（＝hook 端落回時間窗判別）。
 ///
 /// **這裡的保守是有方向的**：記錯 pid 比不記更糟——本尊 hook 的 PPID 會與錯
-/// 的 pid 不符，反被自己的閘門擋掉。所以只有在 `pane_pid` 的 `argv[0]`
-/// basename 確實等於本次 runtime 名時才採用；任何一步取不到、對不上，都退回
-/// 空字串。
+/// 的 pid 不符，M5 的自癒整條失效。所以身分一律走 `proc::attest_runtime`：
+/// `pane_pid` 的 cmdline 形狀確實是本次 runtime、且前後兩次 starttime 相同，
+/// 才採用；任何一步取不到、對不上，都退回空字串。
 fn resolve_worker_identity(tmux: &dyn TmuxClient, pane: &str, runtime: &str) -> (String, String) {
     let empty = (String::new(), String::new());
     if !crate::proc::available() {
@@ -737,11 +737,8 @@ fn resolve_worker_identity(tmux: &dyn TmuxClient, pane: &str, runtime: &str) -> 
         return empty;
     };
     let pid = pid.trim().to_string();
-    if !crate::proc::argv_has_basename(&pid, runtime) {
-        // 夾了 shell、runtime 是 wrapper script、或 pid 已經不在了
-        return empty;
-    }
-    match crate::proc::starttime(&pid) {
+    // 夾了 shell、runtime 是 wrapper script、或 pid 已經不在了 → 空欄 fallback
+    match crate::proc::attest_runtime(&pid, runtime) {
         Some(st) => (pid, st),
         None => empty,
     }
@@ -1366,6 +1363,96 @@ mod tests {
             "AGENT_BRIDGE_SPAWN_TAG=ab-spawn-w1-12345-0123456789AB",
             "w1"
         ));
+    }
+
+    /// 只回一個固定 `pane_pid` 的 tmux 替身，其餘子命令一律失敗。
+    struct PidOnlyTmux(String);
+
+    impl TmuxClient for PidOnlyTmux {
+        fn exec(&self, args: &[&str]) -> Option<crate::tmux::TmuxOutput> {
+            let ok = args.first() == Some(&"display-message") && args.contains(&"#{pane_pid}");
+            Some(crate::tmux::TmuxOutput {
+                status_ok: ok,
+                stdout: if ok {
+                    format!("{}\n", self.0)
+                } else {
+                    String::new()
+                },
+                stderr: String::new(),
+            })
+        }
+        fn available(&self) -> bool {
+            true
+        }
+        fn resolve_pane(&self, _target: &str) -> Option<String> {
+            None
+        }
+        fn pane_exists(&self, _pane: &str) -> bool {
+            false
+        }
+        fn capture_pane(&self, _pane: &str) -> Option<String> {
+            None
+        }
+        fn send_keys(&self, _pane: &str, _keys: &str) -> bool {
+            false
+        }
+    }
+
+    /// STATE-AGENT-4：`resolve_worker_identity` 必須真的驗過 argv 才記身分。
+    ///
+    /// 單元測試只驗 helper 正確擋不住這件事——把這裡的 attestation 整段拿掉，
+    /// helper 的測試仍然全綠（codex 複核 2026-07-31 §4）。所以錨在 caller：
+    /// pane_pid 指向一個 cmdline **不是** runtime 的行程（就用測試行程自己）
+    /// 時，兩欄必須皆空。
+    #[test]
+    fn worker_identity_requires_runtime_attestation() {
+        if !crate::proc::available() {
+            return; // 非 Linux：這條沒有可觀測對象
+        }
+        let me = std::process::id().to_string();
+        let tmux = PidOnlyTmux(me.clone());
+
+        // 名字對不上 pane_pid 的 cmdline → 空欄 fallback，不得記下錯的 pid
+        assert_eq!(
+            resolve_worker_identity(&tmux, "%1", "__surely_not_a_runtime__"),
+            (String::new(), String::new())
+        );
+
+        // 名字對得上時才記，且 starttime 必須是該 pid 當下的值
+        let raw = std::fs::read(format!("/proc/{me}/cmdline")).unwrap();
+        let argv0 = raw.split(|b| *b == 0).next().unwrap();
+        let base =
+            String::from_utf8(argv0.rsplit(|b| *b == b'/').next().unwrap().to_vec()).unwrap();
+        let (pid, st) = resolve_worker_identity(&tmux, "%1", &base);
+        assert_eq!(pid, me);
+        assert_eq!(Some(st), crate::proc::starttime(&me));
+
+        // tmux 拿不到 pane_pid → 空欄
+        struct DeadTmux;
+        impl TmuxClient for DeadTmux {
+            fn exec(&self, _args: &[&str]) -> Option<crate::tmux::TmuxOutput> {
+                None
+            }
+            fn available(&self) -> bool {
+                true
+            }
+            fn resolve_pane(&self, _t: &str) -> Option<String> {
+                None
+            }
+            fn pane_exists(&self, _p: &str) -> bool {
+                false
+            }
+            fn capture_pane(&self, _p: &str) -> Option<String> {
+                None
+            }
+            fn send_keys(&self, _p: &str, _k: &str) -> bool {
+                false
+            }
+        }
+        assert_eq!(
+            resolve_worker_identity(&DeadTmux, "%1", &base),
+            (String::new(), String::new())
+        );
     }
 
     #[test]

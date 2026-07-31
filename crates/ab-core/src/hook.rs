@@ -141,12 +141,15 @@ fn read_json_field(file: &Path, key: &str) -> Option<String> {
 /// `notify_or_defer` 的下界論證）。ts 過期時通知端本來就把這份 state 當
 /// 「未知」走 legacy——通道此刻已降級，交出所有權零損失。
 ///
-/// **M5（HOOK-OWNER-5）**：registry 帶得動行程身分時，先由它裁決，時間窗只是
-/// 落回路徑。`/clear` 的自癒因此變成即時（行程沒變＝身分沒變），不再等 TTL。
+/// **M5（HOOK-OWNER-5）**：行程身分只做一件事——確認得了本尊就即刻放行，
+/// `/clear` 的自癒因此變成即時（行程沒變＝身分沒變），不再等 TTL。確認不了
+/// 就整條交還給下面的 session_id＋TTL，也就是 M4 行為；這條路上沒有「確認為
+/// 冒名」這種結論。
 pub fn owner_gate(file: &Path, sid: &str, reg_file: &Path) -> bool {
-    // 明確相符→放行且不看 sid/ts；明確不符→擋且不得靠 ts 過期取得接管資格
-    if let Some(verdict) = proc_identity_verdict(reg_file) {
-        return verdict;
+    // 確認是 worker 本尊→即刻放行，不看 sid/ts（`/clear` 換 sid 後的自癒）。
+    // 確認不了→什麼都不主張，照 M4 的 session_id＋TTL 走
+    if proc_identity_confirms_self(reg_file) {
+        return true;
     }
     let Some(owner) = read_json_field(file, "owner") else {
         // 檔案不存在、非 JSON、或無 owner 欄（舊格式）一律放行
@@ -168,30 +171,42 @@ pub fn owner_gate(file: &Path, sid: &str, reg_file: &Path) -> bool {
     !(age >= 0 && age <= ttl)
 }
 
-/// HOOK-OWNER-5 的行程身分裁決。`Some(true)`＝本尊、`Some(false)`＝冒名、
-/// `None`＝無法判斷（呼叫端落回 session_id＋TTL）。
+/// HOOK-OWNER-5 的行程身分裁決：`true`＝已確認本 hook 是 registry 記下的那個
+/// worker runtime 直接 fork 的；`false`＝**確認不了**（呼叫端落回 session_id
+/// ＋TTL），不是「確認為冒名」。
 ///
-/// **只在兩欄齊備且 pid 現在還活著時才給裁決**。任何一步缺料都回 `None`：
-/// 這條路的錯誤方向不對稱——誤放行只是回到今天的暴露面，誤擋掉的卻是 worker
-/// 本尊，會讓它的 state 通道永久死掉（比未實作更糟）。
-fn proc_identity_verdict(reg_file: &Path) -> Option<bool> {
+/// **只有 exact match 是安全的 positive**。PPID 與記錄的 pid 不符不能當成冒名
+/// ——合法的中介一樣會不符：runtime fork 出新的主行程而舊主還活著、或使用者經
+/// `AGENT_BRIDGE_CLAUDE_HOOKS`（公開覆蓋面）指定了 hook wrapper。把不符當成
+/// 確定的冒名，會讓本尊被**永久**誤擋，連 TTL 自癒都到不了，正是架構 §11.2
+/// 自己定的「比未實作更糟」（codex 複核 2026-07-31 §1）。
+///
+/// 代價是放棄「冒名者過了 TTL 仍永遠擋」這個收緊：M5 收斂成純粹的本尊即時
+/// 自癒，其餘一律等於 M4 行為，失效方向這才真正對稱。
+///
+/// 取樣順序是 **PPID 先、starttime 後**：反過來的話父行程若在兩次讀取之間退出，
+/// hook 會被 reparent，於是前一步證實了 recorded process、後一步卻拿到新的
+/// PPID（codex 複核 §2 blocker 2）。先讀 PPID 則任何後續變動只會讓
+/// starttime 對不上而落回。
+fn proc_identity_confirms_self(reg_file: &Path) -> bool {
     if !crate::proc::available() {
-        return None;
+        return false;
     }
-    let pid = read_json_field(reg_file, "worker_pid")?;
-    let recorded_start = read_json_field(reg_file, "worker_starttime")?;
+    let (Some(pid), Some(recorded_start)) = (
+        read_json_field(reg_file, "worker_pid"),
+        read_json_field(reg_file, "worker_starttime"),
+    ) else {
+        return false;
+    };
     if pid.is_empty() || recorded_start.is_empty() {
-        return None;
+        return false;
     }
-    // 記錄的行程已不在（starttime 讀不到）：worker 本尊都不存在了，這條路沒有
-    // 可裁決的對象，交還給時間窗
-    let current_start = crate::proc::starttime(&pid)?;
-    if current_start != recorded_start {
-        // pid 還在但已是別的行程（pid 重用）——記錄過期，同樣不裁決
-        return None;
+    // 誰 fork 了這個 hook。不是記下的那個 pid 就什麼都不主張
+    if crate::proc::self_ppid().as_deref() != Some(pid.as_str()) {
+        return false;
     }
-    let ppid = crate::proc::self_ppid()?;
-    Some(ppid == pid)
+    // pid 會被回收重用：父行程得是記錄當下的那一次行程生命，才算本尊
+    crate::proc::starttime(&pid).as_deref() == Some(recorded_start.as_str())
 }
 
 /// hook_oldest_queued:2098 — 最舊一筆 `to == agent` 且狀態為 queued 的 task-id。
@@ -525,25 +540,28 @@ mod tests {
             "PPID 相符時應無視異主的 session_id"
         );
 
-        // 冒名：pid 是個活著的行程（自己），但不是本 hook 的父行程 → 擋
+        // PPID 不符（巢狀 runtime、或合法的中介／新主行程——這裡分不出來）：
+        // 不主張任何事，落回 session_id＋TTL。state 仍新鮮且異主，故照舊擋
         let me = std::process::id().to_string();
         let me_start = crate::proc::starttime(&me).unwrap();
         write_reg(&me, &me_start);
-        assert!(!owner_gate(&state, "nested", &reg), "PPID 不符應擋");
+        assert!(!owner_gate(&state, "nested", &reg), "異主且 state 新鮮應擋");
 
-        // **收緊**：身分明確不符時，ts 過期也不得取得接管資格
+        // 但擋是「時間窗擋的」，不是身分擋的：ts 一過期就該能接管。**不得**
+        // 把 PPID 不符當成確定的冒名——合法中介一樣不符，永久擋死本尊比不做
+        // 還糟（codex 複核 §1）
         std::fs::write(
             &state,
             br#"{"state":"busy","ts":"2020-01-01T00:00:00Z","owner":"s1"}"#,
         )
         .unwrap();
         assert!(
-            !owner_gate(&state, "nested", &reg),
-            "冒名者不該因為等得夠久就變成正主"
+            owner_gate(&state, "nested", &reg),
+            "PPID 不符只是確認不了，過期後仍須可接管"
         );
 
-        // starttime 對不上（pid 被重用）＝記錄過期 → 落回時間窗，此刻 ts 已
-        // 過期故可接管。這條同時證明「不裁決」與「裁決為假」不是同一條路
+        // PPID 相符但 starttime 對不上（pid 被回收重用）：記錄過期，同樣落回
+        // 時間窗——此刻 ts 已過期故可接管
         write_reg(&ppid, "999999999999");
         assert!(
             owner_gate(&state, "other", &reg),
