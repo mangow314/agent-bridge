@@ -26,6 +26,25 @@ pub const ENV_NOTIFY_DELAY: &str = "AGENT_BRIDGE_NOTIFY_DELAY";
 /// hook 端據以析出「我是誰」的 spawn tag。
 pub const ENV_SPAWN_TAG: &str = "AGENT_BRIDGE_SPAWN_TAG";
 
+/// 同時存活的 spawned worker 上限。
+pub const ENV_MAX_SPAWN: &str = "AGENT_BRIDGE_MAX_SPAWN";
+/// spawn 後等待 worker 自報就緒的秒數（0＝不等待）。
+pub const ENV_READY_TIMEOUT: &str = "AGENT_BRIDGE_READY_TIMEOUT";
+/// 就緒探針的重送間隔秒數。
+pub const ENV_READY_PROBE_INTERVAL: &str = "AGENT_BRIDGE_READY_PROBE_INTERVAL";
+/// worker 守則檔路徑。
+pub const ENV_WORKER_BRIEF: &str = "AGENT_BRIDGE_WORKER_BRIEF";
+/// 接手者守則檔路徑（relay 用）。
+pub const ENV_SUCCESSOR_BRIEF: &str = "AGENT_BRIDGE_SUCCESSOR_BRIEF";
+/// claude worker 的 hooks settings 檔路徑。
+pub const ENV_CLAUDE_HOOKS: &str = "AGENT_BRIDGE_CLAUDE_HOOKS";
+/// 額外要穿透進 worker pane 的環境變數名（逗號分隔）。
+pub const ENV_PASS_ENV: &str = "AGENT_BRIDGE_PASS_ENV";
+/// 接力鏈深度（relay 在鏈上逐棒下傳）。
+pub const ENV_RELAY_DEPTH: &str = "AGENT_BRIDGE_RELAY_DEPTH";
+/// 接力鏈深度上限（0＝解除限制）。
+pub const ENV_MAX_RELAY_DEPTH: &str = "AGENT_BRIDGE_MAX_RELAY_DEPTH";
+
 /// state TTL 的預設值（bash `${AGENT_BRIDGE_STATE_TTL:-1800}`）。
 pub const STATE_TTL_DEFAULT: i64 = 1800;
 
@@ -119,9 +138,184 @@ pub fn notify_delay_secs() -> Option<f64> {
     }
 }
 
+/// bash `REPO_ROOT="$(dirname "$(dirname "$SCRIPT_PATH")")"`（bin/agent-bridge:45-46），
+/// 其中 `SCRIPT_PATH` 是 `readlink -f` 後的實體路徑。Rust 這邊
+/// `current_exe()` 在 Linux 讀 `/proc/self/exe`，同樣是解析完符號連結的實體
+/// 路徑——測試把 `$SHIM/agent-bridge` symlink 到執行檔，兩邊都會解析到本尊。
+///
+/// 因此 Rust 執行檔的擺放位置決定預設 brief 找不找得到：必須是
+/// `<root>/<某層>/<執行檔>`，讓 `<root>/share/` 是它的祖父層兄弟目錄
+/// （測試 22f／23a 也是用 `dirname(dirname($BRIDGE))/share` 反推正本位置）。
+fn repo_root() -> std::path::PathBuf {
+    let exe = std::env::current_exe().unwrap_or_default();
+    exe.parent()
+        .and_then(|p| p.parent())
+        .map(|p| p.to_path_buf())
+        .unwrap_or_default()
+}
+
+/// `${VAR:-<repo_root>/<rel>}`：未設定或空字串取預設（ENV-BRIEF-1/2）。
+fn path_env_or(name: &str, rel: &str) -> std::path::PathBuf {
+    match read_env(name) {
+        EnvValue::Text(v) => std::path::PathBuf::from(v),
+        // 非 UTF-8 路徑照原樣用：bash 拿到的也是原始位元組
+        EnvValue::NonUnicode => std::env::var_os(name)
+            .map(std::path::PathBuf::from)
+            .unwrap_or_default(),
+        EnvValue::Unset => repo_root().join(rel),
+    }
+}
+
+/// worker 守則檔（ENV-BRIEF-1）。
+pub fn worker_brief() -> std::path::PathBuf {
+    path_env_or(ENV_WORKER_BRIEF, "share/worker-brief.md")
+}
+
+/// 接手者守則檔（ENV-BRIEF-2）。
+pub fn successor_brief() -> std::path::PathBuf {
+    path_env_or(ENV_SUCCESSOR_BRIEF, "share/successor-brief.md")
+}
+
+/// claude worker 的 hooks settings。
+pub fn claude_hooks_settings() -> std::path::PathBuf {
+    path_env_or(ENV_CLAUDE_HOOKS, "share/claude-worker-hooks.json")
+}
+
+/// bash `[[ "$max" =~ ^[0-9]{1,9}$ ]]`（cmd_spawn:1180）：壞值致命。
+pub fn max_spawn() -> Result<i64> {
+    match read_env(ENV_MAX_SPAWN) {
+        EnvValue::Unset => Ok(4),
+        EnvValue::Text(raw) => parse_ttl(&raw)
+            .ok_or_else(|| Error::new(format!("{ENV_MAX_SPAWN} 需為非負整數：{raw}"))),
+        EnvValue::NonUnicode => Err(Error::new(format!(
+            "{ENV_MAX_SPAWN} 需為非負整數：{}",
+            lossy(ENV_MAX_SPAWN)
+        ))),
+    }
+}
+
+/// `validate_ready_opts`:988 — 兩個 readiness 參數**必須在建 pane 之前**驗完；
+/// 回傳 `(timeout_secs, probe_interval_secs)`。
+pub fn ready_opts() -> Result<(u64, f64)> {
+    let t_raw = match read_env(ENV_READY_TIMEOUT) {
+        EnvValue::Unset => String::from("30"),
+        EnvValue::Text(v) => v,
+        EnvValue::NonUnicode => lossy(ENV_READY_TIMEOUT),
+    };
+    let timeout = parse_ttl(&t_raw).ok_or_else(|| {
+        Error::new(format!(
+            "{ENV_READY_TIMEOUT} 需為非負整數（秒，至多 9 位；0＝不等待）：{t_raw}"
+        ))
+    })? as u64;
+
+    let i_raw = match read_env(ENV_READY_PROBE_INTERVAL) {
+        EnvValue::Unset => String::from("2"),
+        EnvValue::Text(v) => v,
+        EnvValue::NonUnicode => lossy(ENV_READY_PROBE_INTERVAL),
+    };
+    if !decimal_shape_ok(&i_raw) {
+        return Err(Error::new(format!(
+            "{ENV_READY_PROBE_INTERVAL} 需為正數（秒）：{i_raw}"
+        )));
+    }
+    // bash `[[ ! "$i" =~ ^0*(\.0+)?$ ]]`：小數點前後都只有 0（或省略整數位）
+    // 即零值。`.0`／`00` 這些形狀也要擋，否則探針成忙迴圈
+    let interval: f64 = i_raw.parse().unwrap_or(0.0);
+    if interval == 0.0 {
+        return Err(Error::new(format!(
+            "{ENV_READY_PROBE_INTERVAL} 需大於 0（否則探針會忙迴圈）：{i_raw}"
+        )));
+    }
+    Ok((timeout, interval))
+}
+
+/// bash `^([0-9]+|[0-9]*\.[0-9]+)$`（小數點後至少一位；`1.` 不合法）。
+fn decimal_shape_ok(raw: &str) -> bool {
+    match raw.split_once('.') {
+        None => !raw.is_empty() && raw.bytes().all(|b| b.is_ascii_digit()),
+        Some((int_part, frac)) => {
+            int_part.bytes().all(|b| b.is_ascii_digit())
+                && !frac.is_empty()
+                && frac.bytes().all(|b| b.is_ascii_digit())
+        }
+    }
+}
+
+/// `AGENT_BRIDGE_PASS_ENV`（cmd_spawn:1238-1246）：逗號分隔的變數名清單，
+/// 逐個驗 `^[A-Za-z_][A-Za-z0-9_]*$`，空段落跳過；不合法即 die。
+pub fn pass_env_names() -> Result<Vec<String>> {
+    let raw = match read_env(ENV_PASS_ENV) {
+        EnvValue::Unset => return Ok(Vec::new()),
+        EnvValue::Text(v) => v,
+        EnvValue::NonUnicode => lossy(ENV_PASS_ENV),
+    };
+    let mut out = Vec::new();
+    for part in raw.split(',') {
+        if part.is_empty() {
+            continue;
+        }
+        let mut bytes = part.bytes();
+        let head_ok = matches!(bytes.next(), Some(b) if b.is_ascii_alphabetic() || b == b'_');
+        if !head_ok || !bytes.all(|b| b.is_ascii_alphanumeric() || b == b'_') {
+            return Err(Error::new(format!(
+                "{ENV_PASS_ENV} 含不合法的變數名：{part}"
+            )));
+        }
+        out.push(part.to_string());
+    }
+    Ok(out)
+}
+
+/// 接力鏈深度（cmd_relay:1438-1445）。bash 用 `${VAR-0}` 而非 `${VAR:-0}`：
+/// **「已設但為空」不吃預設**，會落進格式檢查被拒——否則
+/// `AGENT_BRIDGE_RELAY_DEPTH=''` 會靜默把鏈深度重置成 0，cap 形同虛設。
+/// 故此處不能用 `read_env`（它把空字串歸進 `Unset`）。
+pub fn relay_depth() -> Result<i64> {
+    depth_var(
+        ENV_RELAY_DEPTH,
+        0,
+        "需為非負整數（空值也不接受，避免靜默重置鏈深度）",
+    )
+}
+
+/// 接力鏈深度上限（預設 10；0＝解除限制）。
+pub fn max_relay_depth() -> Result<i64> {
+    depth_var(ENV_MAX_RELAY_DEPTH, 10, "需為非負整數（空值也不接受）")
+}
+
+fn depth_var(name: &str, default: i64, complaint: &str) -> Result<i64> {
+    let Some(os) = std::env::var_os(name) else {
+        return Ok(default);
+    };
+    let raw = os.to_string_lossy().into_owned();
+    parse_ttl(&raw).ok_or_else(|| Error::new(format!("{name} {complaint}：{raw}")))
+}
+
+fn lossy(name: &str) -> String {
+    std::env::var_os(name)
+        .map(|v| v.to_string_lossy().into_owned())
+        .unwrap_or_default()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `validate_ready_opts` 的零值判斷：`0`／`0.0`／`.0`／`00` 全是零，
+    /// 必須被擋（bash `^0*(\.0+)?$`）。`1.` 則是形狀就不合法。
+    #[test]
+    fn probe_interval_shapes() {
+        for good in ["1", "0.5", ".5", "2", "10.25"] {
+            assert!(decimal_shape_ok(good), "形狀應合法：{good}");
+        }
+        for bad in ["1.", "", ".", "abc", "-1", "1e3"] {
+            assert!(!decimal_shape_ok(bad), "形狀應不合法：{bad}");
+        }
+        for zero in ["0", "0.0", ".0", "00", "0.00"] {
+            assert!(decimal_shape_ok(zero), "形狀合法但值為零：{zero}");
+            assert_eq!(zero.parse::<f64>().unwrap(), 0.0);
+        }
+    }
 
     #[test]
     fn ttl_grammar_matches_bash_regex() {

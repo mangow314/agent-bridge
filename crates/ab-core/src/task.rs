@@ -50,9 +50,14 @@ impl TaskState {
 
 /// 訊息來源：`--message <text>`／`--message-file <path>`／`--message-file -`（stdin）。
 /// 對映 bash `write_message` 的 `mode`/`val` 二元組。
+///
+/// `Text` 帶的是 **argv 的原始位元組**而非 `String`（M3 修）：`--message` 的
+/// 值是 payload 的一部分，分組 6 驗 byte-for-byte 保真，而 bash 的
+/// `printf '%s\n' "$val"` 原樣吐出呼叫端給的位元組。經 `String` 中轉會把非
+/// UTF-8 位元組換成 U+FFFD——payload 邊界走 bytes 是架構 §3 的紅線。
 #[derive(Debug, Clone)]
 pub enum MessageSource {
-    Text(String),
+    Text(Vec<u8>),
     File(PathBuf),
     Stdin,
 }
@@ -147,7 +152,7 @@ pub fn update_meta_status(dir: &Path, new: TaskState) -> Result<()> {
 pub fn write_message(dest: &Path, src: &MessageSource) -> Result<()> {
     let bytes: Vec<u8> = match src {
         MessageSource::Text(t) => {
-            let mut b = t.as_bytes().to_vec();
+            let mut b = t.clone();
             b.push(b'\n');
             b
         }
@@ -205,11 +210,47 @@ pub fn meta_str(dir: &Path, key: &str) -> Result<String> {
     }
 }
 
+/// `last_task_at`:457 — 最後一個派給該 agent 的任務建立時間（ISO），從未被
+/// 派工則回空字串。掃 `tasks/` 而不是在 send 時記進 registry：send 是核心
+/// 路徑，加一次「取鎖＋寫入」會擴大它的失敗面，而這資訊只有回收決策要用。
+///
+/// ISO 8601 UTC 定長字串可直接字典序比大小，不必轉 epoch。單一損壞的
+/// metadata 不該讓整份報表消失——跳過它，繼續看其他任務（bash 的
+/// `|| continue`）。欄位取值走 `jq -r` 語意（`jq_raw_field`）。
+pub fn last_task_at(paths: &Paths, who: &str) -> String {
+    let Ok(rd) = std::fs::read_dir(&paths.tasks_dir) else {
+        return String::new();
+    };
+    let mut latest = String::new();
+    for entry in rd.filter_map(|e| e.ok()) {
+        let meta_path = entry.path().join("metadata.json");
+        if !meta_path.is_file() {
+            continue;
+        }
+        let Ok(content) = std::fs::read_to_string(&meta_path) else {
+            continue;
+        };
+        let Ok(Value::Object(fields)) = json::parse(&content) else {
+            continue;
+        };
+        if json::jq_raw_field(&fields, "to").as_deref() != Some(who) {
+            continue;
+        }
+        let Some(ts) = json::jq_raw_field(&fields, "created_at") else {
+            continue;
+        };
+        if latest.is_empty() || ts > latest {
+            latest = ts;
+        }
+    }
+    latest
+}
+
 /// rand_suffix:146 — `head -c 2 /dev/urandom | od -An -tx1`：2 bytes 轉 4 位
 /// 小寫 hex。std-only（架構 §1），直接讀 `/dev/urandom`；讀不到時退回
 /// pid＋奈秒混合值——task-id 的隨機尾綴只為避免同秒碰撞，不是安全用途，
 /// 且 `cmd_send` 本來就有碰撞重試迴圈兜底。
-fn rand_suffix() -> String {
+pub(crate) fn rand_suffix() -> String {
     let mut buf = [0u8; 2];
     if let Ok(mut f) = std::fs::File::open("/dev/urandom")
         && f.read_exact(&mut buf).is_ok()
@@ -584,6 +625,35 @@ mod tests {
             .filter_map(|e| e.ok())
             .collect();
         assert!(leftovers.is_empty(), "殘缺目錄未清除：{leftovers:?}");
+    }
+
+    /// **先寫裸 status、再寫 metadata**（分組 31i 鎖的 split-brain 方向）。
+    /// 套件那條斷言是源碼耦合的（`sed` 抽 bash 函式本體比對兩行的行號），
+    /// 抽取對象在 M3 固定成 bash 正本，Rust 這側改由本測試守。
+    ///
+    /// 觀察法：把 `status` 換成目錄，讓那次寫入必然失敗（rename 覆蓋不了
+    /// 目錄）。順序正確的話 metadata 根本還沒被動，`status` 欄位維持舊值；
+    /// 順序若被對調，metadata 會先落地成新狀態——那正是「終態轉換可被重放」
+    /// 的殘留方向。
+    #[test]
+    fn status_is_written_before_metadata() {
+        let d = Dir::new("ab-core-task-wr-order");
+        let paths = test_paths(&d);
+        let id = create_task(&paths, "a", "b", &MessageSource::Text(b"x".to_vec()), false).unwrap();
+        let dir = task_dir(&paths, &id);
+
+        std::fs::remove_file(dir.join("status")).unwrap();
+        std::fs::create_dir(dir.join("status")).unwrap();
+
+        assert!(
+            update_meta_status(&dir, TaskState::Completed).is_err(),
+            "status 寫入必須失敗，測試前提才成立"
+        );
+        assert_eq!(
+            meta_str(&dir, "status").unwrap(),
+            "queued",
+            "status 寫入失敗時 metadata 不得已經翻成終態（寫入順序被對調）"
+        );
     }
 
     /// update_meta_status MUST 保持 metadata 既有欄位序（jq 賦值語意），

@@ -52,6 +52,25 @@ pub fn jq_raw_field(fields: &Map<String, Value>, key: &str) -> Option<String> {
     if out.is_empty() { None } else { Some(out) }
 }
 
+/// jq alternative operator `.<key> // <default>` 的**逐字**語意：只有缺欄位、
+/// `null`、`false` 會落到 default，**空字串是 truthy、原樣回傳**。
+///
+/// 與 `jq_raw_field` 的分工：後者模擬的是 bash 慣用的 `.x // empty` 再配
+/// `[[ -n ]]` 判斷（M2 的 hook 欄位全走那個形狀），把空字串併進「沒有值」是
+/// 對的；但 `.spawned_at // .registered_at`、`.disposable_at // "?"` 這類
+/// **鏈式 fallback** 不同——欄位是空字串時 bash 拿到空字串就停在那裡，
+/// 併進 None 會讓它繼續往後掉，於是 idle 對一份 `spawned_at: ""` 的 registry
+/// 印出 registered_at 算出來的秒數，bash 印 `-`（codex 複核 2026-07-31）。
+pub fn jq_alt(fields: &Map<String, Value>, key: &str) -> Option<String> {
+    match fields.get(key) {
+        None | Some(Value::Null) | Some(Value::Bool(false)) => None,
+        Some(Value::String(s)) => Some(s.clone()),
+        Some(Value::Bool(true)) => Some("true".to_string()),
+        Some(Value::Number(n)) => Some(n.to_string()),
+        Some(v) => Some(render_pretty(v)),
+    }
+}
+
 /// 讀取 object 內某個布林欄位是否「明確為 true」；缺欄位／型別不符都回
 /// `false`（對映 `jq -e '.spawned == true'` 的比較語意——`null`、字串、數字
 /// 一律不算 true）。
@@ -191,6 +210,24 @@ mod tests {
             Value::Object(m) => m,
             _ => panic!("預期 Object"),
         }
+    }
+
+    /// `//` 的 alternative operator **只對 `null`／`false` 生效**：空字串是
+    /// truthy，`"" // "x"` 仍是 `""`。`jq_raw_field`（模擬 `// empty` ＋
+    /// `[[ -n ]]`）與 `jq_alt`（模擬鏈式 fallback）在這一點上刻意分岔——
+    /// idle 的 `.spawned_at // .registered_at` 走錯一邊就會多印一個秒數，
+    /// bash 印 `-`（codex 複核 2026-07-31）。
+    #[test]
+    fn alt_operator_treats_empty_string_as_present() {
+        let f = obj(r#"{"a":"","b":null,"c":false,"d":"x","e":3}"#);
+        assert_eq!(jq_alt(&f, "a").as_deref(), Some(""));
+        assert_eq!(jq_alt(&f, "b"), None);
+        assert_eq!(jq_alt(&f, "c"), None);
+        assert_eq!(jq_alt(&f, "missing"), None);
+        assert_eq!(jq_alt(&f, "d").as_deref(), Some("x"));
+        assert_eq!(jq_alt(&f, "e").as_deref(), Some("3"));
+        // 對照組：`// empty` ＋ 非空判斷的形狀把空字串併進「沒有值」
+        assert_eq!(jq_raw_field(&f, "a"), None);
     }
 
     #[test]

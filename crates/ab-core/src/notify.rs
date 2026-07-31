@@ -174,6 +174,25 @@ pub fn notify_or_defer(
 mod tests {
     use super::*;
 
+    /// CC canary 的 Rust 側對應（分組 30）：套件那組把特徵字串拿去比對安裝中
+    /// 的 claude 執行檔，抽取來源是 **bash 正本**（源碼耦合檢查，M4 才改綁
+    /// Rust 源）。在那之前，這個測試守住「Rust 的 matcher 用的是同一組特徵」
+    /// ——否則 canary 盯著 bash、Rust 這邊悄悄改掉特徵也不會有人發現。
+    #[test]
+    fn matcher_uses_the_canary_feature_strings() {
+        assert!(screen_has_prompt(
+            "… Do you want to proceed? … Esc to cancel …"
+        ));
+        assert!(screen_has_prompt(
+            "Claude has written up a plan. Would you like to proceed?"
+        ));
+        // 兩組特徵各自成對才算命中：單邊出現不足以判定是權限框
+        assert!(!screen_has_prompt("Do you want to"));
+        assert!(!screen_has_prompt("Esc to cancel"));
+        assert!(!screen_has_prompt("has written up a plan"));
+        assert!(!screen_has_prompt("Would you like to proceed"));
+    }
+
     #[test]
     fn pane_re_rejects_injection_shapes() {
         assert!(is_valid_pane("%0"));

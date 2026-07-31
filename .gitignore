@@ -2,3 +2,4 @@
 .handoff/
 /target/
 tests/.run-groups.*.sh
+.gate/

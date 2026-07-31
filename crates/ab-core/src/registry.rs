@@ -75,6 +75,127 @@ pub fn is_spawned_not_ready(path: &Path) -> bool {
     }
 }
 
+/// 讀 registry 的任一字串欄位，語意同 `jq -r '.<key> // "<fallback>"'`：
+/// 檔案讀不到／不是 object／欄位缺失都回 `fallback`。取值走 `jq -r` 語意
+/// （`.runtime` 若被寫成數字，bash 會印出那個數字而不是空字串），
+/// fallback 走 `//` 語意（**空字串是 truthy，不觸發 fallback**）。
+pub fn read_field(path: &Path, key: &str, fallback: &str) -> String {
+    let Ok(content) = std::fs::read_to_string(path) else {
+        return fallback.to_string();
+    };
+    match json::parse(&content) {
+        Ok(Value::Object(fields)) => {
+            json::jq_alt(&fields, key).unwrap_or_else(|| fallback.to_string())
+        }
+        _ => fallback.to_string(),
+    }
+}
+
+/// `jq -e '.<key> == true'` 的比較語意：只認布林 `true`，字串／數字／缺欄位
+/// 一律 `false`。讀不到檔案或不是 object 同樣 `false`。
+pub fn read_bool(path: &Path, key: &str) -> bool {
+    let Ok(content) = std::fs::read_to_string(path) else {
+        return false;
+    };
+    match json::parse(&content) {
+        Ok(Value::Object(fields)) => json::bool_field_is_true(&fields, key),
+        _ => false,
+    }
+}
+
+/// `caller_owner`:884 — 呼叫者定位 `"session_name:@window_id"`。
+/// 只認「`TMUX` 與 `TMUX_PANE` 同時存在，且 display-message 真的查得到」：
+/// `TMUX_PANE` 可能是繼承自已死 pane 或別台 server 的殘留值。
+pub fn caller_owner(tmux: &dyn TmuxClient) -> Option<String> {
+    let in_tmux = std::env::var_os("TMUX").is_some_and(|v| !v.is_empty());
+    let pane = std::env::var("TMUX_PANE").ok().filter(|v| !v.is_empty())?;
+    if !in_tmux {
+        return None;
+    }
+    let out = tmux
+        .exec(&[
+            "display-message",
+            "-p",
+            "-t",
+            &pane,
+            "#{session_name}:#{window_id}",
+        ])?
+        .ok_stdout()?;
+    // `[[ "$out" == *":@"* ]]`
+    if out.contains(":@") { Some(out) } else { None }
+}
+
+/// `log_agent_event`:898 — 審計行寫進 `$DATA_DIR/agents.log`，空白分隔固定
+/// 6 欄 `<ts> <action> <name> <pane> <runtime> <actor>`。
+///
+/// **欄位安全在這個唯一咽喉點保證**：name 以外的欄位可能取自 worker 可寫的
+/// registry 或可偽造的環境，故全欄摺空白、空值補 `-`，不靠上游自律。
+/// `actor` 傳 `None` 時就地解析呼叫者定位（tmux 外為 `-`）。
+///
+/// 回傳 `Err` 代表 append 失敗——呼叫端多半只揭露不翻盤（不可逆動作已完成）。
+pub fn log_agent_event(
+    paths: &Paths,
+    tmux: &dyn TmuxClient,
+    action: &str,
+    name: &str,
+    pane: &str,
+    runtime: &str,
+    actor: Option<&str>,
+) -> Result<()> {
+    let actor = match actor {
+        Some(a) => a.to_string(),
+        None => caller_owner(tmux).unwrap_or_else(|| "-".to_string()),
+    };
+    let line = format!(
+        "{} {} {} {} {} {}\n",
+        now_iso(),
+        squash(action),
+        squash(name),
+        squash(pane),
+        squash(runtime),
+        squash(&actor),
+    );
+    let path = paths.data_dir.join("agents.log");
+    append_line(&path, &line)
+        .map_err(|e| Error::new(format!("無法寫入審計檔 {}：{e}", path.display())))
+}
+
+/// `: >> "$DATA_DIR/agents.log"`（cmd_despawn:1517）：以 append 模式實開一次
+/// fd 驗證可寫，**不寫入位元組**。不可逆動作之前的預檢——事後才發現審計寫
+/// 不了，pane 已死、registry 已刪，呼叫端卻收到失敗而去重試。
+pub fn audit_writable(paths: &Paths) -> bool {
+    std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(paths.data_dir.join("agents.log"))
+        .is_ok()
+}
+
+fn append_line(path: &Path, line: &str) -> std::io::Result<()> {
+    use std::io::Write;
+    let mut f = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)?;
+    f.write_all(line.as_bytes())
+}
+
+/// bash `${v//[[:space:]]/_}` 後 `[[ -n $v ]] || v="-"`。空白集合取 C locale
+/// 的 `[[:space:]]`（space／\t／\n／\v／\f／\r）。
+fn squash(v: &str) -> String {
+    let s: String = v
+        .chars()
+        .map(|c| {
+            if matches!(c, ' ' | '\t' | '\n' | '\x0b' | '\x0c' | '\r') {
+                '_'
+            } else {
+                c
+            }
+        })
+        .collect();
+    if s.is_empty() { "-".to_string() } else { s }
+}
+
 /// cmd_unregister:503 — 移除 agent 註冊（CLI-UNREGISTER-1）。**鎖內檢查出身**：
 /// 單純除名 spawned agent 會留下沒人認領的 pane，且讓 cap 少算一個；出身
 /// 不明（registry 損壞）同樣拒絕（fail-closed）。

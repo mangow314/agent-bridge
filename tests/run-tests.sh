@@ -17,6 +17,9 @@ unset ${!AGENT_BRIDGE_@}
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 BRIDGE="${BRIDGE:-$ROOT/bin/agent-bridge}"
+# 源碼耦合檢查（§30 canary、§31i 寫入順序）抽取函式本體的對象：固定綁實作正本，
+# 不跟著 $BRIDGE 走。M4 cutover 後與 check-contract 1–3 一起改綁 Rust 源。
+SRC_BASH="$ROOT/bin/agent-bridge"
 SOCK="agent-bridge-test"
 
 if ! REAL_TMUX="$(command -v tmux)"; then
@@ -1469,21 +1472,30 @@ assert "審計寫入失敗：pane 被回收（pane 數不變）" \
 assert "審計寫入失敗：不留 registry" test ! -e "$DTRAP/agents/audit-x.json"
 
 # 19c'. 回滾刪不掉 registry 時不得靜默（codex 第二輪 FAIL 2）：
-# date shim 在 registry 已寫入後把 agents/ 轉唯讀 → 審計失敗觸發回滾，
-# 但 rm 也失敗。殘留 registry 會繼續佔 cap，必須明講而非吞掉。
+# agents.log 是目錄 → 審計失敗觸發回滾；回滾先殺 pane（if-shell）再刪
+# registry，shim 就趁 if-shell 那一刻把 agents/ 轉唯讀，讓後續的 rm 必然失敗。
+# 殘留 registry 會繼續佔 cap，必須明講而非吞掉。
+# 注入點掛在 tmux 而非 date（M3 改）：date 只是 bash 實作恰好會呼叫的外部
+# 指令，Rust 實作內建時戳、不 fork date，掛在那裡的話這個場景根本不會發生
+# ——測到的是「實作有沒有用 date」而不是「回滾會不會靜默」。if-shell 是兩邊
+# 都必經的回滾步驟，換過去之後這條斷言對兩個實作都成立。
 DRES="$TESTROOT/dres"
 mkdir -p "$DRES/agents" "$DRES/agents.log" "$DRES/locks" "$DRES/tasks"
 RESSHIM="$TESTROOT/resshim"
 mkdir -p "$RESSHIM"
-cat > "$RESSHIM/date" <<EOF
+cat > "$RESSHIM/tmux" <<EOF
 #!/usr/bin/env bash
-# registry 一旦落地就鎖住父目錄，讓後續回滾的 rm 必然失敗
-if [[ -f "$DRES/agents/res-x.json" ]]; then chmod 0555 "$DRES/agents"; fi
-exec /usr/bin/date "\$@"
+unset TMUX
+# 回滾的第一步是 if-shell（原子驗 tag 才殺）；此時 registry 已落地，
+# 鎖住父目錄讓緊接著的 rm 必然失敗
+if [[ "\$1" == "if-shell" ]]; then chmod 0555 "$DRES/agents"; fi
+exec $(printf '%q' "$REAL_TMUX") -L $(printf '%q' "$SOCK") -f /dev/null "\$@"
 EOF
-chmod +x "$RESSHIM/date"
+chmod +x "$RESSHIM/tmux"
+ln -s "$BRIDGE" "$RESSHIM/agent-bridge"
+ln -s "$SHIM/codex" "$RESSHIM/codex"
 before_res="$(pane_count)"
-env AGENT_BRIDGE_DATA="$DRES" AGENT_BRIDGE_READY_TIMEOUT=0 PATH="$RESSHIM:$SHIM:$PATH" \
+env AGENT_BRIDGE_DATA="$DRES" AGENT_BRIDGE_READY_TIMEOUT=0 PATH="$RESSHIM:$PATH" \
   "$BRIDGE" spawn res-x --runtime codex >/dev/null 2>"$TESTROOT/res.err"; rc=$?
 chmod 0755 "$DRES/agents"
 assert "回滾刪不掉 registry：非零退出" test "$rc" -ne 0
@@ -1708,16 +1720,21 @@ DLK="$TESTROOT/dlk"
 mkdir -p "$DLK/agents" "$DLK/locks" "$DLK/tasks"
 LKSHIM="$TESTROOT/lkshim"
 mkdir -p "$LKSHIM"
-cat > "$LKSHIM/date" <<EOF
+# 注入點掛在 tmux 而非 date（M3 改，理由同 §19c'）：建 pane 的那些 tmux 呼叫
+# 全在 registry 鎖內，兩個實作都必經；date 則只有 bash 實作會 fork
+cat > "$LKSHIM/tmux" <<EOF
 #!/usr/bin/env bash
-# spawn 取得 registry 鎖後才會呼叫 date（寫 registered_at）；趁機把鎖目錄弄成非空
+unset TMUX
+# spawn 取得 registry 鎖之後才會建 pane；趁這時把鎖目錄弄成非空
 if [[ -d "$DLK/locks/agents-registry.lock" ]]; then
   : > "$DLK/locks/agents-registry.lock/squatter"
 fi
-exec /usr/bin/date "\$@"
+exec $(printf '%q' "$REAL_TMUX") -L $(printf '%q' "$SOCK") -f /dev/null "\$@"
 EOF
-chmod +x "$LKSHIM/date"
-env AGENT_BRIDGE_DATA="$DLK" AGENT_BRIDGE_READY_TIMEOUT=0 PATH="$LKSHIM:$SHIM:$PATH" \
+chmod +x "$LKSHIM/tmux"
+ln -s "$BRIDGE" "$LKSHIM/agent-bridge"
+ln -s "$SHIM/codex" "$LKSHIM/codex"
+env AGENT_BRIDGE_DATA="$DLK" AGENT_BRIDGE_READY_TIMEOUT=0 PATH="$LKSHIM:$PATH" \
   "$BRIDGE" spawn lk --runtime codex >/dev/null 2>"$TESTROOT/lk.err" || true
 assert "解鎖失敗：stderr 明確警告而非靜默" \
   grep -q '無法釋放鎖目錄' "$TESTROOT/lk.err"
@@ -2682,7 +2699,11 @@ if [[ -n "$REAL_CLAUDE" ]] && CANARY_REAL="$(readlink -f "$REAL_CLAUDE" 2>/dev/n
   # 出現，搜整檔會讓「函式改了 matcher、註解留著舊字串」照樣誤綠
   # （獨立複核 2026-07-24 指出）。函式被改名或抽不出來時檔案為空，
   # 後續 grep 全紅——失效方向是誤報而非漏報
-  sed -n '/^screen_has_prompt() {/,/^}/p' "$BRIDGE" > "$TESTROOT/canary-fn"
+  # 抽取對象固定是 bash 正本而非 $BRIDGE（M3 改）：這是**源碼耦合**檢查，
+  # 與 check-contract 1–3 同一類，不是黑箱行為斷言。$BRIDGE 指向 Rust 執行檔
+  # 時 sed 抽不出 shell 函式，會退化成「換實作就全紅」而不是測到任何東西。
+  # M4 cutover 時與 check-contract 1–3 一起改綁 Rust 源（計畫的 M4 項目）。
+  sed -n '/^screen_has_prompt() {/,/^}/p' "$SRC_BASH" > "$TESTROOT/canary-fn"
   assert "CC canary：screen_has_prompt 函式本體可抽出" test -s "$TESTROOT/canary-fn"
   for kw in 'Do you want to ' 'Esc to cancel' \
             'has written up a plan' 'Would you like to proceed'; do
@@ -2798,7 +2819,8 @@ assert "唯讀查詢不建資料目錄" test ! -d "$D31E"
 # 反向殘留的是「終態轉換可被重放」的 split-brain 方向）。源碼順序不變量，
 # 比照 §30 的函式本體抽取
 UMS_FN="$TESTROOT/ums-fn"
-sed -n '/^update_meta_status() {/,/^}/p' "$BRIDGE" > "$UMS_FN"
+# 抽取對象固定是 bash 正本，理由同 §30 的 canary-fn（源碼耦合檢查，M4 改綁）
+sed -n '/^update_meta_status() {/,/^}/p' "$SRC_BASH" > "$UMS_FN"
 assert "update_meta_status 函式本體可抽出" test -s "$UMS_FN"
 # shellcheck disable=SC2016  # $dir 是源碼字面值，刻意不展開
 sl="$(grep -n 'atomic_write "$dir/status"' "$UMS_FN" | cut -d: -f1 | head -1)"

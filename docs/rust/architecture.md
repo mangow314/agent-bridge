@@ -27,7 +27,7 @@
 | `task` | task 目錄結構、id 生成/驗證、狀態機轉換（queued→delivered→running→終態）、events.log、殘缺 task 目錄清理、**gc（終態 task 清理）** | state.md STATE-TASK-*、cli.md 轉換條款 | `write_message`:276、`log_event`:251、`update_meta_status`:261、`check_task_id`:420、`last_task_at`:457、`send_rollback`:202（清 metadata/status 未寫齊的殘缺 task 目錄，屬 task 寫入交易邊界；交易背景註解始於 :195）、`cmd_gc`:1683 |
 | `notify` | 送鍵通知：權限框雙掃、失敗語意（notify-failed 可復原）、`notify_or_defer` 的 TTL/state 新鮮度 gate | hooks.md HOOK-NOTIFY-*、env.md ENV-TTL-1/2、ENV-NOTIFY-1 | `notify_pane`:330、`screen_has_prompt`:318、`notify_or_defer`:371 |
 | `hook` | hook 三事件核心：身分解析、state 單一寫者、owner gate（session_id 所有權）、oldest-queued；**失敗一律就地吞掉（不上拋 `Result`）**，`run()` 回 `HookOutcome{Silent,Block}`；exit 0 與 panic 兜底在 `ab` dispatch 層（M2 修正，見 §4） | hooks.md 14 條、state.md STATE-CHAN-* | `hook_agent_name`:2010、`hook_write_state`:2035、`hook_owner_gate`:2069、`hook_oldest_queued`:2098、`cmd_hook`:2131 |
-| `spawn` | worker 生命週期：cap、pane 建立、brief 注入、ready 探針、原子回滾、出身防護（tag）、evict/idle/disposable | cli.md spawn 群、env.md ENV-SPAWN/READY/TAG | `cmd_spawn`:1063、`spawn_rollback`:940、`rb_kill_tagged`:928、`spawn_wait_ready`:1038、`worker_prompt_arg`:1007、`relay_prompt_arg`:1024、`cmd_despawn`:1476、`cmd_evict`:1866、`disposable_effective`:444 |
+| `spawn` | worker 生命週期：cap、pane 建立、brief 注入、ready 探針、原子回滾、出身防護（tag）、idle/disposable（**evict 的三段式編排在 `ab` CLI 層**，見 §9） | cli.md spawn 群、env.md ENV-SPAWN/READY/TAG | `cmd_spawn`:1063、`spawn_rollback`:940、`rb_kill_tagged`:928、`spawn_wait_ready`:1038、`worker_prompt_arg`:1007、`relay_prompt_arg`:1024、`cmd_despawn`:1476、`cmd_ready`:1594、`cmd_disposable`:1629、`cmd_idle`:1800、`disposable_effective`:444 |
 | `tmux` | `TmuxClient` trait＋`SubprocessTmux` 實作；**以裸名 `tmux` 經 PATH spawn**（測試 shim 攔截前提，tests/run-tests.sh:91-93）；argv 陣列傳參 | （載具，無獨立 spec 域） | `tmux` token 91 次（command-shaped 呼叫約 65；分佈於 notify/spawn/despawn/registry 各函式群） |
 | `time` | ISO 8601 UTC 時戳（`now_iso`）、epoch 換算、TTL 新鮮度；顯式 UTC、不受 locale/TZ | state.md ts 格式 | `now_iso`:144、TTL epoch 比對段 |
 
@@ -143,3 +143,94 @@ bin/agent-bridge:227 起的錯誤訊息。stale-lock 偵測／回收＝行為變
 1. send→notify_or_defer→hook 通知鏈 — `docs/rust/flow-notify.md`
 2. spawn 生命週期（cap／ready 探針／原子回滾／出身防護）— `docs/rust/flow-spawn.md`
 3. state 通道 TTL 判定（owner gate 含邊角）— `docs/rust/flow-ttl.md`
+
+## 9. M3（spawn 生命週期）的裁決與偏離
+
+### 9.1 執行檔擺放位置是 brief 解析的前提
+
+bash 以 `readlink -f "$BASH_SOURCE"` 反推 `REPO_ROOT`（:45-46），brief／hooks
+settings 的預設值都掛在它下面。Rust 用 `current_exe()`（Linux 讀
+`/proc/self/exe`，同樣解析完符號連結）套**同一條規則**：`REPO_ROOT ＝
+dirname(dirname(執行檔))`。
+
+代價是 `target/release/ab` 的祖父層是 `target/`，預設 brief 會指到
+`target/share/…`。而測試 22f／23a／16a2 又分別用
+`dirname(dirname($BRIDGE))/share` 與硬編的 `$ROOT/share/…` 反推正本位置，兩者
+必須同時成立。故 **parity gate 的執行載具是 `.gate/ab`**（gitignored，由
+`cargo build --release` 後 `cp` 過去）：
+
+```
+cargo build --release && mkdir -p .gate && cp -f target/release/ab .gate/ab
+BRIDGE=$PWD/.gate/ab bash tests/run-tests.sh
+```
+
+這不是為了讓斷言變綠而搬位置：`bin/` 與 `share/` 是兄弟目錄是本專案的安裝
+佈局，`.gate/` 只是讓建置樹長成那個形狀。M4 cutover 後執行檔就落在 `bin/`，
+這層 staging 隨之消失。計畫原文寫的 `BRIDGE=$PWD/target/release/ab` 在 M3 起
+不再適用（M1/M2 的分組不碰 brief 路徑，故當時看不出來）。
+
+### 9.2 `printf %q` 逐位元重現
+
+`spawn::shell_quote` 重現 bash `printf %q`：安全字元集
+`%+-./0-9:=@A-Z_a-z`（本機 bash 5.3 全 byte 實測導出），其餘 printable 前置
+反斜線，含控制字元則整串走 `$'…'`。分組 16a4／16a5 直接比對
+`pane_start_command` 裡的片段（` no_proxy=st\ a\,b exec `），換成語意等價的
+單引號形式那兩條會紅。
+
+### 9.3 審計失敗在 spawn 必須翻盤
+
+`log_agent_event` 在 despawn／disposable／evict 是「只揭露不翻盤」（不可逆
+動作已完成），但在 **spawn 的 registry 寫入之後、回滾解除之前**必須上拋
+（bash 在 `set -e` 下由 EXIT trap 完成回滾）。吞掉會留下一個沒有審計線、卻
+佔著 cap 的 worker，而呼叫端看到成功。分組 19c/19c'/19d/19e 是這條的錨。
+
+### 9.4 測試 harness 的兩處改動（M3）
+
+parity gate 的前提是**測試對實作語言中立**。兩類斷言原本不是：
+
+1. **注入點掛在 `date(1)`**（§19c'、§21）：那只是 bash 實作恰好會 fork 的外部
+   指令；Rust 內建時戳，場景根本不會發生，測到的變成「實作有沒有用 date」。
+   改掛 `tmux`——19c' 掛回滾必經的 `if-shell`，21 掛鎖內建 pane 的呼叫。
+2. **`sed` 抽 shell 函式本體**（§30 CC canary、§31i 寫入順序）：源碼耦合檢查，
+   與 check-contract 1–3 同類。抽取對象改為固定的 `SRC_BASH`（實作正本），
+   **M4 cutover 時與 check-contract 1–3 一起改綁 Rust 源**。在那之前，Rust 側
+   由兩個單元測試補上同一組不變量（`notify::tests::
+   matcher_uses_the_canary_feature_strings`、`task::tests::
+   status_is_written_before_metadata`）。
+
+改後 bash 基準重跑仍為 756 PASS／0 FAIL。
+
+### 9.5 codex 複核一輪的處置（2026-07-31）
+
+rubric 六條判定 REJECTED／CONFIRMED／REJECTED／REJECTED／CONFIRMED／CONFIRMED。
+兩個 blocker 與五個 should-fix 全數修復並重驗：
+
+| 項目 | 症狀 | 處置 |
+|---|---|---|
+| blocker：despawn 謊報成功 | `remove_file` 的錯誤被吞，仍寫審計＋印「已 despawn」 | 上拋（`NotFound` 視為成功）；bash `:1580` 的裸 `rm -f` 在 `set -e` 下同樣帶走整支 |
+| blocker：poll interval 非 UTF-8 | `env::var().unwrap_or_default()` 把它壓成「未設定」→退 1.0，evict 因此把 config 錯誤誤判成真逾時 | 改 `var_os`＋三態；非 UTF-8 走「值不合法」 |
+| `//` 的空字串語意 | `jq_raw_field` 把 `""` 併進 None，鏈式 fallback 會多掉一層（idle 對 `spawned_at: ""` 印秒數，bash 印 `-`） | 新增 `json::jq_alt`（逐字 `//`），idle／`read_field`／`disposable_effective` 改用它；`jq_raw_field` 維持 `// empty` 形狀給 M2 的 hook 欄位 |
+| `printf %q` 只吃 `&str` | proxy／PASS_ENV 值與 hooks 路徑先 lossy 再引號化，非 UTF-8 位元組變 U+FFFD | `shell_quote` 改收 `&[u8]`（`$'\NNN'` 產物是純 ASCII，故不必把啟動指令改成 bytes）；brief 路徑因為是**單引號字面值**無法跳脫，改 fail-closed 拒絕（相對 bash 的刻意偏離，方向是大聲失敗而非靜默注入錯誤守則） |
+| ready interval 可 panic | `Duration::from_secs_f64(inf)` 在「registry 已寫、回滾已解除」之後 panic | 改 `try_from_secs_f64`，不可表示時退 `Duration::MAX`（＝bash 把超大值交給 `sleep` 的同一終態） |
+| spawn tag 的熵可預測 | 沿用 `task::rand_suffix`，`/dev/urandom` 失敗時退回 pid⊕nanos——但 tag 是 despawn 的殺人依據 | 另立 `secure_hex12()`，讀不到熵直接 `Err`（bash 也是在建 pane 前死） |
+| split 失敗仍重排 | `select-layout` 在傳播錯誤前執行 | 先 `?` 取 pane 再 layout（對齊 `:1299-1301`） |
+| evict stderr 非逐字 | 內層 `cmd_send` die／`cmd_await` 逾時行被吞 | 兩處先 `err_line` 內層訊息再印 evict 的中止／逾時行 |
+
+rubric 6（harness 改動正當性）codex 判 CONFIRMED，並建議 M4 讓
+source-contract checker 顯式接收 `source-kind/source-path`，可行處優先改成
+行為測試——記入 M4 待辦。
+
+### 9.6 已收掉與仍開著的缺口
+
+- **已收（M2 遺留）**：`--message` 的非 UTF-8 位元組。`cmd_send`／`cmd_reply`／
+  `cmd_fail` 改收 `&[OsString]`，`MessageSource::Text` 帶 `Vec<u8>`，payload
+  原樣落檔（架構 §3）。其餘指令的參數是 id／名稱／旗標，續用 lossy 視圖；
+  錯誤文案裡的值一律 lossy（給人看的字串，不是 payload）。
+- **仍開**：SIGPIPE 沒有機器 gate（§5 已記），M3 未新增測試組——那需要在
+  套件裡加一組新分組，屬行為錨（spec/tests）的擴充而非 parity 工作。
+- **仍開**：`meta_str` 對「欄位存在但型別非字串」回空字串（M1 起的已知差異）。
+  M3 新寫的讀取面（`registry::read_field`、`task::last_task_at`、
+  `spawn::idle`）一律走 `json::jq_raw_field`（`jq -r` 語意）；`meta_str` 未一併
+  改，因為它的呼叫端（receive/read 標頭、`respond_task` 找 sender）另有「缺欄位
+  印字面 `null`」的對齊要求，兩套語意合併需要各自的測例，留給 M4 與
+  `--contract-manifest` 的形狀討論一起收。

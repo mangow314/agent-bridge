@@ -5,7 +5,41 @@
 use std::path::Path;
 use std::process::{Command, Stdio};
 
+/// 一次 tmux 子行程呼叫的結果。`status_ok` 對映 shell 的退出碼是否為 0；
+/// stdout／stderr 各自捕捉——despawn 的兩處查詢把 stderr 併進 die 訊息
+/// （`2>&1`，bin/agent-bridge:1523、1564），其餘一律丟棄。
+pub struct TmuxOutput {
+    pub status_ok: bool,
+    pub stdout: String,
+    pub stderr: String,
+}
+
+impl TmuxOutput {
+    /// bash 慣用的 `out="$(tmux … 2>/dev/null)" || …`：成功才取 stdout
+    /// （去掉尾端換行），失敗回 `None`。
+    pub fn ok_stdout(self) -> Option<String> {
+        if self.status_ok {
+            Some(self.stdout.trim_end_matches('\n').to_string())
+        } else {
+            None
+        }
+    }
+}
+
 pub trait TmuxClient {
+    /// 泛用逃生口：以 argv 陣列呼叫 tmux，回傳退出狀態與兩條輸出。
+    /// spawn 生命週期用到十來種 tmux 子命令（new-window／split-window／
+    /// if-shell／set-option／show-options／select-*／list-windows…），逐個
+    /// 長成 trait 方法只會讓這層變成 tmux CLI 的鏡像；語意留在 `spawn`
+    /// 模組、這裡只負責「把 argv 送出去、把輸出讀回來」。
+    ///
+    /// 回 `None`＝子行程根本起不來（PATH 沒有 tmux、fork 失敗），與
+    /// 「tmux 跑了但回非零」是兩件事——後者呼叫端要看得到 stderr。
+    ///
+    /// 架構 §5：先讀盡 stdout/stderr 再 `wait()`（`Command::output` 內建
+    /// 如此），避免 pipe buffer 滿載互等。
+    fn exec(&self, args: &[&str]) -> Option<TmuxOutput>;
+
     /// 對齊 bash `command -v tmux`：只驗證 PATH 上有可執行檔，**不**呼叫它
     /// ——測試的 failshim 本身是一個會失敗的可執行腳本，`command -v` 視為
     /// 「存在」，之後呼叫才失敗（另一條 die 訊息路徑）。
@@ -33,6 +67,21 @@ pub struct SubprocessTmux;
 impl TmuxClient for SubprocessTmux {
     fn available(&self) -> bool {
         command_exists("tmux")
+    }
+
+    fn exec(&self, args: &[&str]) -> Option<TmuxOutput> {
+        let out = Command::new("tmux")
+            .args(args)
+            .stdin(Stdio::null())
+            .output()
+            .ok()?;
+        Some(TmuxOutput {
+            status_ok: out.status.success(),
+            // tmux 的輸出是 pane id／視窗清單／選項值這類受控文字，非 payload
+            // 路徑，lossy 轉換不觸及架構 §3 的 byte 保真紅線。
+            stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
+            stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
+        })
     }
 
     fn resolve_pane(&self, target: &str) -> Option<String> {
@@ -101,7 +150,7 @@ impl TmuxClient for SubprocessTmux {
 
 /// PATH 掃描版 `which`：不執行候選檔案，只檢查「是檔案且具備任一可執行位元」
 /// （Unix）。非 Unix 平台退化為只檢查檔案存在。
-fn command_exists(name: &str) -> bool {
+pub fn command_exists(name: &str) -> bool {
     let path = match std::env::var_os("PATH") {
         Some(p) => p,
         None => return false,

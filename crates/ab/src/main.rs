@@ -3,6 +3,7 @@
 //! reply/fail/cancel/status/read/await/gc/hook。spawn 生命週期群屬 M3，
 //! 未實作前一律走「未知指令」分支（不虛構半成品行為）。
 
+use std::ffi::OsString;
 use std::process::ExitCode;
 
 use ab_core::config;
@@ -12,8 +13,9 @@ use ab_core::lock::acquire_lock;
 use ab_core::notify;
 use ab_core::paths::Paths;
 use ab_core::registry;
+use ab_core::spawn;
 use ab_core::task::{self, MessageSource, TaskState};
-use ab_core::tmux::SubprocessTmux;
+use ab_core::tmux::{SubprocessTmux, TmuxClient};
 use ab_core::validate::is_valid_name;
 
 // 逐字對齊 bash `usage()`:84（bin/agent-bridge）的 heredoc 內容。
@@ -91,15 +93,22 @@ fn print_implemented_commands() {
     for cmd in [
         "await",
         "cancel",
+        "despawn",
+        "disposable",
+        "evict",
         "fail",
         "gc",
         "hook",
+        "idle",
         "list",
         "read",
+        "ready",
         "receive",
         "register",
+        "relay",
         "reply",
         "send",
+        "spawn",
         "start",
         "status",
         "unregister",
@@ -151,10 +160,12 @@ fn main() -> ExitCode {
     // 的 Rust 是 101——panic 發生在 catch_unwind 之外）。指令名本身無法轉成
     // UTF-8 時視為未知指令，與 bash 的 `*) die "未知指令"` 同向。
     //
-    // 遺留缺口（誠實記錄）：非指令名的參數在此走 lossy 轉換，`--message` 帶
-    // 非 UTF-8 位元組時內容會被換成 U+FFFD，bash 則原樣保真。要真正對齊得把
-    // 訊息路徑整條改走 `OsStr`/bytes，屬 M3 的 argv 面工作；至少不再 panic。
-    let raw: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();
+    // M3 收掉 M2 留下的缺口：**訊息路徑整條走 `OsString`/bytes**（`cmd_send`／
+    // `cmd_reply`／`cmd_fail` 收 `&[OsString]`），`--message` 的非 UTF-8 位元組
+    // 因此原樣落進 request/response（架構 §3 的 payload 紅線、分組 6）。其餘
+    // 指令的參數是 id／名稱／旗標這類受控 ASCII，續用 lossy 的 `String` 視圖；
+    // 錯誤文案裡的值也一律走 lossy——那是給人看的字串，不是 payload。
+    let raw: Vec<OsString> = std::env::args_os().skip(1).collect();
     if raw.is_empty() {
         print_usage();
         return ExitCode::from(1);
@@ -192,6 +203,7 @@ fn main() -> ExitCode {
         return ExitCode::from(0);
     }
     let rest = &args[1..];
+    let rest_os = &raw[1..];
 
     let paths = Paths::resolve();
     // 唯讀豁免（main dispatch:2262-2269／CLI-RO-1）：status/await/idle/list/
@@ -207,16 +219,23 @@ fn main() -> ExitCode {
         "register" => cmd_register(&paths, rest),
         "unregister" => cmd_unregister(&paths, rest),
         "list" => cmd_list(&paths, rest),
-        "send" => cmd_send(&paths, rest),
+        "send" => cmd_send(&paths, rest_os),
         "receive" => cmd_receive(&paths, rest),
         "start" => cmd_start(&paths, rest),
-        "reply" => cmd_reply(&paths, rest),
-        "fail" => cmd_fail(&paths, rest),
+        "reply" => cmd_reply(&paths, rest_os),
+        "fail" => cmd_fail(&paths, rest_os),
         "cancel" => cmd_cancel(&paths, rest),
         "status" => cmd_status(&paths, rest),
         "read" => cmd_read(&paths, rest),
         "await" => cmd_await(&paths, rest),
         "gc" => cmd_gc(&paths, rest),
+        "spawn" => cmd_spawn(&paths, rest),
+        "relay" => cmd_relay(&paths, rest),
+        "despawn" => cmd_despawn(&paths, rest),
+        "ready" => cmd_ready(&paths, rest),
+        "disposable" => cmd_disposable(&paths, rest),
+        "idle" => cmd_idle(&paths, rest),
+        "evict" => cmd_evict(&paths, rest),
         _ => {
             print_usage();
             Err(Error::new(format!("未知指令：{cmd}")))
@@ -263,30 +282,30 @@ fn cmd_list(paths: &Paths, _args: &[String]) -> Result<()> {
 /// request/metadata/status、通知）留給下一階段，見 ab-core::registry
 /// 與架構文件的 task/notify 模組對映——尚未實作，命中時明確回錯而非
 /// 產生半成品任務。
-fn cmd_send(paths: &Paths, args: &[String]) -> Result<()> {
+fn cmd_send(paths: &Paths, args: &[OsString]) -> Result<()> {
     if args.is_empty() {
         return Err(Error::new(
             "用法：agent-bridge send <agent> --from <sender> (--message <text> | --message-file <path>)",
         ));
     }
-    let to = args[0].clone();
+    let to = lossy(&args[0]);
     let mut it = args[1..].iter();
     let mut from = String::new();
-    let mut mode = String::new(); // "" | "text" | "file"
-    let mut val = String::new();
+    let mut mode = ""; // "" | "text" | "file"
+    let mut val = OsString::new();
 
     while let Some(a) = it.next() {
-        match a.as_str() {
+        match lossy(a).as_str() {
             "--from" => {
                 let v = it.next().ok_or_else(|| Error::new("--from 需要參數"))?;
-                from = v.clone();
+                from = lossy(v);
             }
             "--message" => {
                 let v = it.next().ok_or_else(|| Error::new("--message 需要參數"))?;
                 if !mode.is_empty() {
                     return Err(Error::new("--message 與 --message-file 只能擇一"));
                 }
-                mode = "text".to_string();
+                mode = "text";
                 val = v.clone();
             }
             "--message-file" => {
@@ -296,7 +315,7 @@ fn cmd_send(paths: &Paths, args: &[String]) -> Result<()> {
                 if !mode.is_empty() {
                     return Err(Error::new("--message 與 --message-file 只能擇一"));
                 }
-                mode = "file".to_string();
+                mode = "file";
                 val = v.clone();
             }
             other => return Err(Error::new(format!("未知參數：{other}"))),
@@ -309,15 +328,57 @@ fn cmd_send(paths: &Paths, args: &[String]) -> Result<()> {
     if mode.is_empty() {
         return Err(Error::new("send 需要 --message 或 --message-file"));
     }
+    // 訊息來源先驗再建 task 目錄：來源檔不存在時，原本會先留下一個沒有
+    // metadata/status 的殘缺目錄才 die，而 gc 刻意只清完整形狀的目錄
     if mode == "file" && val != "-" && !std::path::Path::new(&val).is_file() {
-        return Err(Error::new(format!("找不到訊息檔：{val}")));
+        return Err(Error::new(format!(
+            "找不到訊息檔：{}",
+            val.to_string_lossy()
+        )));
     }
-    if !is_valid_name(&to) {
+    let src = message_source(mode, &val);
+    let task_id = do_send(paths, &to, &from, &src, false)?;
+    println!("{task_id}");
+    Ok(())
+}
+
+/// argv 值的顯示形式：只用在旗標比對與錯誤文案。非 UTF-8 位元組在這裡以
+/// U+FFFD 呈現——那些是給人看的字串，不是 payload。
+fn lossy(s: &OsString) -> String {
+    s.to_string_lossy().into_owned()
+}
+
+/// argv 值的原始位元組（payload 路徑專用）。非 Unix 平台無 `OsStrExt`，
+/// 退回 lossy——本專案只支援 Unix（tmux 是硬依賴）。
+fn os_bytes(s: &OsString) -> Vec<u8> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        s.as_os_str().as_bytes().to_vec()
+    }
+    #[cfg(not(unix))]
+    {
+        s.to_string_lossy().into_owned().into_bytes()
+    }
+}
+
+/// cmd_send 的主體（名稱文法 → 收件者已註冊 → 建 task → 通知），回傳 task-id。
+/// evict 的收尾任務走同一條路徑（bash 直接呼叫 `cmd_send`），差別只有 `pinned`
+/// ——收尾筆記裝的是「只存在 worker context 裡」的事實，被 gc 清掉的話這一層
+/// 對「上下文不會憑空消失」的承諾就只是延後兌現。
+fn do_send(
+    paths: &Paths,
+    to: &str,
+    from: &str,
+    src: &MessageSource,
+    pinned: bool,
+) -> Result<String> {
+    if !is_valid_name(to) {
         return Err(Error::new(format!(
             "agent 名稱不合法（僅允許 [A-Za-z0-9_-]+）：{to}"
         )));
     }
-    if !is_valid_name(&from) {
+    if !is_valid_name(from) {
         return Err(Error::new(format!(
             "sender 名稱不合法（僅允許 [A-Za-z0-9_-]+）：{from}"
         )));
@@ -334,8 +395,7 @@ fn cmd_send(paths: &Paths, args: &[String]) -> Result<()> {
         ));
     }
 
-    let src = message_source(&mode, &val);
-    let task_id = task::create_task(paths, &from, &to, &src, false)?;
+    let task_id = task::create_task(paths, from, to, src, pinned)?;
 
     // 通知前重讀 pane（cmd_send:613-619）：從參數檢查到這裡隔著建目錄＋三次
     // 寫檔，期間同名 agent 可能被 unregister＋register 換到別的 pane——舊 pane
@@ -346,21 +406,23 @@ fn cmd_send(paths: &Paths, args: &[String]) -> Result<()> {
     notify::notify_or_defer(
         paths,
         &tmux,
-        &to,
+        to,
         &pane,
         &format!("agent-bridge receive {task_id}"),
         &task_id,
         "receive",
     )?;
 
-    println!("{task_id}");
-    Ok(())
+    Ok(task_id)
 }
 
 /// write_message 的 mode/val 二元組 → `MessageSource`（`--message-file -`＝stdin）。
-fn message_source(mode: &str, val: &str) -> MessageSource {
+/// `val` 維持 `OsString`：`--message` 的內容是 payload，非 UTF-8 位元組要原樣
+/// 落進 request/response 檔（分組 6）；`--message-file` 的路徑同理不該被 lossy
+/// 改寫成一個開不了的檔名。
+fn message_source(mode: &str, val: &OsString) -> MessageSource {
     if mode == "text" {
-        MessageSource::Text(val.to_string())
+        MessageSource::Text(os_bytes(val))
     } else if val == "-" {
         MessageSource::Stdin
     } else {
@@ -370,18 +432,18 @@ fn message_source(mode: &str, val: &str) -> MessageSource {
 
 /// parse_message_opts:664 — reply／fail 共用的 `--message`／`--message-file`
 /// 解析。`cmdname` 只用在「需要訊息」那句 die 的措辭裡，逐字對齊 bash。
-fn parse_message_opts(cmdname: &str, args: &[String]) -> Result<MessageSource> {
-    let mut mode = String::new();
-    let mut val = String::new();
+fn parse_message_opts(cmdname: &str, args: &[OsString]) -> Result<MessageSource> {
+    let mut mode = "";
+    let mut val = OsString::new();
     let mut it = args.iter();
     while let Some(a) = it.next() {
-        match a.as_str() {
+        match lossy(a).as_str() {
             "--message" => {
                 let v = it.next().ok_or_else(|| Error::new("--message 需要參數"))?;
                 if !mode.is_empty() {
                     return Err(Error::new("--message 與 --message-file 只能擇一"));
                 }
-                mode = "text".to_string();
+                mode = "text";
                 val = v.clone();
             }
             "--message-file" => {
@@ -391,7 +453,7 @@ fn parse_message_opts(cmdname: &str, args: &[String]) -> Result<MessageSource> {
                 if !mode.is_empty() {
                     return Err(Error::new("--message 與 --message-file 只能擇一"));
                 }
-                mode = "file".to_string();
+                mode = "file";
                 val = v.clone();
             }
             other => return Err(Error::new(format!("未知參數：{other}"))),
@@ -402,7 +464,7 @@ fn parse_message_opts(cmdname: &str, args: &[String]) -> Result<MessageSource> {
             "{cmdname} 需要 --message 或 --message-file"
         )));
     }
-    Ok(message_source(&mode, &val))
+    Ok(message_source(mode, &val))
 }
 
 /// cmd_unregister:503
@@ -523,13 +585,13 @@ fn respond_task(
 }
 
 /// cmd_reply:708
-fn cmd_reply(paths: &Paths, args: &[String]) -> Result<()> {
+fn cmd_reply(paths: &Paths, args: &[OsString]) -> Result<()> {
     if args.is_empty() {
         return Err(Error::new(
             "用法：agent-bridge reply <task-id> (--message <text> | --message-file <path>)",
         ));
     }
-    let id = &args[0];
+    let id = &lossy(&args[0]);
     task::check_task_id(id)?;
     let src = parse_message_opts("reply", &args[1..])?;
     respond_task(paths, id, TaskState::Completed, "replied", "reply", &src)?;
@@ -538,13 +600,13 @@ fn cmd_reply(paths: &Paths, args: &[String]) -> Result<()> {
 }
 
 /// cmd_fail:717
-fn cmd_fail(paths: &Paths, args: &[String]) -> Result<()> {
+fn cmd_fail(paths: &Paths, args: &[OsString]) -> Result<()> {
     if args.is_empty() {
         return Err(Error::new(
             "用法：agent-bridge fail <task-id> (--message <text> | --message-file <path>)",
         ));
     }
-    let id = &args[0];
+    let id = &lossy(&args[0]);
     task::check_task_id(id)?;
     let src = parse_message_opts("fail", &args[1..])?;
     respond_task(paths, id, TaskState::Failed, "failed", "fail", &src)?;
@@ -679,6 +741,30 @@ fn cmd_await(paths: &Paths, args: &[String]) -> Result<()> {
             other => return Err(Error::new(format!("未知參數：{other}"))),
         }
     }
+    match await_task(paths, id, timeout)? {
+        AwaitOutcome::Terminal(st) => {
+            println!("{st}");
+            Ok(())
+        }
+        AwaitOutcome::Timeout(st) => {
+            err_line(&format!(
+                "await 逾時（{timeout}s）：task {id} 目前狀態 {st}"
+            ));
+            // 專屬退出碼：不走 main 的統一收斂層（那裡一律 1）
+            std::process::exit(124);
+        }
+    }
+}
+
+/// await 的兩種正常終局。**逾時必須與操作性失敗分得開**：呼叫端（evict）只在
+/// 真逾時才走「筆記沒落地仍回收」，其他非零是 await 自己壞掉——worker 可能還
+/// 活著、根本沒等到期限，這時回收等於把活的 context 當逾時殺掉。
+enum AwaitOutcome {
+    Terminal(String),
+    Timeout(String),
+}
+
+fn await_task(paths: &Paths, id: &str, timeout: u64) -> Result<AwaitOutcome> {
     let dir = task::require_task_dir(paths, id)?;
 
     // 輪詢間隔在進迴圈前就驗：壞值在 bash 會讓 sleep 立刻報錯、await 毫秒級
@@ -686,8 +772,20 @@ fn cmd_await(paths: &Paths, args: &[String]) -> Result<()> {
     // 活著的 worker。此處同樣先驗後跑，維持「124 只等於真逾時」的契約。
     // 名字取 config 的常數（集中處），解析與錯誤文案留在 CLI 層——那兩句
     // die 訊息是 await 的契約面，不是設定讀取的一部分。
-    let raw = std::env::var(config::ENV_POLL_INTERVAL).unwrap_or_default();
-    let interval: f64 = if raw.is_empty() {
+    //
+    // **`var_os` 而非 `var`**（codex 複核 2026-07-31 blocker）：`var()` 把
+    // 「已設定但非 UTF-8」壓成 `Err`→空字串→退預設 1.0，而 bash 拿到的是原始
+    // 位元組、regex 判不過就 die。差異不只多睡一秒——evict 會把這種 config
+    // 錯誤誤分類成真逾時而去 despawn 一個還活著的 worker。非 UTF-8 在這裡
+    // 走「值不合法」那條（訊息裡的值以 lossy 呈現，目的是讓人看見自己設了什麼）。
+    let raw_os = std::env::var_os(config::ENV_POLL_INTERVAL).unwrap_or_default();
+    let raw = raw_os.to_string_lossy().into_owned();
+    let is_unicode = raw_os.to_str().is_some();
+    let interval: f64 = if !is_unicode {
+        return Err(Error::new(format!(
+            "AGENT_BRIDGE_POLL_INTERVAL 需為正數（秒）：{raw}"
+        )));
+    } else if raw.is_empty() {
         1.0
     } else {
         let parsed = if poll_interval_shape_ok(&raw) {
@@ -718,15 +816,10 @@ fn cmd_await(paths: &Paths, args: &[String]) -> Result<()> {
             ))
         })?;
         if matches!(st.as_str(), "completed" | "failed" | "cancelled") {
-            println!("{st}");
-            return Ok(());
+            return Ok(AwaitOutcome::Terminal(st));
         }
         if timeout > 0 && started.elapsed().as_secs() >= timeout {
-            err_line(&format!(
-                "await 逾時（{timeout}s）：task {id} 目前狀態 {st}"
-            ));
-            // 專屬退出碼：不走 main 的統一收斂層（那裡一律 1）
-            std::process::exit(124);
+            return Ok(AwaitOutcome::Timeout(st));
         }
         std::thread::sleep(std::time::Duration::from_secs_f64(interval));
     }
@@ -779,6 +872,412 @@ fn cmd_gc(paths: &Paths, args: &[String]) -> Result<()> {
         eprintln!("gc（試算）：可刪 {} 個；{kept}", s.removed);
         eprintln!("確認無誤後加 --apply 才會真的刪除");
     }
+    Ok(())
+}
+
+/// cmd_spawn:1063 的 argv 解析。**`--model` 在解析點就驗**（不等到用時）：
+/// 這個值會進 pane 啟動命令字串，不合法就必須在建 pane 之前死掉。
+fn parse_spawn_args(args: &[String], relay: Option<spawn::Relay>) -> Result<spawn::SpawnRequest> {
+    if args.is_empty() {
+        return Err(Error::new(
+            "用法：agent-bridge spawn <name> --runtime <codex|claude> [--model <model>] [--window]",
+        ));
+    }
+    let name = args[0].clone();
+    let mut runtime = String::new();
+    let mut model = String::new();
+    let mut use_window = false;
+    let mut it = args[1..].iter();
+    while let Some(a) = it.next() {
+        match a.as_str() {
+            "--runtime" => {
+                runtime = it
+                    .next()
+                    .ok_or_else(|| Error::new("--runtime 需要參數"))?
+                    .clone();
+            }
+            "--model" => {
+                model = it
+                    .next()
+                    .ok_or_else(|| Error::new("--model 需要參數"))?
+                    .clone();
+                if !spawn::is_valid_model(&model) {
+                    return Err(Error::new(format!(
+                        "model 名稱不合法（僅允許英數起首的 [A-Za-z0-9._-]{{1,64}}）：{model}"
+                    )));
+                }
+            }
+            "--window" => use_window = true,
+            other => return Err(Error::new(format!("未知參數：{other}"))),
+        }
+    }
+    Ok(spawn::SpawnRequest {
+        name,
+        runtime,
+        model,
+        use_window,
+        relay,
+    })
+}
+
+/// cmd_spawn:1063
+fn cmd_spawn(paths: &Paths, args: &[String]) -> Result<()> {
+    let req = parse_spawn_args(args, None)?;
+    spawn::spawn(paths, &SubprocessTmux, &req)?;
+    Ok(())
+}
+
+/// cmd_relay:1391 — 把主導權交給新 session。與 spawn 的差別只有三處：注入
+/// 接手者守則、把焦點切過去、以及（可選）請接手者回收前一棒；cap／tag／回滾／
+/// 夭折偵測／registry 全部共用 `spawn::spawn`。
+///
+/// `--self-exit` 不是「自殺」：它把回收工作寫進接手者的 prompt，由 B 在 ready
+/// 之後 `despawn A`。既有 despawn 的順序是「kill pane → 確認已死 → 清 registry
+/// → 寫審計」，A 若殺自己的 pane，執行中的 process 會被 SIGHUP 帶走，永遠走不
+/// 到後兩步。
+fn cmd_relay(paths: &Paths, args: &[String]) -> Result<()> {
+    const USAGE_RELAY: &str = "用法：agent-bridge relay <name> --runtime <codex|claude> [--model <model>] --handoff <path> [--window] [--no-select] [--self-exit <my-name>]";
+    if args.is_empty() {
+        return Err(Error::new(USAGE_RELAY));
+    }
+    let name = args[0].clone();
+    let mut runtime = String::new();
+    let mut model = String::new();
+    let mut handoff = String::new();
+    let mut prev = String::new();
+    let mut use_window = false;
+    let mut no_select = false;
+    let mut it = args[1..].iter();
+    while let Some(a) = it.next() {
+        match a.as_str() {
+            "--runtime" => {
+                runtime = it
+                    .next()
+                    .ok_or_else(|| Error::new("--runtime 需要參數"))?
+                    .clone();
+            }
+            // 只收值、不在這裡驗：驗證的正本在 spawn 的解析點（同一條 MODEL_RE）
+            "--model" => {
+                model = it
+                    .next()
+                    .ok_or_else(|| Error::new("--model 需要參數"))?
+                    .clone();
+            }
+            "--handoff" => {
+                handoff = it
+                    .next()
+                    .ok_or_else(|| Error::new("--handoff 需要參數"))?
+                    .clone();
+            }
+            "--self-exit" => {
+                prev = it
+                    .next()
+                    .ok_or_else(|| Error::new("--self-exit 需要參數（你自己的 agent 名稱）"))?
+                    .clone();
+            }
+            "--window" => use_window = true,
+            "--no-select" => no_select = true,
+            other => return Err(Error::new(format!("未知參數：{other}"))),
+        }
+    }
+    if handoff.is_empty() {
+        return Err(Error::new("relay 需要 --handoff <path>（要交棒的交接檔）"));
+    }
+    if !prev.is_empty() && !is_valid_name(&prev) {
+        return Err(Error::new(format!(
+            "--self-exit 的 agent 名稱不合法（僅允許 [A-Za-z0-9_-]+）：{prev}"
+        )));
+    }
+    // 交接檔的兩道檢查都必須在建 pane 之前，理由同 brief：pane 落地後才 die
+    // 會留下佔 cap 的孤兒。-f 一併擋掉目錄與 FIFO
+    if handoff.contains('\'') {
+        return Err(Error::new(format!("交接檔路徑不可含單引號：{handoff}")));
+    }
+    let hp = std::path::Path::new(&handoff);
+    if !hp.is_file() || std::fs::File::open(hp).is_err() {
+        return Err(Error::new(format!("交接檔不是可讀的普通檔案：{handoff}")));
+    }
+
+    // 接力鏈深度上限：這條鏈設計上鼓勵「context 吃緊就再交棒」，沒有上界就是
+    // 無界遞迴。深度靠 AGENT_BRIDGE_RELAY_DEPTH 逐棒下傳——人工起的第一棒沒有
+    // 這個變數＝深度 0，其後每 relay 一次 +1。已知限制：pane 內可自行改寫這個
+    // 變數繞過（與 registry 同屬 worker 可寫面）；這道 cap 擋的是失控迴圈。
+    let depth = config::relay_depth()?;
+    let max_depth = config::max_relay_depth()?;
+    if max_depth > 0 && depth >= max_depth {
+        return Err(Error::new(format!(
+            "已達接力上限（{}={max_depth}，本 session 是第 {depth} 棒）：這條鏈需要人介入確認後才該繼續。確認後可調高上限，或設 0 解除限制。",
+            config::ENV_MAX_RELAY_DEPTH
+        )));
+    }
+
+    let relay = spawn::Relay {
+        handoff,
+        prev: prev.clone(),
+        depth_next: depth + 1,
+    };
+    let mut spawn_args: Vec<String> = vec![name, "--runtime".into(), runtime];
+    if !model.is_empty() {
+        spawn_args.push("--model".into());
+        spawn_args.push(model);
+    }
+    if use_window {
+        spawn_args.push("--window".into());
+    }
+    let req = parse_spawn_args(&spawn_args, Some(relay))?;
+    let tmux = SubprocessTmux;
+    let pane = spawn::spawn(paths, &tmux, &req)?;
+
+    // 切焦點：orchestrator 驅動時沒有人在看畫面，--no-select 是那條路徑的常態。
+    // 失敗不致命——relay 主體（pane＋registry＋審計）此時已經成功落地
+    if !no_select {
+        let _ = tmux.exec(&["select-window", "-t", &pane]);
+        let _ = tmux.exec(&["select-pane", "-t", &pane]);
+    }
+    if prev.is_empty() {
+        eprintln!(
+            "已交棒給 '{}'（前一棒未指定自動回收，請自行收尾）",
+            req.name
+        );
+    } else {
+        eprintln!("已交棒給 '{}'；'{prev}' 將由對方在接手後回收", req.name);
+    }
+    Ok(())
+}
+
+/// cmd_despawn:1476
+fn cmd_despawn(paths: &Paths, args: &[String]) -> Result<()> {
+    if args.len() != 1 {
+        return Err(Error::new("用法：agent-bridge despawn <name>"));
+    }
+    spawn::despawn(
+        paths,
+        &SubprocessTmux,
+        &args[0],
+        &spawn::DespawnCtx::default(),
+    )?;
+    Ok(())
+}
+
+/// cmd_ready:1594
+fn cmd_ready(paths: &Paths, args: &[String]) -> Result<()> {
+    if args.len() != 1 {
+        return Err(Error::new("用法：agent-bridge ready <name>"));
+    }
+    spawn::ready(paths, &args[0])
+}
+
+/// cmd_disposable:1629
+fn cmd_disposable(paths: &Paths, args: &[String]) -> Result<()> {
+    if args.len() != 1 {
+        return Err(Error::new("用法：agent-bridge disposable <name>"));
+    }
+    spawn::disposable(paths, &SubprocessTmux, &args[0])
+}
+
+/// cmd_idle:1800 — 唯讀四欄 TSV（name／ready／disposable／idle_secs）。
+fn cmd_idle(paths: &Paths, args: &[String]) -> Result<()> {
+    if !args.is_empty() {
+        return Err(Error::new("用法：agent-bridge idle（不接參數）"));
+    }
+    for r in spawn::idle(paths) {
+        println!("{}\t{}\t{}\t{}", r.name, r.ready, r.disposable, r.idle_secs);
+    }
+    Ok(())
+}
+
+/// evict 的收尾任務文案。**硬編在這裡而不是抽到 share/**：它是機制的一部分
+/// （「把只存在於你 context 裡的事實寫下來」），不是可調策略。抽成檔案會多一條
+/// 「檔案不存在怎麼辦」的失敗路徑，而那條路徑一旦失敗，等於整個筆記機制悄悄消失。
+const EVICT_MSG: &str = r#"[Wrap-up task — your final round before this pane is reclaimed]
+
+This pane is about to be reclaimed and your context vanishes with it.
+Use reply to hand back a note with the key facts that exist only in your
+context and never made it into earlier responses.
+
+Write:
+- facts you found but never put into a reply (file:line, commands, measured numbers)
+- dead ends you walked and why they failed (so the next runner skips them)
+- open questions, the assumptions you held, and which conclusions were
+  actually conjecture rather than verified
+
+Do not write:
+- restatements of what is already in your responses
+- new work: this round is consolidation only — start no new investigation
+
+When done, run agent-bridge reply <task-id> --message-file <path> (or --message).
+Even with nothing worth keeping, reply anyway with the single line
+"no residual value" — a missing reply is recorded as notes-never-landed."#;
+
+/// cmd_evict:1866 — 撞 cap 時的驅逐，但**不是直接殺**：先派一輪收尾任務，讓
+/// worker 把只存在於它 context 裡的關鍵事實寫下來，落地之後才 despawn。
+///
+/// 三步（send → await → despawn）刻意**不包在一把鎖裡**：鎖是單值，同時持有
+/// 兩把時只會放掉一把。分段的失效方向分別是「多一個沒人收的收尾 task」與
+/// 「筆記已落地、pane 沒收掉（多佔一個 cap）」——都不會刪掉還沒落地的脈絡。
+///
+/// **逾時仍然 despawn**：否則一個不回話的 worker 會把 cap 永久卡死。代價是
+/// 筆記沒落地，所以審計線一定要看得出來（evicted-timeout）。
+fn cmd_evict(paths: &Paths, args: &[String]) -> Result<()> {
+    if args.is_empty() {
+        return Err(Error::new(
+            "用法：agent-bridge evict <name> [--timeout <secs>] [--from <sender>]",
+        ));
+    }
+    let name = args[0].clone();
+    let mut timeout: u64 = 300;
+    let mut from = String::from("orchestrator");
+    let mut it = args[1..].iter();
+    while let Some(a) = it.next() {
+        match a.as_str() {
+            "--timeout" => {
+                let v = it.next().ok_or_else(|| Error::new("--timeout 需要參數"))?;
+                let ok = !v.is_empty() && v.len() <= 9 && v.bytes().all(|b| b.is_ascii_digit());
+                if !ok {
+                    return Err(Error::new(format!(
+                        "--timeout 需為非負整數（秒，至多 9 位），0＝不逾時：{v}"
+                    )));
+                }
+                timeout = v.parse().unwrap_or(0);
+            }
+            "--from" => {
+                from = it
+                    .next()
+                    .ok_or_else(|| Error::new("--from 需要參數"))?
+                    .clone();
+            }
+            other => return Err(Error::new(format!("未知參數：{other}"))),
+        }
+    }
+    if !is_valid_name(&name) {
+        return Err(Error::new(format!(
+            "agent 名稱不合法（僅允許 [A-Za-z0-9_-]+）：{name}"
+        )));
+    }
+    if !is_valid_name(&from) {
+        return Err(Error::new(format!(
+            "sender 名稱不合法（僅允許 [A-Za-z0-9_-]+）：{from}"
+        )));
+    }
+
+    // 出身快檢（不取鎖）：純 fail-fast，避免對人工註冊的 agent 送出一個之後
+    // 必定被 despawn 拒絕、沒人回收的孤兒收尾任務。權威判定仍在 despawn 的鎖內
+    let f = paths.agents_dir.join(format!("{name}.json"));
+    if !f.is_file() {
+        return Err(Error::new(format!("未註冊的 agent：{name}")));
+    }
+    match registry::read_provenance(&f) {
+        registry::Provenance::Manual => {
+            return Err(Error::new(format!(
+                "agent '{name}' 非 spawn 出身，evict 拒絕（人工 pane 的生命週期不歸 bridge 管，請用 unregister）"
+            )));
+        }
+        registry::Provenance::Undetermined => {
+            return Err(Error::new(format!(
+                "agent '{name}' 的 registry 無法解析，出身不明，evict 拒絕；請確認 {} 後手動處理",
+                f.display()
+            )));
+        }
+        registry::Provenance::Spawned => {}
+    }
+
+    // pane/runtime 在 despawn 前取：despawn 會刪掉 registry，之後就讀不到了
+    let pane = registry::read_field(&f, "pane_id", "-");
+    let runtime = registry::read_field(&f, "runtime", "-");
+    // 記下這一代的 spawn_tag，最後 despawn 時綁定比對：收尾任務是派給「這一代」
+    // 的，回收也只能收這一代。tag 空的話綁定等於沒有——正常 spawn 一定寫得出
+    // tag，取不到代表 registry 被動過，這時拒絕動作
+    let gen_tag = registry::read_field(&f, "spawn_tag", "");
+    if gen_tag.is_empty() {
+        return Err(Error::new(format!(
+            "agent '{name}' 的 registry 沒有 spawn_tag，無法鎖定世代，evict 拒絕；請確認 {} 後手動處理",
+            f.display()
+        )));
+    }
+
+    let task_id = do_send(
+        paths,
+        &name,
+        &from,
+        &MessageSource::Text(EVICT_MSG.as_bytes().to_vec()),
+        true,
+    )
+    .map_err(|e| {
+        // 內層錯誤先出聲再蓋上 evict 的中止訊息：bash 的 `cmd_send` 跑在命令
+        // 替換的 subshell 裡，它自己的 die 早就印上 stderr 了，外層 die 是
+        // 第二行（codex 複核 2026-07-31）
+        err_line(&e.message);
+        Error::new(format!(
+            "evict 中止：收尾任務送不出去，未動 pane（agent '{name}' 仍在）"
+        ))
+    })?;
+    eprintln!("evict：收尾任務 {task_id} 已派給 '{name}'，等待筆記落地（timeout {timeout}s）");
+
+    // 只有真正的逾時才走「筆記沒落地仍回收」；await 自己的操作性失敗（壞輪詢
+    // 間隔、status 檔消失等）代表 worker 可能還活著、根本沒等到期限——這時
+    // despawn 等於把活的 context 當逾時殺掉，審計還記成 timeout
+    let final_st = match await_task(paths, &task_id, timeout) {
+        Ok(AwaitOutcome::Terminal(st)) => st,
+        Ok(AwaitOutcome::Timeout(st)) => {
+            // bash 的 cmd_await 在 subshell 內先印自己的逾時行才 exit 124；
+            // 那行是呼叫端追查「等到什麼狀態」的唯一線索，不能吞
+            err_line(&format!(
+                "await 逾時（{timeout}s）：task {task_id} 目前狀態 {st}"
+            ));
+            String::new()
+        }
+        Err(e) => {
+            err_line(&e.message);
+            return Err(Error::new(format!(
+                "evict 中止：await 操作性失敗（rc=1，非逾時），pane 未動（agent '{name}' 仍在）；收尾任務 {task_id} 留存可查"
+            )));
+        }
+    };
+    let outcome = match final_st.as_str() {
+        "completed" => "evicted",
+        // failed/cancelled 也是 await 的正常返回，不是逾時。全記成
+        // evicted-timeout 會讓審計線說謊——「筆記沒落地」的原因不同
+        "failed" | "cancelled" => "evicted-unfinished",
+        _ => "evicted-timeout",
+    };
+
+    let tmux = SubprocessTmux;
+    let result = spawn::despawn(
+        paths,
+        &tmux,
+        &name,
+        &spawn::DespawnCtx {
+            expect_tag: Some(gen_tag),
+            notes_handled: true,
+        },
+    )?;
+
+    // stale＝registry 清掉了，但那個 pane 還活著、已經不屬於這個 agent。它沒有
+    // 被回收，所以不能記 evicted*——despawn 自己已經記過 despawn-stale，再補一筆
+    // 只會讓審計線宣稱發生過一次沒發生的回收
+    if result == spawn::DespawnResult::Stale {
+        err_line(&format!(
+            "警告：agent '{name}' 的註冊已清除，但 pane {pane} 已不屬於它、未被回收；收尾任務 {task_id}（{final_st}）請自行判讀"
+        ));
+        println!("{task_id}");
+        return Ok(());
+    }
+    // 記在 despawn 成功之後：despawn 失敗代表 pane 還在、根本沒被驅逐
+    if registry::log_agent_event(paths, &tmux, outcome, &name, &pane, &runtime, None).is_err() {
+        err_line("警告：evict 已完成，但審計未落地（agents.log append 失敗）");
+    }
+    match outcome {
+        "evicted" => {
+            eprintln!("已 evict agent '{name}'；收尾筆記可用：agent-bridge read {task_id}")
+        }
+        "evicted-unfinished" => err_line(&format!(
+            "警告：收尾任務 {task_id} 以 {final_st} 結束，筆記未落地；agent '{name}' 仍已回收"
+        )),
+        _ => err_line(&format!(
+            "警告：收尾任務 {task_id} 逾時（{timeout}s）未回覆，筆記未落地；agent '{name}' 仍已回收（避免 cap 卡死）"
+        )),
+    }
+    println!("{task_id}");
     Ok(())
 }
 
