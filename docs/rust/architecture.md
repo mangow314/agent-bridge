@@ -401,11 +401,18 @@ rollback 基準——它代表「回到 M4 的行為」，不該再長新功能�
   下任何結論，因此不提供「冒名者過 TTL 仍擋」的保證。要真正分辨「合法新主」
   與「巢狀同 runtime」，得有 runtime 提供的、非繼承的身分（禁讀 environ 的
   前提下，pid/starttime/argv 三者都做不到，祖先鏈也已知無解）。
-- **codex runtime 未量測**：codex 的 hook 走 profile overlay，行程樹未必與
-  claude 相同。attestation 仍對所有 runtime 啟用——**因為誤判的後果已經降為
-  「該放行卻落回」＝M4 行為**，不再是永久誤擋，所以「未量測就關掉」的保守
-  已無必要（那反而白白放棄 codex 本尊的自癒）。要確認 codex 也吃得到自癒，
-  補一次 `m5-proposal.md` §1 的量測流程即可。
+- **codex worker 拿不到自癒**（2026-07-31 已量測，`docs/codex-hooks-probe.md`
+  補測節）：codex 經 npm 安裝，`bin/codex` 是一支 **node launcher**，tmux exec
+  的是它（＝`pane_pid`），它不 exec 取代自己而是 fork 出平台原生執行檔，再由
+  原生執行檔 fork hook。中間多一層，hook 的直接 PPID 因此**永遠不等於**
+  `pane_pid`，M5 對 codex 一律確認不了、全面落回 M4 行為。
+  attestation 仍對所有 runtime 啟用：argv 規則對 launcher 正確命中，寫入的兩欄
+  也確實指向 pane 行程，只是後續比對不會成立。**這無害，因為 11.2 收斂後誤判
+  的後果就是「該放行卻落回」**——反過來說，這次量測正是那次收斂的實證：把實測
+  值代進首版邏輯（pid 活著、starttime 相符、PPID 不符），每一個 codex worker
+  的每一個 hook 都會被永久擋死。
+  要讓 codex 也吃到自癒，得記到原生執行檔那個行程，但它在 spawn 當下未必存在，
+  且「pane_pid 的哪個子行程才是它」需要新規則——另案，不在 M5 範圍。
 - **`pane_pid` == runtime 本尊依賴 tmux 直接 exec**：本機實測成立，但那是 tmux
   的行為不是承諾。分組 35f 鎖住了「記到的 pid 等於 pane_pid 且 starttime 相符」，
   若哪天中間多一層 shell，argv 比對會失敗、兩欄留空、全面落回（安全但窗回來）。

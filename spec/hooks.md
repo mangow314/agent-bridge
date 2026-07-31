@@ -95,7 +95,9 @@ wrapper。當成冒名的話本尊會被**永久**擋死，連 TTL 自癒都到�
 巢狀 runtime 的暴露面維持 HOOK-OWNER-2 的原狀。
 Note: 「直接 fork」是 2026-07-31 對本機這版 claude 的實測（`docs/rust/
 m5-proposal.md` §1），不是介面承諾。故本條的價值只在相符時的即時自癒，落回
-路徑是常態而非例外處置。
+路徑是常態而非例外處置。**codex 已實測為落回**：npm 安裝的 `bin/codex` 是
+node launcher，tmux exec 的是它，它再 fork 原生執行檔、原生執行檔才 fork
+hook，PPID 永遠對不上（`docs/codex-hooks-probe.md` 補測節）。
 Note: 取樣順序 MUST 是先讀自身 PPID、再驗該 pid 的 starttime。反過來的話父
 行程若在兩次讀取之間退出，hook 會被 reparent，於是前一步證實了記錄中的行程、
 後一步卻拿到新的 PPID。registry 對同互信域的 worker 可寫，本條防的是**巢狀

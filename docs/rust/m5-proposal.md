@@ -107,11 +107,13 @@ sleep 重試）直接違反 hook 的 exit 0 鐵律與延遲要求。
 
 ## 4. 未量測 / 殘餘風險
 
-- **codex runtime 沒量**。codex 的 hook 走 profile overlay，行程樹未必相同。
-  A 路線對 codex 的效果目前是未知；未知的後果就是落回第 3 條（退回時間窗）
-  ＝ codex worker 維持現狀。**因此落地版對所有 runtime 一律啟用 attestation**
-  ——第 2 條刪掉之後，猜錯不會擋死誰，只是拿不到自癒。要確認 codex 也吃得到
-  自癒，補一次同樣的量測。
+- ~~**codex runtime 沒量**~~ → **已量（2026-07-31，`docs/codex-hooks-probe.md`
+  補測節）：codex 落回第 3 條，拿不到自癒。** 原因不是 profile overlay，是
+  npm 的 node launcher——tmux exec 的是 launcher（＝`pane_pid`），它 fork 出
+  原生執行檔，原生執行檔才 fork hook，中間多一層，PPID 永遠對不上。
+  落地版仍對所有 runtime 啟用 attestation：第 2 條刪掉之後，猜錯不會擋死誰，
+  只是拿不到自癒。反過來說，這次量測正是第 2 條該刪的實證——不刪的話每個
+  codex worker 的每個 hook 都會被永久擋死。
 - **`pane_pid` 等於 runtime 本尊，依賴 tmux 直接 exec**。本機實測成立，但
   這是 tmux 的行為不是承諾；若哪天中間多一層 shell，spawn 記到的會是 shell
   的 pid，判別會全面落回第 3 條（安全，但窗又回來了）。值得在 gate 裡加一條

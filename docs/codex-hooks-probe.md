@@ -30,7 +30,7 @@ without requiring **persisted hook trust** for this invocation」。codex 對 ho
 就是不執行。持久化位置在 `~/.codex/config.toml`：
 
 ```toml
-[hooks.state."/home/mango/.codex/config.toml:pre_tool_use:0:0"]
+[hooks.state."/home/<user>/.codex/config.toml:pre_tool_use:0:0"]
 trusted_hash = "sha256:cecc094d…"
 enabled = true
 ```
@@ -191,3 +191,71 @@ TTL 的降級窗、長壽巢狀 session 越過 TTL 的奪權可能）詳見 READ
 - block 語意本身是在 `--dangerously-bypass-hook-trust` 下測的；走正規信任流程後
   只驗到 hook 會觸發與 busy 派工端到端成功，沒有再單獨重測一次 block JSON 的
   拒絕分支（`stop_hook_active` ＋同 id 放行）。
+
+---
+
+# 補測（2026-07-31）：codex 的 hook 行程樹
+
+M5 把「codex 行程樹未量測」列為開著的缺口（架構 §11.6）。這一節把它量掉。
+
+- 版本：codex-cli **0.146.0**
+- 方法：`bin/agent-bridge` shim 暫時加一段探針，`hook` 子命令進來時先把自身
+  祖先鏈（pid／ppid／starttime／comm）附加到記錄檔再 `exec` 真的執行檔——
+  stdin、argv、退出碼都不碰。spawn 一個真的 codex worker（`m5codex`）取其
+  prompt-submit 與 stop 事件，量完 despawn、`git checkout` 還原 shim。
+- 結論：**codex 的 hook 行程直接父行程不是 `pane_pid`，M5 的行程身分閘門對
+  codex 一律確認不了，全面落回 M4 的時間窗判別。**
+
+## 實測行程樹
+
+```
+hook_pid=1612290  ppid=1609575  starttime=56855455  bash
+        1609575   ppid=1609509  starttime=56853512  codex   <- 原生執行檔，fork hook 的是它
+        1609509   ppid=9411     starttime=56853508  node    <- pane_pid，registry 記的是它
+           9411   ppid=1        starttime=11683     tmux: server
+```
+
+兩個行程的 argv：
+
+```
+1609509: node /home/<user>/.nvm/versions/node/v22.18.0/bin/codex --profile agent-worker
+1609575: /home/<user>/.nvm/.../@openai/codex-linux-x64/vendor/.../bin/codex --profile agent-worker
+```
+
+## 為什麼與 claude 不同
+
+claude 是 tmux 直接 exec 的單一行程，pane_pid 就是 fork hook 的那個行程。
+codex 經 npm 安裝，`bin/codex` 是一支 **node launcher**：tmux exec 的是
+`node …/bin/codex`（＝pane_pid），它**不 exec 取代自己**，而是 fork 出平台
+原生執行檔，再由原生執行檔 fork hook。中間因此多一層。
+
+STATE-AGENT-4 的 argv 規則對 launcher **正確命中**（argv[0] 是直譯器 `node`、
+argv[1] 的 basename 是 `codex`），所以 registry 兩欄照樣寫入：
+
+```
+worker_pid = 1609509（= tmux 回報的 pane_pid）
+worker_starttime = 56853508（與該 pid 當下相符）
+```
+
+命中的是「pane 行程確實是 codex 的啟動器」——這句話為真。不為真的是後面那個
+隱含前提：**啟動器不等於 fork hook 的那個行程**。
+
+## 這同時是本輪修補的實證
+
+把實測值代進 M5 首版的判別邏輯：`worker_pid` 1609509 仍活著（✓）、其
+starttime 與紀錄相符（✓）、hook 的 PPID 1609575 不等於它（✓）——正好命中
+首版那條「明確冒名 → 擋，且 ts 過期也不得接管」。也就是說首版一旦上線，
+**每一個 codex worker 的每一個 hook 事件都會被永久擋死**，state 通道整條沒有
+自癒路徑。
+
+複核者當初的反對是論證加一個合成實測；這次量到的是本機真實存在的形狀。修補
+後的行為是落回 M4：實測期間 `state/m5codex.json` 正常更新（`idle`，owner 為
+codex 的 session id），通知通道與 M5 之前完全相同。
+
+## 尚未收的
+
+- **codex worker 拿不到 M5 的即時自癒**。要收就得讓 spawn 記到原生執行檔那個
+  行程，但它在 spawn 當下未必已經存在，而「pane_pid 的哪一個子行程才是它」
+  需要新規則——那是新的設計決定，不在 M5 範圍內，另案。
+- 只量了 npm 全域安裝這一種佈署形狀。若哪天 codex 改成單一原生執行檔直接
+  上 PATH，行程樹會與 claude 同形，屆時要重量。

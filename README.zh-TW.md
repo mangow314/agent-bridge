@@ -583,7 +583,11 @@ tests/run-tests.sh
     是 `/clear` 換 session id 後的自癒路徑）。殘餘邊界（刻意不美化）：
     (1) `/clear` 後最長一個 TTL（預設 1800 秒）內 parent 的 hooks 被舊 owner
     鎖住，state 凍結、stop 不 block，deferred 任務最壞要等 TTL 過期後 parent
-    的下一次 turn 結束才被取件；(2) 長壽巢狀 session 若存活超過 TTL 且期間
+    的下一次 turn 結束才被取件——**M5 對 claude worker 關掉了這個窗**：spawn
+    記下 worker runtime 的 `(pid, starttime)`，hook 比對自身直接父行程，相符
+    即放行，`/clear` 的自癒因此是即時的。**codex worker 不適用**（npm 的 node
+    launcher 讓行程中間多一層，PPID 對不上，一律落回本段所述的時間窗；實測見
+    `docs/codex-hooks-probe.md` 補測節）；(2) 長壽巢狀 session 若存活超過 TTL 且期間
     parent 零 hook 事件，仍可能奪走所有權；(3) 缺 `session_id` 的 payload
     不參與 state 通道（不寫、不 block），行為退回 legacy 送鍵；(4) `owner`
     欄與 state 檔同屬 worker 可寫互信域，防的是**意外汙染**不是蓄意偽造
