@@ -28,6 +28,10 @@
 `agent-bridge ui` ＝ **PTY 無關的 alternate-screen 全螢幕 TUI**（lazygit 形），
 落在既有佔位 crate `crates/ab-tui`。
 
+- **部署形態（P0 後補裁定）**：`ab-tui` 是 lib crate，`ab` 新增 `ui` 子指令
+  呼叫 `ab_tui::run()`——部署邊界是 `cp target/release/ab bin/ab` 單一 binary，
+  第二個 binary 會在部署時失蹤。
+
 - `tmux display-popup -E 'agent-bridge ui'` 只是 binding 層的召喚方式，
   **程式不知道自己在不在 popup 裡**。
 - 唯一需要模式感知的是 `Enter` focus（popup 下＝關 popup ＋ select-pane），
