@@ -252,10 +252,40 @@ starttime 與紀錄相符（✓）、hook 的 PPID 1609575 不等於它（✓）
 後的行為是落回 M4：實測期間 `state/m5codex.json` 正常更新（`idle`，owner 為
 codex 的 session id），通知通道與 M5 之前完全相同。
 
+## 追測（同日）：這個窗對 codex 是否真的存在
+
+前一節確認了 codex 拿不到自癒，但「拿不到」只有在 session_id 真的會變、而行程
+不變的情況下才會痛。這是另案立案前的第一道 gate，先量掉。
+
+- 方法：同一支 shim 探針，改記 hook payload 的 `session_id` 與 `PPID`
+  （stdin 照 hook 本身的形狀讀完再餵回去）。spawn 一個 codex worker
+  （`m5sid`），取基準事件，於 pane 內下 `/new`，再送一個 prompt 觸發 turn。
+- 結論：**窗存在。**
+
+```
+/new 前  prompt-submit / stop   sid=019fb677-4b22-77b3-8b67-0814fe3a97ca  ppid=1646226
+/new 後  prompt-submit / stop   sid=019fb677-bebd-7353-ad01-03936ba3f5a4  ppid=1646226
+```
+
+**PPID 完全不變（1646226），session_id 換了。** 這正是 M5 窗 1 的形狀：行程沒
+變＝身分沒變，但 session_id 判別認不出來。
+
+實際傷害也重現了：`/new` 之後兩次 hook 事件都被擋，`state/m5sid.json` 的
+`owner` 停在**舊** sid，ts 凍結在 `/new` 前最後一次寫入。要等 TTL（預設 1800
+秒）過期才交還。
+
+傷害程度取決於凍結當下的值：停在 `idle` 時通知端照樣走 send-keys 送達（回到
+legacy，不算致命）；停在**新鮮的 `busy`** 時通知端不送鍵、而 worker 的 stop
+hook 又被擋著不發 block，**任務會卡在 mailbox 直到 TTL 過期**——那才是這個窗
+真正的代價。
+
 ## 尚未收的
 
-- **codex worker 拿不到 M5 的即時自癒**。要收就得讓 spawn 記到原生執行檔那個
-  行程，但它在 spawn 當下未必已經存在，而「pane_pid 的哪一個子行程才是它」
-  需要新規則——那是新的設計決定，不在 M5 範圍內，另案。
+- **codex worker 拿不到 M5 的即時自癒，且上述 gate 已確認這個窗對 codex 真的
+  存在**。要收有兩條路：改記錄的對象（spawn/ready 時找到原生執行檔），或改
+  比對的條件（hook 側走有界祖先鏈，要求中間不得夾著另一個 runtime 形狀的
+  行程）。後者不動 registry 與信任根，是目前偏好的方向。**未立案**——它第一次
+  讓誤判可能比 M4 更糟（巢狀被誤認＝立即奪權，而非等 TTL），驗收重心必須放在
+  巢狀反例上。
 - 只量了 npm 全域安裝這一種佈署形狀。若哪天 codex 改成單一原生執行檔直接
   上 PATH，行程樹會與 claude 同形，屆時要重量。
