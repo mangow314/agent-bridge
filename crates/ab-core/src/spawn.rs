@@ -611,11 +611,6 @@ fn spawn_locked(
         let _ = tmux.exec(&["select-layout", "-t", &worker_win, "tiled"]);
         Ok(p)
     } else if !ctx.owner.is_empty() {
-        let wname = if ctx.owner_winname.is_empty() {
-            "workers"
-        } else {
-            ctx.owner_winname
-        };
         new_window(
             tmux,
             &[
@@ -624,7 +619,7 @@ fn spawn_locked(
                 "-t",
                 ctx.owner_win,
                 "-n",
-                &format!("ab:{wname}"),
+                &worker_window_name(ctx.owner_winname),
             ],
             &tagged_cmd,
         )
@@ -723,6 +718,24 @@ fn spawn_locked(
         Some(actor),
     )?;
     Ok(pane)
+}
+
+/// worker window 的名字：owner 所在 window 名冠上 `ab:` 前綴。
+///
+/// **冠之前必須把既有的 `ab:` 前綴全部剝掉**：orchestrator 自己就可能坐在
+/// `ab:` 開頭的 window（relay 接棒、或從 worker window 內再 spawn），直接冠
+/// 會逐代累積成 `ab:ab:ab:…`（使用者實測回報，現場堆到七層）。剝到空字串
+/// （owner window 就叫 `ab:`）退回 `workers`，與 owner_winname 為空時同解。
+pub fn worker_window_name(owner_winname: &str) -> String {
+    let mut base = owner_winname;
+    while let Some(rest) = base.strip_prefix("ab:") {
+        base = rest;
+    }
+    if base.is_empty() {
+        "ab:workers".to_string()
+    } else {
+        format!("ab:{base}")
+    }
 }
 
 fn new_window(tmux: &dyn TmuxClient, opts: &[&str], cmd: &str) -> Result<String> {
@@ -1347,6 +1360,24 @@ fn writeln_stdout(s: &str) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// worker window 名不得逐代累積 `ab:` 前綴（使用者實測回報：現場堆到
+    /// `ab:ab:ab:ab:ab:ab:ab:claude`）。累積來自 orchestrator 自己坐在
+    /// `ab:` 開頭的 window（relay 接棒／從 worker window 內再 spawn）。
+    #[test]
+    fn worker_window_name_never_stacks_the_prefix() {
+        assert_eq!(worker_window_name("claude"), "ab:claude");
+        // 已帶前綴：剝掉再冠，不疊加
+        assert_eq!(worker_window_name("ab:claude"), "ab:claude");
+        assert_eq!(worker_window_name("ab:ab:ab:claude"), "ab:claude");
+        // 空名／只剩前綴：退回 workers（與 owner_winname 為空時同解）
+        assert_eq!(worker_window_name(""), "ab:workers");
+        assert_eq!(worker_window_name("ab:"), "ab:workers");
+        assert_eq!(worker_window_name("ab:ab:"), "ab:workers");
+        // `ab` 不是前綴，不得被剝
+        assert_eq!(worker_window_name("abc"), "ab:abc");
+        assert_eq!(worker_window_name("ab"), "ab:ab");
+    }
 
     /// `printf %q` 的安全字元集以本機 bash 實測導出；`,` 與空白會被反斜線
     /// 跳脫，測試 16a4／16a5 直接比對這個形狀。
