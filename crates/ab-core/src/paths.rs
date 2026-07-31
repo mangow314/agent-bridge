@@ -5,6 +5,7 @@ use crate::error::{Error, Result};
 
 /// 資料目錄佈局（`agents/` `tasks/` `state/` `locks/`）與 `AGENT_BRIDGE_DATA`
 /// 解析（ENV-DATA-1）。對映 bash：全域初始化（DATA_DIR）與 `ensure_dirs`:148。
+#[derive(Clone)]
 pub struct Paths {
     pub data_dir: PathBuf,
     pub agents_dir: PathBuf,

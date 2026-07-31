@@ -379,6 +379,32 @@ exit 0；**任何**失敗（非 JSON stdin、依賴缺失、寫入失敗）MUST 
 需要 block 時得有 stdout。不可放寬。
 Source: cmd_hook
 
+## `ui`
+
+### CLI-UI-1 [tested: 40]
+`ui`：alternate-screen 全螢幕 TUI dashboard（設計正本 `docs/tui-design.md`，
+本條款對應其第一縱切 §8）。MUST 以 alternate screen 進出：退出後（正常
+`q` 退出**與** panic／錯誤退出皆然，後者由 panic hook 保證）MUST 還原
+terminal（raw mode 關閉、離開 alternate screen），且 tmux 的 pane id／
+window id／layout 與 geometry 不變。`Enter` focus 語意：目標 pane 在
+current session → select-window＋select-pane；在其他 session → 先
+switch-client；linked window 多位置 → 優先 current session，否則取第一個
+live location，不彈詢問框。`x` 僅對 task 列合法（worker 列 MUST 提示無
+效），單一確認框 MUST 逐字顯示等價 CLI 原文 `agent-bridge cancel
+<task-id>`，確認後執行與 `cancel` 相同的轉換與通知（CLI-CANCEL-1）。
+read model 為磁碟輪詢（500ms）＋tmux 節流查詢（2s）；每條 tmux 查詢
+MUST bounded（ENV-TMUX-1）**且 MUST NOT 在 UI thread 上執行**（背景 worker
+＋channel），逾時該欄降級 unknown、動作顯示進行中，MUST NOT 凍結 UI——
+`AGENT_BRIDGE_TMUX_TIMEOUT=0`（不設限）時亦然。首頁 selection MUST 落在
+current owner（呼叫者所在 `session:@window`；對不上時以 current pane 反查
+registry），而非字典序第一筆。task status MUST 顯示權威狀態字（不存在
+`blocked`）。
+啟動器協定（popup）：程式 MUST NOT 自行偵測 popup；由 binding 設定
+`AGENT_BRIDGE_UI_POPUP=1`（ENV-UI-1）宣告，此模式下 `Enter` focus 成功後
+MUST 直接正常退出（`display-popup -E` 的行程結束即關 popup，人落在目標
+pane）；未設定時 focus 後繼續執行。
+Source: cmd_ui / ab_tui::run
+
 ---
 
 ## 唯讀指令的 sandbox 契約

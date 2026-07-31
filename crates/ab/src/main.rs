@@ -18,7 +18,9 @@ use ab_core::task::{self, MessageSource, TaskState};
 use ab_core::tmux::{SubprocessTmux, TmuxClient};
 use ab_core::validate::is_valid_name;
 
-// 逐字對齊 bash `usage()`:84（bin/agent-bridge）的 heredoc 內容。
+// 逐字對齊 bash `usage()`:84（bin/agent-bridge）的 heredoc 內容；
+// 唯一例外是 `ui` 一段——Rust 獨有的子指令（bash 正本自 M4 凍結，不含 TUI），
+// additive 插入，其餘行維持逐字。
 const USAGE: &str = r#"用法：
   agent-bridge register <agent> <tmux-target>   註冊 agent 與其 tmux pane
   agent-bridge unregister <agent>               移除 agent 註冊
@@ -55,6 +57,8 @@ const USAGE: &str = r#"用法：
   agent-bridge gc [--older-than <days>] [--apply] [--include-notes]
                                                 清掉夠舊的終態 task（預設 14 天）；未完成的與
                                                 evict 收尾筆記一律保留。預設只試算，--apply 才刪
+  agent-bridge ui                               alternate-screen dashboard（OWNERS/WORKERS、
+                                                Enter focus、x cancel；q 離開；docs/tui-design.md）
   agent-bridge hook <stop|prompt-submit|notification>
                                                 （由 Claude Code 呼叫，非人工手動用）落地 hook
                                                 協定：stdin 收事件 JSON，依 AGENT_BRIDGE_SPAWN_TAG
@@ -112,6 +116,7 @@ fn print_implemented_commands() {
         "spawn",
         "start",
         "status",
+        "ui",
         "unregister",
     ] {
         println!("{cmd}");
@@ -237,6 +242,7 @@ fn main() -> ExitCode {
         "disposable" => cmd_disposable(&paths, rest),
         "idle" => cmd_idle(&paths, rest),
         "evict" => cmd_evict(&paths, rest),
+        "ui" => cmd_ui(rest),
         _ => {
             print_usage();
             Err(Error::new(format!("未知指令：{cmd}")))
@@ -642,43 +648,25 @@ fn cmd_fail(paths: &Paths, args: &[OsString]) -> Result<()> {
 }
 
 /// cmd_cancel:744 — queued/delivered/running 皆可取消；通知失敗不影響取消本身。
+/// 轉態／通知的正本在 `ab_core::task::cancel_task`（TUI 共用同一份，審查 F6）；
+/// 這裡只負責 CLI 呈現層——三行 stderr 文案逐字沿用 bash 正本。
 fn cmd_cancel(paths: &Paths, args: &[String]) -> Result<()> {
     if args.len() != 1 {
         return Err(Error::new("用法：agent-bridge cancel <task-id>"));
     }
     let id = &args[0];
-    task::check_task_id(id)?;
-    let dir = task::require_task_dir(paths, id)?;
-
-    let guard = acquire_lock(paths, id)?;
-    let outcome = (|| -> Result<()> {
-        let st = task::read_status(&dir)?;
-        if !matches!(st.as_str(), "queued" | "delivered" | "running") {
-            return Err(Error::new(format!(
-                "task 狀態為 {st}，無法 cancel（僅 queued/delivered/running 可）"
-            )));
-        }
-        task::update_meta_status(&dir, TaskState::Cancelled)?;
-        task::log_event(paths, id, "cancelled", "")
-    })();
-    guard.release();
-    outcome?;
-
-    // 通知 worker 查狀態（會看到 cancelled）
-    let to = task::meta_str(&dir, "to")?;
-    let agent_file = paths.agents_dir.join(format!("{to}.json"));
-    if agent_file.is_file() {
-        let pane = registry::read_pane(&agent_file);
-        let tmux = SubprocessTmux;
-        notify::notify_or_defer(
-            paths,
-            &tmux,
-            &to,
-            &pane,
-            &format!("agent-bridge status {id}"),
-            id,
-            "status",
-        )?;
+    let tmux = SubprocessTmux;
+    let outcome = task::cancel_task(paths, &tmux, id)?;
+    match outcome.notify {
+        Some(notify::NotifyOutcome::Deferred) => eprintln!(
+            "agent-bridge: 提示：{} 目前忙碌中，通知延後——訊息已在 mailbox，對方 turn 結束時會由 hook 自行取件",
+            outcome.to
+        ),
+        Some(notify::NotifyOutcome::Failed) => eprintln!(
+            "agent-bridge: 警告：無法通知 {}（pane {}）；請手動在對方 session 執行：{}",
+            outcome.to, outcome.pane, outcome.cmdline
+        ),
+        _ => {}
     }
     eprintln!("已取消 task {id}（cancelled）");
     Ok(())
@@ -1306,6 +1294,16 @@ fn cmd_evict(paths: &Paths, args: &[String]) -> Result<()> {
     }
     println!("{task_id}");
     Ok(())
+}
+
+/// CLI-UI-1 — alternate-screen dashboard（設計正本 docs/tui-design.md）。
+/// terminal 生命週期（raw mode／alt screen／panic hook）全部收在
+/// `ab_tui::run` 內；這裡只擋參數面。Rust 獨有指令（bash 正本自 M4 凍結）。
+fn cmd_ui(args: &[String]) -> Result<()> {
+    if !args.is_empty() {
+        return Err(Error::new("用法：agent-bridge ui（不接參數）"));
+    }
+    ab_tui::run()
 }
 
 /// 精確翻譯 bash `^([0-9]+|[0-9]*\.[0-9]+)$`（bin/agent-bridge:847-848）：

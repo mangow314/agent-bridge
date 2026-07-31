@@ -1,0 +1,318 @@
+//! Read model 與 selection model（tui-design.md §2／§4）。
+//!
+//! 資料來源分兩層、兩種節奏（§4）：
+//! - 磁碟 task-plane＋registry：每 500ms 重讀（權威）
+//! - tmux liveness：每 2s 一輪（只補位置與死活；查不到＝unknown，不覆寫權威）
+//!
+//! 純資料轉換全部放這裡（不碰 terminal），單元測試不經 render。
+
+use std::collections::HashMap;
+
+use ab_core::paths::Paths;
+use ab_core::registry::{self, AgentSnapshot};
+use ab_core::task::{self, InFlight};
+use ab_core::tmux::TmuxClient;
+
+/// 磁碟 read model 的一輪快照。
+pub struct Model {
+    /// 去重後的 owner 標籤（字典序）。manual worker 統一掛在 `-` 之下
+    /// （沿用 `list --long` 的 owner 欄慣例：人工註冊者沒有 owner 概念）。
+    pub owners: Vec<String>,
+    pub workers: Vec<AgentSnapshot>,
+    pub tasks: Vec<InFlight>,
+}
+
+impl Model {
+    pub fn load(paths: &Paths) -> Self {
+        let workers = registry::snapshot(paths);
+        let tasks = task::in_flight(paths);
+        let mut owners: Vec<String> = workers.iter().map(owner_label).collect();
+        owners.sort();
+        owners.dedup();
+        Model {
+            owners,
+            workers,
+            tasks,
+        }
+    }
+}
+
+/// worker 的歸屬標籤：spawned 且有 owner 欄→其字面值；manual→`-`；
+/// spawned 但 owner 缺失（或 registry 損壞）→`?`。
+pub fn owner_label(w: &AgentSnapshot) -> String {
+    if w.corrupt {
+        "?".to_string()
+    } else if !w.spawned {
+        "-".to_string()
+    } else if w.owner.is_empty() {
+        "?".to_string()
+    } else {
+        w.owner.clone()
+    }
+}
+
+/// tmux liveness 快照（§4：節流每 2s，且每條查詢 bounded——逾時整層降級
+/// `None`＝unknown，MUST NOT 凍結 UI）。
+pub struct LiveIndex {
+    /// pane id → 所有出現位置 `(session_name, window_id)`（linked window 下
+    /// 同一 pane 可出現多次，cardinality 不可丟——§2 focus 語意要用）。
+    pub panes: Option<HashMap<String, Vec<(String, String)>>>,
+    /// 現存 window id 集合（owner 死活判定）。
+    pub windows: Option<Vec<String>>,
+}
+
+impl LiveIndex {
+    pub fn query(tmux: &dyn TmuxClient) -> Self {
+        let panes = tmux
+            .exec(&[
+                "list-panes",
+                "-a",
+                "-F",
+                "#{pane_id}\t#{session_name}\t#{window_id}",
+            ])
+            .and_then(|o| o.ok_stdout())
+            .map(|out| {
+                let mut map: HashMap<String, Vec<(String, String)>> = HashMap::new();
+                for line in out.lines() {
+                    let mut it = line.splitn(3, '\t');
+                    if let (Some(p), Some(s), Some(w)) = (it.next(), it.next(), it.next()) {
+                        map.entry(p.to_string())
+                            .or_default()
+                            .push((s.to_string(), w.to_string()));
+                    }
+                }
+                map
+            });
+        let windows = tmux
+            .exec(&["list-windows", "-a", "-F", "#{window_id}"])
+            .and_then(|o| o.ok_stdout())
+            .map(|out| out.lines().map(|l| l.to_string()).collect());
+        LiveIndex { panes, windows }
+    }
+
+    /// 全 unknown 的空快照。UI 的起始值就是它——第一輪 liveness 由背景
+    /// worker 回報，UI thread 一次 tmux 都不自己查（審查 F1）。
+    pub fn unknown() -> Self {
+        LiveIndex {
+            panes: None,
+            windows: None,
+        }
+    }
+}
+
+/// 三態死活：查不到（tmux 逾時／不可用）≠ 查了但不在（同 `list --long` 的
+/// 顯示紀律：誤標 dead 會讓人以為該回收）。
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Liveness {
+    Live,
+    Dead,
+    Unknown,
+}
+
+pub fn pane_liveness(live: &LiveIndex, pane: &str) -> Liveness {
+    if pane.is_empty() {
+        return Liveness::Unknown;
+    }
+    match &live.panes {
+        None => Liveness::Unknown,
+        Some(m) => {
+            if m.contains_key(pane) {
+                Liveness::Live
+            } else {
+                Liveness::Dead
+            }
+        }
+    }
+}
+
+/// owner 標籤形如 `<session>:@<winid>` 時以 window id 判死活；其他形
+/// （`-`／`?`）無死活可言→Unknown。
+pub fn owner_liveness(live: &LiveIndex, label: &str) -> Liveness {
+    let Some((_, win)) = label.rsplit_once(':') else {
+        return Liveness::Unknown;
+    };
+    if !win.starts_with('@') {
+        return Liveness::Unknown;
+    }
+    match &live.windows {
+        None => Liveness::Unknown,
+        Some(ws) => {
+            if ws.iter().any(|w| w == win) {
+                Liveness::Live
+            } else {
+                Liveness::Dead
+            }
+        }
+    }
+}
+
+/// WORKERS 欄的一列：worker 列或其下的 in-flight task 列（§2 selection
+/// model：兩者皆可選取，task 列自帶 immutable task id）。值是 `Model`
+/// 內的索引，不複製資料。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Row {
+    Worker(usize),
+    Task { worker: usize, task: usize },
+}
+
+/// 攤平選中 owner 之下的 worker／task 列。worker 依 snapshot 序（檔名字典
+/// 序），task 依 id 序（in_flight 已排序）。
+pub fn worker_rows(model: &Model, owner: &str) -> Vec<Row> {
+    let mut rows = Vec::new();
+    for (wi, w) in model.workers.iter().enumerate() {
+        if owner_label(w) != owner {
+            continue;
+        }
+        rows.push(Row::Worker(wi));
+        for (ti, t) in model.tasks.iter().enumerate() {
+            if t.to == w.name {
+                rows.push(Row::Task {
+                    worker: wi,
+                    task: ti,
+                });
+            }
+        }
+    }
+    rows
+}
+
+/// `Enter` focus 的執行計畫（§2）：目標在 current session→只 select；
+/// 在別的 session→先 switch-client。linked window 多位置→優先 current
+/// session 的 location，否則取第一個 live location；不彈詢問框。
+/// 回傳 `None`＝pane 位置查不到（死了或 tmux unknown），呼叫端降級成訊息。
+#[derive(PartialEq, Eq, Debug)]
+pub struct FocusPlan {
+    pub switch_to: Option<String>,
+    pub window: String,
+}
+
+pub fn focus_plan(
+    locs: Option<&Vec<(String, String)>>,
+    current_session: Option<&str>,
+) -> Option<FocusPlan> {
+    let locs = locs?;
+    let chosen = current_session
+        .and_then(|cur| locs.iter().find(|(s, _)| s == cur))
+        .or_else(|| locs.first())?;
+    let switch_to = match current_session {
+        Some(cur) if cur == chosen.0 => None,
+        // tmux 外啟動（無 current session）也給出 switch 目標：有 client 就
+        // 切得過去，沒 client 只是查詢失敗降級
+        _ => Some(chosen.0.clone()),
+    };
+    Some(FocusPlan {
+        switch_to,
+        window: chosen.1.clone(),
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn snap(name: &str, spawned: bool, owner: &str) -> AgentSnapshot {
+        AgentSnapshot {
+            name: name.to_string(),
+            pane: format!("%{}", name.len()),
+            runtime: "codex".to_string(),
+            owner: owner.to_string(),
+            ready: "ready".to_string(),
+            spawned,
+            corrupt: false,
+        }
+    }
+
+    fn inflight(id: &str, to: &str) -> InFlight {
+        InFlight {
+            id: id.to_string(),
+            from: "alice".to_string(),
+            to: to.to_string(),
+            status: "queued".to_string(),
+        }
+    }
+
+    /// selection model（§2）：worker 列與其 in-flight task 列皆為可選取列，
+    /// task 緊接在所屬 worker 之後；別的 owner 的 worker 不得混入。
+    #[test]
+    fn worker_rows_interleave_tasks_under_their_worker() {
+        let model = Model {
+            owners: vec!["-".into(), "it:@1".into()],
+            workers: vec![
+                snap("w1", true, "it:@1"),
+                snap("w2", true, "it:@1"),
+                snap("manual", false, ""),
+            ],
+            tasks: vec![
+                inflight("20260731T000001Z-aaaa", "w1"),
+                inflight("20260731T000002Z-bbbb", "w2"),
+                inflight("20260731T000003Z-cccc", "w1"),
+            ],
+        };
+        let rows = worker_rows(&model, "it:@1");
+        assert_eq!(
+            rows,
+            vec![
+                Row::Worker(0),
+                Row::Task { worker: 0, task: 0 },
+                Row::Task { worker: 0, task: 2 },
+                Row::Worker(1),
+                Row::Task { worker: 1, task: 1 },
+            ]
+        );
+        assert_eq!(worker_rows(&model, "-"), vec![Row::Worker(2)]);
+    }
+
+    /// §2 focus 語意逐條：current session 優先、跨 session 才 switch、
+    /// linked window 多位置不彈框、查不到＝None。
+    #[test]
+    fn focus_plan_follows_design_semantics() {
+        let locs = vec![
+            ("other".to_string(), "@7".to_string()),
+            ("cur".to_string(), "@3".to_string()),
+        ];
+        // current session 的 location 優先，且不 switch
+        assert_eq!(
+            focus_plan(Some(&locs), Some("cur")),
+            Some(FocusPlan {
+                switch_to: None,
+                window: "@3".to_string()
+            })
+        );
+        // current session 沒有 → 取第一個 live location，先 switch
+        assert_eq!(
+            focus_plan(Some(&locs), Some("elsewhere")),
+            Some(FocusPlan {
+                switch_to: Some("other".to_string()),
+                window: "@7".to_string()
+            })
+        );
+        // 查不到位置（pane 死了／tmux unknown）→ None（降級，不凍結不猜）
+        assert_eq!(focus_plan(None, Some("cur")), None);
+        assert_eq!(focus_plan(Some(&Vec::new()), Some("cur")), None);
+    }
+
+    /// 三態死活：查不到 ≠ 不在（顯示紀律，tui-design §5）。
+    #[test]
+    fn liveness_keeps_unknown_distinct_from_dead() {
+        let unknown = LiveIndex::unknown();
+        assert!(matches!(pane_liveness(&unknown, "%1"), Liveness::Unknown));
+        assert!(matches!(
+            owner_liveness(&unknown, "it:@1"),
+            Liveness::Unknown
+        ));
+
+        let mut panes = HashMap::new();
+        panes.insert("%1".to_string(), vec![("it".to_string(), "@1".to_string())]);
+        let live = LiveIndex {
+            panes: Some(panes),
+            windows: Some(vec!["@1".to_string()]),
+        };
+        assert!(matches!(pane_liveness(&live, "%1"), Liveness::Live));
+        assert!(matches!(pane_liveness(&live, "%9"), Liveness::Dead));
+        assert!(matches!(owner_liveness(&live, "it:@1"), Liveness::Live));
+        assert!(matches!(owner_liveness(&live, "it:@9"), Liveness::Dead));
+        // manual（`-`）與 `?` 沒有死活可言
+        assert!(matches!(owner_liveness(&live, "-"), Liveness::Unknown));
+        assert!(matches!(owner_liveness(&live, "?"), Liveness::Unknown));
+    }
+}

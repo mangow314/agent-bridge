@@ -344,6 +344,84 @@ pub fn list(paths: &Paths) -> Result<Vec<(String, String, String)>> {
     Ok(out)
 }
 
+/// TUI read model 的一列（tui-design.md §4）。`ready` 沿用 `list` 的三值
+/// （`ready`／`starting`／`-`）；`runtime`／`owner` 缺欄位以空字串表示。
+pub struct AgentSnapshot {
+    pub name: String,
+    pub pane: String,
+    pub runtime: String,
+    pub owner: String,
+    pub ready: String,
+    pub spawned: bool,
+    pub corrupt: bool,
+}
+
+/// registry 全池唯讀快照（TUI read model，tui-design.md §4）。
+///
+/// 與 `list` 的 all-or-nothing 語意刻意不同：`list` 是 CLI 契約面（損壞檔
+/// MUST 整體非零退出，CLI-GEN-1），dashboard 的職責則是把損壞**顯示出來**
+/// 而不是整面消失——同 `spawn::list_long` 對壞檔的處置（整列降級後繼續）。
+/// 唯讀：不取鎖、不建目錄；目錄缺失＝空池。
+pub fn snapshot(paths: &Paths) -> Vec<AgentSnapshot> {
+    let mut files: Vec<std::path::PathBuf> = match std::fs::read_dir(&paths.agents_dir) {
+        Ok(rd) => rd
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .filter(|p| p.extension().map(|e| e == "json").unwrap_or(false))
+            .collect(),
+        Err(_) => return Vec::new(),
+    };
+    files.sort();
+
+    let mut out = Vec::new();
+    for f in files {
+        let base_name = f
+            .file_stem()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let fields = match std::fs::read_to_string(&f).map(|c| json::parse(&c)) {
+            Ok(Ok(Value::Object(m))) => m,
+            _ => {
+                // 損壞的 registry 照樣佔 cap，必須看得見（同 list_long）
+                out.push(AgentSnapshot {
+                    name: base_name,
+                    pane: String::new(),
+                    runtime: String::new(),
+                    owner: String::new(),
+                    ready: "?".to_string(),
+                    spawned: false,
+                    corrupt: true,
+                });
+                continue;
+            }
+        };
+        let mut name = json::jq_raw_field(&fields, "name").unwrap_or_default();
+        if name.is_empty() {
+            name = base_name;
+        }
+        let spawned = json::bool_field_is_true(&fields, "spawned");
+        let ready = if spawned {
+            if json::bool_field_is_true(&fields, "ready") {
+                "ready"
+            } else {
+                "starting"
+            }
+        } else {
+            "-"
+        };
+        out.push(AgentSnapshot {
+            name,
+            pane: json::jq_raw_field(&fields, "pane_id").unwrap_or_default(),
+            runtime: json::jq_raw_field(&fields, "runtime").unwrap_or_default(),
+            owner: json::jq_raw_field(&fields, "owner").unwrap_or_default(),
+            ready: ready.to_string(),
+            spawned,
+            corrupt: false,
+        });
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -421,6 +499,50 @@ mod tests {
             state_dir: d.path.join("state"),
         };
         assert!(list(&paths).unwrap().is_empty());
+        assert!(!paths.agents_dir.exists(), "唯讀路徑不得建目錄");
+    }
+
+    /// snapshot 是 dashboard 的 read model：損壞檔降級成單列 `corrupt`，
+    /// MUST NOT 讓整份快照消失（與 `list` 的 all-or-nothing 相對照）。
+    #[test]
+    fn snapshot_degrades_corrupt_file_per_row() {
+        let d = Dir::new("ab-core-registry-snap");
+        let paths = test_paths(&d);
+        std::fs::write(
+            paths.agents_dir.join("good.json"),
+            "{\n  \"name\": \"good\",\n  \"pane_id\": \"%1\",\n  \"runtime\": \"codex\",\n  \"owner\": \"it:@0\",\n  \"spawned\": true,\n  \"ready\": true\n}\n",
+        )
+        .unwrap();
+        std::fs::write(paths.agents_dir.join("broken.json"), "{ not json").unwrap();
+
+        let rows = snapshot(&paths);
+        assert_eq!(rows.len(), 2, "壞檔不得吃掉整份快照");
+        // 檔名字典序：broken < good
+        assert!(rows[0].corrupt);
+        assert_eq!(rows[0].name, "broken");
+        assert_eq!(rows[0].ready, "?");
+        let g = &rows[1];
+        assert!(!g.corrupt);
+        assert_eq!(
+            (g.name.as_str(), g.pane.as_str(), g.runtime.as_str()),
+            ("good", "%1", "codex")
+        );
+        assert_eq!((g.owner.as_str(), g.ready.as_str()), ("it:@0", "ready"));
+        assert!(g.spawned);
+    }
+
+    /// 唯讀：`agents/` 缺失＝空池，不建目錄（CLI-RO-1 同向）。
+    #[test]
+    fn snapshot_missing_dir_is_empty_and_readonly() {
+        let d = Dir::new("ab-core-registry-snap-empty");
+        let paths = Paths {
+            data_dir: d.path.clone(),
+            agents_dir: d.path.join("agents"),
+            tasks_dir: d.path.join("tasks"),
+            locks_dir: d.path.join("locks"),
+            state_dir: d.path.join("state"),
+        };
+        assert!(snapshot(&paths).is_empty());
         assert!(!paths.agents_dir.exists(), "唯讀路徑不得建目錄");
     }
 

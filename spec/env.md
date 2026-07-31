@@ -1,6 +1,6 @@
 # 環境變數契約
 
-全部 15 個 `AGENT_BRIDGE_*` 變數。通則：
+全部 16 個 `AGENT_BRIDGE_*` 變數。通則：
 
 ### ENV-GEN-1 [untested]
 未設定（unset）時每個變數 MUST 取本檔載明的預設值；本檔未列的
@@ -94,6 +94,16 @@ Source: cmd_spawn / cmd_relay
 hook 端由它析出「我是誰」；despawn/evict 以它比對出身與世代。使用者手動
 設定此變數不構成身分授權（詳 hooks.md 的出身防護條款）。
 Source: cmd_spawn / hook_agent_name / cmd_despawn
+
+## TUI
+
+### ENV-UI-1 [tested: 40]
+`AGENT_BRIDGE_UI_POPUP`：`ui` 的啟動器協定旗標，由 tmux binding
+（`display-popup -E 'agent-bridge ui'`）設定，值 `1` 生效、其餘值等同未設定。
+設定時 `Enter` focus 成功後 MUST 直接正常退出（行程結束＝popup 關閉，人落在
+目標 pane）；未設定時 focus 後繼續執行。程式 MUST NOT 自行偵測是否身處
+popup（tui-design.md §2：模式感知屬啟動器，不進核心）。預設未設定。
+Source: ab_tui::run（event_loop）
 
 ## relay 鏈
 

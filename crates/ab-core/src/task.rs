@@ -543,6 +543,123 @@ pub fn gc(paths: &Paths, days: u64, apply: bool, include_notes: bool) -> Result<
     Ok(stats)
 }
 
+/// `cancel` 一次執行的終態（CLI-CANCEL-1）。轉態本身若失敗會以 `Err` 收場，
+/// 故拿到 `CancelOutcome` 即代表 task 已轉 `cancelled`；`notify` 只描述通知
+/// 這一段（`None`＝對方未註冊，依 bash 正本不通知也不算失敗）。
+#[derive(Clone, Debug)]
+pub struct CancelOutcome {
+    pub to: String,
+    pub pane: String,
+    /// 請對方執行的命令原文（通知失敗時要求人工執行的那條）
+    pub cmdline: String,
+    pub notify: Option<crate::notify::NotifyOutcome>,
+}
+
+/// cmd_cancel:744 的完整語意（鎖／轉態／事件／通知），CLI 與 TUI 的**單一
+/// 正本**——先前 TUI 另抄一份，兩邊會各自漂移（審查 F6）。
+///
+/// **函式內不印任何字**：呈現層由呼叫端決定（CLI 印 stderr；TUI 進 footer，
+/// alternate screen 下 stderr 會畫花畫面，審查 F7）。
+pub fn cancel_task(
+    paths: &Paths,
+    tmux: &dyn crate::tmux::TmuxClient,
+    id: &str,
+) -> Result<CancelOutcome> {
+    check_task_id(id)?;
+    let dir = require_task_dir(paths, id)?;
+
+    let guard = crate::lock::acquire_lock(paths, id)?;
+    let outcome = (|| -> Result<()> {
+        let st = read_status(&dir)?;
+        if !matches!(st.as_str(), "queued" | "delivered" | "running") {
+            return Err(Error::new(format!(
+                "task 狀態為 {st}，無法 cancel（僅 queued/delivered/running 可）"
+            )));
+        }
+        update_meta_status(&dir, TaskState::Cancelled)?;
+        log_event(paths, id, "cancelled", "")
+    })();
+    guard.release();
+    outcome?;
+
+    // 通知 worker 查狀態（會看到 cancelled）；worker 未註冊就只是不通知
+    let to = meta_str(&dir, "to")?;
+    let cmdline = format!("agent-bridge status {id}");
+    let agent_file = paths.agents_dir.join(format!("{to}.json"));
+    let mut out = CancelOutcome {
+        to,
+        pane: String::new(),
+        cmdline,
+        notify: None,
+    };
+    if agent_file.is_file() {
+        out.pane = crate::registry::read_pane(&agent_file);
+        out.notify = Some(crate::notify::notify_or_defer_outcome(
+            paths,
+            tmux,
+            &out.to,
+            &out.pane,
+            &out.cmdline,
+            id,
+            "status",
+        )?);
+    }
+    Ok(out)
+}
+
+/// TUI read model 的一列（tui-design.md §4）：一個尚未到終態的任務。
+/// `status` 是權威狀態字（`queued`／`delivered`／`running`）。
+#[derive(Debug)]
+pub struct InFlight {
+    pub id: String,
+    pub from: String,
+    pub to: String,
+    pub status: String,
+}
+
+/// in-flight（非終態）任務的唯讀快照（TUI read model，tui-design.md §4）。
+///
+/// 只認本工具生成形狀的目錄名與完整形狀（metadata＋status 都在）——與 gc
+/// 的掃描門檻同一條理由：`tasks/` 裡任何人都能放目錄。單一損壞任務跳過
+/// 而不是讓整份 dashboard 消失（同 `last_task_at` 的 `|| continue` 方向）。
+/// 唯讀且**不取鎖**：dashboard 每 500ms 掃一輪，取鎖會與正常狀態轉換互撞；
+/// 讀到轉換中途的舊值只是晚一輪刷新，不影響任何狀態機不變量。
+pub fn in_flight(paths: &Paths) -> Vec<InFlight> {
+    let Ok(rd) = std::fs::read_dir(&paths.tasks_dir) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for entry in rd.filter_map(|e| e.ok()) {
+        let dir = entry.path();
+        let id = match dir.file_name().and_then(|n| n.to_str()) {
+            Some(n) => n.to_string(),
+            None => continue,
+        };
+        if !is_generated_task_dirname(&id) || !dir.join("metadata.json").is_file() {
+            continue;
+        }
+        let Ok(st) = read_status(&dir) else { continue };
+        if !matches!(st.as_str(), "queued" | "delivered" | "running") {
+            continue;
+        }
+        let Ok(content) = std::fs::read_to_string(dir.join("metadata.json")) else {
+            continue;
+        };
+        let Ok(Value::Object(fields)) = json::parse(&content) else {
+            continue;
+        };
+        out.push(InFlight {
+            id,
+            from: json::jq_raw_field(&fields, "from").unwrap_or_default(),
+            to: json::jq_raw_field(&fields, "to").unwrap_or_default(),
+            status: st,
+        });
+    }
+    // task-id 以時間戳起首，字典序＝時間序，畫面因此穩定
+    out.sort_by(|a, b| a.id.cmp(&b.id));
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -861,6 +978,124 @@ mod tests {
             for name in ["foo", "important-notes", "20200101T000000Z-XYZW", "2020"] {
                 assert!(paths.tasks_dir.join(name).is_dir(), "{name} 被動到了");
             }
+        }
+    }
+
+    /// `cancel_task` 是 CLI 與 TUI 的單一正本（審查 F6）：轉態＋`cancelled`
+    /// 事件＋通知終態一次到位，且**函式內不印字**（F7，呈現交外殼）。
+    #[test]
+    fn cancel_task_transitions_and_reports_notify_outcome() {
+        struct FakeTmux {
+            sent: std::cell::RefCell<Vec<String>>,
+        }
+        impl crate::tmux::TmuxClient for FakeTmux {
+            fn exec(&self, _args: &[&str]) -> Option<crate::tmux::TmuxOutput> {
+                None
+            }
+            fn available(&self) -> bool {
+                true
+            }
+            fn resolve_pane(&self, _t: &str) -> Option<String> {
+                None
+            }
+            fn pane_exists(&self, _p: &str) -> bool {
+                true
+            }
+            fn capture_pane(&self, _p: &str) -> Option<String> {
+                Some(String::new())
+            }
+            fn pane_in_mode(&self, _p: &str) -> Option<bool> {
+                Some(false)
+            }
+            fn send_keys(&self, _p: &str, keys: &str) -> bool {
+                self.sent.borrow_mut().push(keys.to_string());
+                true
+            }
+        }
+
+        let d = Dir::new("ab-core-task-cancel");
+        let paths = test_paths(&d);
+        let id = create_task(
+            &paths,
+            "alice",
+            "bob",
+            &MessageSource::Text("x".into()),
+            false,
+        )
+        .unwrap();
+        std::fs::write(
+            paths.agents_dir.join("bob.json"),
+            "{\"name\":\"bob\",\"pane_id\":\"%7\"}\n",
+        )
+        .unwrap();
+
+        let tmux = FakeTmux {
+            sent: std::cell::RefCell::new(Vec::new()),
+        };
+        let out = cancel_task(&paths, &tmux, &id).unwrap();
+        assert_eq!(read_status(&task_dir(&paths, &id)).unwrap(), "cancelled");
+        assert_eq!((out.to.as_str(), out.pane.as_str()), ("bob", "%7"));
+        assert_eq!(out.cmdline, format!("agent-bridge status {id}"));
+        assert_eq!(out.notify, Some(crate::notify::NotifyOutcome::Notified));
+        let events = std::fs::read_to_string(paths.tasks_dir.join(&id).join("events.log")).unwrap();
+        assert!(events.contains("cancelled"), "實際：{events}");
+        assert!(events.contains("notified"), "通知事件必須落地：{events}");
+        assert!(
+            tmux.sent.borrow().iter().any(|k| k.contains(&id)),
+            "MUST 通知對方查狀態"
+        );
+
+        // 終態不可再取消（與 CLI 同一條轉換條件）
+        let err = cancel_task(&paths, &tmux, &id).unwrap_err();
+        assert!(err.message.contains("cancelled"), "實際：{}", err.message);
+    }
+
+    /// in_flight 只收非終態＋生成形狀＋完整形狀；損壞任務跳過不致整份消失。
+    #[test]
+    fn in_flight_filters_terminal_foreign_and_corrupt() {
+        let d = Dir::new("ab-core-task-inflight");
+        let paths = test_paths(&d);
+        let q = create_task(
+            &paths,
+            "alice",
+            "bob",
+            &MessageSource::Text("x".into()),
+            false,
+        )
+        .unwrap();
+        let r = create_task(
+            &paths,
+            "alice",
+            "bob",
+            &MessageSource::Text("y".into()),
+            false,
+        )
+        .unwrap();
+        update_meta_status(&task_dir(&paths, &r), TaskState::Running).unwrap();
+        let done = create_task(
+            &paths,
+            "alice",
+            "bob",
+            &MessageSource::Text("z".into()),
+            false,
+        )
+        .unwrap();
+        update_meta_status(&task_dir(&paths, &done), TaskState::Completed).unwrap();
+        // 外來目錄名與損壞 status 各一：都不得出現，也不得毒死整份快照
+        std::fs::create_dir(paths.tasks_dir.join("foreign-dir")).unwrap();
+        let bad = paths.tasks_dir.join("20200101T000000Z-dead");
+        std::fs::create_dir(&bad).unwrap();
+        std::fs::write(bad.join("metadata.json"), "{ not json").unwrap();
+        std::fs::write(bad.join("status"), "queued\n").unwrap();
+
+        let rows = in_flight(&paths);
+        let ids: Vec<&str> = rows.iter().map(|t| t.id.as_str()).collect();
+        let mut expect = vec![q.as_str(), r.as_str()];
+        expect.sort();
+        assert_eq!(ids, expect, "只收非終態且形狀完整者，並依 id 排序");
+        for t in &rows {
+            assert_eq!((t.from.as_str(), t.to.as_str()), ("alice", "bob"));
+            assert!(matches!(t.status.as_str(), "queued" | "running"));
         }
     }
 

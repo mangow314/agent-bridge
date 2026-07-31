@@ -143,12 +143,30 @@ fn sleep_notify_delay() {
     }
 }
 
+/// 一次通知嘗試的終態，與寫進 events.log 的事件字一一對應。
+///
+/// 存在的理由：alternate-screen 的消費端（TUI）不能讓 helper 直接 `eprintln!`
+/// ——stderr 會畫花畫面且訊息進不了 footer。故把「決定」與「印字」拆開：
+/// 這裡只回終態，印字留在 CLI 外殼（`notify_or_defer`）。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum NotifyOutcome {
+    /// 送鍵成功（`notified`）
+    Notified,
+    /// 對方新鮮 busy，延後由 hook 取件（`notify-deferred`）
+    Deferred,
+    /// 送鍵失敗，需人工在對方 session 執行（`notify-failed`）
+    Failed,
+}
+
 /// notify_or_defer:371 — send／respond_task／cancel 三個通知呼叫點共用的 gate。
 ///
 /// state/<agent>.json 的語意是「建議非權威」：讀不到、解析失敗、或 ts 已超過
 /// `AGENT_BRIDGE_STATE_TTL` 秒都視為「未知」，直接落回 notify_pane 路徑。
 /// 只有明確讀到 state=busy 且新鮮，才完全不送鍵。
-pub fn notify_or_defer(
+///
+/// **函式內不印任何字**（事件照記）：呈現層由呼叫端決定。CLI 走
+/// `notify_or_defer`（印 stderr，逐字沿用 bash 正本文案）。
+pub fn notify_or_defer_outcome(
     paths: &Paths,
     tmux: &dyn TmuxClient,
     agent: &str,
@@ -156,7 +174,7 @@ pub fn notify_or_defer(
     cmdline: &str,
     task_id: &str,
     tag: &str,
-) -> Result<()> {
+) -> Result<NotifyOutcome> {
     let ttl = config::state_ttl_strict()?;
     let mut fresh_busy = false;
 
@@ -189,10 +207,7 @@ pub fn notify_or_defer(
             "notify-deferred",
             &format!("pane={pane} cmd={tag}"),
         )?;
-        eprintln!(
-            "agent-bridge: 提示：{agent} 目前忙碌中，通知延後——訊息已在 mailbox，對方 turn 結束時會由 hook 自行取件"
-        );
-        return Ok(());
+        return Ok(NotifyOutcome::Deferred);
     }
 
     if notify_pane(tmux, pane, cmdline) {
@@ -202,6 +217,7 @@ pub fn notify_or_defer(
             "notified",
             &format!("pane={pane} cmd={tag}"),
         )?;
+        Ok(NotifyOutcome::Notified)
     } else {
         log_event(
             paths,
@@ -209,9 +225,29 @@ pub fn notify_or_defer(
             "notify-failed",
             &format!("pane={pane} cmd={tag}"),
         )?;
-        eprintln!(
+        Ok(NotifyOutcome::Failed)
+    }
+}
+
+/// CLI 外殼：終態 → stderr 文案（與 bash 正本逐字一致，既有測試以 byte 級
+/// 比對這兩行）。TUI 不走這條，改用 `notify_or_defer_outcome` 自行呈現。
+pub fn notify_or_defer(
+    paths: &Paths,
+    tmux: &dyn TmuxClient,
+    agent: &str,
+    pane: &str,
+    cmdline: &str,
+    task_id: &str,
+    tag: &str,
+) -> Result<()> {
+    match notify_or_defer_outcome(paths, tmux, agent, pane, cmdline, task_id, tag)? {
+        NotifyOutcome::Notified => {}
+        NotifyOutcome::Deferred => eprintln!(
+            "agent-bridge: 提示：{agent} 目前忙碌中，通知延後——訊息已在 mailbox，對方 turn 結束時會由 hook 自行取件"
+        ),
+        NotifyOutcome::Failed => eprintln!(
             "agent-bridge: 警告：無法通知 {agent}（pane {pane}）；請手動在對方 session 執行：{cmdline}"
-        );
+        ),
     }
     Ok(())
 }

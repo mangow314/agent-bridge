@@ -4346,6 +4346,252 @@ else
   printf 'SKIP: 39 copy-mode 送鍵防線（SRC_KIND=bash：bash 正本凍結在 M4）\n'
 fi
 
+# ---- 40. TUI 第一縱切（ui dashboard） ----
+# spec: CLI-UI-1 CLI-CANCEL-1
+# 設計正本 docs/tui-design.md §8／§9 P1 的三個 gate，全部腳本化：
+#   (a) 導航到指定 task 列，x＋確認 → task 檔狀態轉 cancelled（且確認框逐字
+#       顯示等價 CLI 原文；通知事件落地；別的 task 不受波及）
+#   (b) 退出後 window id／layout string／geometry 不變、**termios 逐字還原**
+#       （同一條 shell 命令內 `stty -g` 前後比對——bash/readline 重畫 prompt
+#       時會自行重設 termios，隔著 prompt 比對驗不到 raw mode 有沒有留下）；
+#       正常退出（q）／panic／非 panic 的 Err 三條路徑各一次
+#   (c) Enter 後**真 client**（control-mode attached client）的
+#       `session:window.pane` 等於目標——不是 detached session 的 active
+#       window：後者在 switch/select 全壞掉時照樣綠
+# 另含消費端防線：無界 tmux（hanging shim＋TMUX_TIMEOUT=0）下 UI 仍畫得出來、
+# 收得了鍵（§4 bounded-read 硬條款的 UI 側），以及 popup 啟動器協定
+# （AGENT_BRIDGE_UI_POPUP=1 時 focus 成功即正常退出，ENV-UI-1）。
+# 畫面斷言一律 capture-pane 落檔後 grep 特徵字串，不做整畫面 byte 比對
+# （alternate screen 承諾不了 byte 級不變，終審已裁定）。
+# 與 35–39 同理只對 Rust 執行；bash 正本自 M4 凍結，顯式 SKIP。
+if [[ "$SRC_KIND" == rust ]]; then
+
+D40="$TESTROOT/d40"
+mkdir -p "$D40/agents" "$D40/tasks"
+
+# fixture：2 owner／3 worker／2 task（P1 用小 fixture；P4 的大 fixture 不在本階段）
+# live worker 放在獨立 window：Enter focus 的跨 window 案例
+W40_WIN="$(tmx new-window -dP -F '#{window_id}' -t it "$pane_cmd")"
+P40A="$(tmx list-panes -t "$W40_WIN" -F '#{pane_id}')"
+# dead worker：開了就殺（驗 dead 標示不毒死畫面；也是 P1 之後異常軸的地基）
+P40B="$(tmx split-window -dP -F '#{pane_id}' -t it "$pane_cmd")"
+tmx kill-pane -t "$P40B"
+# TUI 跑在自己 window 的 bash 裡（不是直接當 window command）：退出後 pane
+# 仍在，才驗得了「退出還原、terminal 可用」
+TUI40="$(tmx new-window -dP -F '#{pane_id}' -t it "$pane_cmd")"
+# current owner＝TUI 自己所在的 window（§2「以 current owner 為根」）
+OWN40="$(tmx display -p -t "$TUI40" '#{session_name}:#{window_id}')"
+# 第二個 owner，字典序**刻意排在 current 之前**（`aaa:` < `it:`）：首頁若退
+# 回字典序第 0 筆，這一列的 worker 就會出現在 WORKERS 欄 → F2 回歸抓得到
+OWN40X="aaa:@1"
+printf '{"name":"tuiw1","pane_id":"%s","registered_at":"2026-07-31T00:00:00Z","spawned":true,"ready":true,"runtime":"codex","spawn_tag":"t40-1","owner":"%s"}\n' \
+  "$P40A" "$OWN40" > "$D40/agents/tuiw1.json"
+printf '{"name":"tuiw2","pane_id":"%s","registered_at":"2026-07-31T00:00:00Z","spawned":true,"ready":true,"runtime":"claude","spawn_tag":"t40-2","owner":"%s"}\n' \
+  "$P40B" "$OWN40" > "$D40/agents/tuiw2.json"
+printf '{"name":"tuiwother","pane_id":"%%940","registered_at":"2026-07-31T00:00:00Z","spawned":true,"ready":true,"runtime":"codex","spawn_tag":"t40-3","owner":"%s"}\n' \
+  "$OWN40X" > "$D40/agents/tuiwother.json"
+# 兩個 queued task 都派給 tuiw1（手工鋪完整形狀：metadata＋status＋request，
+# 不經 send——不觸發通知，狀態確定停在 queued）
+T40A="20260731T000001Z-40aa"
+T40B="20260731T000002Z-40bb"
+for _t40 in "$T40A" "$T40B"; do
+  mkdir -p "$D40/tasks/$_t40"
+  printf 'queued\n' > "$D40/tasks/$_t40/status"
+  printf 'p1 fixture task\n' > "$D40/tasks/$_t40/request.md"
+  printf '{"version":1,"task_id":"%s","from":"alice","to":"tuiw1","created_at":"2026-07-31T00:00:01Z","updated_at":"2026-07-31T00:00:01Z","working_directory":"/tmp","status":"queued"}\n' \
+    "$_t40" > "$D40/tasks/$_t40/metadata.json"
+done
+
+tmx send-keys -t "$TUI40" \
+  "$(printf 'echo AB40-MAIN-SCREEN; touch %q' "$TESTROOT/tui40-ready")" Enter
+wait_for 10 test -f "$TESTROOT/tui40-ready"
+
+# gate (c) 要的是**真 client**：整套測試的 tmux server 全程 detached，
+# `display -t it:` 只讀得到 session 的 active window——switch-client／
+# select-pane 全壞掉它照樣綠。這裡起一個 control-mode client（不需要 pty、
+# 不改動 window 尺寸與 layout，已實測），之後一律以 `display -c <client>`
+# 觀測「使用者實際在哪」。fd 9 常開著 fifo，client 才不會在下一條命令就掉。
+CC40="$TESTROOT/tui40-cc.fifo"
+mkfifo "$CC40"
+( tmx -C attach -t it < "$CC40" > "$TESTROOT/tui40-cc.log" 2>&1 & )
+exec 9<>"$CC40"
+# shellcheck disable=SC2329  # 經 wait_for 間接呼叫
+cc40_up() { [[ -n "$(tmx list-clients -F '#{client_name}' 2>/dev/null)" ]]; }
+assert "40 前置：control-mode client 已 attach（gate (c) 的觀測點）" \
+  wait_for 10 cc40_up
+CLIENT40="$(tmx list-clients -F '#{client_name}' 2>/dev/null | head -1)"
+
+# fixture 齊備後快照 tmux 世界（gate (b) 的比對基準）：window id＋layout
+# string（內含 geometry 與 pane id）
+tmx list-windows -F '#{window_id} #{window_layout}' > "$TESTROOT/tui40-before.txt"
+
+# tui40_run <tag> [env 指派…]：在 TUI40 的 shell 裡跑一次 `ui`，並以**同一條
+# shell 命令**把 `stty -g` 夾在前後——中間不回 prompt，bash/readline 沒有機會
+# 代為重設 termios，raw mode 有沒有還原才驗得準（審查 F5）。
+tui40_run() {
+  local tag="$1"; shift
+  tmx send-keys -t "$TUI40" "$(printf 'stty -g > %q; env %s AGENT_BRIDGE_DATA=%q %q ui; stty -g > %q' \
+    "$TESTROOT/stty-$tag-before" "$*" "$D40" "$BRIDGE" "$TESTROOT/stty-$tag-after")" Enter
+}
+# shellcheck disable=SC2329  # 經 assert 的 "$@" 間接呼叫
+stty40_same() { diff -q "$TESTROOT/stty-$1-before" "$TESTROOT/stty-$1-after"; }
+
+# tmx 是本檔的 shell function，bash -c 子殼裡不存在：一律先擷取到檔案再斷言
+cap40() { tmx capture-pane -p -t "$TUI40" > "$TESTROOT/tui40-cap.txt" 2>/dev/null; }
+# shellcheck disable=SC2329  # 經 assert/wait_for 的 "$@" 間接呼叫
+ui_shows() { cap40 && grep -qF "$1" "$TESTROOT/tui40-cap.txt"; }
+# shellcheck disable=SC2329  # 經 assert/wait_for 的 "$@" 間接呼叫
+ui_lacks() { cap40 && ! grep -qF "$1" "$TESTROOT/tui40-cap.txt"; }
+# 真 client 當下所在的 session:window.pane（不是 session 的 active window）
+# shellcheck disable=SC2329  # 經 wait_for 間接呼叫
+focus40_is() {
+  [[ "$(tmx display -p -c "$CLIENT40" '#{session_name}:#{window_id}.#{pane_id}' 2>/dev/null)" \
+     == "it:$W40_WIN.$P40A" ]]
+}
+
+tui40_run q
+# 40a 讀模型→畫面：owner／兩 worker／兩 task 列（權威狀態字）都在
+assert "40a UI 起畫面：worker 列 tuiw1 可見" wait_for 10 ui_shows "tuiw1"
+assert "40a UI：dead worker tuiw2 亦在列（不毒死畫面）" ui_shows "tuiw2"
+assert "40a UI：owner 標籤（$OWN40）在 OWNERS 欄" ui_shows "$OWN40"
+assert "40a UI：另一個 owner（$OWN40X）亦在 OWNERS 欄" ui_shows "$OWN40X"
+# §2「以 current owner 為根」：字典序第 0 筆是 aaa:@1，首頁若退字典序就會顯示
+# 它底下的 tuiwother——WORKERS 欄看不到它，才證明根是 current owner（審查 F2）
+assert "40a 首頁根＝current owner（非字典序第一筆）" wait_for 10 ui_lacks "tuiwother"
+assert "40a UI：task 列帶 immutable id（$T40A）" ui_shows "$T40A"
+assert "40a UI：第二個 task 列亦可見" ui_shows "$T40B"
+assert "40a UI：task status 顯示權威字 queued" ui_shows "queued"
+# alternate screen 進場：主畫面的哨兵行此刻不可見
+cap40
+assert "40a alternate screen：主畫面內容已被覆蓋" \
+  bash -c '! grep -qF AB40-MAIN-SCREEN "$1"' _ "$TESTROOT/tui40-cap.txt"
+
+# 40b ?＝當前選中項的合法鍵；任意鍵關閉
+tmx send-keys -t "$TUI40" '?'
+assert "40b ? 顯示當前選中項合法鍵" wait_for 10 ui_shows "合法鍵"
+tmx send-keys -t "$TUI40" k
+
+# 40c x 的合法目標只有 task 列：worker 列上按 x 無效並提示
+tmx send-keys -t "$TUI40" x
+assert "40c worker 列按 x：提示無效、不開確認框" wait_for 10 ui_shows "僅對 task 列有效"
+
+# 40d gate (c)：Enter focus 跨 window。前置：真 client 不在目標 window 上
+tmx display -p -c "$CLIENT40" '#{window_id}' > "$TESTROOT/tui40-curwin.txt"
+assert "40d 前置：client 不在目標 window（跨 window 案例成立）" \
+  bash -c '! grep -qFx "$1" "$2"' _ "$W40_WIN" "$TESTROOT/tui40-curwin.txt"
+tmx send-keys -t "$TUI40" Enter
+assert "40d Enter focus：真 client 的 session:window.pane 等於目標" \
+  wait_for 10 focus40_is
+# focus 走背景 worker（審查 F1）：結果經 channel 回到 footer，且**UI 沒退出**
+# ——非 popup 模式 focus 後繼續跑（與 40j 的 popup 協定成對）
+assert "40d focus 結果回到 footer（背景 worker → channel）" \
+  wait_for 10 ui_shows "已 focus 'tuiw1'"
+
+# 40e gate (a)：導航到第一個 task 列，x → 確認框顯示等價 CLI 原文 → y 執行
+tmx send-keys -t "$TUI40" j
+tmx send-keys -t "$TUI40" x
+assert "40e 確認框逐字顯示等價 CLI：agent-bridge cancel <task-id>" \
+  wait_for 10 ui_shows "agent-bridge cancel $T40A"
+tmx send-keys -t "$TUI40" y
+assert "40e 確認後 task 檔狀態轉 cancelled" wait_for 10 st_is "$D40" "$T40A" cancelled
+assert "40e events.log 記 cancelled 事件" evt_grep "$D40/tasks/$T40A/events.log" cancelled
+# CLI-UI-1 要求「與 cancel 相同的轉換**與通知**」：少了通知呼叫，狀態照樣轉
+# cancelled，只有通知事件會消失——故必須另立斷言（審查 F6）
+# 通知在轉態**之後**、且送鍵之間隔 NOTIFY_DELAY，故要等（狀態轉好不代表
+# 通知已落地）
+assert "40e 通知語意與 CLI 一致（notified／notify-deferred／notify-failed 之一）" \
+  wait_for 10 evt_grep "$D40/tasks/$T40A/events.log" '(notified|notify-deferred|notify-failed)'
+assert "40e cancel 結果回到 footer（背景 worker → channel，不印 stderr）" \
+  wait_for 10 ui_shows "已取消 task $T40A"
+assert "40e 另一個 task 不受波及（仍 queued）" st_is "$D40" "$T40B" queued
+
+# 40f gate (b) 正常退出：q 後回主畫面、termios 逐字還原、tmux 世界不變
+tmx send-keys -t "$TUI40" q
+assert "40f q 退出：離開 alternate screen（主畫面哨兵行回來）" \
+  wait_for 10 ui_shows "AB40-MAIN-SCREEN"
+assert "40f q 退出：termios 逐字還原（同一條命令內 stty -g 前後比對）" \
+  wait_for 10 stty40_same q
+tmx send-keys -t "$TUI40" \
+  "$(printf 'touch %q' "$TESTROOT/tui40-after-q")" Enter
+assert "40f q 退出後 terminal 可用（shell 收得到指令）" \
+  wait_for 10 test -f "$TESTROOT/tui40-after-q"
+tmx list-windows -F '#{window_id} #{window_layout}' > "$TESTROOT/tui40-after.txt"
+assert "40f window id／layout／geometry 不變" \
+  diff -q "$TESTROOT/tui40-before.txt" "$TESTROOT/tui40-after.txt"
+
+# 40g gate (b) 錯誤退出之一：panic 注入（AB_TUI_SELFTEST_PANIC——測試 harness
+# 的注入點，非 AGENT_BRIDGE_* 設定面）。panic hook 先還原 terminal 再印訊息，
+# 所以 panic 訊息必須出現在**主畫面**上
+tui40_run panic AB_TUI_SELFTEST_PANIC=1
+assert "40g panic 退出：訊息印在主畫面（alt screen 已離開＝hook 有跑）" \
+  wait_for 10 ui_shows "AB_TUI_SELFTEST_PANIC"
+assert "40g panic 退出：termios 逐字還原" wait_for 10 stty40_same panic
+tmx send-keys -t "$TUI40" \
+  "$(printf 'touch %q' "$TESTROOT/tui40-after-panic")" Enter
+assert "40g panic 退出後 terminal 可用（raw mode 已還原）" \
+  wait_for 10 test -f "$TESTROOT/tui40-after-panic"
+tmx list-windows -F '#{window_id} #{window_layout}' > "$TESTROOT/tui40-after2.txt"
+assert "40g panic 退出後 window id／layout／geometry 仍不變" \
+  diff -q "$TESTROOT/tui40-before.txt" "$TESTROOT/tui40-after2.txt"
+
+# 40h gate (b) 錯誤退出之二：**非 panic 的 Err**（AB_TUI_SELFTEST_ERR）。
+# draw／event::poll／event::read 都以 Err 返回，那條路徑不經 panic hook；
+# 只驗 panic 擋不住未來有人在 cleanup 之前提早 return（審查 F10）。
+tui40_run err AB_TUI_SELFTEST_ERR=1
+assert "40h Err 退出：錯誤訊息印在主畫面（已離開 alt screen）" \
+  wait_for 10 ui_shows "AB_TUI_SELFTEST_ERR"
+assert "40h Err 退出：termios 逐字還原" wait_for 10 stty40_same err
+tmx list-windows -F '#{window_id} #{window_layout}' > "$TESTROOT/tui40-after3.txt"
+assert "40h Err 退出後 window id／layout／geometry 仍不變" \
+  diff -q "$TESTROOT/tui40-before.txt" "$TESTROOT/tui40-after3.txt"
+
+# 40i §4 bounded-read 硬條款的 UI 側：tmux 整個掛住（hanging shim）＋
+# AGENT_BRIDGE_TMUX_TIMEOUT=0（不設限）。tmux 全部在背景 worker 上跑，
+# 所以 UI 仍須畫得出磁碟 read model、仍須收得了鍵、仍須 q 得掉（審查 F1）。
+HANG40="$TESTROOT/hangshim40"
+mkdir -p "$HANG40"
+printf '#!/usr/bin/env bash\nsleep 30\n' > "$HANG40/tmux"
+chmod +x "$HANG40/tmux"
+tui40_run hang "AGENT_BRIDGE_TMUX_TIMEOUT=0 PATH=$(printf '%q' "$HANG40:$PATH")"
+# 注意：tmux 掛住時連 current owner 都查不到，首頁只能退字典序第 0 筆
+# （$OWN40X）——這正是「該欄降級、UI 照跑」的正確終態，故斷言挑
+# owner-independent 的證據：OWNERS 欄仍列得出磁碟上的 owner 標籤
+assert "40i 無界 tmux 下 UI 照樣畫得出磁碟 read model" \
+  wait_for 10 ui_shows "$OWN40"
+assert "40i 無界 tmux 下 liveness 降級（不凍結、照畫）" ui_shows "$OWN40X"
+tmx send-keys -t "$TUI40" '?'
+assert "40i 無界 tmux 下鍵盤仍活（? 開得了合法鍵頁）" \
+  wait_for 10 ui_shows "合法鍵"
+tmx send-keys -t "$TUI40" k
+tmx send-keys -t "$TUI40" q
+# 退出證據用檔案不用畫面：畫面只有可見區，連跑多輪後哨兵行會捲出去
+assert "40i 無界 tmux 下 q 退得掉（UI thread 沒被 tmux 卡住）" \
+  wait_for 10 test -f "$TESTROOT/stty-hang-after"
+assert "40i 無界 tmux 退出後 termios 仍逐字還原" wait_for 10 stty40_same hang
+
+# 40j 啟動器協定（ENV-UI-1）：AGENT_BRIDGE_UI_POPUP=1 時 focus 成功即正常
+# 退出（`display-popup -E` 的行程結束＝關 popup，人落在目標 pane）。
+# 前置：先把 client 帶離目標 window，否則「有沒有 focus」分不出來。
+tmx select-window -t "$TUI40"
+tui40_run popup AGENT_BRIDGE_UI_POPUP=1
+assert "40j popup 模式：UI 起得來" wait_for 10 ui_shows "tuiw1"
+tmx send-keys -t "$TUI40" Enter
+assert "40j popup 模式：focus 成功後直接正常退出" \
+  wait_for 10 test -f "$TESTROOT/stty-popup-after"
+assert "40j popup 退出後真 client 落在目標 pane" wait_for 10 focus40_is
+assert "40j popup 退出：termios 逐字還原" wait_for 10 stty40_same popup
+
+# 收場：先放掉 control-mode client（fd 9 一關，attach 就結束），再殺本組開的
+# window（P40B 已死）
+exec 9>&-
+tmx detach-client -t "$CLIENT40" 2>/dev/null || true
+tmx kill-pane -t "$TUI40" 2>/dev/null || true
+tmx kill-window -t "$W40_WIN" 2>/dev/null || true
+
+else
+  printf 'SKIP: 40 TUI 第一縱切（SRC_KIND=bash：bash 正本凍結在 M4，不含 TUI）\n'
+fi
+
 # ---- 總結 ----
 printf '\n共 %d PASS、%d FAIL\n' "$PASS" "$FAIL"
 if (( FAIL > 0 )); then
