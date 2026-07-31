@@ -315,28 +315,50 @@ pub fn spawn(paths: &Paths, tmux: &dyn TmuxClient, req: &SpawnRequest) -> Result
     }
     if req.runtime.is_empty() {
         return Err(Error::new(
-            "spawn 需要 --runtime <runtime>（支援 codex、claude）",
+            "spawn 需要 --runtime <runtime>（支援 codex、claude、agy）",
         ));
     }
 
-    // runtime 表：指令 ＋ 守則注入方式。兩個 runtime 都走「initial prompt
+    // runtime 表：指令 ＋ 守則注入方式。三個 runtime 都走「initial prompt
     // 位置參數」。claude 的旗標選擇理由見 bin/agent-bridge:1093-1110，不複製。
+    //
+    // agy（Antigravity CLI）的旗標選擇（量測正本 docs/agy-probe.md）：
+    // agy 沒有 codex `--profile` 那種細粒度權限路線，也沒有 `--settings` 可讓
+    // worker 掛自己的一份，只有粗粒度旗標——姿態由使用者裁決為
+    // skip-permissions＋sandbox（2026-07-31），sandbox 實測不擋 agent-bridge
+    // CLI 呼叫與專案內寫檔。agy 無 hooks，state 通道不存在，通知恆走 legacy
+    // 送鍵（spec/cli.md CLI-SPAWN-1 的 Note）。
+    //
+    // `--prompt-interactive` 必須是**最後一個旗標**：它不是布林開關而是吃下
+    // 一個 token 當值的 string flag（實測 `agy --prompt-interactive
+    // --not-a-real-flag --help` rc=0——未知旗標被當成值吞掉，沒有報錯）。
+    // 擺在 `--model` 之前的話，`--model` 會被吃成 initial prompt、模型旗標
+    // 失效、真正的 prompt 變成錯位的位置參數（跨廠複核 2026-07-31 抓出）。
+    // 故 agy 的尾旗標從 runtime_cmd 拆出來，等 --model 附加完再接上去。
     let hooks_settings = config::claude_hooks_settings();
-    let mut runtime_cmd = match req.runtime.as_str() {
-        "codex" => "codex --profile agent-worker".to_string(),
-        "claude" => format!(
-            "claude --permission-mode auto --settings {}",
-            shell_quote_os(hooks_settings.as_os_str())
+    let (mut runtime_cmd, runtime_tail) = match req.runtime.as_str() {
+        "codex" => ("codex --profile agent-worker".to_string(), ""),
+        "claude" => (
+            format!(
+                "claude --permission-mode auto --settings {}",
+                shell_quote_os(hooks_settings.as_os_str())
+            ),
+            "",
+        ),
+        "agy" => (
+            "agy --dangerously-skip-permissions --sandbox".to_string(),
+            " --prompt-interactive",
         ),
         other => {
             return Err(Error::new(format!(
-                "不支援的 runtime：{other}（支援 codex、claude）"
+                "不支援的 runtime：{other}（支援 codex、claude、agy）"
             )));
         }
     };
     if !req.model.is_empty() {
         runtime_cmd.push_str(&format!(" --model {}", req.model));
     }
+    runtime_cmd.push_str(runtime_tail);
     if !tmux.available() {
         return Err(Error::new("找不到 tmux，spawn 需要 tmux"));
     }

@@ -177,9 +177,9 @@ agent-bridge cancel <task-id>                 # （sender）queued/delivered/run
 agent-bridge status <task-id>                 # stdout 只印裸狀態字一行
 agent-bridge read <task-id>                   # completed/failed 可讀；標頭走 stderr、原文走 stdout
 agent-bridge await <task-id> [--timeout <secs>]  # 阻塞至終態，印裸狀態字；逾時 exit 124（其他錯誤非 124）
-agent-bridge spawn <name> --runtime <codex|claude> [--model <model>] [--window]
+agent-bridge spawn <name> --runtime <codex|claude|agy> [--model <model>] [--window]
                                               # spawn worker pane；stdout 只印 pane-id
-agent-bridge relay <name> --runtime <codex|claude> [--model <model>] --handoff <path> \
+agent-bridge relay <name> --runtime <codex|claude|agy> [--model <model>] --handoff <path> \
                           [--window] [--no-select] [--self-exit <my-name>]
                                               # 把主導權交給接手者 session（注入接手者守則＋交接檔）；stdout 只印 pane-id
 agent-bridge despawn <name>                   # 回收 spawn 出身的 worker（人工註冊拒殺）
@@ -297,10 +297,29 @@ agent-bridge despawn worker-1                          # 任務收尾：kill pan
     形式（實測見過 `echo` 重導向被換成 Write 工具），但 `agent-bridge` 是外部
     CLI、沒有等價工具可替換，故這條路徑不受影響。另外**不可用 `-p/--print`**：
     那是 headless，跑完即退出，pane 不會留下來收探針
+  - `agy` → `agy --dangerously-skip-permissions --sandbox [--model <m>]
+    --prompt-interactive`（Antigravity CLI，量測正本 `docs/agy-probe.md`）。
+    `--prompt-interactive` 吃空白分隔的旗標值，位置參數因此原樣落為初始
+    prompt，注入路徑與前兩者共用。⚠️ 它**必須排在最後**：那不是布林開關而是
+    吃下一個 token 當值的 string flag（`agy --prompt-interactive
+    --not-a-real-flag --help` rc=0，未知旗標被吞成值而非報錯），擺在 `--model`
+    之前會讓模型旗標被吃掉、真 prompt 錯位。
+    旗標姿態是**使用者裁決**而非實作偏好：agy 沒有 codex `--profile` 那種細粒度
+    權限路線，也沒有 `--settings` 可讓 worker 掛自己的一份，只有粗粒度旗標；
+    sandbox 實測不擋 `agent-bridge` CLI 呼叫與專案內寫檔。
+    ⚠️ 現行 agy（實測 1.1.9）**沒有可掛載的 hooks 介面** → 不產生
+    `state/<name>.json` → 通知端恆走 legacy 送鍵（`notify_or_defer` 的「未知」
+    分支）。這是接受的 degradation：任務狀態機不倚賴 state 通道。另：agy 的
+    權限框 footer 是**小寫** `esc to cancel`，claude 的特徵一個都不命中，故
+    `screen_has_prompt` 另加**兩個**錨：header 的 `Requesting permission for:`，
+    以及下緣備援的 `Do you want to proceed?` ＋小寫 `esc to cancel` 成對。
+    備援錨不是冗餘——worker 預設進共用 window 並 tiled 均分，pane 一多就矮到
+    header 被捲出可見一屏，那時只有下緣還在（回歸鎖在分組 37e）。不補的話送鍵
+    的 Enter 會替 worker 按下預設的「1. Yes」。**bash 正本自 M4 凍結、不支援 agy**，本 runtime 只存在於 Rust
   - 新增 runtime 前必須實測該 CLI 的位置參數確實會被當第一則 user message 執行
     且執行完 session 常駐；只吃 stdin 或需要別的旗標的 CLI 要另外長出注入方式
-- **`--model` 指定 worker 的模型**（兩個 runtime 都吃 `--model` 長旗標，實測
-  2026-07-23）：不給＝繼承該 CLI 的使用者預設——主 session 把預設模型換到高階
+- **`--model` 指定 worker 的模型**（三個 runtime 都吃 `--model` 長旗標，codex／
+  claude 實測 2026-07-23、agy 實測 2026-07-31）：不給＝繼承該 CLI 的使用者預設——主 session 把預設模型換到高階
   層級時，worker 會跟著變貴，**規劃在主 session、執行下放的分工要靠這個旗標
   落地**（策略見 `share/orchestrator-brief.md`）。值會被拼進 pane 啟動命令
   字串，故驗證與 brief 路徑同級：字元集 `[A-Za-z0-9._-]{1,64}` 擋 sh/tmux
@@ -352,7 +371,7 @@ agent-bridge despawn worker-1                          # 任務收尾：kill pan
 ### relay：把主導權交給下一棒
 
 ```bash
-agent-bridge relay <name> --runtime <codex|claude> [--model <model>] --handoff <path> \
+agent-bridge relay <name> --runtime <codex|claude|agy> [--model <model>] --handoff <path> \
   [--window] [--no-select] [--self-exit <my-name>]
 ```
 

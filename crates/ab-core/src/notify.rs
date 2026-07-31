@@ -26,7 +26,27 @@ pub fn is_valid_pane(pane: &str) -> bool {
 }
 
 /// screen_has_prompt:318 — 一屏可見文字裡是否有會被 Enter 誤批的確認對話框。
-/// 兩組特徵（權限框／plan mode 退出框）依 bash 逐字。
+/// 前兩組特徵（claude 權限框／plan mode 退出框）依 bash 逐字。
+///
+/// 第三組是 agy（Antigravity CLI）的權限框，**Rust 獨有**：bash 正本自 M4
+/// 凍結、也不支援 agy runtime，這裡的分歧是設計而非漂移。agy 的框長成
+/// 「Requesting permission for: … Do you want to proceed? … esc to cancel」
+/// ——footer 是**小寫** `esc`，前兩組特徵一個都不命中（量測見
+/// docs/agy-probe.md，缺口 AGY-PROMPT-1）。若不補，送鍵的 Enter 會落在預設
+/// 選項 `1. Yes`，替一個正等人類決策的 worker 按下批准。
+///
+/// 錨用 agy 獨有的 `Requesting permission for:` 而非放寬 `esc` 的大小寫：
+/// agy 執行中 footer 常駐小寫 `esc to cancel`，只放寬大小寫會讓「助理輸出
+/// 自己寫出 Do you want to …」湊成誤判。誤判方向是漏送通知（任務仍在
+/// mailbox），比誤批權限框輕，但沒有理由白收。
+///
+/// **header 單錨不夠**（跨廠複核 2026-07-31 的 blocker）：掃描只看可見一屏
+/// （`capture-pane -pJ`，不取 scrollback），而預設 worker 會進共用 window 並
+/// `tiled` 均分——pane 一多就矮，框的 header 會被捲出畫面、只剩下緣的
+/// 選項與 footer。那時 header 錨失效、claude 那組又因大寫 `Esc` 不命中，
+/// 送鍵的 Enter 就落在 `1. Yes`。故第四組是下緣備援：完整句
+/// `Do you want to proceed?` ＋小寫 `esc to cancel` 成對。成對要求把誤判面
+/// 壓回「助理輸出剛好整句寫出那個問句」的窄縫，而不是任何含 esc 的畫面。
 ///
 /// 比對前先把整屏空白（含換行）摺疊成單一空格，對映 `tr -s '[:space:]' ' '`：
 /// TUI 的 word-wrap 與 tmux 軟折行會把特徵片段拆到兩行，逐行比對必偽陰性
@@ -49,6 +69,8 @@ pub fn screen_has_prompt(screen: &str) -> bool {
     }
     (norm.contains("Do you want to ") && norm.contains("Esc to cancel"))
         || (norm.contains("has written up a plan") && norm.contains("Would you like to proceed"))
+        || norm.contains("Requesting permission for:")
+        || (norm.contains("Do you want to proceed?") && norm.contains("esc to cancel"))
 }
 
 /// notify_pane:330 — 先驗 pane 存活、掃描確認框，再分兩次送鍵（文字、Enter）。
@@ -191,6 +213,26 @@ mod tests {
         assert!(!screen_has_prompt("Esc to cancel"));
         assert!(!screen_has_prompt("has written up a plan"));
         assert!(!screen_has_prompt("Would you like to proceed"));
+    }
+
+    /// agy 權限框（AGY-PROMPT-1）：實測畫面逐字，含小寫 `esc to cancel`
+    /// footer——前兩組特徵一個都不命中，只有第三組錨救得回來。
+    #[test]
+    fn agy_permission_box_is_detected() {
+        let screen = "● Bash(./bin/agent-bridge receive t1)\n\nCommand\n\
+             ────────\n\nRequesting permission for:\n   ./bin/agent-bridge receive t1\n\n\
+             Do you want to proceed?\n> 1. Yes\n  4. No\n\nesc to cancel";
+        assert!(screen_has_prompt(screen));
+        // header 錨單獨成立即可
+        assert!(screen_has_prompt("Requesting permission for:"));
+        // 矮 pane：header 被捲出一屏，只剩框的下緣——備援錨要接住
+        assert!(screen_has_prompt(
+            "Do you want to proceed?\n> 1. Yes\n  4. No\n\nesc to cancel"
+        ));
+        // agy 執行中的常駐 footer 不足以構成特徵
+        assert!(!screen_has_prompt("⣽ Running...\nesc to cancel"));
+        // 備援錨要求成對：單邊出現不算
+        assert!(!screen_has_prompt("Do you want to proceed?"));
     }
 
     #[test]

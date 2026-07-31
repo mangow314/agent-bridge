@@ -23,13 +23,13 @@ mechanics. Read the section for the role you are playing.
 agent-bridge list                     # delegable agents (name<TAB>pane_id<TAB>ready column: -/starting/ready)
 agent-bridge register <name> <tmux-target>
                                       # manually register an existing pane as an agent (unregister to remove)
-agent-bridge spawn <name> --runtime <codex|claude> [--model <model>] [--window]
+agent-bridge spawn <name> --runtime <codex|claude|agy> [--model <model>] [--window]
                                       # open + register a worker pane; prints pane-id on stdout (no --model = that CLI's default)
                                       # placement: workers land in this orchestrator's own worker window (created
                                       # next to it, reused across spawns, tiled); owner granularity is the caller's
                                       # tmux window; --window = a fully separate window; outside tmux it falls
                                       # back to splitting the current window
-agent-bridge relay <name> --runtime <codex|claude> [--model <model>] --handoff <path> [--window] [--no-select] [--self-exit <my-name>]
+agent-bridge relay <name> --runtime <codex|claude|agy> [--model <model>] --handoff <path> [--window] [--no-select] [--self-exit <my-name>]
                                       # hand over: open a successor pane (injects successor brief + handoff file); not a worker
                                       # chain depth is capped (AGENT_BRIDGE_MAX_RELAY_DEPTH, default 10); hitting it means stop and get a human, not raise it yourself
 agent-bridge despawn <name>           # reclaim a bridge-spawned worker (manually registered agents are refused)

@@ -18,4 +18,40 @@ When dispatching any independent review (code-review, codex-rescue, subagent rev
 - **"獨立 worker" in a user instruction means an agent-bridge spawned worker** — a subagent or MCP call does NOT satisfy it. When unsure which vehicle the user meant, the pane worker is the default reading.
 - **Known limit — codex pane workers cannot re-run this repo's test suite** (observed 2026-07-28, two rounds): the codex sandbox denies creating the suite's dedicated tmux socket (`Operation not permitted`), so `tests/run-tests.sh` dies early (`PANES[0]: unbound variable`). Consequence for every review round: suite numbers (e.g. "N PASS / 0 FAIL") are always maker claims, never independently re-run by the reviewer; scope the dispatch as code review + statically checkable evidence, and have the reviewer mark test-result verdicts as unverifiable-by-vehicle rather than confirmed.
 
+## Plan-stage second opinions (codex + agy)
+
+A **plan-stage** second opinion is a design input, not a diff verification. It is
+therefore **outside** the per-diff round cap in `~/.claude/rules/review-discipline.md`
+— that cap governs verification rounds on a diff (subagent verify + one cross-vendor
+codex round). Do not count plan-stage opinion rounds against it, and do not use the
+cap as a reason to skip one.
+
+- **Two vendors by default when the design space is wide**: one `--runtime codex`
+  worker and one `--runtime agy` worker, each given the same plan and asked
+  independently — ask them before they see each other's answer, or the second
+  opinion collapses into agreement with the first.
+- **Headless stays available**: a one-shot opinion needs no pane worker at all —
+  `codex exec …` / `agy -p '…'` from the main session is the cheaper path. Reach for
+  a pane worker when you want the opinion to survive across turns (follow-up
+  questioning, multi-round argument) or want both vendors working in parallel.
+- **agy worker caveats** (measured in `docs/agy-probe.md`): agy has no hooks
+  subsystem, so it never writes `state/<name>.json` and notifications always take the
+  legacy send-keys path. Nothing in send/receive/reply depends on the state channel,
+  so the worker contract is unaffected — but do not expect `notify-deferred` behavior
+  from an agy worker.
+
+### Orchestrator's arbitration authority (user directive, 2026-07-31)
+
+The orchestrator running the plan stage **may drive the two vendors against each
+other**: relay A's objection to B for rebuttal, iterate over several rounds, and
+decide when to stop. When the rounds do not converge:
+
+- **the orchestrator rules on it** — stating which position it adopted and why — **or**
+- **escalates the disagreement to the user as concrete questions**, each stating what
+  each vendor claimed and what turns on the answer.
+
+What is not allowed is letting a live disagreement pass silently into the plan.
+Whichever exit is taken, record it where the plan lives, so the decision is auditable
+later.
+
 Referenced from ~/.claude/rules/review-discipline.md; SKILL.md pointer to be added by the repo owner.

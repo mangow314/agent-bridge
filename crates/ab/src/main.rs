@@ -37,10 +37,10 @@ const USAGE: &str = r#"用法：
   agent-bridge await <task-id> [--timeout <secs>]
                                                 阻塞等待 task 到終態，印裸狀態字後 exit 0；
                                                 逾時以 exit 124 退出（其他錯誤一律非 124，供呼叫端區分）
-  agent-bridge spawn <name> --runtime <codex|claude> [--model <model>] [--window]
+  agent-bridge spawn <name> --runtime <codex|claude|agy> [--model <model>] [--window]
                                                 spawn 一個 worker pane 並註冊；stdout 只印 pane-id
                                                 （--model 不給＝該 CLI 的使用者預設模型）
-  agent-bridge relay <name> --runtime <codex|claude> [--model <model>] --handoff <path> [--window] [--no-select] [--self-exit <my-name>]
+  agent-bridge relay <name> --runtime <codex|claude|agy> [--model <model>] --handoff <path> [--window] [--no-select] [--self-exit <my-name>]
                                                 把主導權交給新 session（注入接手者守則＋交接檔）；stdout 只印 pane-id
   agent-bridge despawn <name>                   回收 spawn 出身的 worker（kill pane＋除名；人工註冊拒殺）
   agent-bridge ready <name>                     （worker）回報就緒；僅限 spawned agent
@@ -880,7 +880,7 @@ fn cmd_gc(paths: &Paths, args: &[String]) -> Result<()> {
 fn parse_spawn_args(args: &[String], relay: Option<spawn::Relay>) -> Result<spawn::SpawnRequest> {
     if args.is_empty() {
         return Err(Error::new(
-            "用法：agent-bridge spawn <name> --runtime <codex|claude> [--model <model>] [--window]",
+            "用法：agent-bridge spawn <name> --runtime <codex|claude|agy> [--model <model>] [--window]",
         ));
     }
     let name = args[0].clone();
@@ -936,7 +936,7 @@ fn cmd_spawn(paths: &Paths, args: &[String]) -> Result<()> {
 /// → 寫審計」，A 若殺自己的 pane，執行中的 process 會被 SIGHUP 帶走，永遠走不
 /// 到後兩步。
 fn cmd_relay(paths: &Paths, args: &[String]) -> Result<()> {
-    const USAGE_RELAY: &str = "用法：agent-bridge relay <name> --runtime <codex|claude> [--model <model>] --handoff <path> [--window] [--no-select] [--self-exit <my-name>]";
+    const USAGE_RELAY: &str = "用法：agent-bridge relay <name> --runtime <codex|claude|agy> [--model <model>] --handoff <path> [--window] [--no-select] [--self-exit <my-name>]";
     if args.is_empty() {
         return Err(Error::new(USAGE_RELAY));
     }

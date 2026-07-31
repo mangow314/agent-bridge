@@ -155,6 +155,9 @@ EOF
 make_runtime_shim codex
 # 真 claude 也在 PATH 上，但 shim 排在最前面，測試不會叫到真的
 make_runtime_shim claude
+# agy 同理（真 agy 也可能在 PATH 上）。shim 無條件建立、只有分組 37 會用到：
+# bash 正本不支援 agy runtime，多這個檔對它是死碼而非行為差異
+make_runtime_shim agy
 
 # spawn 出來的 pane 由 tmux server 啟動，PATH 繼承自 server 環境；
 # 在 server 啟動前把 shim 排進 PATH，pane 才找得到假 codex 與 agent-bridge
@@ -3886,6 +3889,138 @@ assert "36f 鏈中斷（worker 已死、中介被 reparent）：不得確認" \
 
 else
   printf 'SKIP: 36 codex launcher 形（SRC_KIND=bash：bash 正本凍結在 M4 行為，不含 M5）\n'
+fi
+
+# ---- 37. agy runtime（Antigravity CLI）----
+# spec: CLI-SPAWN-1 HOOK-NOTIFY-2
+# 第三個 runtime。量測正本 docs/agy-probe.md：`--prompt-interactive` 吃空白
+# 分隔的旗標值，位置參數原樣落為初始 prompt，故沿用同一條 worker_prompt_arg
+# 注入路徑；旗標姿態（skip-permissions＋sandbox）是使用者裁決，不是實作偏好，
+# 因此用白名單式 argv 斷言鎖住——與 16a2 同理，子字串比對擋不住偷偷追加的旗標。
+#
+# 與 35／36 同理只對 Rust 執行；bash 正本自 M4 凍結、不支援 agy，顯式 SKIP。
+if [[ "$SRC_KIND" == rust ]]; then
+
+# 37a 快樂路徑＋argv 白名單
+pane_wy="$(absp "$DSPAWN" 20 spawn wy1 --runtime agy 2>/dev/null)"; rc=$?
+assert "37a spawn --runtime agy：exit 0" test "$rc" -eq 0
+assert "37a spawn stdout 只印 pane-id（%N）一行" \
+  bash -c "[[ '$pane_wy' =~ ^%[0-9]+\$ ]]"
+assert "37a agy registry：runtime 欄為 agy" \
+  jq -e '.runtime == "agy"' "$DSPAWN/agents/wy1.json"
+assert "37a agy 一樣注入 worker brief（走同一條 worker_prompt_arg）" \
+  grep -q -- 'The above is your worker brief' "$TESTROOT/agy-args.txt"
+# 白名單：argv 必須「恰好」是 --dangerously-skip-permissions / --sandbox /
+# --prompt-interactive / <prompt> 四個。少一個旗標＝姿態被悄悄放寬（例如
+# 掉了 --sandbox），多一個＝有人往 worker 啟動旗標塞東西，兩個方向都該紅
+assert "37a agy argv 恰好四個參數（追加或遺漏任何旗標都該紅）" \
+  bash -c "mapfile -d '' -t A < '$TESTROOT/agy-argv.txt'; (( \${#A[@]} == 4 ))"
+assert "37a agy argv 前三個恰為裁決的旗標、第四個是 prompt 非旗標" \
+  bash -c "mapfile -d '' -t A < '$TESTROOT/agy-argv.txt'; [[ \${A[0]} == '--dangerously-skip-permissions' && \${A[1]} == '--sandbox' && \${A[2]} == '--prompt-interactive' && \${A[3]} != -* ]]"
+# 否定式斷言先證明「有東西可否定」（16a2 的空綠教訓）：-p 會讓 pane 跑完即退
+assert "37a agy 不帶 -p/--print（headless 會讓 pane 跑完即退）" \
+  bash -c "[[ -s '$TESTROOT/agy-args.txt' ]] && ! grep -qE -- '(^| )(-p|--print)( |\$)' '$TESTROOT/agy-args.txt'"
+assert "37a agy 探針重送生效：ready == true" \
+  jq -e '.ready == true' "$DSPAWN/agents/wy1.json"
+assert "37a agents.log 記 spawned wy1 … agy" \
+  grep -qE "Z spawned wy1 ${pane_wy} agy -\$" "$DSPAWN/agents.log"
+
+# 37b --model 下放。**順序是語意，不是排版**：`--prompt-interactive` 不是布林
+# 開關而是吃下一個 token 當值的 string flag（實測 `agy --prompt-interactive
+# --not-a-real-flag --help` rc=0，未知旗標被吞成值而非報錯）。它必須是最後一個
+# 旗標，否則 `--model` 會被吃成 initial prompt、模型旗標失效、真 prompt 錯位。
+# shim 只記 argv 不解析 agy 旗標，所以錯序照樣「綠」——這條斷言鎖的就是那個
+# shim 看不見的語意（跨廠複核 2026-07-31 抓出實作錯序，本斷言曾一度鎖住錯形）
+absp "$DSPAWN" 20 spawn wy2 --runtime agy --model gemini-3.6-flash-high >/dev/null 2>&1; rc=$?
+assert "37b spawn --runtime agy --model：exit 0" test "$rc" -eq 0
+assert "37b agy argv 恰好六個參數（37a 的四個 ＋ --model <m>）" \
+  bash -c "mapfile -d '' -t A < '$TESTROOT/agy-argv.txt'; (( \${#A[@]} == 6 ))"
+assert "37b agy argv 完整序列：--model 在 --prompt-interactive **之前**、prompt 緊接其後且在最後" \
+  bash -c "mapfile -d '' -t A < '$TESTROOT/agy-argv.txt'; [[ \${A[0]} == '--dangerously-skip-permissions' && \${A[1]} == '--sandbox' && \${A[2]} == '--model' && \${A[3]} == 'gemini-3.6-flash-high' && \${A[4]} == '--prompt-interactive' && \${A[5]} != -* ]]"
+assert "37b agy worker 可正常 despawn" ab "$DSPAWN" despawn wy2
+assert "37a agy worker 可正常 despawn" ab "$DSPAWN" despawn wy1
+
+# 37c agy 無 hooks → 不寫 state → 通知端一律走 legacy 送鍵（CLI-SPAWN-1 的
+# Note）。鎖的是「缺 state 檔時通知照樣送達 agy worker」——降級鏈本身在分組
+# 33/34 已鎖，這裡確認 agy 這個 runtime 落在該鏈的「未知」分支而非別處
+D37="$TESTROOT/d37"
+p_agy="$(tmx split-window -dP -F '#{pane_id}' -t it "$pane_cmd")"
+ab "$D37" register wy3 "$p_agy" 2>/dev/null
+tmx send-keys -t "$p_agy" \
+  "touch $TESTROOT/agy37c-ready ; while IFS= read -r l ; do printf '%s\n' \"\$l\" >> $TESTROOT/agy37c-got.txt ; done" Enter
+wait_for 10 test -f "$TESTROOT/agy37c-ready"
+id37c="$(ab "$D37" send wy3 --from alice --message hi 2>/dev/null)"
+assert "37c 本組佈景確認：該 agent 無 state 檔（真機無 hooks 的事實見 probe）" \
+  test ! -e "$D37/state/wy3.json"
+assert "37c 無 state → legacy 送鍵照樣送達（got 收到含 task-id 的 receive 行）" \
+  wait_for 10 grep -q "$id37c" "$TESTROOT/agy37c-got.txt"
+tmx kill-pane -t "$p_agy" 2>/dev/null || true
+
+# 37d AGY-PROMPT-1：agy 權限框的送鍵防線。agy 的框 footer 是**小寫**
+# `esc to cancel`，claude 的兩組特徵一個都不命中；不補的話送鍵的 Enter 會落在
+# 預設選項 `1. Yes`，替一個正等人類決策的 worker 按下批准。錨是 agy 獨有的
+# `Requesting permission for:`（不放寬 esc 大小寫的理由見 notify.rs 註解）。
+# 畫面文字逐字抄自實測（docs/agy-probe.md）。攔截判準沿用 8a 的哨兵法：
+# 先證明記錄機制活著，再斷言 got 恰好只有哨兵一行——只驗「不含 task-id」擋不住
+# 「只送了一個 Enter」這種 regression，而那個 Enter 正是會誤批的東西
+#
+# pane 開在**自己的視窗**而非 split 進 `it`：跑全套時 `it` 已累積多個 pane，
+# 每個只剩幾列高，六行框加上折行的指令列會超過可見高度，特徵被捲出「一屏」
+# 之外——`screen_has_prompt` 依契約只看一屏可見文字，那是測試佈景的假紅，
+# 不是防線失效（單跑分組 37 全綠、全套紅，實測 2026-07-31）。
+D37P="$TESTROOT/d37p"
+p_agyask="$(tmx new-window -dP -F '#{pane_id}' "$pane_cmd")"
+ab "$D37P" register wy4 "$p_agyask" 2>/dev/null
+tmx send-keys -t "$p_agyask" \
+  "printf '%s\n' 'Requesting permission for:' '   ./bin/agent-bridge receive t1' 'Do you want to proceed?' '> 1. Yes' '  4. No' 'esc to cancel' ; touch $TESTROOT/agyask-ready ; while IFS= read -r l ; do printf '%s\n' \"\$l\" >> $TESTROOT/agyask-got.txt ; done" Enter
+wait_for 10 test -f "$TESTROOT/agyask-ready"
+id37d="$(ab "$D37P" send wy4 --from alice --message hi 2>/dev/null)"; rc=$?
+tmx send-keys -t "$p_agyask" 'SENTINEL-agy' Enter
+assert "37d agy 框偵測：send 仍 exit 0" test "$rc" -eq 0
+assert "37d agy 框偵測：記錄機制活著（哨兵行有進 got）" \
+  wait_for 10 grep -q 'SENTINEL-agy' "$TESTROOT/agyask-got.txt"
+# shellcheck disable=SC2016  # $1/$2 由內層 bash 展開，刻意單引號
+assert "37d agy 權限框在場時一個按鍵都沒送進去（否則 Enter 替 worker 按下 1. Yes）" \
+  bash -c 'test "$(wc -l < "$1")" -eq 1 && grep -Fxq "$2" "$1"' _ "$TESTROOT/agyask-got.txt" 'SENTINEL-agy'
+assert "37d agy 框偵測：events.log 記 notify-failed" \
+  evt_grep "$D37P/tasks/$id37d/events.log" notify-failed
+tmx kill-window -t "$p_agyask" 2>/dev/null || true
+
+# 37e **矮 pane（production 形狀）**：worker 預設進共用 window 並 tiled 均分，
+# pane 一多就矮到框的 header 捲出可見一屏——掃描只看一屏（capture-pane -pJ，
+# 不取 scrollback），那時 `Requesting permission for:` 已不在畫面。37d 用獨立
+# 視窗驗完整框，這條驗只剩下緣的情形：header 不可見、選項與小寫 footer 仍在。
+# 單靠 header 錨的版本在這裡必紅（跨廠複核 2026-07-31 的 blocker）
+D37S="$TESTROOT/d37s"
+w_short="$(tmx new-window -dP -F '#{window_id}' "$pane_cmd")"
+p_short="$(tmx list-panes -t "$w_short" -F '#{pane_id}')"
+# 把視窗壓到 6 列：框只放得下下緣（問句＋兩個選項＋footer），header 進 scrollback
+tmx resize-window -t "$w_short" -x 200 -y 6 2>/dev/null || true
+tmx send-keys -t "$p_short" \
+  "printf '%s\n' 'Requesting permission for:' '   ./bin/agent-bridge receive t1' 'Do you want to proceed?' '> 1. Yes' '  4. No' 'esc to cancel' ; touch $TESTROOT/agyshort-ready ; while IFS= read -r l ; do printf '%s\n' \"\$l\" >> $TESTROOT/agyshort-got.txt ; done" Enter
+wait_for 10 test -f "$TESTROOT/agyshort-ready"
+# 前置斷言：確認這一屏真的看不到 header——否則本組退化成 37d 的複本、什麼都沒鎖。
+# 先把可見一屏擷取到檔案再斷言：`tmx` 是本殼的 function，`bash -c` 子殼裡不存在，
+# 直接寫進 assert 的子殼會讓否定式前置**假綠**（找不到指令 → 無輸出 → ! 成立）
+tmx capture-pane -pJ -t "$p_short" > "$TESTROOT/agyshort-screen.txt"
+assert "37e 前置：矮 pane 的可見一屏已看不到 header 錨" \
+  bash -c "! grep -qF 'Requesting permission for:' '$TESTROOT/agyshort-screen.txt'"
+assert "37e 前置：下緣特徵仍在可見一屏" \
+  grep -qF 'esc to cancel' "$TESTROOT/agyshort-screen.txt"
+ab "$D37S" register wy5 "$p_short" 2>/dev/null
+id37e="$(ab "$D37S" send wy5 --from alice --message hi 2>/dev/null)"
+tmx send-keys -t "$p_short" 'SENTINEL-short' Enter
+assert "37e 矮 pane 記錄機制活著（哨兵行有進 got）" \
+  wait_for 10 grep -q 'SENTINEL-short' "$TESTROOT/agyshort-got.txt"
+# shellcheck disable=SC2016  # $1/$2 由內層 bash 展開，刻意單引號
+assert "37e header 捲出一屏時仍 MUST NOT 送鍵（下緣備援錨接住）" \
+  bash -c 'test "$(wc -l < "$1")" -eq 1 && grep -Fxq "$2" "$1"' _ "$TESTROOT/agyshort-got.txt" 'SENTINEL-short'
+assert "37e events.log 記 notify-failed" \
+  evt_grep "$D37S/tasks/$id37e/events.log" notify-failed
+tmx kill-window -t "$w_short" 2>/dev/null || true
+
+else
+  printf 'SKIP: 37 agy runtime（SRC_KIND=bash：bash 正本凍結在 M4，不支援 agy）\n'
 fi
 
 # ---- 總結 ----

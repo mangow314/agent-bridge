@@ -103,7 +103,7 @@ ln -s ~/projects/agent-bridge ~/.claude/skills/agent-bridge
 ```bash
 # Orchestrator side: spawn a worker pane (registers it, injects the worker
 # brief as its initial prompt, waits for the readiness probe)
-agent-bridge spawn researcher --runtime codex        # or --runtime claude
+agent-bridge spawn researcher --runtime codex        # or --runtime claude / --runtime agy
 agent-bridge list                                    # researcher  %N  ready
 
 # Delegate a task (multi-line requests go through stdin)

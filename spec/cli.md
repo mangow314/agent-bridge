@@ -138,11 +138,18 @@ Source: cmd_await
 
 ## `spawn`
 
-### CLI-SPAWN-1 [tested: 16]
-`spawn <name> --runtime <codex|claude> [--model <model>] [--window]`：
+### CLI-SPAWN-1 [tested: 16, 37]
+`spawn <name> --runtime <codex|claude|agy> [--model <model>] [--window]`：
 建立 worker pane 並註冊。model 文法 `[A-Za-z0-9][A-Za-z0-9._-]{0,63}`、
 不支援的 runtime、同名已註冊（任一出身）——MUST 全部在建立 pane 之前拒絕。
 成功時 stdout 恰為 pane id 一行。
+
+Note（`agy` 的降級，量測正本 `docs/agy-probe.md`）：現行 agy（實測 1.1.9）
+沒有可供本專案掛載的 hooks 介面，故 agy worker **不會**有
+`state/<name>.json`，通知端恆走 legacy 送鍵
+（HOOK-NOTIFY-1 的「未知」分支）。這是接受的 degradation 而非缺陷：
+send/receive/reply 的任務狀態機不倚賴 state 通道。bash 正本自 M4 凍結，
+`agy` MUST 只存在於 Rust 實作。
 Source: cmd_spawn
 
 ### CLI-SPAWN-2 [tested: 16, 19, 20b]
