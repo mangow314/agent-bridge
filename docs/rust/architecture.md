@@ -307,3 +307,75 @@ check 3 之所以不動：它的比對對象只有 spec。`hook_*` 這四個名�
 
 兩項都不是 M4 引入的，也不因 cutover 惡化——但都**仍是開著的缺口**，不得
 當成已完成。
+
+## 11. M5：行程身分閘門（窗 1 關閉）
+
+提案與量測數據：`docs/rust/m5-proposal.md`。條款：HOOK-OWNER-5、STATE-AGENT-4。
+分組 35（15 條斷言）。**只關窗 1**（`/clear` 後的 TTL 降級窗）；窗 2（無鎖
+先到先得的認領競態）維持現狀，論證見 `docs/owner-gate-boundary-assessment.md`。
+
+### 11.1 為什麼不是 daemon
+
+計畫原文寫的是「daemon 單一寫者」。實測後改走行程身分：hook 行程的**直接
+PPID** 就是啟動它的那個 runtime，本尊與巢狀因此精確可分。daemon 真正買到的
+只有窗 2，而窗 2 的前置條件自我矛盾（認領發生在派工前，那一刻巢狀對手還不
+存在），代價卻是常駐行程＋改寫產品定位＋一條「daemon 掛掉就退回現行寫法」的
+降級路徑——而那條路一走，兩個窗就都回來了。
+
+被否決過的是 PPID **祖先鏈**（HOOK-OWNER-4 Note）：巢狀的祖先鏈必然包含本尊，
+鏈式比對區分不出來。直接父行程沒有這個問題。
+
+### 11.2 三段判別與失效方向
+
+`hook::proc_identity_verdict` 回三態，`owner_gate` 據此分流：
+
+| 情形 | 裁決 | 理由 |
+|---|---|---|
+| 兩欄齊備、pid 現存、starttime 相符、PPID == pid | 放行，不看 sid/ts | `/clear` 換 session_id 但行程沒變＝身分沒變，自癒即時 |
+| 同上但 PPID != pid | **擋**，且 ts 過期也不得接管 | 相對 HOOK-OWNER-2 的收緊：冒名者不該因為等得夠久就變正主 |
+| 欄位缺、pid 已死、starttime 不符（pid 重用）、無 `/proc` | 落回 sid＋TTL | 沒有可裁決的對象 |
+
+**錯誤方向不對稱**是整節的設計軸：誤放行只是回到 M4 的暴露面；誤擋掉的卻是
+worker 本尊，會讓它的 state 通道永久死掉——比未實作更糟。所以只有「明確」
+兩端才裁決，其餘一律落回。「記錄過期→落回而非擋」也是同一條理由推出來的。
+
+### 11.3 身分確認為什麼是 argv 而不是別的
+
+spawn 端要確認 `pane_pid` 真的是 runtime 本尊，否則記錯 pid 會讓本尊被自己的
+閘門擋掉。做法是逐 argv 比 basename：
+
+- 只看 `argv[0]` 會漏掉腳本形（`["bash", "/path/to/claude", …]`）；
+- 在整串 cmdline 裡找子字串會把中介 shell 誤認成 runtime
+  （`["sh", "-c", "…exec claude …"]`）——那正是最該避免的誤判方向。
+
+**不讀 `/proc/<pid>/environ`**：spawn tag 存在環境而非 argv，用它確認身分本來
+最直接，但那個路徑是本專案安全邊界的絕對禁區（行程完整環境含憑證）。因此身分
+確認只能走 argv 這條較弱的線索，不足之處由「不確定就留空、留空就落回」吸收。
+
+### 11.4 bash 正本凍結
+
+分組 35 只對 Rust 執行，`SRC_KIND=bash` 時顯式印 SKIP。bash 正本自 M4 起是
+rollback 基準——它代表「回到 M4 的行為」，不該再長新功能。因此 parity 的形狀
+從「兩邊同數字」變成「Rust 771／bash 756＋顯式 SKIP」。
+
+### 11.5 自檢
+
+新斷言以 mutation 反證過，不是看著綠燈就收工：
+
+| mutation | 預期 | 實測 |
+|---|---|---|
+| 停用整條行程身分分支（＝回到 M4） | 35a、35c 紅 | 相符（13 PASS／2 FAIL） |
+| 「明確不符→擋」弱化成「落回」 | 只有 35c 紅 | 相符（14 PASS／1 FAIL） |
+
+第二個 mutation 專門打 11.2 表格第二列那個決定——它是本節最微妙的一步，
+弱化之後其餘 14 條都還是綠的。
+
+### 11.6 仍開著的
+
+- **codex runtime 未量測**：codex 的 hook 走 profile overlay，行程樹未必與
+  claude 相同。未量＝未知，保守假設是 codex worker 落回時間窗（行為同 M4）。
+  要收就補一次 `m5-proposal.md` §1 的量測流程。
+- **`pane_pid` == runtime 本尊依賴 tmux 直接 exec**：本機實測成立，但那是 tmux
+  的行為不是承諾。分組 35f 鎖住了「記到的 pid 等於 pane_pid 且 starttime 相符」，
+  若哪天中間多一層 shell，argv 比對會失敗、兩欄留空、全面落回（安全但窗回來）。
+- **窗 2**：仍在，仍只有 daemon 一條路，仍是獨立的一件事。

@@ -107,7 +107,7 @@ pub fn agent_name() -> Option<String> {
 pub fn write_state(file: &Path, state: &str, last_delivered: Option<&str>, owner: &str) {
     let ld = match last_delivered {
         Some(v) => v.to_string(),
-        None => read_state_field(file, "last_delivered").unwrap_or_default(),
+        None => read_json_field(file, "last_delivered").unwrap_or_default(),
     };
     let doc = JsonObject::new()
         .push_str("state", state)
@@ -118,13 +118,13 @@ pub fn write_state(file: &Path, state: &str, last_delivered: Option<&str>, owner
     let _ = atomic_write(file, format!("{doc}\n").as_bytes());
 }
 
-/// 讀 state 檔的單一欄位，對映 bash `jq -r '.x // empty' … 2>/dev/null || x=""`。
-/// 檔案不存在／非 JSON 一律 `None`。
+/// 讀某個 JSON 檔的單一欄位，對映 bash `jq -r '.x // empty' … 2>/dev/null || x=""`。
+/// 檔案不存在／非 JSON 一律 `None`。state 檔與 registry 都走這支。
 ///
 /// 走 `json::jq_raw_field` 而非 `str_field`：`jq -r` 對非字串值會印出其文字，
 /// bash 端拿到的是非空字串。這個差別在 `owner` 上是安全性的——`owner: 1` 在
 /// bash 是「有主」（擋異主），用 `str_field` 會變成「無主」（直接放行）。
-fn read_state_field(file: &Path, key: &str) -> Option<String> {
+fn read_json_field(file: &Path, key: &str) -> Option<String> {
     let content = std::fs::read_to_string(file).ok()?;
     let Ok(Value::Object(fields)) = json::parse(&content) else {
         return None;
@@ -139,10 +139,16 @@ fn read_state_field(file: &Path, key: &str) -> Option<String> {
 ///
 /// 接管條件：state ts 超過 TTL 或落在未來（未來 ts 不可信，比照
 /// `notify_or_defer` 的下界論證）。ts 過期時通知端本來就把這份 state 當
-/// 「未知」走 legacy——通道此刻已降級，交出所有權零損失；這同時是 /clear 後
-/// parent 換新 session_id 的自癒路徑，自癒上限＝TTL。
-pub fn owner_gate(file: &Path, sid: &str) -> bool {
-    let Some(owner) = read_state_field(file, "owner") else {
+/// 「未知」走 legacy——通道此刻已降級，交出所有權零損失。
+///
+/// **M5（HOOK-OWNER-5）**：registry 帶得動行程身分時，先由它裁決，時間窗只是
+/// 落回路徑。`/clear` 的自癒因此變成即時（行程沒變＝身分沒變），不再等 TTL。
+pub fn owner_gate(file: &Path, sid: &str, reg_file: &Path) -> bool {
+    // 明確相符→放行且不看 sid/ts；明確不符→擋且不得靠 ts 過期取得接管資格
+    if let Some(verdict) = proc_identity_verdict(reg_file) {
+        return verdict;
+    }
+    let Some(owner) = read_json_field(file, "owner") else {
         // 檔案不存在、非 JSON、或無 owner 欄（舊格式）一律放行
         return true;
     };
@@ -152,7 +158,7 @@ pub fn owner_gate(file: &Path, sid: &str) -> bool {
     let ttl = config::state_ttl_lenient();
     // ts 壞掉／缺欄位：這份 state 已不可信，視同過期、允許接管（與
     // notify_or_defer 把解析失敗當「未知」同向）。
-    let Some(ts) = read_state_field(file, "ts") else {
+    let Some(ts) = read_json_field(file, "ts") else {
         return true;
     };
     let Some(epoch) = parse_iso_to_epoch(&ts) else {
@@ -160,6 +166,32 @@ pub fn owner_gate(file: &Path, sid: &str) -> bool {
     };
     let age = now_epoch() - epoch;
     !(age >= 0 && age <= ttl)
+}
+
+/// HOOK-OWNER-5 的行程身分裁決。`Some(true)`＝本尊、`Some(false)`＝冒名、
+/// `None`＝無法判斷（呼叫端落回 session_id＋TTL）。
+///
+/// **只在兩欄齊備且 pid 現在還活著時才給裁決**。任何一步缺料都回 `None`：
+/// 這條路的錯誤方向不對稱——誤放行只是回到今天的暴露面，誤擋掉的卻是 worker
+/// 本尊，會讓它的 state 通道永久死掉（比未實作更糟）。
+fn proc_identity_verdict(reg_file: &Path) -> Option<bool> {
+    if !crate::proc::available() {
+        return None;
+    }
+    let pid = read_json_field(reg_file, "worker_pid")?;
+    let recorded_start = read_json_field(reg_file, "worker_starttime")?;
+    if pid.is_empty() || recorded_start.is_empty() {
+        return None;
+    }
+    // 記錄的行程已不在（starttime 讀不到）：worker 本尊都不存在了，這條路沒有
+    // 可裁決的對象，交還給時間窗
+    let current_start = crate::proc::starttime(&pid)?;
+    if current_start != recorded_start {
+        // pid 還在但已是別的行程（pid 重用）——記錄過期，同樣不裁決
+        return None;
+    }
+    let ppid = crate::proc::self_ppid()?;
+    Some(ppid == pid)
 }
 
 /// hook_oldest_queued:2098 — 最舊一筆 `to == agent` 且狀態為 queued 的 task-id。
@@ -264,6 +296,9 @@ pub fn run(paths: &Paths, args: &[String]) -> HookOutcome {
         return HookOutcome::Silent;
     }
     let state_file = paths.state_dir.join(format!("{name}.json"));
+    // HOOK-OWNER-5 的行程身分來源。**只讀不寫**：hook 從來不碰 registry，
+    // 這裡也不建立它——讀不到就是落回時間窗
+    let reg_file = paths.agents_dir.join(format!("{name}.json"));
 
     let stdin_json = read_stdin_bounded();
     let fields = match json::parse(&stdin_json) {
@@ -279,7 +314,7 @@ pub fn run(paths: &Paths, args: &[String]) -> HookOutcome {
     let Some(sid) = json::jq_raw_field(&fields, "session_id") else {
         return HookOutcome::Silent;
     };
-    if !owner_gate(&state_file, &sid) {
+    if !owner_gate(&state_file, &sid, &reg_file) {
         return HookOutcome::Silent;
     }
 
@@ -330,7 +365,7 @@ fn run_stop(
         return HookOutcome::Silent;
     };
 
-    let last_delivered = read_state_field(state_file, "last_delivered").unwrap_or_default();
+    let last_delivered = read_json_field(state_file, "last_delivered").unwrap_or_default();
     if stop_active && pending == last_delivered {
         // 同一個仍待處理的 task 已經被擋過一輪、模型還是選擇停下：這才是真
         // 迴圈的訊號（模型不理會 reason），一輪就放行，不再無限擋。多任務
@@ -399,20 +434,23 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("ab-hook-gate-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let f = dir.join("s.json");
+        // 這一組測的是**落回路徑**（HOOK-OWNER-2 的 session_id＋TTL）：registry
+        // 不存在 ⇒ 沒有行程身分可用。M5 的身分分支由 proc_identity_* 各測例覆蓋
+        let no_reg = dir.join("no-such-registry.json");
 
         // 檔案不存在
-        assert!(owner_gate(&f, "s1"));
+        assert!(owner_gate(&f, "s1", &no_reg));
 
         // 無 owner 欄
         std::fs::write(&f, br#"{"state":"idle","ts":"2020-01-01T00:00:00Z"}"#).unwrap();
-        assert!(owner_gate(&f, "s1"));
+        assert!(owner_gate(&f, "s1", &no_reg));
 
         // 本人
         write_state(&f, "busy", Some("t1"), "s1");
-        assert!(owner_gate(&f, "s1"));
+        assert!(owner_gate(&f, "s1", &no_reg));
 
         // 異主且新鮮 → 擋
-        assert!(!owner_gate(&f, "other"));
+        assert!(!owner_gate(&f, "other", &no_reg));
 
         // owner 是非字串但 `jq -r` 印得出東西（number／true／物件）＝有主，
         // 異主且新鮮就得擋。用 str_field 會把它讀成「無主」而放行，那正是
@@ -423,7 +461,10 @@ mod tests {
                 crate::time::now_iso()
             );
             std::fs::write(&f, doc.as_bytes()).unwrap();
-            assert!(!owner_gate(&f, "nested"), "owner={owner_json} 應視為有主");
+            assert!(
+                !owner_gate(&f, "nested", &no_reg),
+                "owner={owner_json} 應視為有主"
+            );
         }
         // `false` 與 `null` 在 jq 的 `//` 之下都落到 empty＝無主
         for owner_json in [r#"false"#, r#"null"#] {
@@ -432,7 +473,10 @@ mod tests {
                 crate::time::now_iso()
             );
             std::fs::write(&f, doc.as_bytes()).unwrap();
-            assert!(owner_gate(&f, "nested"), "owner={owner_json} 應視為無主");
+            assert!(
+                owner_gate(&f, "nested", &no_reg),
+                "owner={owner_json} 應視為無主"
+            );
         }
 
         // 異主但 ts 過期 → 可接管
@@ -441,7 +485,7 @@ mod tests {
             br#"{"state":"busy","ts":"2020-01-01T00:00:00Z","owner":"s1"}"#,
         )
         .unwrap();
-        assert!(owner_gate(&f, "other"));
+        assert!(owner_gate(&f, "other", &no_reg));
 
         // 異主但 ts 落在未來 → 不可信，可接管
         std::fs::write(
@@ -449,7 +493,74 @@ mod tests {
             br#"{"state":"busy","ts":"2999-01-01T00:00:00Z","owner":"s1"}"#,
         )
         .unwrap();
-        assert!(owner_gate(&f, "other"));
+        assert!(owner_gate(&f, "other", &no_reg));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// HOOK-OWNER-5：行程身分在場時凌駕時間窗，且「不確定」一律落回。
+    #[test]
+    fn proc_identity_overrides_the_time_window_and_falls_back_when_unsure() {
+        let dir = std::env::temp_dir().join(format!("ab-hook-proc-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let state = dir.join("s.json");
+        let reg = dir.join("r.json");
+        // 異主且新鮮：沒有行程身分的話這是「擋」
+        write_state(&state, "busy", Some("t1"), "s1");
+
+        let ppid = crate::proc::self_ppid().expect("/proc 應可讀");
+        let ppid_start = crate::proc::starttime(&ppid).expect("父行程 starttime 應可讀");
+        let write_reg = |pid: &str, start: &str| {
+            std::fs::write(
+                &reg,
+                format!(r#"{{"worker_pid":"{pid}","worker_starttime":"{start}"}}"#),
+            )
+            .unwrap();
+        };
+
+        // 本尊：直接 PPID 與 starttime 都對上 → 放行，且不看 session_id
+        write_reg(&ppid, &ppid_start);
+        assert!(
+            owner_gate(&state, "brand-new-session", &reg),
+            "PPID 相符時應無視異主的 session_id"
+        );
+
+        // 冒名：pid 是個活著的行程（自己），但不是本 hook 的父行程 → 擋
+        let me = std::process::id().to_string();
+        let me_start = crate::proc::starttime(&me).unwrap();
+        write_reg(&me, &me_start);
+        assert!(!owner_gate(&state, "nested", &reg), "PPID 不符應擋");
+
+        // **收緊**：身分明確不符時，ts 過期也不得取得接管資格
+        std::fs::write(
+            &state,
+            br#"{"state":"busy","ts":"2020-01-01T00:00:00Z","owner":"s1"}"#,
+        )
+        .unwrap();
+        assert!(
+            !owner_gate(&state, "nested", &reg),
+            "冒名者不該因為等得夠久就變成正主"
+        );
+
+        // starttime 對不上（pid 被重用）＝記錄過期 → 落回時間窗，此刻 ts 已
+        // 過期故可接管。這條同時證明「不裁決」與「裁決為假」不是同一條路
+        write_reg(&ppid, "999999999999");
+        assert!(
+            owner_gate(&state, "other", &reg),
+            "記錄過期應落回時間窗而非擋死"
+        );
+
+        // 欄位缺其一、空值、registry 不存在 → 一律落回
+        for doc in [
+            r#"{"worker_pid":"1"}"#,
+            r#"{"worker_starttime":"1"}"#,
+            r#"{"worker_pid":"","worker_starttime":""}"#,
+            r#"{}"#,
+        ] {
+            std::fs::write(&reg, doc.as_bytes()).unwrap();
+            assert!(owner_gate(&state, "other", &reg), "doc={doc} 應落回");
+        }
+        assert!(owner_gate(&state, "other", &dir.join("nope.json")));
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -463,17 +574,17 @@ mod tests {
 
         write_state(&f, "busy", Some("task-1"), "s1");
         assert_eq!(
-            read_state_field(&f, "last_delivered").as_deref(),
+            read_json_field(&f, "last_delivered").as_deref(),
             Some("task-1")
         );
 
         write_state(&f, "idle", None, "s2");
-        assert_eq!(read_state_field(&f, "state").as_deref(), Some("idle"));
+        assert_eq!(read_json_field(&f, "state").as_deref(), Some("idle"));
         assert_eq!(
-            read_state_field(&f, "last_delivered").as_deref(),
+            read_json_field(&f, "last_delivered").as_deref(),
             Some("task-1")
         );
-        assert_eq!(read_state_field(&f, "owner").as_deref(), Some("s2"));
+        assert_eq!(read_json_field(&f, "owner").as_deref(), Some("s2"));
 
         let _ = std::fs::remove_dir_all(&dir);
     }

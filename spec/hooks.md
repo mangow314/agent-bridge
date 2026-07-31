@@ -65,11 +65,40 @@ Source: hook_owner_gate
 ### HOOK-OWNER-4 [tested: 34.5+]
 接管成功的寫入 MUST 以本次事件的 session_id 為新 owner，MUST NOT 從舊檔
 沿用（STATE-CHAN-2）。
-Note: hook 端「parent 的新 session」與「巢狀 session」在環境與 payload 面
-不可區分，只能靠時間窗交還、不能靠身分判別（PPID 祖先鏈方案已否決）。
+Note: 在**沒有**行程身分可用時（HOOK-OWNER-5 的落回路徑），hook 端「parent
+的新 session」與「巢狀 session」在環境與 payload 面不可區分，只能靠時間窗
+交還——PPID **祖先鏈**方案在此仍然無效（巢狀的祖先鏈必然包含本尊）。
 `receive` 端刻意不加驗：巢狀繼承同 SPAWN_TAG、tag 比對無效；門在 hook 端
 不發 block（cross-vendor 複核確認此裁定）。
 Source: hook_write_state / cmd_hook
+
+### HOOK-OWNER-5 [tested: 35]
+**行程身分優先於時間窗**。registry 同時具備 `worker_pid` 與
+`worker_starttime`（STATE-AGENT-4）時，閘門 MUST 先比對本 hook 行程的**直接
+父行程**：
+
+- 直接 PPID 等於 `worker_pid` 且該 pid 的 starttime 等於 `worker_starttime`
+  → MUST 放行，且 MUST NOT 再看 `session_id` 或 `ts`。這是 parent `/clear`
+  換新 session_id 的即時自癒路徑（行程沒變，身分就沒變），取代 HOOK-OWNER-2
+  的 TTL 等待。
+- 兩欄齊備、`worker_pid` 現存、且其當下 starttime 等於 `worker_starttime`
+  （＝記錄仍指向同一個活著的行程），而直接 PPID 不等於 `worker_pid`
+  → MUST 擋（靜默 exit 0、無 stdout、stop 不發 block），且 MUST NOT 因 `ts`
+  過期而取得接管資格——冒名者不會因為等得夠久就變成正主。這是相對
+  HOOK-OWNER-2 的**收緊**。
+- 欄位缺其一、該 pid 已不存在、其 starttime 與記錄不符（pid 已被重用，記錄
+  過期）、或執行環境無此能力 → MUST 落回 HOOK-OWNER-2 的 session_id＋TTL
+  判別，行為與未實作本條時完全相同。**記錄過期時不得擋**：那代表本尊已不在，
+  擋下所有人只會讓通道永久死掉。
+
+判別 MUST 只在「明確相符」時放行、「兩欄齊備且明確不符」時擋，其餘一律落回。
+失效方向因此收斂到現狀，不會比未實作更糟。
+Note: 前提是 runtime 直接 fork hook 行程（2026-07-31 實測 claude 如此，
+`docs/rust/m5-proposal.md` §1）。這是實測結果不是介面承諾，故落回路徑是本條
+的一部分而非例外處置。registry 對同互信域的 worker 可寫，本條防的是**巢狀
+runtime 意外冒用**，不是防具寫入權的惡意行為者——後者早已在信任模型之外
+（STATE-AGENT-4 Note）。
+Source: hook_owner_gate
 
 ## 三事件語意
 

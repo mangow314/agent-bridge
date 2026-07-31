@@ -27,7 +27,7 @@ Source: NAME_RE（cmd_register / cmd_send 驗證）
 每個 agent 一份 `agents/<name>.json`。人工註冊（register）欄位：
 `{name, pane_id, registered_at}`。spawn 出身另含
 `{spawned: true, runtime, model, spawned_at, ready, spawn_tag, owner,
-worker_window}`。
+worker_window}`，以及 STATE-AGENT-4 的 `{worker_pid, worker_starttime}`。
 Source: cmd_register / cmd_spawn
 
 ### STATE-AGENT-2 [tested: 20]
@@ -41,6 +41,24 @@ register 對既存同名 agent：spawn 出身 MUST 拒絕覆寫（要求先 desp
 人工註冊允許覆寫（換 pane）。registry 寫入 MUST 持 registry 鎖，與
 spawn/despawn/ready 互斥。
 Source: cmd_register
+
+### STATE-AGENT-4 [tested: 35]
+spawn 出身另 MUST 記 `{worker_pid, worker_starttime}`：worker runtime 行程的
+pid，與該 pid 的行程啟動刻度（Linux `/proc/<pid>/stat` 第 22 欄，用於分辨
+pid 重用）。取不到任一項時 MUST 寫入空字串而非讓 spawn 失敗——這兩欄是
+HOOK-OWNER-5 的最佳化輸入，缺了只是落回時間窗判別，不影響 spawn 是否成立。
+Note: `pane_pid` 之所以就是 runtime 本尊，是因為 tmux 直接 exec 啟動命令、
+中間無 shell 層（2026-07-31 實測）。若該前提在某環境不成立，記到的會是中介
+行程的 pid，而本尊 hook 的 PPID 會與之不符、反被 HOOK-OWNER-5 擋掉——比不做
+更糟。**故 spawn MUST 在寫入前確認該 pid 的 `argv[0]` basename 等於本次
+runtime 名**，不符則兩欄留空走落回路徑。只看 `argv[0]` 是刻意的：夾了 shell
+時整串 cmdline 找得到 runtime 名（在 `sh -c` 的引數裡），argv[0] 則是 `sh`。
+Note: 身分確認 MUST NOT 讀 `/proc/<pid>/environ`（行程完整環境，含憑證，屬
+本專案安全邊界的絕對禁區）。spawn tag 存在環境而非 argv，因此確認手段只能
+是 argv[0] 這條較弱的線索；不足之處由「不確定就留空、留空就落回」吸收。
+Note: 本檔對同互信域的 worker 可寫，這兩欄與 `spawn_tag` 同級——是身分**線索**
+不是憑證，防的是巢狀 runtime 的意外冒用而非具寫入權的惡意行為者。
+Source: cmd_spawn
 
 ## tasks/（mailbox）
 

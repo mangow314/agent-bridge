@@ -17,6 +17,7 @@ pub mod json;
 pub mod lock;
 pub mod notify;
 pub mod paths;
+pub mod proc;
 pub mod registry;
 pub mod spawn;
 pub mod task;

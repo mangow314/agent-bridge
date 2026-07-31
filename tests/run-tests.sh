@@ -3532,6 +3532,148 @@ assert "34.13 缺 sid：exit 0" test "$rc" -eq 0
 assert "34.13 缺 sid：無 stdout（不 block）" test ! -s "$TESTROOT/h34m.out"
 assert "34.13 缺 sid：不產生 state 檔" bash -c "! test -e '$D34m/state/wes.json'"
 
+# ---- 35. 行程身分閘門（M5 窗 1）----
+# spec: HOOK-OWNER-5 STATE-AGENT-4
+# registry 帶得動 worker 的 (pid, starttime) 時，閘門先比對 hook 行程的**直接**
+# 父行程，比對得出結論就不看 session_id／ts。這關掉的是「parent /clear 換新
+# session_id 後被自己的閘門擋住、要等 TTL 才自癒」那個窗——行程沒變＝身分沒變。
+# 設計依據與實測：docs/rust/m5-proposal.md。
+#
+# 這一組只對 Rust 正本執行：bash 正本凍結在 M4 的行為（rollback 基準），
+# 不再長新功能。SKIP 是顯式的，不靜默跳過。
+if [[ "$SRC_KIND" == rust ]]; then
+
+# hookcall 的 pipeline 右段由當前 shell fork，故受測 hook 行程的直接父行程
+# 就是這個 shell——$BASHPID 即「本尊」該有的 pid
+ME_PID="$BASHPID"
+
+# /proc/<pid>/stat 第 22 欄。comm（第 2 欄）可含空白與右括號，故從最後一個
+# ") " 之後才開始數；切完 $1 是第 3 欄，第 22 欄因此是 ${20}
+proc_starttime() {
+  local raw
+  raw="$(<"/proc/$1/stat")" || return 1
+  raw="${raw##*') '}"
+  # shellcheck disable=SC2086  # 刻意分詞：stat 欄位以空白分隔
+  set -- $raw
+  printf '%s\n' "${20}"
+}
+
+# 寫一份只含身分兩欄的 registry（其餘欄位與本組無關；閘門只讀這兩欄）
+write_ident_reg() {
+  local dir="$1" name="$2" pid="$3" start="$4"
+  mkdir -p "$dir/agents"
+  jq -n --arg p "$pid" --arg s "$start" \
+    '{name: "x", pane_id: "%1", worker_pid: $p, worker_starttime: $s}' \
+    > "$dir/agents/$name.json"
+}
+
+# 異主且新鮮的 state：沒有行程身分時這一定是「擋」，是本組所有對照的基準
+seed_fresh_foreign_state() {
+  local dir="$1" name="$2"
+  mkdir -p "$dir/state"
+  jq -n --arg t "$(now_iso_test)" \
+    '{state: "busy", ts: $t, last_delivered: "", owner: "sP"}' \
+    > "$dir/state/$name.json"
+}
+
+ME_START="$(proc_starttime "$ME_PID")"
+assert "35 前置：取得本 shell 的 starttime" test -n "$ME_START"
+
+# 35a 本尊：PPID 與 starttime 都對上 → 放行，且無視異主的 session_id
+D35A="$TESTROOT/d35a"
+seed_fresh_foreign_state "$D35A" ida
+write_ident_reg "$D35A" ida "$ME_PID" "$ME_START"
+hookcall "$D35A" "ab-spawn-ida-1-aaaaaaaaaaaa" prompt-submit '{"session_id":"sNEW"}' \
+  >/dev/null 2>&1
+assert "35a 本尊：異主 sid 仍放行（state 被寫入）" \
+  state_field_is "$D35A/state/ida.json" state busy
+assert "35a 本尊：owner 換成本次 session_id" \
+  state_field_is "$D35A/state/ida.json" owner sNEW
+
+# 35b 冒名：pid 指向一個活著、但不是本 hook 父行程的行程 → 擋
+# 用 tmux server 當那個「別人」：它一定活著且必然不是測試 shell 的子行程
+OTHER_PID="$(tmux -L "$SOCK" display -p '#{pid}' 2>/dev/null || echo 1)"
+OTHER_START="$(proc_starttime "$OTHER_PID")"
+D35B="$TESTROOT/d35b"
+seed_fresh_foreign_state "$D35B" idb
+write_ident_reg "$D35B" idb "$OTHER_PID" "$OTHER_START"
+cp "$D35B/state/idb.json" "$TESTROOT/idb-before.json"
+hookcall "$D35B" "ab-spawn-idb-1-aaaaaaaaaaaa" prompt-submit '{"session_id":"sC"}' \
+  > "$TESTROOT/h35b.out" 2>/dev/null; rc=$?
+assert "35b 冒名：exit 0" test "$rc" -eq 0
+assert "35b 冒名：無 stdout" test ! -s "$TESTROOT/h35b.out"
+assert "35b 冒名：state 檔逐位元不變" \
+  cmp -s "$D35B/state/idb.json" "$TESTROOT/idb-before.json"
+
+# 35c **收緊**：身分明確不符時，ts 過期也不得取得接管資格。
+# 這是 HOOK-OWNER-5 相對 HOOK-OWNER-2 的行為差異，也是本組最該紅的一條——
+# 少了它，冒名者只要等過 TTL 就能變成正主
+D35C="$TESTROOT/d35c"
+mkdir -p "$D35C/state"
+jq -n '{state: "busy", ts: "2020-01-01T00:00:00Z", last_delivered: "", owner: "sP"}' \
+  > "$D35C/state/idc.json"
+write_ident_reg "$D35C" idc "$OTHER_PID" "$OTHER_START"
+cp "$D35C/state/idc.json" "$TESTROOT/idc-before.json"
+hookcall "$D35C" "ab-spawn-idc-1-aaaaaaaaaaaa" prompt-submit '{"session_id":"sC"}' \
+  >/dev/null 2>&1
+assert "35c 冒名＋ts 過期：仍不得接管（state 逐位元不變）" \
+  cmp -s "$D35C/state/idc.json" "$TESTROOT/idc-before.json"
+
+# 35d 記錄過期（pid 還在但 starttime 對不上＝pid 被重用）→ 落回時間窗。
+# 落回之後 ts 過期，於是可接管——證明「無法裁決」與「裁決為冒名」不同路
+D35D="$TESTROOT/d35d"
+mkdir -p "$D35D/state"
+jq -n '{state: "busy", ts: "2020-01-01T00:00:00Z", last_delivered: "", owner: "sP"}' \
+  > "$D35D/state/idd.json"
+write_ident_reg "$D35D" idd "$ME_PID" 999999999999
+hookcall "$D35D" "ab-spawn-idd-1-aaaaaaaaaaaa" prompt-submit '{"session_id":"sTAKE"}' \
+  >/dev/null 2>&1
+assert "35d 記錄過期：落回時間窗，過期 state 可接管" \
+  state_field_is "$D35D/state/idd.json" owner sTAKE
+
+# 35e 欄位不全 → 落回。三種形狀各驗一次（缺一欄、兩欄皆空、無 registry）
+i=0
+for reg_doc in '{"worker_pid":"'"$ME_PID"'"}' '{"worker_pid":"","worker_starttime":""}' ''; do
+  i=$((i + 1))
+  DE="$TESTROOT/d35e$i"
+  mkdir -p "$DE/state"
+  jq -n '{state: "busy", ts: "2020-01-01T00:00:00Z", last_delivered: "", owner: "sP"}' \
+    > "$DE/state/ide.json"
+  if [[ -n "$reg_doc" ]]; then
+    mkdir -p "$DE/agents"
+    printf '%s\n' "$reg_doc" > "$DE/agents/ide.json"
+  fi
+  hookcall "$DE" "ab-spawn-ide-1-aaaaaaaaaaaa" prompt-submit '{"session_id":"sFB"}' \
+    >/dev/null 2>&1
+  assert "35e-$i 身分欄不全：落回時間窗（過期可接管）" \
+    state_field_is "$DE/state/ide.json" owner sFB
+done
+
+# 35f STATE-AGENT-4：spawn 真的把身分兩欄寫進 registry，且 worker_pid 指向的
+# 行程確實是本次 runtime。少了這條，上面幾條驗的都只是自己捏的 registry，
+# 「spawn 會不會寫」完全沒被鎖住
+D35F="$TESTROOT/d35f"
+pane_35f="$(absp "$D35F" 20 spawn wid --runtime codex 2>/dev/null)"
+assert "35f spawn 寫入 worker_pid（純數字）" \
+  jq -e '.worker_pid | test("^[0-9]+$")' "$D35F/agents/wid.json"
+assert "35f spawn 寫入 worker_starttime（純數字）" \
+  jq -e '.worker_starttime | test("^[0-9]+$")' "$D35F/agents/wid.json"
+# 記到的必須是這個 pane 的行程，而且是同一次行程生命。
+# **刻意不在這裡事後比對 argv**：runtime stub 收工前會 `exec bash` 換掉自己的
+# argv（pid 不變、starttime 不變）——這正好示範了為什麼持續判別要綁 starttime
+# 而不是綁 argv。argv 只在 spawn 當下用來確認「pane_pid 是 runtime 不是中介
+# shell」，那一層由 proc::argv_has_basename 的單元測試守
+wid_pid="$(jq -r '.worker_pid' "$D35F/agents/wid.json")"
+assert "35f worker_pid 等於 tmux 回報的 pane_pid" \
+  test "$wid_pid" = "$(tmx display -pt "$pane_35f" '#{pane_pid}')"
+assert "35f worker_starttime 與該 pid 當下的 starttime 相符" \
+  bash -c "[ \"\$(bash -c 'raw=\$(</proc/$wid_pid/stat); raw=\${raw##*\") \"}; set -- \$raw; echo \${20}')\" = \"$(jq -r '.worker_starttime' "$D35F/agents/wid.json")\" ]"
+absp "$D35F" 5 despawn wid >/dev/null 2>&1
+
+else
+  printf 'SKIP: 35 行程身分閘門（SRC_KIND=bash：bash 正本凍結在 M4 行為，不含 M5）\n'
+fi
+
 # ---- 總結 ----
 printf '\n共 %d PASS、%d FAIL\n' "$PASS" "$FAIL"
 if (( FAIL > 0 )); then

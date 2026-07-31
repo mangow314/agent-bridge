@@ -48,6 +48,7 @@
 | 33 | 通知原生化 Phase 1 | CLI-HOOK-1, HOOK-ID-1, HOOK-ID-2, HOOK-EVT-1, HOOK-EVT-2, HOOK-EVT-3, HOOK-EVT-4, HOOK-NOTIFY-1, STATE-CHAN-1, STATE-CHAN-2, STATE-CHAN-3, ENV-TTL-1 |
 | 34 | 獨立複核 blocker 修補 | HOOK-ID-3, HOOK-EVT-3, HOOK-NOTIFY-1, ENV-TTL-1, ENV-TTL-2 |
 | 34.5+ | 巢狀 runtime 冒名（owner gate） | HOOK-OWNER-1, HOOK-OWNER-2, HOOK-OWNER-3, HOOK-OWNER-4, HOOK-EVT-4, ENV-TTL-3, STATE-CHAN-2 |
+| 35 | 行程身分閘門（M5 窗 1） | HOOK-OWNER-5, STATE-AGENT-4 |
 
 ## `[untested]` 缺口處置（本輪只記錄，不補測）
 

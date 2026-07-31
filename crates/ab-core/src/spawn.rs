@@ -664,9 +664,10 @@ fn spawn_locked(
         let _ = tmux.exec(&["set-option", "-w", "-t", &pane, "pane-border-status", "top"]);
     }
 
-    // spawn_tag 一併存進 registry：pane id 會被 tmux 重用，光憑 id 無法證明
-    // 「這個 pane 就是我 spawn 的那一個」。model／owner／worker_window 亦然
-    // （回收決策與事後追查用；空字串＝沿用預設／tmux 外 spawn）
+    // 行程身分（STATE-AGENT-4）：hook 端用它取代時間窗判所有權（HOOK-OWNER-5）。
+    // 兩欄要嘛都有、要嘛都空——只有一半的話 hook 端無法判斷 pid 是否已被重用，
+    // 而「不確定」在這條路上一律要落回時間窗
+    let (worker_pid, worker_starttime) = resolve_worker_identity(tmux, &pane, &req.runtime);
     let ts = now_iso();
     let doc = JsonObject::new()
         .push_str("name", name)
@@ -679,7 +680,9 @@ fn spawn_locked(
         .push_bool("ready", false)
         .push_str("spawn_tag", &spawn_tag_env)
         .push_str("owner", ctx.owner)
-        .push_str("worker_window", &reg_win);
+        .push_str("worker_window", &reg_win)
+        .push_str("worker_pid", &worker_pid)
+        .push_str("worker_starttime", &worker_starttime);
     rb.reg = Some(reg_file.clone());
     atomic_write(&reg_file, format!("{}\n", doc.render()).as_bytes())?;
     let actor = if ctx.owner.is_empty() { "-" } else { ctx.owner };
@@ -715,6 +718,35 @@ fn new_window(tmux: &dyn TmuxClient, opts: &[&str], cmd: &str) -> Result<String>
 /// 存在都冒充得了。信任根源放在攻擊面之外——建窗時把 owner 印記寫進 tmux 視窗
 /// 選項 `@ab_owner`，沿用前驗證其值等於「本次 live 解析」的 owner；只能寫
 /// registry 的攻擊者碰不到 tmux 選項。
+/// STATE-AGENT-4：取 worker runtime 行程的 `(pid, starttime)`，取不到就兩欄
+/// 皆空（＝hook 端落回時間窗判別）。
+///
+/// **這裡的保守是有方向的**：記錯 pid 比不記更糟——本尊 hook 的 PPID 會與錯
+/// 的 pid 不符，反被自己的閘門擋掉。所以只有在 `pane_pid` 的 `argv[0]`
+/// basename 確實等於本次 runtime 名時才採用；任何一步取不到、對不上，都退回
+/// 空字串。
+fn resolve_worker_identity(tmux: &dyn TmuxClient, pane: &str, runtime: &str) -> (String, String) {
+    let empty = (String::new(), String::new());
+    if !crate::proc::available() {
+        return empty;
+    }
+    let Some(pid) = tmux
+        .exec(&["display-message", "-p", "-t", pane, "#{pane_pid}"])
+        .and_then(|o| o.ok_stdout())
+    else {
+        return empty;
+    };
+    let pid = pid.trim().to_string();
+    if !crate::proc::argv_has_basename(&pid, runtime) {
+        // 夾了 shell、runtime 是 wrapper script、或 pid 已經不在了
+        return empty;
+    }
+    match crate::proc::starttime(&pid) {
+        Some(st) => (pid, st),
+        None => empty,
+    }
+}
+
 fn find_worker_window(paths: &Paths, tmux: &dyn TmuxClient, owner: &str) -> String {
     for wf in registry_files(paths) {
         let Ok(content) = std::fs::read_to_string(&wf) else {
