@@ -3,8 +3,8 @@
 (This file is the canonical strategy for the orchestrating side. Nothing
 injects it automatically — the orchestrator is usually the very session
 you are in; read it yourself before you start dispatching workers. The
-mechanism-level invariants live in `bin/agent-bridge`; this file is
-strategy only.)
+mechanism-level invariants live in the CLI implementation (`crates/`, with
+`spec/` as their written contract); this file is strategy only.)
 
 You are orchestrating a fleet of **worker panes**: each worker is a full
 `claude` session with its own context window, inheriting your global

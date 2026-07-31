@@ -1,15 +1,26 @@
 #!/usr/bin/env bash
 # check-contract.sh [1 2 3 4]：spec/ 與實作／測試套件的形狀交叉核對。
 # 無參數＝跑全部。grep/awk 級集合比對，不解析語意（語意由測試套件把關）。
-#   1  env：bin 內 AGENT_BRIDGE_* 變數集合 == spec/env.md 條款集合
-#   2  cli：bin 內 cmd_* 函式每個在 spec/cli.md 有對應章節
+#   1  env：實作正本內 AGENT_BRIDGE_* 變數集合 == spec/env.md 條款集合
+#   2  cli：實作宣稱的子指令每個在 spec/cli.md 有對應章節
 #   3  hooks：hook_* 函式與三事件在 spec/hooks.md 有條款
 #   4  traceability：run-tests.sh 每個編號分組被 traceability.md 引用 >=1 次；
 #      統計 [untested] 數並比對 traceability.md 頂部宣告
+#
+# M4 cutover：1／2 的來源從 bash 正本改綁 Rust（正本已是 Rust）。
+# SRC_KIND 顯式可覆蓋——`SRC_KIND=bash tests/check-contract.sh 1 2` 仍可對
+# bin/agent-bridge.bash 核對，rollback 期與雙實作對照都用得上。
+#   1  rust: grep crates/**/*.rs（與 bash 的 grep 同構）
+#   2  rust: `ab __implemented-commands`（隱藏內省指令，非 spec 條款面）——
+#      比 grep dispatch 表抗重構，且 M1–M3 的里程碑 gate 已在用同一支
 set -u
 cd "$(dirname "${BASH_SOURCE[0]}")/.." || exit 1
 
-BIN=bin/agent-bridge
+SRC_KIND="${SRC_KIND:-rust}"
+BIN_BASH=bin/agent-bridge.bash
+SRC_RUST=crates
+# 內省指令的載具：預設走 shim（＝套件的 BRIDGE 預設），可用 BRIDGE 指別的執行檔
+BRIDGE="${BRIDGE:-$PWD/bin/agent-bridge}"
 SPEC=spec
 TESTS=tests/run-tests.sh
 FAIL=0
@@ -20,7 +31,11 @@ ok()   { printf 'ok   %s\n' "$1"; }
 check_1() {
   local want got
   # [A-Z] 起頭強制至少一字元：env.md 行文中的通配寫法 `AGENT_BRIDGE_*` 不算名稱
-  want="$(grep -oE 'AGENT_BRIDGE_[A-Z][A-Z_]*' "$BIN" | sort -u)"
+  if [[ "$SRC_KIND" == bash ]]; then
+    want="$(grep -oE 'AGENT_BRIDGE_[A-Z][A-Z_]*' "$BIN_BASH" | sort -u)"
+  else
+    want="$(grep -rhoE 'AGENT_BRIDGE_[A-Z][A-Z_]*' --include='*.rs' "$SRC_RUST" | sort -u)"
+  fi
   got="$(grep -oE 'AGENT_BRIDGE_[A-Z][A-Z_]*' "$SPEC/env.md" | sort -u)"
   if [[ "$want" == "$got" ]]; then
     ok "1 env 集合一致（$(wc -l <<<"$want") 個）"
@@ -31,13 +46,29 @@ check_1() {
 }
 
 check_2() {
-  local missing=0 c
+  local missing=0 c cmds n
+  if [[ "$SRC_KIND" == bash ]]; then
+    cmds="$(grep -o '^cmd_[a-z_]*()' "$BIN_BASH" | sed 's/^cmd_//; s/()$//')"
+  else
+    # 執行檔宣稱的實作集合。空輸出＝載具壞了，別讓迴圈零圈通過而假綠
+    cmds="$("$BRIDGE" __implemented-commands 2>/dev/null)" || cmds=""
+    if [[ -z "$cmds" ]]; then
+      fail "2 取不到 __implemented-commands（載具：$BRIDGE）"
+      return
+    fi
+  fi
   while IFS= read -r c; do
+    [[ -n "$c" ]] || continue
     grep -q "^## \`$c\`" "$SPEC/cli.md" 2>/dev/null || { fail "2 cli.md 缺章節：$c"; missing=1; }
-  done < <(grep -o '^cmd_[a-z_]*()' "$BIN" | sed 's/^cmd_//; s/()$//')
-  (( missing )) || ok "2 cli.md 涵蓋全部 $(grep -c '^cmd_[a-z_]*()' "$BIN") 個子指令"
+  done <<<"$cmds"
+  n="$(grep -c . <<<"$cmds")"
+  (( missing )) || ok "2 cli.md 涵蓋全部 $n 個子指令（源：$SRC_KIND）"
 }
 
+# check 3 不受 cutover 影響：名單是硬編的，比對對象只有 spec/hooks.md，
+# 從來沒讀過實作正本。hook_* 這四個名字在 Rust 側續存於 ab-core/src/hook.rs
+# 的對映註解（每個函式標了它對應的 bash 函式與行號），spec 的 Source 標記
+# 因此仍指得到實作
 check_3() {
   local missing=0 h
   for h in hook_agent_name hook_write_state hook_owner_gate hook_oldest_queued; do

@@ -3,3 +3,5 @@
 /target/
 tests/.run-groups.*.sh
 .gate/
+# M4 cutover 後 bin/agent-bridge exec 的 Rust 產物（build 出來，不進版控）
+/bin/ab

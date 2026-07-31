@@ -71,15 +71,23 @@ permissions, and hooks, the same as a pane you opened yourself.
 
 ## Requirements
 
-`bash`, `jq`, `tmux`. Nothing else — no daemon, no network service.
+`tmux`, plus a Rust toolchain (edition 2024) to build the binary. `bash` is
+only needed for the `bin/agent-bridge` shim. Running the test suite also needs
+`bash` and `jq`. No daemon, no network service.
 
 ## Install
 
 ```bash
 git clone https://github.com/mangow314/agent-bridge.git ~/projects/agent-bridge
+cd ~/projects/agent-bridge
+cargo build --release && cp -f target/release/ab bin/ab
 ln -s ~/projects/agent-bridge/bin/agent-bridge ~/.local/bin/agent-bridge
 command -v agent-bridge   # should resolve to the symlink
 ```
+
+`bin/agent-bridge` is a small `exec` shim onto `bin/ab` (the build product,
+untracked). The binary has to sit in `bin/` — the default paths for the
+`share/` briefs are derived from its grandparent directory.
 
 Optional — load the delegation-protocol skill into Claude Code by symlinking
 the whole repo as the skill directory (SKILL.md references `share/` briefs by
@@ -119,7 +127,9 @@ a fake completion). Panes you opened yourself can join via
 
 ## How it works
 
-- **Thin bash CLI** (`bin/agent-bridge`) — the only entry point.
+- **Thin CLI** (`bin/agent-bridge` — a shim onto the Rust binary `bin/ab`) —
+  the only entry point. The original bash implementation is kept alongside as
+  `bin/agent-bridge.bash`; both pass the same suite.
 - **Filesystem mailbox** (`~/.local/share/agent-bridge/`, override with
   `AGENT_BRIDGE_DATA`): task files with atomic, lock-protected state
   transitions (`queued → delivered → running → completed/failed/cancelled`).

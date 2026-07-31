@@ -17,9 +17,15 @@ unset ${!AGENT_BRIDGE_@}
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 BRIDGE="${BRIDGE:-$ROOT/bin/agent-bridge}"
-# 源碼耦合檢查（§30 canary、§31i 寫入順序）抽取函式本體的對象：固定綁實作正本，
-# 不跟著 $BRIDGE 走。M4 cutover 後與 check-contract 1–3 一起改綁 Rust 源。
-SRC_BASH="$ROOT/bin/agent-bridge"
+# 源碼耦合檢查（§30 canary、§31i 寫入順序）抽取函式本體的對象。不跟著 $BRIDGE
+# 走——$BRIDGE 是黑箱受測體，這兩處要的是**源碼**。M4 cutover 後正本是 Rust，
+# 故預設 rust；`SRC_KIND=bash` 可切回 bash 正本（rollback 期與雙實作對照用）。
+# 顯式的 kind＋path 是 M3 codex 複核的建議形（source-kind／source-path）：
+# 兩者不匹配時抽取結果為空，套件會紅在「函式本體可抽出」那條，不會靜默空轉。
+SRC_KIND="${SRC_KIND:-rust}"
+SRC_BASH="$ROOT/bin/agent-bridge.bash"
+SRC_NOTIFY_RS="$ROOT/crates/ab-core/src/notify.rs"
+SRC_TASK_RS="$ROOT/crates/ab-core/src/task.rs"
 SOCK="agent-bridge-test"
 
 if ! REAL_TMUX="$(command -v tmux)"; then
@@ -2699,15 +2705,18 @@ if [[ -n "$REAL_CLAUDE" ]] && CANARY_REAL="$(readlink -f "$REAL_CLAUDE" 2>/dev/n
   # 出現，搜整檔會讓「函式改了 matcher、註解留著舊字串」照樣誤綠
   # （獨立複核 2026-07-24 指出）。函式被改名或抽不出來時檔案為空，
   # 後續 grep 全紅——失效方向是誤報而非漏報
-  # 抽取對象固定是 bash 正本而非 $BRIDGE（M3 改）：這是**源碼耦合**檢查，
-  # 與 check-contract 1–3 同一類，不是黑箱行為斷言。$BRIDGE 指向 Rust 執行檔
-  # 時 sed 抽不出 shell 函式，會退化成「換實作就全紅」而不是測到任何東西。
-  # M4 cutover 時與 check-contract 1–3 一起改綁 Rust 源（計畫的 M4 項目）。
-  sed -n '/^screen_has_prompt() {/,/^}/p' "$SRC_BASH" > "$TESTROOT/canary-fn"
+  # 抽取對象是**源碼正本**而非 $BRIDGE（M3 改、M4 改綁 Rust）：這是源碼耦合
+  # 檢查，與 check-contract 1–2 同一類，不是黑箱行為斷言。$BRIDGE 是編譯後的
+  # 執行檔，sed 抽不出函式本體，硬綁它只會退化成「換實作就全紅」。
+  if [[ "$SRC_KIND" == bash ]]; then
+    sed -n '/^screen_has_prompt() {/,/^}/p' "$SRC_BASH" > "$TESTROOT/canary-fn"
+  else
+    sed -n '/^pub fn screen_has_prompt/,/^}/p' "$SRC_NOTIFY_RS" > "$TESTROOT/canary-fn"
+  fi
   assert "CC canary：screen_has_prompt 函式本體可抽出" test -s "$TESTROOT/canary-fn"
   for kw in 'Do you want to ' 'Esc to cancel' \
             'has written up a plan' 'Would you like to proceed'; do
-    assert "CC canary：特徵「$kw」與 bin 的 screen_has_prompt 一致" \
+    assert "CC canary：特徵「$kw」與正本 screen_has_prompt 一致" \
       grep -qF -- "$kw" "$TESTROOT/canary-fn"
   done
 else
@@ -2819,13 +2828,23 @@ assert "唯讀查詢不建資料目錄" test ! -d "$D31E"
 # 反向殘留的是「終態轉換可被重放」的 split-brain 方向）。源碼順序不變量，
 # 比照 §30 的函式本體抽取
 UMS_FN="$TESTROOT/ums-fn"
-# 抽取對象固定是 bash 正本，理由同 §30 的 canary-fn（源碼耦合檢查，M4 改綁）
-sed -n '/^update_meta_status() {/,/^}/p' "$SRC_BASH" > "$UMS_FN"
+# 抽取對象是源碼正本，理由同 §30 的 canary-fn（源碼耦合檢查，M4 已改綁 Rust）
+if [[ "$SRC_KIND" == bash ]]; then
+  sed -n '/^update_meta_status() {/,/^}/p' "$SRC_BASH" > "$UMS_FN"
+  # shellcheck disable=SC2016  # $dir 是源碼字面值，刻意不展開
+  SL_PAT='atomic_write "$dir/status"'
+  # shellcheck disable=SC2016  # 同上
+  ML_PAT='atomic_write "$dir/metadata.json"'
+else
+  sed -n '/^pub fn update_meta_status/,/^}/p' "$SRC_TASK_RS" > "$UMS_FN"
+  # 兩次 atomic_write 的引數：status 那次跨行寫（`&dir.join("status"),` 自成
+  # 一行），故各鎖引數字面值而非整個呼叫頭
+  SL_PAT='dir.join("status")'
+  ML_PAT='atomic_write(&meta_path'
+fi
 assert "update_meta_status 函式本體可抽出" test -s "$UMS_FN"
-# shellcheck disable=SC2016  # $dir 是源碼字面值，刻意不展開
-sl="$(grep -n 'atomic_write "$dir/status"' "$UMS_FN" | cut -d: -f1 | head -1)"
-# shellcheck disable=SC2016  # 同上
-ml="$(grep -n 'atomic_write "$dir/metadata.json"' "$UMS_FN" | cut -d: -f1 | head -1)"
+sl="$(grep -nF "$SL_PAT" "$UMS_FN" | cut -d: -f1 | head -1)"
+ml="$(grep -nF "$ML_PAT" "$UMS_FN" | cut -d: -f1 | head -1)"
 assert "先寫 status 再寫 metadata（split-brain 方向鎖定）" \
   test -n "$sl" -a -n "$ml" -a "$sl" -lt "$ml"
 

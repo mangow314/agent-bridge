@@ -234,3 +234,53 @@ source-contract checker 顯式接收 `source-kind/source-path`，可行處優先
   改，因為它的呼叫端（receive/read 標頭、`respond_task` 找 sender）另有「缺欄位
   印字面 `null`」的對齊要求，兩套語意合併需要各自的測例，留給 M4 與
   `--contract-manifest` 的形狀討論一起收。
+
+## 10. M4 cutover 的裁決
+
+### 10.1 為什麼是 shim，執行檔為什麼必須在 `bin/`
+
+`bin/agent-bridge` 這條路徑是對外契約：`~/.local/bin/agent-bridge` 是它的
+symlink，spawn 出去的 pane 也照這個名字呼叫。執行檔是 build 產物、不進版控，
+所以路徑留給 shim、產物擺 `bin/ab`（gitignored）。
+
+擺 `bin/` 不是慣例問題而是硬需求：`config::repo_root()` 取
+`dirname(dirname(current_exe))`（對齊 bash 的 `REPO_ROOT`），`share/` 的三個
+預設路徑由它反推。exec 之後 `/proc/self/exe` 就是 `bin/ab`，祖父層＝repo 根。
+M3 那層 `.gate/` staging 正是為了繞開 `target/release/ab` 祖父層是 `target/`
+的問題，cutover 後退場。
+
+缺產物時 shim **大聲失敗**（exit 127＋建置提示），不靜默退回 bash 正本：
+兩套實作靜默互換會讓套件以為在驗 Rust、其實驗到 bash，那是假綠。
+
+### 10.2 source-contract 檢查改綁 Rust（含 M3 codex 的建議形）
+
+`SRC_KIND`（`rust` 預設／`bash`）成為顯式旋鈕，貫穿兩個檢查載具：
+
+| 檢查 | rust 源 | bash 源 |
+|---|---|---|
+| check-contract 1（env 集合） | `grep -r crates --include='*.rs'` | `grep bin/agent-bridge.bash` |
+| check-contract 2（子指令集合） | `$BRIDGE __implemented-commands` | `grep '^cmd_*()'` |
+| check-contract 3（hook 名＋事件） | 不受影響——名單硬編，只比對 `spec/hooks.md`，從未讀實作 | 同左 |
+| run-tests §30（CC canary 特徵） | `sed` 抽 `notify.rs` 的 `screen_has_prompt` | 抽 bash 同名函式 |
+| run-tests §31i（寫入順序） | `sed` 抽 `task.rs` 的 `update_meta_status`，比 `dir.join("status")` 與 `atomic_write(&meta_path` 的行序 | 抽 bash 同名函式比兩次 `atomic_write` 行序 |
+
+check 2 的 human judgment（計畫列為 M4 待裁）**裁給既有的
+`__implemented-commands`**，不另立 `--contract-manifest`：抗重構的目的它已達成
+（M1–M3 的里程碑 gate 一路在用同一支），而新增一個介面就要再守一次「這不算
+CLI 條款面」的界線。取不到輸出時顯式 fail——空集合會讓 `while` 迴圈零圈通過，
+那是假綠方向。
+
+check 3 之所以不動：它的比對對象只有 spec。`hook_*` 這四個名字在 Rust 側續存
+於 `ab-core/src/hook.rs` 每個函式的對映註解，spec 的 `Source:` 標記仍指得到
+實作（`spec/README.md` 的錨點規則已同步改寫）。
+
+### 10.3 刻意未在 M4 收的兩項
+
+- **SIGPIPE 仍無機器 gate**（§9.6）：要補得在套件新增一組分組，是行為錨擴充，
+  不是 cutover 工作。
+- **`meta_str` 的型別語意**（§9.6）：原本掛在「與 `--contract-manifest` 一起
+  收」，但 10.2 已裁決不新增該介面，這條就跟著脫鉤。它需要自己的測例（兩套
+  語意各一組），同樣屬行為錨擴充，留給後續獨立處理。
+
+兩項都不是 M4 引入的，也不因 cutover 惡化——但都**仍是開著的缺口**，不得
+當成已完成。

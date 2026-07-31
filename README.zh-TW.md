@@ -59,7 +59,9 @@ context 管理都要自己來。agent-bridge 編排的是你平常手上在用�
 
 三個組成，全部本機、無常駐程序：
 
-1. **薄 bash CLI**（`bin/agent-bridge`）：二十個子指令，唯一的進入點。
+1. **薄 CLI**（`bin/agent-bridge`，exec shim 接到 Rust 執行檔 `bin/ab`）：
+   21 個子指令，唯一的進入點。原本的 bash 實作留在 `bin/agent-bridge.bash`，
+   兩邊過同一套測試。
 2. **檔案系統 mailbox**（預設 `~/.local/share/agent-bridge/`，可用環境變數
    `AGENT_BRIDGE_DATA` 覆蓋）：
    - `agents/<name>.json`：agent 註冊表（`{name, pane_id, registered_at}`；
@@ -138,13 +140,19 @@ queued | delivered | running --cancel--> cancelled（終態）
 
 ## 安裝
 
-硬依賴：`bash`、`jq`、`tmux`（缺 jq 會報錯並以非零碼退出）。
+硬依賴：`tmux`，加上建置用的 Rust toolchain（edition 2024）。`bash` 只有
+`bin/agent-bridge` 這層 shim 會用到；跑測試套件另需 `bash` 與 `jq`。
 
 ```bash
 git clone <repo-url> ~/projects/agent-bridge
+cd ~/projects/agent-bridge
+cargo build --release && cp -f target/release/ab bin/ab
 ln -s ~/projects/agent-bridge/bin/agent-bridge ~/.local/bin/agent-bridge
 command -v agent-bridge   # 應解析到 symlink
 ```
+
+`bin/agent-bridge` 是 exec shim，接到 `bin/ab`（建置產物，不進版控）。執行檔
+必須放在 `bin/` 底下：`share/` 的 briefs 預設路徑是從它的祖父層目錄反推的。
 
 Claude Code 的委派協定 skill：把**整個 repo** symlink 成 skill 目錄
 （SKILL.md 以相對路徑引用 `share/` 的 briefs，必須跟它們同目錄才解析得到；
