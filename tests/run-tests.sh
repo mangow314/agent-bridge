@@ -5109,6 +5109,333 @@ else
   printf 'SKIP: 43 TUI evict 證據框（SRC_KIND=bash：bash 正本凍結在 M4，不含 TUI）\n'
 fi
 
+# ---- 44. P4 效率驗收（replay script 步數 gate） ----
+# spec: CLI-UI-1 CLI-LIST-2
+# 設計正本 docs/tui-design.md §9 P4：固定 fixture（3 owner／12 worker／
+# 20 task／3 異常）＋兩份固定 replay script（baseline：list --long＋合法唯讀
+# 命令序列；TUI：key 序列）＋明確成功 marker（三個異常 id 均被輸出／複製）。
+# Gate：TUI 步數 ≤ baseline 的 50%，正確率 100%。
+#
+# 計數規則＝script 內的按鍵／命令步數，**從 script 檔機械導出**
+# （tests/replay/p4-baseline.cmds／p4-tui.keys，非註解非空行＝一步）——
+# 手寫死數字會在 script 改動時悄悄失準。
+#
+# 附註（設計原文）：replay script 是 fixture 的一部分（固定初始 selection 與
+# 異常排序位置），量的是「固定操作序列下的步數差」，不宣稱量到任意操作者的
+# 自由行為。
+#
+# 前置：BLOCKER 軸（§4 v1 matcher 契約：硬編碼 prompt matcher ＋結構性
+# occlusion）——沒有它 TUI 定位不到 blocked prompt，正確率必然 2/3。
+# 與 40–43 同理只對 Rust 執行。
+if [[ "$SRC_KIND" == rust ]]; then
+
+D44="$TESTROOT/d44"
+P4OUT="$TESTROOT/p4out"
+mkdir -p "$D44/agents" "$D44/tasks" "$P4OUT"
+# baseline script 用的 CLI 載具（唯讀命令；PATH 走 shim 讓 tmux 指到測試 socket）
+# shellcheck disable=SC2329  # 經 replay script 的 eval 間接呼叫
+ab_p4() { env AGENT_BRIDGE_DATA="$D44" PATH="$SHIM:$PATH" "$BRIDGE" "$@"; }
+
+# owner A＝TUI 自己所在的 window（§2「以 current owner 為根」→ 首頁 selection
+# 固定落在它）。**TUI 獨佔這個 window**：worker 的 pane 另開一個 window 擺
+# ——owner 記的是「誰派出這個 worker」，pane 在哪是另一回事（`list --long` 的
+# OWNER 與 WHERE 本來就是兩欄）。擠在同一個 window 會把 TUI 壓成十來行高，
+# 量到的就變成捲動成本而不是定位成本。
+W44A="$(tmx new-window -dP -F '#{window_id}' -t it "$pane_cmd")"
+TUI44="$(tmx list-panes -t "$W44A" -F '#{pane_id}' | head -1)"
+OWN44A="$(tmx display -p -t "$TUI44" '#{session_name}:#{window_id}')"
+# owner A 的 6 個 worker pane（p4w01..p4w06）
+W44P="$(tmx new-window -dP -F '#{window_id}' -t it "$pane_cmd")"
+P4P01="$(tmx list-panes -t "$W44P" -F '#{pane_id}' | head -1)"
+for _i in 2 3 4 5 6; do
+  eval "P4P0$_i=\"\$(tmx split-window -dP -F '#{pane_id}' -t \"\$W44P\" \"\$pane_cmd\")\""
+done
+# split-window 每次對半切 active pane：不重排的話最後一個 pane 只剩 2-3 行，
+# capture-pane 抓不到完整的權限框畫面（實測踩過）
+tmx select-layout -t "$W44P" even-vertical
+
+# owner B／C 的標籤用**受控的 session 名**＋真實 window id：owner 欄的死活
+# 只看 `@winid`（`owner_liveness`／`list --long` 都是），而 session 名決定
+# OWNERS 欄的字典序。`it:@N` < `zzb:…` < `zzc:…`，三個 owner 的排序因此固定
+# ——那是 replay script 的一部分（設計 §9 P4 附註：固定異常排序位置）。
+W44B="$(tmx new-window -dP -F '#{window_id}' -t it "$pane_cmd")"
+P4P07="$(tmx list-panes -t "$W44B" -F '#{pane_id}' | head -1)"
+P4P08="$(tmx split-window -dP -F '#{pane_id}' -t "$W44B" "$pane_cmd")"
+P4P10="$(tmx split-window -dP -F '#{pane_id}' -t "$W44B" "$pane_cmd")"
+P4P11="$(tmx split-window -dP -F '#{pane_id}' -t "$W44B" "$pane_cmd")"
+tmx select-layout -t "$W44B" even-vertical
+OWN44B="zzb:$W44B"
+# owner C：建完就 kill——它的 window id 於是不存在＝dead owner 異常
+W44C="$(tmx new-window -dP -F '#{window_id}' -t it "$pane_cmd")"
+tmx kill-window -t "$W44C" 2>/dev/null || true
+OWN44C="zzc:$W44C"
+
+# registry：12 個 worker／3 個 owner。名字一律 p4wNN（**中性命名**：名字不
+# 洩漏誰是異常，異常的字典序位置因此不是為了好看而挑的）
+w44() { # w44 <name> <pane> <owner>
+  printf '{"name":"%s","pane_id":"%s","registered_at":"2026-07-31T00:00:00Z","spawned":true,"ready":true,"runtime":"codex","spawn_tag":"t44-%s","owner":"%s"}\n' \
+    "$1" "$2" "$1" "$3" > "$D44/agents/$1.json"
+}
+w44 p4w01 "$P4P01" "$OWN44A"
+w44 p4w02 "$P4P02" "$OWN44A"
+w44 p4w03 "$P4P03" "$OWN44A"
+w44 p4w04 "$P4P04" "$OWN44A"
+w44 p4w05 "$P4P05" "$OWN44A"
+# 異常 2／3：blocked prompt（pane 活著，畫面是權限框）——掃描序中的第 6 個
+w44 p4w06 "$P4P06" "$OWN44A"
+w44 p4w07 "$P4P07" "$OWN44B"
+w44 p4w08 "$P4P08" "$OWN44B"
+# 異常 1／3：orphaned worker（registry 有、pane 不在，owner 仍活著）
+w44 p4w09 "%94409" "$OWN44B"
+w44 p4w10 "$P4P10" "$OWN44B"
+w44 p4w11 "$P4P11" "$OWN44B"
+# 異常 3／3：dead owner 底下的 worker（owner window 已被 kill）
+w44 p4w12 "%94412" "$OWN44C"
+
+# 20 個 task（目錄名後綴必須是 hex，task.rs:378 會拒非 hex）。12 個 in-flight
+# ＋8 個終態：WORKERS 欄因此有 task 列（導航噪音），TASKS 欄有東西可讀
+_i=0
+for _spec in \
+  "p4w01 queued" "p4w01 running" "p4w02 delivered" "p4w03 running" \
+  "p4w04 queued" "p4w05 running" "p4w06 running" "p4w07 queued" \
+  "p4w08 delivered" "p4w09 running" "p4w10 queued" "p4w11 running" \
+  "p4w01 completed" "p4w02 completed" "p4w03 failed" "p4w04 completed" \
+  "p4w05 cancelled" "p4w06 completed" "p4w07 completed" "p4w12 completed"; do
+  set -- $_spec
+  _to="$1"; _st="$2"
+  _tid="$(printf '20260731T0000%02dZ-44%02x' "$_i" "$((160 + _i))")"
+  mkdir -p "$D44/tasks/$_tid"
+  printf '%s\n' "$_st" > "$D44/tasks/$_tid/status"
+  printf 'p4 fixture task\n' > "$D44/tasks/$_tid/request.md"
+  printf 'p4 fixture response\n' > "$D44/tasks/$_tid/response.md"
+  printf '{"version":1,"task_id":"%s","from":"alice","to":"%s","created_at":"2026-07-31T00:00:01Z","updated_at":"2026-07-31T00:00:01Z","working_directory":"/tmp","status":"%s"}\n' \
+    "$_tid" "$_to" "$_st" > "$D44/tasks/$_tid/metadata.json"
+  _i=$((_i + 1))
+done
+# fixture 的形狀是整組的前提，要驗到**每一個維度**：只數 worker 與 task 的話，
+# 「把 12 個 worker 全塞進 2 個 owner」這種 mutation 照樣全綠，而 owner 數正是
+# TUI 步數的來源（codex 複核 major #2）。owner 集合逐字比對＋各 owner 的 worker
+# 分布，全部從 registry JSON 機械萃取
+assert "44 前置：worker 與 task 數（12／20）" \
+  bash -c '[[ "$(ls "$1"/agents | wc -l)" == 12 && "$(ls "$1"/tasks | wc -l)" == 20 ]]' _ "$D44"
+jq -r '.owner' "$D44"/agents/*.json | sort -u > "$P4OUT/owners.actual"
+printf '%s\n' "$OWN44A" "$OWN44B" "$OWN44C" | sort > "$P4OUT/owners.expect"
+assert "44 前置：owner 集合恰為 3 個、逐字相符（防兩-owner mutation）" \
+  diff -q "$P4OUT/owners.expect" "$P4OUT/owners.actual"
+# shellcheck disable=SC2329  # 經 assert 的 "$@" 間接呼叫
+p4_owner_count() { jq -r --arg o "$2" 'select(.owner==$o) | .name' "$1"/agents/*.json | wc -l; }
+while read -r _own _want; do
+  [[ -z "$_own" ]] && continue
+  assert "44 前置：owner $_own 底下恰 $_want 個 worker" \
+    test "$(p4_owner_count "$D44" "$_own")" -eq "$_want"
+done <<EOF
+$OWN44A 6
+$OWN44B 5
+$OWN44C 1
+EOF
+
+# blocked prompt 的畫面：用**真的長得像權限框**的內容（notify::screen_has_prompt
+# 的第一組錨：`Do you want to …` ＋ `Esc to cancel`），不依賴 matcher 的誤判面
+tmx send-keys -t "$P4P06" \
+  "clear; printf 'Do you want to make this edit?\\n 1. Yes\\n 2. No, keep going\\n\\nEsc to cancel\\n'" Enter
+# 其餘 pane 保持乾淨的 shell 畫面（baseline 掃描要掃得到「不是它」）
+# shellcheck disable=SC2329  # 經 wait_for 間接呼叫
+p4_blocked_ready() {
+  tmx capture-pane -p -t "$P4P06" > "$TESTROOT/p4w06-probe.txt" 2>/dev/null \
+    && grep -qF "Esc to cancel" "$TESTROOT/p4w06-probe.txt"
+}
+assert "44 前置：blocked prompt 的畫面已就緒（異常 2／3 的來源）" \
+  wait_for 15 p4_blocked_ready
+
+
+# ---- 步數：宣告值與執行值必須是**兩個獨立證據** ----
+# 只比「行數 vs 行數」是同一個 predicate 自我比較：`true; true; true` 一行三
+# 命令會被記成 1 步，步數就被灌水了（codex 複核 major #1，附反例）。兩道防線：
+#   (a) **格式收窄**：每一步必須是單一命令——拒絕 `;`／`|`／`&`／命令替換／
+#       續行。不合形狀的行直接記成 bad，不執行。
+#   (b) **執行計數只在該步成功後才 +1**（baseline 看 rc、TUI 看 send-keys 的
+#       rc），與行數導出的宣告值來自完全不同的來源。
+p4_steps() { grep -cvE '^[[:space:]]*(#|$)' "$1"; }
+# 單一命令的形狀（變數展開允許，命令替換與命令分隔一律拒絕）
+p4_cmd_shape_ok() {
+  case "$1" in
+    *';'* | *'|'* | *'&'* | *'$('* | *'`'* | *'\') return 1 ;;
+  esac
+  return 0
+}
+# TUI 按鍵的 allowlist（tmux 鍵名；一行一鍵，不接受任何組合寫法）
+p4_key_ok() {
+  case "$1" in
+    Tab | BTab | Enter | Escape | Up | Down | [a-z] | '?') return 0 ;;
+    *) return 1 ;;
+  esac
+}
+BASE_CMDS="$(dirname "${BASH_SOURCE[0]}")/replay/p4-baseline.cmds"
+TUI_KEYS="$(dirname "${BASH_SOURCE[0]}")/replay/p4-tui.keys"
+STEPS_BASE="$(p4_steps "$BASE_CMDS")"
+STEPS_TUI="$(p4_steps "$TUI_KEYS")"
+
+# ---- baseline replay ----
+_n=0
+_nbad=0
+while IFS= read -r _line; do
+  [[ "$_line" =~ ^[[:space:]]*(#|$) ]] && continue
+  if ! p4_cmd_shape_ok "$_line"; then
+    _nbad=$((_nbad + 1))
+    continue
+  fi
+  if eval "$_line" 2>/dev/null; then
+    _n=$((_n + 1))
+  else
+    _nbad=$((_nbad + 1))
+  fi
+done < "$BASE_CMDS"
+assert "44 baseline：每一步都是單一命令且執行成功（bad=$_nbad）" test "$_nbad" -eq 0
+assert "44 baseline：成功執行的步數＝script 導出的步數（$_n vs $STEPS_BASE）" \
+  test "$_n" -eq "$STEPS_BASE"
+
+# baseline 的答案（全部從步驟輸出機械萃取）：
+#   dead owner  → list --long 的 OWNER 欄為 owner-dead
+#   orphaned    → WHERE 欄為 dead 但 OWNER 不是 owner-dead（owner 還活著）
+#   blocked     → 哪一個 <worker>.screen 命中權限框特徵（檔名即答案）
+B44_DEAD="$(awk -F'\t' 'NR>1 && $6=="owner-dead" {print $1}' "$P4OUT/list-long.txt")"
+B44_ORPH="$(awk -F'\t' 'NR>1 && $5=="dead" && $6!="owner-dead" {print $1}' "$P4OUT/list-long.txt")"
+B44_BLOCK=""
+for _f in "$P4OUT"/*.screen; do
+  if grep -qF "Do you want to " "$_f" && grep -qF "Esc to cancel" "$_f"; then
+    B44_BLOCK="$(basename "$_f" .screen)"
+  fi
+done
+printf '%s\n' "$B44_DEAD" "$B44_ORPH" "$B44_BLOCK" | sort > "$P4OUT/baseline.answer"
+assert "44 baseline：三個異常 id 全對（正確率 100%）" \
+  bash -c 'printf "p4w06\np4w09\np4w12\n" | diff -q - "$1"' _ "$P4OUT/baseline.answer"
+
+# ---- TUI replay ----
+tmx send-keys -t "$TUI44" \
+  "$(printf 'echo AB44-MAIN-SCREEN; touch %q' "$TESTROOT/tui44-ready")" Enter
+wait_for 10 test -f "$TESTROOT/tui44-ready"
+tmx send-keys -t "$TUI44" \
+  "$(printf 'env AGENT_BRIDGE_DATA=%q %q ui' "$D44" "$BRIDGE")" Enter
+cap44() { tmx capture-pane -p -t "$TUI44" > "$P4OUT/tui-step$1.cap" 2>/dev/null; }
+# shellcheck disable=SC2329  # 經 wait_for 間接呼叫
+ui44_ready() { cap44 boot && grep -qF "p4w01" "$P4OUT/tui-stepboot.cap" 2>/dev/null; }
+# shellcheck disable=SC2329  # 經 wait_for 間接呼叫
+ui44_blocker_ready() { cap44 boot && grep -qF "blocked" "$P4OUT/tui-stepboot.cap"; }
+assert "44 TUI：UI 起得來" wait_for 10 ui44_ready
+# BLOCKER 軸的第一輪查詢（tmux capture-pane ×N，走背景 worker）要跑完才算
+# 「首頁畫面」——步 0 的兩個異常之一就靠它
+assert "44 TUI：BLOCKER 軸第一輪查詢已落地（步 0 的前提）" \
+  wait_for 15 ui44_blocker_ready
+cap44 0
+
+_k=0
+_kbad=0
+while IFS= read -r _key; do
+  [[ "$_key" =~ ^[[:space:]]*(#|$) ]] && continue
+  if ! p4_key_ok "$_key"; then
+    _kbad=$((_kbad + 1))
+    continue
+  fi
+  if tmx send-keys -t "$TUI44" "$_key" 2>/dev/null; then
+    _k=$((_k + 1))
+  else
+    _kbad=$((_kbad + 1))
+  fi
+  sleep 0.6
+  cap44 "$_k"
+done < "$TUI_KEYS"
+assert "44 TUI：每一步都是合法單鍵且送達成功（bad=$_kbad）" test "$_kbad" -eq 0
+assert "44 TUI：成功送出的按鍵數＝script 導出的步數（$_k vs $STEPS_TUI）" \
+  test "$_k" -eq "$STEPS_TUI"
+
+# ---- TUI 的成功 marker：canonical answer，逐幀綁定 ----
+# 只做 substring 命中不夠：`p4w12` 與「它的 owner 已死」必須來自**同一幀**
+# （不同幀分開 grep 等於允許兩個互不相干的畫面湊出一個結論），而且不能只驗
+# 「有命中」——多餘的誤標也必須讓斷言紅（codex 複核 major #3）。
+#
+# 做法：逐幀抽事實三元組 `<worker> <mark> <owner死活> <owner>`——
+#   - owner 取該幀 OWNERS 欄帶 `▸` 的那一列（＝當前選中 owner，含其死活 glyph）
+#   - worker 列以 `▸ p4wNN` 起頭、切到欄邊框 `│` 為止（DETAIL 欄也會出現
+#     `blocked` 字樣，不切欄就會把它算進來）
+# 然後**只留下異常**（有標記，或 owner 已死）去重排序，與期望的三行 exact-diff。
+p4_frame_facts() {
+  local f="$1" og glyph owner line name mark
+  og="$(grep -oE '▸ (●|✗|\?) [^│ ]+' "$f" | head -1)"
+  [[ -z "$og" ]] && return 0
+  case "$og" in
+    *'●'*) glyph=live ;;
+    *'✗'*) glyph=dead ;;
+    *) glyph=unknown ;;
+  esac
+  owner="${og##* }"
+  while IFS= read -r line; do
+    name="$(printf '%s' "$line" | grep -oE 'p4w[0-9]{2}' | head -1)"
+    [[ -z "$name" ]] && continue
+    mark=none
+    case "$line" in
+      *blocked*) mark=blocked ;;
+      *'✗dead'*) mark=dead ;;
+      *copy-mode*) mark=occluded ;;
+    esac
+    printf '%s %s %s %s\n' "$name" "$mark" "$glyph" "$owner"
+  done < <(grep -oE '▸ p4w[0-9]{2}[^│]*' "$f")
+}
+: > "$P4OUT/tui.facts"
+for _f in "$P4OUT"/tui-step[0-9]*.cap; do
+  p4_frame_facts "$_f" >> "$P4OUT/tui.facts"
+done
+# 異常＝worker 自己帶標記，或它掛在已死的 owner 下。其餘（正常 worker）
+# 一律不得出現在答案裡——誤標會多一行，漏標會少一行，兩邊都紅
+awk '$2 != "none" || $3 == "dead"' "$P4OUT/tui.facts" | sort -u > "$P4OUT/tui.answer"
+# p4w12 的 pane 隨著 owner 的 window 一起消失，所以它自己也帶 dead 標記——
+# 「worker 的 pane 死了」與「它掛在死掉的 owner 下」是兩個獨立的軸，這一行
+# 同時滿足兩者（orphan 的 p4w09 則是 pane 死、owner 活）
+printf '%s\n' \
+  "p4w06 blocked live $OWN44A" \
+  "p4w09 dead live $OWN44B" \
+  "p4w12 dead dead $OWN44C" | sort > "$P4OUT/tui.expect"
+printf '  [P4] TUI canonical answer：\n'
+sed 's/^/    /' "$P4OUT/tui.answer"
+assert "44 TUI：三個異常的 canonical answer 逐幀綁定、無多餘命中" \
+  diff -q "$P4OUT/tui.expect" "$P4OUT/tui.answer"
+
+# 44g：BLOCKER 軸的 occluded 分支（§4 v1 契約的第二項，結構性 `pane_in_mode`）。
+# **不屬 P4 的步數量測**（按鍵在 replay script 之外，步數斷言此時已完成）：
+# 這是上一輪自己標記的覆蓋缺口——occlusion 先前只有單元測試，沒有畫面驗證。
+# 手法沿用分組 39（真 copy-mode，不是模擬）。
+tmx send-keys -t "$TUI44" k
+tmx send-keys -t "$TUI44" k   # OWNERS 欄回到 owner A（p4w01 在它底下）
+tmx copy-mode -t "$P4P01"
+tmx display -pt "$P4P01" '#{pane_in_mode}' > "$TESTROOT/p44-mode.txt" 2>/dev/null
+assert "44g 前置：pane 確實進入 copy-mode（不驗這條可能在沒進 mode 的畫面上假綠）" \
+  grep -Fxq 1 "$TESTROOT/p44-mode.txt"
+# shellcheck disable=SC2329  # 經 wait_for 間接呼叫
+ui44_occluded() {
+  tmx capture-pane -p -t "$TUI44" > "$P4OUT/tui-occl.cap" 2>/dev/null \
+    && grep -qE 'p4w01.*copy-mode' "$P4OUT/tui-occl.cap"
+}
+assert "44g BLOCKER 軸 occluded：copy-mode 的 worker 在畫面上標 copy-mode" \
+  wait_for 15 ui44_occluded
+# copy-mode 是「人正在看」，不是「worker 被框住」——兩者 MUST NOT 混為一談
+assert "44g occluded MUST NOT 被寫成 blocked" \
+  bash -c '! grep -qE "p4w01.*blocked" "$1"' _ "$P4OUT/tui-occl.cap"
+tmx send-keys -t "$P4P01" -X cancel 2>/dev/null || true
+
+# ---- gate ----
+printf '  [P4] baseline 步數＝%s、TUI 步數＝%s（比值 %s%%；gate ≤50%%）\n' \
+  "$STEPS_BASE" "$STEPS_TUI" "$((STEPS_TUI * 100 / STEPS_BASE))"
+assert "44 gate：TUI 步數 ≤ baseline 的 50%（$STEPS_TUI vs $STEPS_BASE）" \
+  test "$((STEPS_TUI * 2))" -le "$STEPS_BASE"
+
+tmx send-keys -t "$TUI44" q
+tmx kill-window -t "$W44A" 2>/dev/null || true
+tmx kill-window -t "$W44P" 2>/dev/null || true
+tmx kill-window -t "$W44B" 2>/dev/null || true
+
+else
+  printf 'SKIP: 44 P4 效率驗收（SRC_KIND=bash：bash 正本凍結在 M4，不含 TUI）\n'
+fi
+
 # ---- 總結 ----
 printf '\n共 %d PASS、%d FAIL\n' "$PASS" "$FAIL"
 if (( FAIL > 0 )); then

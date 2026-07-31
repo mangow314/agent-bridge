@@ -45,7 +45,7 @@ ready 欄：人工註冊 `-`、spawned 未就緒 `starting`、已就緒 `ready`�
 MUST NOT 因 `--long` 的加入而改變一個位元組。
 Source: cmd_list
 
-### CLI-LIST-2 [tested: 38]
+### CLI-LIST-2 [tested: 38, 44]
 `list --long`（`-l` 為等價別名）：人可讀的介入視圖。首行 MUST 為欄名標頭
 `NAME\tPANE\tREADY\tORIGIN\tWHERE\tOWNER\tDISPOSABLE\tIDLE`，其後每 agent
 一行、TAB 分隔恰八欄。欄值 MUST NOT 含 TAB／換行／控制字元（`name`、
@@ -399,7 +399,7 @@ Source: cmd_hook
 
 ## `ui`
 
-### CLI-UI-1 [tested: 40, 41, 43]
+### CLI-UI-1 [tested: 40, 41, 43, 44]
 `ui`：alternate-screen 全螢幕 TUI dashboard（設計正本 `docs/tui-design.md`，
 本條款對應其第一縱切 §8）。MUST 以 alternate screen 進出：退出後（正常
 `q` 退出**與** panic／錯誤退出皆然，後者由 panic hook 保證）MUST 還原
@@ -410,6 +410,13 @@ switch-client；linked window 多位置 → 優先 current session，否則取�
 live location，不彈詢問框。`x` 僅對 task 列合法（worker 列 MUST 提示無
 效），單一確認框 MUST 逐字顯示等價 CLI 原文 `agent-bridge cancel
 <task-id>`，確認後執行與 `cancel` 相同的轉換與通知（CLI-CANCEL-1）。
+狀態顯示為 **ACTIVITY × BLOCKER 雙軸正交**（設計 §4）：BLOCKER 是獨立的一軸，
+MUST NOT 取代 task status、MUST NOT 造出權威字以外的 task 狀態。v1 的 BLOCKER
+契約只承諾兩項（皆有現成實作來源，設計 §4／§7 終審收窄）：`prompt`（沿用
+`notify::screen_has_prompt` 的硬編碼 matcher）與 `occluded`（**結構性查詢**
+`pane_in_mode`，非畫面比對）。三態 MUST 保留：查不到＝`unknown`，
+**MUST NOT 顯示成「沒有 blocker」**（顯示紀律 §5）。查詢與 liveness 同一輪
+節流、同樣 bounded、同樣 MUST NOT 在 UI thread 上執行。
 read model 為磁碟輪詢（500ms）＋tmux 節流查詢（2s）；每條 tmux 查詢
 MUST bounded（ENV-TMUX-1）**且 MUST NOT 在 UI thread 上執行**（背景 worker
 ＋channel），逾時該欄降級 unknown、動作顯示進行中，MUST NOT 凍結 UI——
@@ -424,7 +431,9 @@ pane）；未設定時 focus 後繼續執行。
 版面（設計 §2 P2）：四面板 `OWNERS｜WORKERS／TASKS｜DETAIL`。TASKS 欄是
 當前選中 owner 底下所有 worker 的任務平坦列表（**含終態**，id 反序）；
 DETAIL 欄 MUST NOT 可聚焦，永遠顯示當前聚焦面板選中項的唯讀細節。`Tab`
-MUST 在 `OWNERS → WORKERS → TASKS → OWNERS` 三欄間循環。`x` 的合法目標
+MUST 在 `OWNERS → WORKERS → TASKS → OWNERS` 三欄間循環，`Shift+Tab`
+（`BackTab`）MUST 為其反向且互為逆運算（P4 效率量測驅動的 additive 補入，
+設計 §3／§9 P4 量測史）。`x` 的合法目標
 擴為 WORKERS 欄的 task 列與 TASKS 欄的**非終態**列；TASKS 欄的終態列
 MUST 提示無效且 MUST NOT 開確認框。
 唯讀鍵（三者皆 MUST NOT 改變任何 task／registry 狀態，`read` 事件除外）：

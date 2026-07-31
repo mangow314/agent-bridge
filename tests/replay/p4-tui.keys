@@ -1,0 +1,30 @@
+# P4 TUI replay script（tui-design.md §9 P4）
+#
+# 同一個 fixture、同一個任務：定位三個異常（dead owner／blocked prompt／
+# orphaned worker）。每行一個按鍵（tmux send-keys 的鍵名），`#` 開頭與空行
+# 不計步；步數由 run-tests.sh 從本檔機械導出。
+#
+# 固定初始狀態（設計 §9 P4 附註：replay script 是 fixture 的一部分）：
+# TUI 開在 owner A 的 window 裡，故首頁 selection 落在 owner A（§2「以 current
+# owner 為根」），焦點在 WORKERS 欄第一列（`App::new` 的固定起點）。
+#
+# 步 0（不按鍵，故不計步）：首頁畫面上已經有一個異常——
+#   WORKERS 欄的 p4w06 標 ⛔blocked（BLOCKER 軸，§4 v1 matcher）。
+# OWNERS 欄同時看得到 owner C 標 ✗（window 已死），但**它底下那個 worker 的
+# 名字**還沒出現（WORKERS 欄投影的是當前選中的 owner A），所以還要走過去。
+#
+# 量測史：首輪只有單向 `Tab` 時，這裡要按兩次才走得到 OWNERS（總計 4 步、
+# 57%、未達 ≤50% 的 gate）。反向鍵補入後是 3 步（43%）——差的那一步純粹是
+# 面板循環方向，不是定位能力。
+
+# 步 1：BTab（Shift+Tab）→ WORKERS 反向一步就到 OWNERS。
+#       （WORKERS 欄永遠是「當前選中 owner」的投影，之後不需要再切回去。）
+BTab
+
+# 步 2：j → 選 owner B。WORKERS 欄隨即列出它的 worker，
+#       orphaned 的 p4w09 帶 ✗dead 標記（registry 有、pane 不在）。
+j
+
+# 步 3：j → 選 owner C（OWNERS 欄該列本身標 ✗＝window 已死）。
+#       WORKERS 欄列出它底下的 p4w12 ——dead owner 異常的具名證據。
+j

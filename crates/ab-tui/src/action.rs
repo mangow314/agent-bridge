@@ -8,7 +8,9 @@ use ab_core::spawn::DespawnResult;
 use ab_core::tmux::TmuxClient;
 
 use crate::app::Sel;
-use crate::model::{FocusPlan, LiveIndex, Liveness, Model, focus_plan, pane_liveness};
+use crate::model::{
+    Blocker, BlockerIndex, FocusPlan, LiveIndex, Liveness, Model, focus_plan, pane_liveness,
+};
 
 /// `x` 的等價 CLI 原文（確認框 MUST 逐字顯示，§2 薄殼原則）。
 pub fn cancel_cmdline(id: &str) -> String {
@@ -106,7 +108,12 @@ pub fn copy(clip: &dyn Clipboard, payload: &str) -> Result<()> {
 /// `registry::snapshot` 的**同一次 parse** 取得——按鍵當下另外重讀會把不同
 /// 世代的欄位拼成同一頁（registry 是 atomic replace，跨廠審查 major #3）。
 /// liveness 維持三態，`unknown` MUST NOT 寫成 dead（§5 顯示紀律）。
-pub fn info_page(model: &Model, live: &LiveIndex, name: &str) -> Vec<String> {
+pub fn info_page(
+    model: &Model,
+    live: &LiveIndex,
+    blockers: &BlockerIndex,
+    name: &str,
+) -> Vec<String> {
     let Some(w) = model.workers.iter().find(|w| w.name == name) else {
         return vec![format!("registry 已無 '{name}'")];
     };
@@ -131,6 +138,16 @@ pub fn info_page(model: &Model, live: &LiveIndex, name: &str) -> Vec<String> {
                 Liveness::Live => "live",
                 Liveness::Dead => "dead",
                 Liveness::Unknown => "unknown",
+            }
+        ),
+        // BLOCKER 軸（§4 雙軸）：與 liveness 各自一行，三態不得壓成兩態
+        format!(
+            "blocker      : {}",
+            match blockers.get(&w.pane) {
+                Blocker::None => "none",
+                Blocker::Prompt => "permission/plan prompt（blocked）",
+                Blocker::Occluded => "occluded（copy-mode）",
+                Blocker::Unknown => "unknown",
             }
         ),
         String::new(),
@@ -656,10 +673,7 @@ mod tests {
         for (case, body) in [
             ("registry 消失", None),
             ("registry 損壞", Some("not json")),
-            (
-                "改成人工註冊",
-                Some(r#"{"name":"w1","pane_id":"%5"}"#),
-            ),
+            ("改成人工註冊", Some(r#"{"name":"w1","pane_id":"%5"}"#)),
             (
                 "spawn_tag 消失",
                 Some(r#"{"name":"w1","pane_id":"%5","spawned":true}"#),
@@ -718,7 +732,10 @@ mod tests {
         let m = evict_message("w1", &Ok(out("evicted", DespawnResult::Killed)));
         assert!(m.contains("已 evict 'w1'") && m.contains("agent-bridge read"));
         let m = evict_message("w1", &Ok(out("evicted-unfinished", DespawnResult::Killed)));
-        assert!(m.contains("筆記未落地") && m.contains("failed"), "實際：{m}");
+        assert!(
+            m.contains("筆記未落地") && m.contains("failed"),
+            "實際：{m}"
+        );
         let m = evict_message("w1", &Ok(out("evicted-timeout", DespawnResult::Killed)));
         assert!(m.contains("逾時") && m.contains("筆記未落地"), "實際：{m}");
         // stale：pane 未被回收，訊息不得宣稱回收成功

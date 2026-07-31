@@ -115,6 +115,78 @@ impl LiveIndex {
     }
 }
 
+/// BLOCKER 軸（tui-design §4 的雙軸狀態：ACTIVITY × BLOCKER 正交疊加）。
+///
+/// v1 契約**只承諾兩件事**，兩者都有現成實作來源（§4／§7 終審收窄）：
+/// - `Prompt`：沿用 `notify::screen_has_prompt` 的硬編碼 matcher
+///   （permission／plan 兩類框，含 agy 與下緣備援錨）
+/// - `Occluded`：**結構性查詢** `pane_in_mode`（AB-COPYMODE-1），不靠畫面比對
+///   ——copy-mode 是人在看，不是 worker 閒著
+///
+/// `Unknown` MUST 與 `None` 分開（顯示紀律 §5）：查不到不等於「沒有 blocker」。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Blocker {
+    /// 查得到、沒有可見 blocker
+    None,
+    /// 權限／計畫確認框（`screen_has_prompt`）
+    Prompt,
+    /// pane 在 copy-mode 等 tmux mode（結構性，不是畫面比對）
+    Occluded,
+    /// tmux 查不到（逾時／不可用／pane 已不在）
+    Unknown,
+}
+
+/// 一輪 blocker 查詢的快照。與 `LiveIndex` 同一輪節流（2s），每條查詢
+/// bounded（§4 bounded-read 硬條款）。
+pub struct BlockerIndex {
+    /// pane id → blocker。整層查不到時為 `None`（全 unknown）
+    pub panes: Option<HashMap<String, Blocker>>,
+}
+
+impl BlockerIndex {
+    /// 對指定 pane 逐一查詢。**只查傳進來的 pane**（呼叫端給的是 registry
+    /// 快照裡的 pane）：dashboard 每 2s 一輪，對整台機器的 pane 掃描是白工。
+    pub fn query(tmux: &dyn TmuxClient, panes: &[String]) -> Self {
+        let mut map = HashMap::new();
+        for p in panes {
+            if p.is_empty() {
+                continue;
+            }
+            map.insert(p.clone(), blocker_of(tmux, p));
+        }
+        BlockerIndex { panes: Some(map) }
+    }
+
+    pub fn unknown() -> Self {
+        BlockerIndex { panes: None }
+    }
+
+    pub fn get(&self, pane: &str) -> Blocker {
+        match &self.panes {
+            None => Blocker::Unknown,
+            Some(m) => m.get(pane).copied().unwrap_or(Blocker::Unknown),
+        }
+    }
+}
+
+/// 單一 pane 的 blocker 判定（純粹是兩次 bounded 查詢的組合，可用假件單測）。
+///
+/// 先問結構性的 copy-mode 再看畫面：copy-mode 下的 `capture-pane` 拿到的是
+/// 人捲到的位置，拿它判 prompt 只會是誤判。查不到一律 `Unknown`——**MUST NOT
+/// 當成 `None`**（§5：沒有訊號 ≠ 沒有 blocker）。
+pub fn blocker_of(tmux: &dyn TmuxClient, pane: &str) -> Blocker {
+    match tmux.pane_in_mode(pane) {
+        Some(true) => return Blocker::Occluded,
+        Some(false) => {}
+        None => return Blocker::Unknown,
+    }
+    match tmux.capture_pane(pane) {
+        Some(screen) if ab_core::notify::screen_has_prompt(&screen) => Blocker::Prompt,
+        Some(_) => Blocker::None,
+        None => Blocker::Unknown,
+    }
+}
+
 /// 三態死活：查不到（tmux 逾時／不可用）≠ 查了但不在（同 `list --long` 的
 /// 顯示紀律：誤標 dead 會讓人以為該回收）。
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -356,6 +428,81 @@ mod tests {
         // 查不到位置（pane 死了／tmux unknown）→ None（降級，不凍結不猜）
         assert_eq!(focus_plan(None, Some("cur")), None);
         assert_eq!(focus_plan(Some(&Vec::new()), Some("cur")), None);
+    }
+
+    /// blocker 判定用的假 tmux：可分別調 `pane_in_mode` 與 `capture_pane`
+    /// 的回應（含 `None`＝bounded 查詢逾時／不可用）。
+    struct BlockerTmux {
+        in_mode: Option<bool>,
+        screen: Option<&'static str>,
+    }
+
+    impl TmuxClient for BlockerTmux {
+        fn exec(&self, _args: &[&str]) -> Option<ab_core::tmux::TmuxOutput> {
+            None
+        }
+        fn available(&self) -> bool {
+            true
+        }
+        fn resolve_pane(&self, _t: &str) -> Option<String> {
+            None
+        }
+        fn pane_exists(&self, _p: &str) -> bool {
+            true
+        }
+        fn capture_pane(&self, _p: &str) -> Option<String> {
+            self.screen.map(|s| s.to_string())
+        }
+        fn pane_in_mode(&self, _p: &str) -> Option<bool> {
+            self.in_mode
+        }
+        fn send_keys(&self, _p: &str, _k: &str) -> bool {
+            false
+        }
+    }
+
+    /// BLOCKER 軸的 v1 契約（§4）：硬編碼 prompt matcher ＋結構性 occlusion，
+    /// 且 **unknown MUST 與 none 分開**（§5：沒有訊號 ≠ 沒有 blocker）。
+    #[test]
+    fn blocker_axis_keeps_v1_contract_and_three_states() {
+        // 真的長得像 claude 權限框（`screen_has_prompt` 的第一組錨）
+        let prompt = "Do you want to make this edit?\n 1. Yes\n 2. No\nEsc to cancel";
+        let cases: [(Option<bool>, Option<&'static str>, Blocker); 6] = [
+            // copy-mode 是結構性判定，先於畫面：人在看，不是 worker 閒著
+            (Some(true), Some(prompt), Blocker::Occluded),
+            (Some(true), None, Blocker::Occluded),
+            // 非 copy-mode → 看畫面
+            (Some(false), Some(prompt), Blocker::Prompt),
+            (Some(false), Some("just some output\n$ "), Blocker::None),
+            // 畫面查不到（bounded 逾時）→ unknown，MUST NOT 當成 none
+            (Some(false), None, Blocker::Unknown),
+            // 連 mode 都查不到 → unknown
+            (None, Some(prompt), Blocker::Unknown),
+        ];
+        for (in_mode, screen, want) in cases {
+            let tmux = BlockerTmux { in_mode, screen };
+            assert_eq!(
+                blocker_of(&tmux, "%1"),
+                want,
+                "in_mode={in_mode:?} screen={screen:?}"
+            );
+        }
+    }
+
+    /// `BlockerIndex`：只查傳進來的 pane；沒查過的與整層失效都是 unknown。
+    #[test]
+    fn blocker_index_defaults_to_unknown_outside_the_queried_set() {
+        let tmux = BlockerTmux {
+            in_mode: Some(false),
+            screen: Some("idle output"),
+        };
+        let idx = BlockerIndex::query(&tmux, &["%1".to_string(), String::new()]);
+        assert_eq!(idx.get("%1"), Blocker::None);
+        // 空 pane 不查（registry 缺 pane_id），也不會被當成 none
+        assert_eq!(idx.get(""), Blocker::Unknown);
+        assert_eq!(idx.get("%404"), Blocker::Unknown, "沒查過的 pane＝unknown");
+        // 整層 unknown（UI 起始值／worker 還沒回報）
+        assert_eq!(BlockerIndex::unknown().get("%1"), Blocker::Unknown);
     }
 
     /// 三態死活：查不到 ≠ 不在（顯示紀律，tui-design §5）。

@@ -23,7 +23,7 @@ use ab_core::tmux::SubprocessTmux;
 use crossterm::event::{self, Event, KeyCode, KeyEventKind};
 
 use app::{App, Effect, Key};
-use model::{LiveIndex, Model};
+use model::{BlockerIndex, LiveIndex, Model};
 use worker::{Msg, Req};
 
 /// 磁碟 read model 的輪詢節奏（§4：500ms；tmux liveness 另以 2s 節流）。
@@ -88,6 +88,8 @@ fn event_loop(
     let mut model = Model::load(paths);
     // liveness 起始為 unknown，等 worker 第一則回報——不在 UI thread 上查
     let mut live = LiveIndex::unknown();
+    // blocker 軸同樣起始 unknown：unknown MUST NOT 顯示成「沒有 blocker」（§5）
+    let mut blockers = BlockerIndex::unknown();
     let mut app = App::new();
     let mut last_disk = Instant::now();
     let mut last_live = Instant::now();
@@ -96,7 +98,7 @@ fn event_loop(
 
     loop {
         terminal
-            .draw(|f| view::render(f, &model, &live, &app))
+            .draw(|f| view::render(f, &model, &live, &blockers, &app))
             .map_err(|e| Error::new(format!("畫面繪製失敗：{e}")))?;
         if selftest_panic {
             panic!("AB_TUI_SELFTEST_PANIC：測試觸發的錯誤退出（驗 terminal 還原）");
@@ -113,8 +115,9 @@ fn event_loop(
                     app.origin_pane = pane;
                     app.apply_origin(&model);
                 }
-                Msg::Live(l) => {
+                Msg::Live(l, b) => {
                     live = l;
+                    blockers = b;
                     live_inflight = false;
                 }
                 Msg::Focus { label, pane, res } => match res {
@@ -218,7 +221,7 @@ fn event_loop(
                     // `i` 只消費已載入的 read model／liveness 快照，不開檔也
                     // 不查 tmux，故就地組頁（同一份快照＝同一個世代）
                     Effect::Info { worker: name } => {
-                        app.info = Some(action::info_page(&model, &live, &name));
+                        app.info = Some(action::info_page(&model, &live, &blockers, &name));
                     }
                     Effect::Copy { payload } => {
                         app.message = "複製證據中…".to_string();
@@ -391,6 +394,8 @@ fn translate(code: KeyCode) -> Option<Key> {
     match code {
         KeyCode::Char(c) => Some(Key::Char(c)),
         KeyCode::Tab => Some(Key::Tab),
+        // `Shift+Tab`：crossterm 回的是獨立的 BackTab，不是帶 SHIFT 修飾的 Tab
+        KeyCode::BackTab => Some(Key::BackTab),
         KeyCode::Enter => Some(Key::Enter),
         KeyCode::Esc => Some(Key::Esc),
         KeyCode::Down => Some(Key::Down),
@@ -436,7 +441,11 @@ mod tests {
 
         for (e, needle) in [(e, "boom-str"), (e2, "boom-string")] {
             assert!(e.message.contains("異常結束"), "實際：{}", e.message);
-            assert!(e.message.contains(needle), "MUST 帶 panic 原因：{}", e.message);
+            assert!(
+                e.message.contains(needle),
+                "MUST 帶 panic 原因：{}",
+                e.message
+            );
             assert!(
                 e.message.contains("agent-bridge list --long"),
                 "MUST 指出下一步：{}",
@@ -491,7 +500,10 @@ mod tests {
                 pane: "%5".into(),
             })
         };
-        assert!(evict_outcome_is_clean(&out("evicted", DespawnResult::Killed)));
+        assert!(evict_outcome_is_clean(&out(
+            "evicted",
+            DespawnResult::Killed
+        )));
         assert!(!evict_outcome_is_clean(&out(
             "evicted",
             DespawnResult::Stale

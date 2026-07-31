@@ -45,6 +45,8 @@ pub struct Pager {
 pub enum Key {
     Char(char),
     Tab,
+    /// `Shift+Tab`（crossterm 的 `KeyCode::BackTab`）：反向面板循環
+    BackTab,
     Enter,
     Esc,
     Down,
@@ -351,6 +353,19 @@ pub fn handle_key(app: &mut App, model: &Model, key: Key) -> Effect {
                 Panel::Owners => Panel::Workers,
                 Panel::Workers => Panel::Tasks,
                 Panel::Tasks => Panel::Owners,
+            };
+            Effect::None
+        }
+        // 反向循環（`Shift+Tab`）。**P4 效率量測驅動的 additive 補入**：
+        // 首輪量到 TUI 4 步／baseline 7 步（57%，未達 §9 P4 的 ≤50%），而那
+        // 4 步裡有 2 步純粹是「從初始的 WORKERS 單向繞到 OWNERS」的固定開銷。
+        // 補上反向鍵之後同一份 replay script 是 3 步（43%）。純鍵位面 additive，
+        // 不動 selection 起點、不動任何協定語意。
+        Key::BackTab => {
+            app.panel = match app.panel {
+                Panel::Owners => Panel::Tasks,
+                Panel::Workers => Panel::Owners,
+                Panel::Tasks => Panel::Workers,
             };
             Effect::None
         }
@@ -700,6 +715,36 @@ mod tests {
         assert_eq!(app.panel, Panel::Workers);
     }
 
+    /// `Shift+Tab` 反向循環：OWNERS → TASKS → WORKERS → OWNERS，且與 `Tab`
+    /// 互為逆運算（P4 效率量測驅動的 additive 補入；DETAIL 仍不在循環裡）。
+    #[test]
+    fn backtab_cycles_three_panels_in_reverse() {
+        let m = model();
+        let mut app = App::new();
+        assert_eq!(app.panel, Panel::Workers);
+        handle_key(&mut app, &m, Key::BackTab);
+        assert_eq!(app.panel, Panel::Owners, "初始 WORKERS 反向一步就到 OWNERS");
+        handle_key(&mut app, &m, Key::BackTab);
+        assert_eq!(app.panel, Panel::Tasks);
+        handle_key(&mut app, &m, Key::BackTab);
+        assert_eq!(app.panel, Panel::Workers);
+
+        // 與 Tab 互為逆運算（三個起點各驗一次）
+        for start in [Panel::Owners, Panel::Workers, Panel::Tasks] {
+            app.panel = start;
+            handle_key(&mut app, &m, Key::Tab);
+            handle_key(&mut app, &m, Key::BackTab);
+            assert_eq!(app.panel, start, "Tab→BackTab MUST 回到原欄：{start:?}");
+        }
+
+        // 模態下照樣被吞掉（與 Tab 同紀律：破壞性動作確認期不得換欄）
+        app.panel = Panel::Workers;
+        app.confirm = Some("20260731T000001Z-aaaa".into());
+        assert_eq!(handle_key(&mut app, &m, Key::BackTab), Effect::None);
+        assert_eq!(app.panel, Panel::Workers);
+        assert!(app.confirm.is_some());
+    }
+
     /// TASKS 欄的 `x`：非終態列開確認框（綁 immutable id）；終態列只提示、
     /// **不開確認框**，訊息須點名「終態」。
     #[test]
@@ -869,7 +914,11 @@ mod tests {
         app.evict_prompt = Some(prompt());
         assert_eq!(handle_key(&mut app, &m, Key::Esc), Effect::None);
         assert!(app.evict_prompt.is_none());
-        assert!(app.message.contains("已放棄 evict"), "實際：{}", app.message);
+        assert!(
+            app.message.contains("已放棄 evict"),
+            "實際：{}",
+            app.message
+        );
     }
 
     /// 警告是 sticky 的有界歷史（major #2）：**append 不覆寫**、連續重複只留
@@ -895,7 +944,10 @@ mod tests {
             app.push_warning(format!("w{i}"));
         }
         assert_eq!(app.warnings.len(), MAX_WARNINGS);
-        assert_eq!(app.warnings.last().unwrap(), &format!("w{}", MAX_WARNINGS + 1));
+        assert_eq!(
+            app.warnings.last().unwrap(),
+            &format!("w{}", MAX_WARNINGS + 1)
+        );
         assert!(
             !app.warnings.iter().any(|w| w == "無法通知 w1"),
             "溢位時丟的是最舊的"

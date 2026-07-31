@@ -13,7 +13,9 @@ use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
 
 use crate::action::{cancel_cmdline, evidence};
 use crate::app::{App, Panel, Sel};
-use crate::model::{LiveIndex, Liveness, Model, Row, owner_liveness, pane_liveness};
+use crate::model::{
+    Blocker, BlockerIndex, LiveIndex, Liveness, Model, Row, owner_liveness, pane_liveness,
+};
 
 /// task id 的固定長度（`YYYYMMDDTHHMMSSZ-xxxx`，見 `ab_core::task`）。
 const TASK_ID_W: u16 = 21;
@@ -34,7 +36,7 @@ const DETAIL_STRIP_H: u16 = 11;
 /// `render_footer`）。
 const WARN_ROWS: usize = 3;
 
-pub fn render(f: &mut Frame, model: &Model, live: &LiveIndex, app: &App) {
+pub fn render(f: &mut Frame, model: &Model, live: &LiveIndex, blockers: &BlockerIndex, app: &App) {
     // footer 高度隨 sticky 警告伸縮（major #2：警告不得被單行 message 覆寫，
     // 所以它們需要自己的行）。上限 `WARN_ROWS`，溢位以「另 N 則」帶出，
     // 不是靜默丟掉
@@ -65,18 +67,17 @@ pub fn render(f: &mut Frame, model: &Model, live: &LiveIndex, app: &App) {
     } else {
         let [top, d] =
             Layout::vertical([Constraint::Min(6), Constraint::Length(DETAIL_STRIP_H)]).areas(main);
-        let [o, m] =
-            Layout::horizontal([Constraint::Length(OWNERS_W), Constraint::Min(MID_MIN_W)])
-                .areas(top);
+        let [o, m] = Layout::horizontal([Constraint::Length(OWNERS_W), Constraint::Min(MID_MIN_W)])
+            .areas(top);
         (o, m, d)
     };
     let [workers_area, tasks_area] =
         Layout::vertical([Constraint::Percentage(50), Constraint::Percentage(50)]).areas(mid_area);
 
     render_owners(f, owners_area, model, live, app);
-    render_workers(f, workers_area, model, live, app);
+    render_workers(f, workers_area, model, live, blockers, app);
     render_tasks(f, tasks_area, model, app);
-    render_detail(f, detail_area, model, live, app);
+    render_detail(f, detail_area, model, live, blockers, app);
     render_footer(f, footer, app);
 
     // overlay 優先序：確認框（cancel／evict）> 全文 pager > 摘要頁 > 合法鍵
@@ -127,7 +128,14 @@ fn render_owners(f: &mut Frame, area: Rect, model: &Model, live: &LiveIndex, app
     );
 }
 
-fn render_workers(f: &mut Frame, area: Rect, model: &Model, live: &LiveIndex, app: &App) {
+fn render_workers(
+    f: &mut Frame,
+    area: Rect,
+    model: &Model,
+    live: &LiveIndex,
+    blockers: &BlockerIndex,
+    app: &App,
+) {
     let focused = app.panel == Panel::Workers;
     let rows = app.rows(model);
     let mut lines = Vec::new();
@@ -147,13 +155,14 @@ fn render_workers(f: &mut Frame, area: Rect, model: &Model, live: &LiveIndex, ap
                     Liveness::Unknown => "  ?",
                 };
                 format!(
-                    "{}▸ {}  {}  {}  {}{}",
+                    "{}▸ {}  {}  {}  {}{}{}",
                     sel_prefix(selected),
                     w.name,
                     rt,
                     if w.pane.is_empty() { "-" } else { &w.pane },
                     w.ready,
-                    alive
+                    alive,
+                    blocker_mark(blockers.get(&w.pane))
                 )
             }
             Row::Task { task, .. } => {
@@ -219,7 +228,14 @@ fn render_tasks(f: &mut Frame, area: Rect, model: &Model, app: &App) {
 
 /// DETAIL 欄（§2）：**不可聚焦**，永遠是「當前聚焦面板選中項」的唯讀投影。
 /// evidence 區與 `c` 的 payload 共用 `action::evidence`（白名單同一份來源）。
-fn render_detail(f: &mut Frame, area: Rect, model: &Model, live: &LiveIndex, app: &App) {
+fn render_detail(
+    f: &mut Frame,
+    area: Rect,
+    model: &Model,
+    live: &LiveIndex,
+    blockers: &BlockerIndex,
+    app: &App,
+) {
     let sel = app.selection(model);
     let mut lines: Vec<Line> = Vec::new();
     match &sel {
@@ -235,6 +251,12 @@ fn render_detail(f: &mut Frame, area: Rect, model: &Model, live: &LiveIndex, app
             for l in worker_detail(w, live) {
                 lines.push(Line::from(l));
             }
+            // BLOCKER 是與 ACTIVITY 正交的另一軸（§4 雙軸狀態）：獨立一欄，
+            // 不與死活混寫
+            lines.push(Line::from(format!(
+                "blocker: {}",
+                blocker_word(blockers.get(&w.pane))
+            )));
         }
         Sel::Task { task, worker } => {
             lines.push(Line::from(format!("task-id: {}", task.id)));
@@ -246,6 +268,10 @@ fn render_detail(f: &mut Frame, area: Rect, model: &Model, live: &LiveIndex, app
                     "pane   : {}  {}",
                     if w.pane.is_empty() { "-" } else { &w.pane },
                     liveness_word(pane_liveness(live, &w.pane))
+                )));
+                lines.push(Line::from(format!(
+                    "blocker: {}",
+                    blocker_word(blockers.get(&w.pane))
                 )));
             }
         }
@@ -286,6 +312,32 @@ fn worker_detail(w: &ab_core::registry::AgentSnapshot, live: &LiveIndex) -> Vec<
         format!("ready  : {}", w.ready),
         format!("狀態   : {}", liveness_word(pane_liveness(live, &w.pane))),
     ]
+}
+
+/// BLOCKER 軸的列標記（§2 雙軸：`running ⛔`——blocker 是**另一軸**，
+/// MUST NOT 取代 task status，也 MUST NOT 寫成不存在的 task 狀態字）。
+///
+/// glyph 後面帶英文字面（`blocked`／`copy-mode`）而不是只有 emoji：
+/// `capture-pane` 的特徵字串斷言吃不到樣式，也吃不準 emoji 的寬度——標記
+/// 必須落在字元層才驗得到（同 selection marker 的理由，§2）。
+/// `Unknown` 一律**不畫**：沒有訊號 ≠ 沒有 blocker，畫成空白比畫成「無」誠實
+/// （DETAIL 欄仍逐字寫出 unknown）。
+fn blocker_mark(b: Blocker) -> &'static str {
+    match b {
+        Blocker::Prompt => "  ⛔blocked",
+        Blocker::Occluded => "  👁copy-mode",
+        Blocker::None | Blocker::Unknown => "",
+    }
+}
+
+/// BLOCKER 軸的字面（DETAIL／`i` 摘要頁用；三態不得壓成兩態）。
+fn blocker_word(b: Blocker) -> &'static str {
+    match b {
+        Blocker::None => "none",
+        Blocker::Prompt => "permission/plan prompt（blocked）",
+        Blocker::Occluded => "occluded（copy-mode：人正在看）",
+        Blocker::Unknown => "unknown",
+    }
 }
 
 /// 三態死活的字面（`unknown` MUST NOT 寫成 dead，§5 顯示紀律）。
@@ -348,7 +400,7 @@ fn render_info(f: &mut Frame, lines: &[String]) {
 fn render_footer(f: &mut Frame, area: Rect, app: &App) {
     let mut lines = vec![
         Line::from(
-            " Tab/j/k（↓↑）導航 · Enter focus · r read · i 摘要 · c 複製證據 · x cancel · e evict · ? 合法鍵 · q 離開",
+            " Tab/S-Tab/j/k（↓↑）導航 · Enter focus · r read · i 摘要 · c 複製證據 · x cancel · e evict · ? 合法鍵 · q 離開",
         ),
         Line::from(format!(" [poll 500ms · tmux 2s] {}", app.message)),
     ];
@@ -406,7 +458,9 @@ fn render_evict_confirm(f: &mut Frame, lines: &[String]) {
 
 fn render_help(f: &mut Frame, model: &Model, app: &App) {
     // `?`＝當前選中項的合法鍵（§3）
-    let mut lines = vec![Line::from("Tab 換欄 · j/k（↓↑）移動 · ? 本頁 · q 離開")];
+    let mut lines = vec![Line::from(
+        "Tab 換欄（S-Tab 反向）· j/k（↓↑）移動 · Esc 清警告 · ? 本頁 · q 離開",
+    )];
     match app.panel {
         Panel::Owners => lines.push(Line::from("owner 列：無列上動作（Enter/x 無效）")),
         Panel::Workers => match app.selected_row(model) {
@@ -474,10 +528,7 @@ fn popup(f: &mut Frame, w: u16, h: u16, title: &str, lines: Vec<Line<'static>>) 
     // 等價 CLI（約 112 字元）截掉尾端的 generation——那條命令原文是薄殼原則
     // 的憑證，截半條等於畫面上沒有它（codex 複核 minor #5）
     let inner = w.saturating_sub(2).max(1) as usize;
-    let rows: usize = lines
-        .iter()
-        .map(|l| l.width().div_ceil(inner).max(1))
-        .sum();
+    let rows: usize = lines.iter().map(|l| l.width().div_ceil(inner).max(1)).sum();
     let h = h.max(rows as u16 + 2);
     let h = h.min(area.height);
     let rect = Rect {

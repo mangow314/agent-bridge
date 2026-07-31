@@ -20,7 +20,7 @@ use ab_core::registry;
 use ab_core::task::{self, CancelOutcome, ReadOutcome};
 use ab_core::tmux::TmuxClient;
 
-use crate::model::LiveIndex;
+use crate::model::{BlockerIndex, LiveIndex};
 
 /// UI → worker 的請求。
 pub enum Req {
@@ -44,7 +44,10 @@ pub enum Msg {
         owner: Option<String>,
         pane: Option<String>,
     },
-    Live(LiveIndex),
+    /// 一輪 tmux 查詢：死活（§4 liveness）＋ blocker 軸（§4 v1 matcher 契約）。
+    /// 兩者同一輪回報：分兩則會讓畫面出現「死活已更新、blocker 還是上一輪」
+    /// 的混搭狀態
+    Live(LiveIndex, BlockerIndex),
     Focus {
         label: String,
         pane: String,
@@ -169,12 +172,12 @@ pub fn spawn<T: TmuxClient + Send + 'static>(tmux: T, paths: Paths) -> Handle {
         {
             return;
         }
-        if msg_tx.send(Msg::Live(LiveIndex::query(&tmux))).is_err() {
+        if msg_tx.send(live_round(&tmux, &paths)).is_err() {
             return;
         }
         while let Ok(req) = req_rx.recv() {
             let msg = match req {
-                Req::Live => Msg::Live(LiveIndex::query(&tmux)),
+                Req::Live => live_round(&tmux, &paths),
                 Req::Focus { pane, label } => {
                     let res = crate::action::focus(&tmux, &pane, session.as_deref());
                     Msg::Focus { label, pane, res }
@@ -203,6 +206,21 @@ pub fn spawn<T: TmuxClient + Send + 'static>(tmux: T, paths: Paths) -> Handle {
         rx: msg_rx,
         msg_tx: oneshot_tx,
     }
+}
+
+/// 一輪 tmux 查詢：死活索引 ＋ blocker 索引。
+///
+/// blocker 只對 registry 快照裡的 pane 查（`snapshot` 讀的是小 JSON，不取鎖），
+/// 每個 pane 兩次 bounded 呼叫（`pane_in_mode`＋`capture_pane`）。整輪跑在
+/// 背景 worker 上，卡住的終態是「該欄 stale」，不是凍結（§4 硬條款）。
+fn live_round(tmux: &dyn TmuxClient, paths: &Paths) -> Msg {
+    let live = LiveIndex::query(tmux);
+    let panes: Vec<String> = registry::snapshot(paths)
+        .into_iter()
+        .map(|w| w.pane)
+        .filter(|p| !p.is_empty())
+        .collect();
+    Msg::Live(live, BlockerIndex::query(tmux, &panes))
 }
 
 /// 呼叫者所在的 owner 標籤 `session:@window`。先走 `caller_owner`

@@ -88,7 +88,8 @@ CLI 才是介面；任何 TUI 能做的事，人離開 TUI 都做得到。
 
 | 鍵 | 動作 | 等價 CLI | 破壞性 |
 |---|---|---|---|
-| `Tab` | 面板間切換 | — | — |
+| `Tab` | 面板間切換（正向 `OWNERS → WORKERS → TASKS`） | — | — |
+| `Shift+Tab` | 面板間切換（反向） | — | —（**P4 效率量測（首輪 57%）驅動的 additive 補入**：量到的 4 步裡有 2 步是「從初始 WORKERS 單向繞到 OWNERS」的固定開銷；純鍵位面，不動 selection 起點與任何協定語意） |
 | `j`/`k`（`↓`/`↑`） | 面板內移動 | — | — |
 | `Enter` | focus 選中 worker 的 pane | §2 focus 語意（popup 下先關 popup） | — |
 | `r` | 讀選中 task 全文 | `agent-bridge read <task-id>` | —（注意：`read` 會追加 read event，非純唯讀；gate 據此設計） |
@@ -238,6 +239,15 @@ focus 跨 window 語意、CAS（cancel 綁 id）。
 
 P4 附註：replay script 是 fixture 的一部分（固定初始 selection 與異常排序位置），
 量的是「固定操作序列下的步數差」，不宣稱量到任意操作者的自由行為。
+
+**P4 量測史（本輪實測，分組 44）**：首輪 Tab 單向循環下 TUI 4 步／baseline
+7 步＝**57%，未達標**；量到的缺口是「初始焦點在 WORKERS，單向繞到 OWNERS 要
+兩步」的固定開銷（三個異常裡有兩個在步 0 就已可見）。據此補入 `Shift+Tab`
+反向循環（§3 鍵位表，純 additive），同一份 replay script 降為 3 步＝3/7
+≈ **43%，達標**（分組 44 以整數截斷印為 42%）。baseline 兩輪都是 7 步（`list --long` 一次判定 orphan 與 dead owner，
+再逐 pane `capture-pane` 找 blocked prompt——CLI 沒有 blocker 軸，掃到第 6 個
+命中）。BLOCKER 軸（§4 v1 契約）在本輪一併補齊，否則 TUI 側定位不到
+blocked prompt，量到的會是功能缺口而不是效率差距。
 
 ### P5 rubric（每條可由證據答是／否）
 
