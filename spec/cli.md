@@ -372,6 +372,21 @@ despawn 段 MUST 綁定 evict 起始時記下的 spawn_tag 世代：期間同名
 MUST NOT 包在同一把鎖內；各段之間中斷的失效方向 MUST 不刪未落地脈絡。
 Source: cmd_evict / cmd_despawn
 
+### CLI-EVICT-4 [tested: 42]
+`evict` 的 additive 參數 `--expect-pane <pane>`／`--expect-generation <tag>`
+（compare-and-act，設計正本 `docs/tui-design.md` §5）。兩者各自獨立可用，
+MUST 只驗帶到的那一項；**兩者皆不帶時行為與現行完全相同**。
+expect 驗證 MUST 在**任何副作用之前**執行，且與收尾任務的建立在**同一把
+registry 鎖內**完成——驗證與建立之間若能換代，收尾任務就會派給新世代並
+回收它（CLI-EVICT-3 的綁定只保護「送出後 → despawn」那個窗口，兩個 race
+window 各有各的防線）。該鎖 MUST 只在帶了 expect 參數時取用：無條件取鎖
+會讓不帶參數的呼叫在 registry 鎖被佔用時等滿重試上限才以鎖錯誤失敗，
+既有的錯誤優先序因此改變，與上一句的「完全相同」相矛盾。通知 MUST NOT 圈在該鎖內（送鍵帶延遲，會與
+spawn／despawn 互撞）；三段整體仍 MUST NOT 共用一把鎖（CLI-EVICT-3）。
+不符 MUST 以含 `selection stale` 的訊息非 0 退出，且 MUST NOT 建立 task、
+MUST NOT 通知、MUST NOT kill pane、MUST NOT 更動 registry 或審計。
+Source: cmd_evict / check_expect
+
 ## `hook`
 
 ### CLI-HOOK-1 [tested: 33]

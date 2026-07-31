@@ -406,6 +406,23 @@ fn do_send(
     src: &MessageSource,
     pinned: bool,
 ) -> Result<String> {
+    let task_id = create_send_task(paths, to, from, src, pinned)?;
+    notify_send(paths, to, &task_id)?;
+    Ok(task_id)
+}
+
+/// `do_send` 的前半：名稱文法 → 收件者已註冊 → not-ready 警告 → 建 task。
+///
+/// 與後半分開是為了 evict 的入口 CAS（CLI-EVICT-4）：expect 驗證與收尾任務的
+/// 建立 MUST 在**同一把 registry 鎖內**完成，而本函式自己不取鎖，呼叫端因此
+/// 可以在持鎖狀態下呼叫它。
+fn create_send_task(
+    paths: &Paths,
+    to: &str,
+    from: &str,
+    src: &MessageSource,
+    pinned: bool,
+) -> Result<String> {
     if !is_valid_name(to) {
         return Err(Error::new(format!(
             "agent 名稱不合法（僅允許 [A-Za-z0-9_-]+）：{to}"
@@ -428,12 +445,20 @@ fn do_send(
         ));
     }
 
-    let task_id = task::create_task(paths, from, to, src, pinned)?;
+    task::create_task(paths, from, to, src, pinned)
+}
 
+/// `do_send` 的後半：通知收件者。
+///
+/// **MUST 在釋放 registry 鎖之後呼叫**：`notify_or_defer` 會送 tmux 鍵並帶
+/// 延遲，圈進鎖裡會讓 registry 鎖被持有數百毫秒以上，與 spawn／despawn 互撞
+/// （`acquire_lock` 只重試 25 次 × 0.2s 就放棄）。
+fn notify_send(paths: &Paths, to: &str, task_id: &str) -> Result<()> {
     // 通知前重讀 pane（cmd_send:613-619）：從參數檢查到這裡隔著建目錄＋三次
     // 寫檔，期間同名 agent 可能被 unregister＋register 換到別的 pane——舊 pane
     // 若已屬別人的 session，這行 command＋Enter 就打進無辜視窗。重讀把窗口縮到
     // 次毫秒級；徹底關閉需要「讀 registry 與 send-keys」原子化，tmux 給不了。
+    let agent_file = paths.agents_dir.join(format!("{to}.json"));
     let pane = registry::read_pane(&agent_file);
     let tmux = SubprocessTmux;
     notify::notify_or_defer(
@@ -442,11 +467,9 @@ fn do_send(
         to,
         &pane,
         &format!("agent-bridge receive {task_id}"),
-        &task_id,
+        task_id,
         "receive",
-    )?;
-
-    Ok(task_id)
+    )
 }
 
 /// write_message 的 mode/val 二元組 → `MessageSource`（`--message-file -`＝stdin）。
@@ -1117,15 +1140,45 @@ Even with nothing worth keeping, reply anyway with the single line
 ///
 /// **逾時仍然 despawn**：否則一個不回話的 worker 會把 cap 永久卡死。代價是
 /// 筆記沒落地，所以審計線一定要看得出來（evicted-timeout）。
+/// CLI-EVICT-4 的 compare-and-act 比對（純函式，可單測）。
+///
+/// 只驗**帶到的**那一項：兩項都不帶時一律通過，evict 行為與現行完全相同
+/// （設計正本 §1 非目標：既有 invocation 語意零改變）。
+/// 不符一律回含 `selection stale` 的錯誤——呼叫端據此非 0 退出，且此時
+/// 尚未產生任何副作用。
+fn check_expect(
+    name: &str,
+    actual_pane: &str,
+    actual_gen: &str,
+    expect_pane: Option<&str>,
+    expect_gen: Option<&str>,
+) -> Result<()> {
+    for (label, actual, expect) in [
+        ("pane", actual_pane, expect_pane),
+        ("世代（spawn_tag）", actual_gen, expect_gen),
+    ] {
+        if let Some(want) = expect
+            && want != actual
+        {
+            return Err(Error::new(format!(
+                "evict 中止（selection stale）：agent '{name}' 的{label}實際為 {actual}（期望 {want}）；未建立任何任務、未通知、未回收"
+            )));
+        }
+    }
+    Ok(())
+}
+
 fn cmd_evict(paths: &Paths, args: &[String]) -> Result<()> {
     if args.is_empty() {
         return Err(Error::new(
-            "用法：agent-bridge evict <name> [--timeout <secs>] [--from <sender>]",
+            "用法：agent-bridge evict <name> [--timeout <secs>] [--from <sender>] [--expect-pane <pane>] [--expect-generation <tag>]",
         ));
     }
     let name = args[0].clone();
     let mut timeout: u64 = 300;
     let mut from = String::from("orchestrator");
+    let mut expect_pane: Option<String> = None;
+    let mut expect_gen: Option<String> = None;
     let mut it = args[1..].iter();
     while let Some(a) = it.next() {
         match a.as_str() {
@@ -1145,6 +1198,26 @@ fn cmd_evict(paths: &Paths, args: &[String]) -> Result<()> {
                     .ok_or_else(|| Error::new("--from 需要參數"))?
                     .clone();
             }
+            // CLI-EVICT-4（additive）：兩者各自獨立可用，只驗帶到的那一項；
+            // 都不帶時行為與現行完全相同
+            "--expect-pane" => {
+                let v = it
+                    .next()
+                    .ok_or_else(|| Error::new("--expect-pane 需要參數"))?;
+                if v.is_empty() {
+                    return Err(Error::new("--expect-pane 不得為空"));
+                }
+                expect_pane = Some(v.clone());
+            }
+            "--expect-generation" => {
+                let v = it
+                    .next()
+                    .ok_or_else(|| Error::new("--expect-generation 需要參數"))?;
+                if v.is_empty() {
+                    return Err(Error::new("--expect-generation 不得為空"));
+                }
+                expect_gen = Some(v.clone());
+            }
             other => return Err(Error::new(format!("未知參數：{other}"))),
         }
     }
@@ -1159,52 +1232,101 @@ fn cmd_evict(paths: &Paths, args: &[String]) -> Result<()> {
         )));
     }
 
-    // 出身快檢（不取鎖）：純 fail-fast，避免對人工註冊的 agent 送出一個之後
-    // 必定被 despawn 拒絕、沒人回收的孤兒收尾任務。權威判定仍在 despawn 的鎖內
     let f = paths.agents_dir.join(format!("{name}.json"));
-    if !f.is_file() {
-        return Err(Error::new(format!("未註冊的 agent：{name}")));
-    }
-    match registry::read_provenance(&f) {
-        registry::Provenance::Manual => {
-            return Err(Error::new(format!(
-                "agent '{name}' 非 spawn 出身，evict 拒絕（人工 pane 的生命週期不歸 bridge 管，請用 unregister）"
-            )));
+
+    // CLI-EVICT-4：出身檢查、世代讀取、**expect 比對**與收尾任務的建立全部
+    // 收進**同一把 registry 鎖**內。
+    //
+    // 為什麼一定要同一把鎖：expect 比對若在鎖外做，「驗完 → do_send」之間仍
+    // 有換代窗口，收尾任務就會派給新世代並回收它——那正是本條款要堵的第一個
+    // race window（設計正本 §5）。既有的 despawn 綁定（CLI-EVICT-3）只保護
+    // 「送出後 → despawn」那第二個窗口，兩者各有各的防線。
+    //
+    // 通知**不在**鎖內（`notify_send` 在鎖外）：它會送 tmux 鍵並帶延遲，圈進
+    // 鎖裡會與 spawn／despawn 互撞。
+    //
+    // **鎖只在帶了 expect 參數時才取**：無條件取鎖會讓「不帶 expect＝行為與
+    // 現行完全相同」變成假話——別的 registry 操作持鎖時，舊碼直接以「未註冊」
+    // 之類的既有錯誤結束，無條件取鎖版卻會先等滿重試上限再以鎖逾時失敗，
+    // 連錯誤優先序都變了（跨廠審查 P3a major #1，實測 elapsed≈4.8s）。
+    let prepare = || -> Result<(String, String, String, String)> {
+        // 出身快檢：純 fail-fast，避免對人工註冊的 agent 送出一個之後必定被
+        // despawn 拒絕、沒人回收的孤兒收尾任務。權威判定仍在 despawn 的鎖內
+        if !f.is_file() {
+            return Err(Error::new(format!("未註冊的 agent：{name}")));
         }
-        registry::Provenance::Undetermined => {
+        match registry::read_provenance(&f) {
+            registry::Provenance::Manual => {
+                return Err(Error::new(format!(
+                    "agent '{name}' 非 spawn 出身，evict 拒絕（人工 pane 的生命週期不歸 bridge 管，請用 unregister）"
+                )));
+            }
+            registry::Provenance::Undetermined => {
+                return Err(Error::new(format!(
+                    "agent '{name}' 的 registry 無法解析，出身不明，evict 拒絕；請確認 {} 後手動處理",
+                    f.display()
+                )));
+            }
+            registry::Provenance::Spawned => {}
+        }
+
+        // pane/runtime 在 despawn 前取：despawn 會刪掉 registry，之後就讀不到了
+        let pane = registry::read_field(&f, "pane_id", "-");
+        let runtime = registry::read_field(&f, "runtime", "-");
+        // 記下這一代的 spawn_tag，最後 despawn 時綁定比對：收尾任務是派給「這一代」
+        // 的，回收也只能收這一代。tag 空的話綁定等於沒有——正常 spawn 一定寫得出
+        // tag，取不到代表 registry 被動過，這時拒絕動作
+        let gen_tag = registry::read_field(&f, "spawn_tag", "");
+        if gen_tag.is_empty() {
             return Err(Error::new(format!(
-                "agent '{name}' 的 registry 無法解析，出身不明，evict 拒絕；請確認 {} 後手動處理",
+                "agent '{name}' 的 registry 沒有 spawn_tag，無法鎖定世代，evict 拒絕；請確認 {} 後手動處理",
                 f.display()
             )));
         }
-        registry::Provenance::Spawned => {}
-    }
 
-    // pane/runtime 在 despawn 前取：despawn 會刪掉 registry，之後就讀不到了
-    let pane = registry::read_field(&f, "pane_id", "-");
-    let runtime = registry::read_field(&f, "runtime", "-");
-    // 記下這一代的 spawn_tag，最後 despawn 時綁定比對：收尾任務是派給「這一代」
-    // 的，回收也只能收這一代。tag 空的話綁定等於沒有——正常 spawn 一定寫得出
-    // tag，取不到代表 registry 被動過，這時拒絕動作
-    let gen_tag = registry::read_field(&f, "spawn_tag", "");
-    if gen_tag.is_empty() {
-        return Err(Error::new(format!(
-            "agent '{name}' 的 registry 沒有 spawn_tag，無法鎖定世代，evict 拒絕；請確認 {} 後手動處理",
-            f.display()
-        )));
-    }
+        // MUST 在任何副作用之前：不符就直接出去，此時尚未建任何 task、
+        // 未通知、未動 registry、未碰 pane
+        check_expect(
+            &name,
+            &pane,
+            &gen_tag,
+            expect_pane.as_deref(),
+            expect_gen.as_deref(),
+        )?;
 
-    let task_id = do_send(
-        paths,
-        &name,
-        &from,
-        &MessageSource::Text(EVICT_MSG.as_bytes().to_vec()),
-        true,
-    )
-    .map_err(|e| {
-        // 內層錯誤先出聲再蓋上 evict 的中止訊息：bash 的 `cmd_send` 跑在命令
-        // 替換的 subshell 裡，它自己的 die 早就印上 stderr 了，外層 die 是
-        // 第二行（codex 複核 2026-07-31）
+        let task_id = create_send_task(
+            paths,
+            &name,
+            &from,
+            &MessageSource::Text(EVICT_MSG.as_bytes().to_vec()),
+            true,
+        )
+        .map_err(|e| {
+            // 內層錯誤先出聲再蓋上 evict 的中止訊息：bash 的 `cmd_send` 跑在命令
+            // 替換的 subshell 裡，它自己的 die 早就印上 stderr 了，外層 die 是
+            // 第二行（codex 複核 2026-07-31）
+            err_line(&e.message);
+            Error::new(format!(
+                "evict 中止：收尾任務送不出去，未動 pane（agent '{name}' 仍在）"
+            ))
+        })?;
+        Ok((pane, runtime, gen_tag, task_id))
+    };
+
+    // 帶了 expect＝要 CAS，才需要把比對與建 task 圈在同一把鎖內；沒帶就照
+    // HEAD 的無鎖路徑走（含它原本的錯誤優先序）
+    let outcome = if expect_pane.is_some() || expect_gen.is_some() {
+        let guard = acquire_lock(paths, "agents-registry")?;
+        let r = prepare();
+        guard.release();
+        r
+    } else {
+        prepare()
+    };
+    let (pane, runtime, gen_tag, task_id) = outcome?;
+
+    // 鎖外通知：task 已落地，通知失敗的處置與拆分前的 `do_send` 相同
+    notify_send(paths, &name, &task_id).map_err(|e| {
         err_line(&e.message);
         Error::new(format!(
             "evict 中止：收尾任務送不出去，未動 pane（agent '{name}' 仍在）"
@@ -1327,6 +1449,39 @@ fn write_bytes_stdout(bytes: &[u8]) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// CLI-EVICT-4 的 compare-and-act 比對：只驗帶到的那一項，兩項都不帶時
+    /// MUST 通過（不帶 expect 參數＝行為與現行完全相同）。
+    #[test]
+    fn check_expect_only_validates_supplied_fields() {
+        let ok = |ep, eg| check_expect("w1", "%5", "tag-1", ep, eg);
+        // 都不帶／各自相符／兩者皆符 → 通過
+        assert!(ok(None, None).is_ok(), "不帶 expect MUST 與現行行為相同");
+        assert!(ok(Some("%5"), None).is_ok());
+        assert!(ok(None, Some("tag-1")).is_ok());
+        assert!(ok(Some("%5"), Some("tag-1")).is_ok());
+
+        // 任一不符 → selection stale，且訊息要指出實際值與期望值
+        for (ep, eg, want) in [
+            (Some("%9"), None, "%9"),
+            (None, Some("tag-2"), "tag-2"),
+            (Some("%5"), Some("tag-2"), "tag-2"),
+            (Some("%9"), Some("tag-1"), "%9"),
+        ] {
+            let e = ok(ep, eg).unwrap_err();
+            assert!(
+                e.message.contains("selection stale"),
+                "MUST 含 selection stale：{}",
+                e.message
+            );
+            assert!(e.message.contains(want), "MUST 帶期望值：{}", e.message);
+            assert!(
+                e.message.contains("未建立任何任務"),
+                "MUST 說清楚沒有副作用：{}",
+                e.message
+            );
+        }
+    }
 
     /// bash regex 的接受集合，逐點對齊（含 `1.` 這個 Rust `parse::<f64>`
     /// 會放行、bash 會拒的形狀）。

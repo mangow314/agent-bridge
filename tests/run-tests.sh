@@ -4794,6 +4794,147 @@ else
   printf 'SKIP: 41 TUI 四面板＋唯讀鍵（SRC_KIND=bash：bash 正本凍結在 M4，不含 TUI）\n'
 fi
 
+# ---- 42. evict 入口 CAS（CLI-EVICT-4） ----
+# spec: CLI-EVICT-4 CLI-EVICT-3
+# 設計正本 docs/tui-design.md §5／§9 P3 的三則 gate：
+#   (a) expect 相符 → evict 成功
+#   (b) **invocation 前已換代** → selection stale 非 0 退出，且不建 task、
+#       無通知、pane 未 kill、registry 未動、審計未新增
+#   (c) 送出後 → despawn 前換代 → 照舊拒收（既有 CLI-EVICT-3 行為，
+#       由分組 26 覆蓋；本組只確認新增的入口鎖沒有削弱它）
+# 與 35–41 同理只對 Rust 執行（bash 正本自 M4 凍結，不含 --expect-*）。
+if [[ "$SRC_KIND" == rust ]]; then
+
+D42="$TESTROOT/d42"
+
+# agents.log 的行數（證明「被拒時審計未新增」）
+# shellcheck disable=SC2329  # 經 assert 的 "$@" 間接呼叫
+audit_lines42() { wc -l < "$D42/agents.log" 2>/dev/null || printf '0'; }
+
+pane42="$(absp "$D42" 0 spawn ev42 --runtime codex 2>/dev/null)"
+GEN42="$(jq -r '.spawn_tag' "$D42/agents/ev42.json")"
+assert "42 前置：spawn_tag 讀得到（世代綁定的前提）" test -n "$GEN42"
+
+# 42a 參數面（additive）：值不得為空、缺參數被拒；被拒時不留孤兒任務
+before42="$(task_count "$D42")"
+before_audit42="$(audit_lines42)"
+assert_fails "42a --expect-pane 缺參數被拒" ab "$D42" evict ev42 --expect-pane
+assert_fails "42a --expect-generation 缺參數被拒" ab "$D42" evict ev42 --expect-generation
+assert_fails "42a --expect-pane 空值被拒" ab "$D42" evict ev42 --expect-pane ""
+assert "42a 參數被拒時不留孤兒收尾任務" test "$(task_count "$D42")" -eq "$before42"
+
+# 42b gate (b)：**invocation 前已換代**。以舊值呼叫 → selection stale，
+# 且此刻 MUST 一個副作用都沒有
+cp "$D42/agents/ev42.json" "$TESTROOT/ev42-before.json"
+jq --arg t "$GEN42-NEXT" '.spawn_tag = $t' "$TESTROOT/ev42-before.json" \
+  > "$D42/agents/ev42.json"
+cp "$D42/agents/ev42.json" "$TESTROOT/ev42-snapshot.json"
+before42="$(task_count "$D42")"
+before_audit42="$(audit_lines42)"
+ab "$D42" evict ev42 --expect-generation "$GEN42" \
+  > "$TESTROOT/ev42-stale.out" 2> "$TESTROOT/ev42-stale.err" && rc42=0 || rc42=$?
+assert "42b 世代不符：非 0 退出" test "$rc42" -ne 0
+assert "42b 世代不符：訊息含 selection stale" \
+  grep -qF "selection stale" "$TESTROOT/ev42-stale.err"
+assert "42b 世代不符：**不建 task**（tasks/ 數量不變）" \
+  test "$(task_count "$D42")" -eq "$before42"
+assert "42b 世代不符：pane 未被 kill" pane_alive "$pane42"
+assert "42b 世代不符：registry 未被動（逐字元不變）" \
+  diff -q "$TESTROOT/ev42-snapshot.json" "$D42/agents/ev42.json"
+assert "42b 世代不符：審計未新增" test "$(audit_lines42)" -eq "$before_audit42"
+assert "42b 世代不符：stdout 空（沒有 task-id 可印）" test ! -s "$TESTROOT/ev42-stale.out"
+
+# 42c pane 不符走同一條防線（只帶 --expect-pane）
+before42="$(task_count "$D42")"
+ab "$D42" evict ev42 --expect-pane "%999999" \
+  > /dev/null 2> "$TESTROOT/ev42-pane.err" && rc42=0 || rc42=$?
+assert "42c pane 不符：非 0 退出" test "$rc42" -ne 0
+assert "42c pane 不符：訊息含 selection stale" \
+  grep -qF "selection stale" "$TESTROOT/ev42-pane.err"
+assert "42c pane 不符：不建 task" test "$(task_count "$D42")" -eq "$before42"
+assert "42c pane 不符：pane 未被 kill" pane_alive "$pane42"
+
+# 42f 起始狀態 MUST 是**有效**的：42b 留下的 stale registry 若不還原，evict
+# 一進門就被擋，那又退回成「呼叫前就 stale」的形狀，殺不到 mutant
+cp "$TESTROOT/ev42-before.json" "$D42/agents/ev42.json"
+
+# 42f 鎖邊界（本組唯一能殺 mutant 的一條）：42b／42c 只證明「stale 會被擋」，
+# 但那在「先比對、後取鎖」的錯誤實作下**照樣綠**——registry 在呼叫前就已經
+# 是 stale 了。這裡改成讓換代發生在 evict **已經開始、正卡在鎖上**的時候：
+#   佔住 agents-registry 鎖 → 背景啟動帶舊 expect 的 evict（卡住）
+#   → 換代 → 放鎖 → evict 取得鎖後 MUST 重讀並判 stale
+# 「先比對後取鎖」的實作會在卡住之前就讀到舊值、比對通過，於是建出 task。
+mkdir -p "$D42/locks"
+LOCK42="$D42/locks/agents-registry.lock"
+mkdir "$LOCK42"
+before42="$(task_count "$D42")"
+# --timeout 1：正確實作會在 await 之前就 stale 掉，根本走不到那裡；帶上它是
+# 為了讓**錯誤實作**快速失敗而不是掛在預設 300s 的 await 上（實測 mutant 會）
+( ab "$D42" evict ev42 --expect-generation "$GEN42" --timeout 1 \
+    > "$TESTROOT/ev42-race.out" 2> "$TESTROOT/ev42-race.err"; \
+  printf '%s' "$?" > "$TESTROOT/ev42-race.rc" ) &
+race42_pid=$!
+sleep 0.6
+# evict 此刻 MUST 還沒建任何 task（它卡在鎖上，還沒讀 registry）
+assert "42f evict 卡在鎖上時尚未建任何 task" \
+  test "$(task_count "$D42")" -eq "$before42"
+jq --arg t "$GEN42-RACE" '.spawn_tag = $t' "$TESTROOT/ev42-before.json" \
+  > "$D42/agents/ev42.json"
+rmdir "$LOCK42"
+wait "$race42_pid" 2>/dev/null || true
+assert "42f 取得鎖後重讀 registry：判 selection stale" \
+  grep -qF "selection stale" "$TESTROOT/ev42-race.err"
+assert "42f 鎖競爭下非 0 退出" test "$(<"$TESTROOT/ev42-race.rc")" -ne 0
+assert "42f 鎖競爭下不建 task（比對若在取鎖前做，這裡會多一個）" \
+  test "$(task_count "$D42")" -eq "$before42"
+
+# 42g 「不通知」是 spec 明文（CLI-EVICT-4），pane_alive 證不到它——用計數
+# shim 直接數：selection stale 路徑 MUST 一次 send-keys 都沒有
+SHIM42="$TESTROOT/shim42"
+mkdir -p "$SHIM42"
+printf '#!/usr/bin/env bash\nprintf "%%s\\n" "$*" >> %q\nexec %q "$@"\n' \
+  "$TESTROOT/tmux-calls42.txt" "$(command -v tmux)" > "$SHIM42/tmux"
+chmod +x "$SHIM42/tmux"
+: > "$TESTROOT/tmux-calls42.txt"
+before42="$(task_count "$D42")"
+PATH="$SHIM42:$PATH" ab "$D42" evict ev42 --expect-generation "$GEN42" \
+  > /dev/null 2>&1 || true
+assert "42g selection stale：一次 send-keys 都沒有（＝沒通知任何人）" \
+  bash -c '! grep -q "send-keys" "$1"' _ "$TESTROOT/tmux-calls42.txt"
+assert "42g selection stale：仍未建 task" test "$(task_count "$D42")" -eq "$before42"
+
+# 換代模擬到此為止：registry 的 tag 已與 pane 的 pane_start_command 分家，
+# 留著會讓 42d 的 despawn 走 stale 路徑（那是 CLI-EVICT-3 的既有防線，不是
+# 本組要測的東西）。還原成真值，42d 才驗得到「相符 → 真的回收」
+cp "$TESTROOT/ev42-before.json" "$D42/agents/ev42.json"
+
+# 42d gate (a)：expect 相符（兩項都帶且都對）→ 走完整流程並成功回收
+bg_reply "$D42" ev42 "收尾筆記：CAS 相符路徑"
+tid42="$(ab "$D42" evict ev42 --from alice \
+  --expect-pane "$pane42" --expect-generation "$GEN42" \
+  2> "$TESTROOT/ev42-ok.err")" && rc42=0 || rc42=$?
+assert "42d expect 相符：exit 0" test "$rc42" -eq 0
+assert "42d expect 相符：stdout 是真的收尾 task-id" test -d "$D42/tasks/$tid42"
+assert "42d expect 相符：收尾任務派給被驅逐者" \
+  test "$(jq -r '.to' "$D42/tasks/$tid42/metadata.json")" = ev42
+assert "42d expect 相符：registry 已回收" test ! -f "$D42/agents/ev42.json"
+assert "42d expect 相符：審計記了 evicted*" \
+  grep -qE 'evicted' "$D42/agents.log"
+
+# 42e 不帶 expect 參數＝行為與現行完全相同（additive 的核心承諾）
+pane42b="$(absp "$D42" 0 spawn ev42b --runtime codex 2>/dev/null)"
+bg_reply "$D42" ev42b "收尾筆記：不帶 expect 的既有路徑"
+tid42b="$(ab "$D42" evict ev42b --from alice 2> "$TESTROOT/ev42b.err")" \
+  && rc42=0 || rc42=$?
+assert "42e 不帶 expect：exit 0（既有行為不變）" test "$rc42" -eq 0
+assert "42e 不帶 expect：收尾任務落地" test -d "$D42/tasks/$tid42b"
+assert "42e 不帶 expect：registry 已回收" test ! -f "$D42/agents/ev42b.json"
+tmx kill-pane -t "$pane42b" 2>/dev/null || true
+
+else
+  printf 'SKIP: 42 evict 入口 CAS（SRC_KIND=bash：bash 正本凍結在 M4，不含 --expect-*）\n'
+fi
+
 # ---- 總結 ----
 printf '\n共 %d PASS、%d FAIL\n' "$PASS" "$FAIL"
 if (( FAIL > 0 )); then
