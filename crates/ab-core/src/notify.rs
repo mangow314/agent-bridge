@@ -73,7 +73,34 @@ pub fn screen_has_prompt(screen: &str) -> bool {
         || (norm.contains("Do you want to proceed?") && norm.contains("esc to cancel"))
 }
 
-/// notify_pane:330 — 先驗 pane 存活、掃描確認框，再分兩次送鍵（文字、Enter）。
+/// 送鍵前的兩道畫面關卡，`notify_pane` 在送文字前與送 Enter 前各跑一次。
+///
+/// 第一道是 copy-mode（**AB-COPYMODE-1**）：pane 停在 tmux 的 copy-mode 時，
+/// `send-keys` 送出的字元會落進 copy-mode 的按鍵表而不是 worker 的輸入，實測
+/// 還會讓 `send-keys` 子行程**永不返回**（`agent-bridge receive <id>` 這串在
+/// vi copy-mode 下 5 秒逾時砍不掉自己）。這正是「人為介入」情境本身——人一
+/// 捲動 worker pane 就進 copy-mode——卻會把 orchestrator 的 `send` 整個鎖死。
+///
+/// **不得**自作主張送 `-X cancel` 把人踢出 copy-mode：那會清掉人正在看的捲動
+/// 位置，是在「人正在介入」時破壞人的現場。降級成 notify-failed 即可，訊息
+/// 仍在 mailbox，人在 pane 裡自己收得到。
+///
+/// 第二道是權限確認對話框：那個 Enter 會被當成「確認預設選項」，替一個正等
+/// 人類決策的 worker 按下批准。
+///
+/// 兩道都 fail-closed（讀不出來一律回 `false`）：無法確認 pane 狀態時放行送
+/// 鍵，等於整條防線被略過。
+fn pane_accepts_keys(tmux: &dyn TmuxClient, pane: &str) -> bool {
+    if tmux.pane_in_mode(pane) != Some(false) {
+        return false;
+    }
+    match tmux.capture_pane(pane) {
+        Some(screen) => !screen_has_prompt(&screen),
+        None => false,
+    }
+}
+
+/// notify_pane:330 — 先驗 pane 存活、過畫面關卡，再分兩次送鍵（文字、Enter）。
 /// 任一關卡失敗都回 `false`（呼叫端走 notify-failed 降級：訊息仍在 mailbox，
 /// 可復原）。
 pub fn notify_pane(tmux: &dyn TmuxClient, pane: &str, cmd: &str) -> bool {
@@ -86,23 +113,20 @@ pub fn notify_pane(tmux: &dyn TmuxClient, pane: &str, cmd: &str) -> bool {
     if !tmux.pane_exists(pane) {
         return false;
     }
-    // 送鍵前確認 pane 沒停在權限確認對話框：那個 Enter 會被當成「確認預設
-    // 選項」，替一個正等人類決策的 worker 按下批准。capture 失敗一律
-    // fail-closed（`None` → 回 false），不放行送鍵。
-    match tmux.capture_pane(pane) {
-        Some(screen) if !screen_has_prompt(&screen) => {}
-        _ => return false,
+    if !pane_accepts_keys(tmux, pane) {
+        return false;
     }
     if !tmux.send_keys(pane, cmd) {
         return false;
     }
     sleep_notify_delay();
-    // 送 Enter 前再掃一次（同樣 fail-closed）：worker 可能在這段延遲內才彈框。
-    // 殘留 race 與 bash 同（capture 與 send-keys 之間的微小空窗，tmux 給不了
-    // pane-side 原子性）。
-    match tmux.capture_pane(pane) {
-        Some(screen) if !screen_has_prompt(&screen) => {}
-        _ => return false,
+    // 送 Enter 前再過一次同樣的關卡：worker 可能在這段延遲內才彈框，人也可能
+    // 剛好在這段延遲內捲動 pane 進 copy-mode。殘留 race 與 bash 同（檢查與
+    // send-keys 之間的微小空窗，tmux 給不了 pane-side 原子性）——那道空窗由
+    // `send_keys` 自身的逾時兜底（tmux.rs `wait_with_timeout`），不會變成
+    // 永久鎖死。
+    if !pane_accepts_keys(tmux, pane) {
+        return false;
     }
     tmux.send_keys(pane, "Enter")
 }
@@ -195,6 +219,113 @@ pub fn notify_or_defer(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::RefCell;
+
+    /// 可調三個關卡回應的 tmux 替身，並記下實際送出的鍵。
+    ///
+    /// `modes` 是**逐次查詢**的回應序列（用完後沿用最後一個）：`notify_pane`
+    /// 會掃兩次，而「第一次乾淨、第二次才進 copy-mode」正是人在 0.3 秒延遲裡
+    /// 捲動 pane 的情形——固定值的替身測不出第二道關卡是否真的存在。
+    struct FakeTmux {
+        modes: Vec<Option<bool>>,
+        mode_calls: std::cell::Cell<usize>,
+        screen: Option<&'static str>,
+        sent: RefCell<Vec<String>>,
+    }
+
+    impl FakeTmux {
+        fn new(in_mode: Option<bool>, screen: Option<&'static str>) -> Self {
+            Self::with_modes(vec![in_mode], screen)
+        }
+
+        fn with_modes(modes: Vec<Option<bool>>, screen: Option<&'static str>) -> Self {
+            Self {
+                modes,
+                mode_calls: std::cell::Cell::new(0),
+                screen,
+                sent: RefCell::new(Vec::new()),
+            }
+        }
+    }
+
+    impl TmuxClient for FakeTmux {
+        fn exec(&self, _args: &[&str]) -> Option<crate::tmux::TmuxOutput> {
+            None
+        }
+        fn available(&self) -> bool {
+            true
+        }
+        fn resolve_pane(&self, _t: &str) -> Option<String> {
+            None
+        }
+        fn pane_exists(&self, _p: &str) -> bool {
+            true
+        }
+        fn capture_pane(&self, _p: &str) -> Option<String> {
+            self.screen.map(|s| s.to_string())
+        }
+        fn pane_in_mode(&self, _p: &str) -> Option<bool> {
+            let n = self.mode_calls.get();
+            self.mode_calls.set(n + 1);
+            self.modes[n.min(self.modes.len() - 1)]
+        }
+        fn send_keys(&self, _p: &str, keys: &str) -> bool {
+            self.sent.borrow_mut().push(keys.to_string());
+            true
+        }
+    }
+
+    /// AB-COPYMODE-1：pane 停在 copy-mode 時 MUST NOT 送鍵。
+    ///
+    /// 「回 false」單獨不夠——**一個鍵都不能送出去**才是重點：copy-mode 中的
+    /// send-keys 實測會永不返回，而且會把人正在看的捲動現場攪掉。
+    #[test]
+    fn copy_mode_pane_gets_no_keys_at_all() {
+        let tmux = FakeTmux::new(Some(true), Some("$ ls\nfoo\n"));
+        assert!(!notify_pane(&tmux, "%1", "agent-bridge receive t1"));
+        assert!(tmux.sent.borrow().is_empty());
+    }
+
+    /// mode 讀不出來（tmux 查詢失敗）→ fail-closed，同 capture 失敗的方向：
+    /// 無法確認 pane 狀態時放行送鍵，等於整條防線被略過。
+    #[test]
+    fn unknown_mode_fails_closed() {
+        let tmux = FakeTmux::new(None, Some("$ ls\nfoo\n"));
+        assert!(!notify_pane(&tmux, "%1", "agent-bridge receive t1"));
+        assert!(tmux.sent.borrow().is_empty());
+    }
+
+    /// 三個關卡都乾淨才送鍵，且是「文字、Enter」兩次。
+    #[test]
+    fn clean_pane_gets_command_then_enter() {
+        let tmux = FakeTmux::new(Some(false), Some("$ ls\nfoo\n"));
+        assert!(notify_pane(&tmux, "%1", "agent-bridge receive t1"));
+        assert_eq!(
+            *tmux.sent.borrow(),
+            vec!["agent-bridge receive t1".to_string(), "Enter".to_string()]
+        );
+    }
+
+    /// 人在兩次送鍵之間的延遲裡捲動了 pane：第二道關卡必須攔下 Enter。
+    ///
+    /// 沒有這條，把送 Enter 前的 mode 檢查刪掉一樣全綠——而那個 Enter 會落進
+    /// copy-mode 的按鍵表，還可能讓 send-keys 卡住。
+    #[test]
+    fn entering_copy_mode_during_the_delay_blocks_the_enter() {
+        let tmux = FakeTmux::with_modes(vec![Some(false), Some(true)], Some("$ ls\nfoo\n"));
+        assert!(!notify_pane(&tmux, "%1", "agent-bridge receive t1"));
+        // 文字已送出（第一次掃描時畫面還乾淨），但 Enter 必須被擋下
+        assert_eq!(*tmux.sent.borrow(), vec!["agent-bridge receive t1"]);
+    }
+
+    /// copy-mode 的關卡不得取代權限框的關卡：不在 mode、但畫面停在權限框時，
+    /// 仍然一個鍵都不送。
+    #[test]
+    fn permission_box_still_blocks_when_not_in_mode() {
+        let tmux = FakeTmux::new(Some(false), Some("Do you want to proceed? … Esc to cancel"));
+        assert!(!notify_pane(&tmux, "%1", "agent-bridge receive t1"));
+        assert!(tmux.sent.borrow().is_empty());
+    }
 
     /// CC canary 的 Rust 側對應（分組 30）：套件那組把特徵字串拿去比對安裝中
     /// 的 claude 執行檔，抽取來源是 **bash 正本**（源碼耦合檢查，M4 才改綁

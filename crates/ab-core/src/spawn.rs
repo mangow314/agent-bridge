@@ -1746,6 +1746,9 @@ mod tests {
         fn capture_pane(&self, _pane: &str) -> Option<String> {
             None
         }
+        fn pane_in_mode(&self, _pane: &str) -> Option<bool> {
+            None
+        }
         fn send_keys(&self, _pane: &str, _keys: &str) -> bool {
             false
         }
@@ -1796,6 +1799,9 @@ mod tests {
                 false
             }
             fn capture_pane(&self, _p: &str) -> Option<String> {
+                None
+            }
+            fn pane_in_mode(&self, _p: &str) -> Option<bool> {
                 None
             }
             fn send_keys(&self, _p: &str, _k: &str) -> bool {

@@ -44,6 +44,8 @@ pub const ENV_PASS_ENV: &str = "AGENT_BRIDGE_PASS_ENV";
 pub const ENV_RELAY_DEPTH: &str = "AGENT_BRIDGE_RELAY_DEPTH";
 /// 接力鏈深度上限（0＝解除限制）。
 pub const ENV_MAX_RELAY_DEPTH: &str = "AGENT_BRIDGE_MAX_RELAY_DEPTH";
+/// 單次 tmux 送鍵子行程的逾時秒數（0＝不設限）。
+pub const ENV_TMUX_TIMEOUT: &str = "AGENT_BRIDGE_TMUX_TIMEOUT";
 
 /// state TTL 的預設值（bash `${AGENT_BRIDGE_STATE_TTL:-1800}`）。
 pub const STATE_TTL_DEFAULT: i64 = 1800;
@@ -135,6 +137,47 @@ pub fn notify_delay_secs() -> Option<f64> {
     match raw.parse::<f64>() {
         Ok(v) if v.is_finite() && v > 0.0 => Some(v),
         _ => None,
+    }
+}
+
+/// `AGENT_BRIDGE_TMUX_TIMEOUT`：單次 tmux 送鍵子行程的逾時秒數，預設 `5`。
+/// `Some(d)`＝設此上限，`None`＝不設限。
+///
+/// **壞值退預設、不 die**：這是防止整個指令被鎖死的安全網（AB-COPYMODE-1），
+/// 拼錯一個環境變數不該把安全網整個拆掉——與 `state_ttl_lenient` 同方向。
+/// `0` 則是顯式的逃生口（回到加逾時之前的無限等待），照收。
+///
+/// 上限只需涵蓋「tmux 正常回應」的量級（毫秒級），預設 5 秒已極寬鬆；真正
+/// 的 copy-mode 卡死是永不返回，多寬的窗都會撞到。
+pub fn tmux_timeout() -> Option<std::time::Duration> {
+    match read_env(ENV_TMUX_TIMEOUT) {
+        EnvValue::Text(raw) => parse_tmux_timeout(Some(&raw)),
+        // 未設定與非 UTF-8 都退預設（安全網不因壞值消失）
+        _ => parse_tmux_timeout(None),
+    }
+}
+
+/// `tmux_timeout` 的純判定核心（環境變數已讀成 `Option<&str>`）。
+///
+/// 抽出來是為了可測：直接測 `tmux_timeout()` 得動 process 全域的環境變數，
+/// 而測試是平行跑的——那種測試會做出隨機紅。
+///
+/// 上限 `MAX_SECS`（一天）不是「合理的等待時間」而是溢位護欄：
+/// `Instant::now() + Duration::from_secs(u64::MAX)` 會 panic，而 panic 的位置
+/// 在任務已建立之後的通知階段（跨廠複核 2026-07-31 finding 2）。夾住而非退
+/// 預設，是因為使用者寫一個超大值的意圖顯然是「幾乎別逾時」，夾到一天完整
+/// 保留那個意圖；真的想要不設限有 `0` 這個顯式逃生口。
+fn parse_tmux_timeout(raw: Option<&str>) -> Option<std::time::Duration> {
+    const DEFAULT_SECS: u64 = 5;
+    const MAX_SECS: u64 = 86_400;
+    let secs = match raw {
+        Some(s) => s.trim().parse::<u64>().unwrap_or(DEFAULT_SECS),
+        None => DEFAULT_SECS,
+    };
+    if secs == 0 {
+        None
+    } else {
+        Some(std::time::Duration::from_secs(secs.min(MAX_SECS)))
     }
 }
 
@@ -300,6 +343,42 @@ fn lossy(name: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// ENV-TMUX-1 的值域：預設 5、`0`＝不設限、壞值退預設。
+    ///
+    /// 壞值必須退預設而非關掉上限：這是防止整個 `send` 被 tmux 鎖死的安全網
+    /// （AB-COPYMODE-1），拼錯一個變數名不該把安全網拆掉。
+    #[test]
+    fn tmux_timeout_value_domain() {
+        use std::time::Duration;
+        assert_eq!(parse_tmux_timeout(None), Some(Duration::from_secs(5)));
+        assert_eq!(parse_tmux_timeout(Some("2")), Some(Duration::from_secs(2)));
+        assert_eq!(
+            parse_tmux_timeout(Some(" 7 ")),
+            Some(Duration::from_secs(7))
+        );
+        // 顯式逃生口：不設限
+        assert_eq!(parse_tmux_timeout(Some("0")), None);
+        // 壞值一律退預設，**不得**變成 None（那等於安全網被壞值拆掉）
+        for bad in ["abc", "", "-1", "1.5", "5s"] {
+            assert_eq!(
+                parse_tmux_timeout(Some(bad)),
+                Some(Duration::from_secs(5)),
+                "壞值應退預設：{bad}"
+            );
+        }
+    }
+
+    /// 溢位護欄：合法但極大的 `u64` 曾讓 `Instant + Duration` 在通知階段
+    /// panic（跨廠複核 2026-07-31 finding 2）。夾到上限，不是退預設也不是 panic。
+    #[test]
+    fn absurdly_large_timeout_is_clamped_not_fatal() {
+        use std::time::Duration;
+        let huge = parse_tmux_timeout(Some(&u64::MAX.to_string())).expect("不得變成不設限");
+        assert_eq!(huge, Duration::from_secs(86_400));
+        // 夾過的值必須加得出期限（原 panic 的算式）
+        assert!(std::time::Instant::now().checked_add(huge).is_some());
+    }
 
     /// `validate_ready_opts` 的零值判斷：`0`／`0.0`／`.0`／`00` 全是零，
     /// 必須被擋（bash `^0*(\.0+)?$`）。`1.` 則是形狀就不合法。

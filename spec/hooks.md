@@ -171,3 +171,14 @@ notify-failed 警告；pane 已死、capture 失敗同走 notify-failed，任務
 mailbox 不遺失。偵測是 best-effort 字串特徵比對，特徵字串 MUST 與現裝
 runtime 實際文案保持一致（有 canary 測試守著）。
 Source: notify_pane / screen_has_prompt
+
+### HOOK-NOTIFY-3 [tested: 39]
+legacy 送鍵前 MUST 確認目標 pane 不在 tmux 的 copy-mode，是則 MUST NOT 送鍵，
+降級為 notify-failed（任務仍在 mailbox）。查不到 mode 狀態同樣 MUST 視為不可
+送鍵（fail-closed，同 HOOK-NOTIFY-2 的 capture 失敗）。**MUST NOT** 為了送鍵
+而把 pane 踢出 copy-mode：捲動位置是人正在介入的現場。
+通知路徑用到的**每一個** tmux 子行程（pane 存活查詢、mode 查詢、capture、
+送鍵）MUST 有逾時（見 env.md ENV-TMUX-1）：檢查與送鍵之間存在 TOCTOU 空窗，
+而 copy-mode 中的 send-keys 實測永不返回；只擋送鍵則任一查詢卡住仍會鎖死
+整條 `send`，上限形同不存在。逾時 MUST 與「tmux 起不來」同樣 fail-closed。
+Source: notify_pane / pane_accepts_keys / tmux::run_bounded

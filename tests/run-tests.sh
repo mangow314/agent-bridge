@@ -4182,6 +4182,170 @@ else
   printf 'SKIP: 38 list --long（SRC_KIND=bash：bash 正本凍結在 M4）\n'
 fi
 
+# ---- 39 copy-mode 送鍵防線（AB-COPYMODE-1）----
+#
+# 人一捲動 worker pane 就會進 tmux copy-mode——那正是「人為介入」情境本身。
+# 實測：pane 在 copy-mode 時 `tmux send-keys -t <pane> 'agent-bridge receive
+# <id>'` **永不返回**，於是 orchestrator 的整條 send 被鎖死，且沒有逾時能救。
+#
+# 本組鎖四件事：① copy-mode 中一個按鍵都不送、降級成 notify-failed；②
+# **不得**替人 `-X cancel`——人正在看的捲動位置是介入現場，清掉比不通知更糟；
+# ③ 送鍵子行程有逾時兜底（檢查與送鍵之間的 TOCTOU 空窗仍可能撞上 copy-mode，
+# 沒有逾時那個空窗就是永久鎖死）；④ mode 查不出來時 fail-closed。
+#
+# 與 35–38 同理只對 Rust 執行；bash 正本自 M4 凍結，顯式 SKIP。
+if [[ "$SRC_KIND" == rust ]]; then
+
+D39="$TESTROOT/d39"
+
+# 39a／39b 真 copy-mode。用一個**全透傳**的 shim（行為與正常 SHIM 相同，只多
+# 記一筆 send-keys 呼叫）：光看「shell 沒收到字」證不了 gate 存在——拿掉 gate
+# 只留逾時，send-keys 照樣被呼叫、照樣卡死逾時、shell 照樣沒收到字、mode 照樣
+# 沒被取消，四條斷言全綠（跨廠複核 2026-07-31 finding 3 的假綠）。marker 檔把
+# 「有沒有真的呼叫下去」直接變成可觀察量。
+KEYSHIM="$TESTROOT/keyshim"
+mkdir -p "$KEYSHIM"
+cat > "$KEYSHIM/tmux" <<EOF
+#!/usr/bin/env bash
+unset TMUX
+if [[ "\$1" == "send-keys" ]]; then
+  { printf '%s ' "\$@"; printf '\n'; } >> $(printf '%q' "$TESTROOT/a39-sendkeys.log")
+fi
+exec $(printf '%q' "$REAL_TMUX") -L $(printf '%q' "$SOCK") -f /dev/null "\$@"
+EOF
+chmod +x "$KEYSHIM/tmux"
+
+p39="$(tmx split-window -dP -F '#{pane_id}' -t it "$pane_cmd")"
+ab "$D39" register cm39 "$p39" >/dev/null 2>&1
+tmx send-keys -t "$p39" \
+  "printf '%s\n' 'normal worker output' ; touch $TESTROOT/cm-ready ; while IFS= read -r l ; do printf '%s\n' \"\$l\" >> $TESTROOT/cm-got.txt ; done" Enter
+wait_for 10 test -f "$TESTROOT/cm-ready"
+tmx copy-mode -t "$p39"
+# 前置條件：pane 真的進了 mode。不驗這條，39a 可能是在「根本沒進 copy-mode」
+# 的畫面上假綠通過
+tmx display -pt "$p39" '#{pane_in_mode}' > "$TESTROOT/cm-mode-pre.txt" 2>/dev/null
+assert "39a 前置：pane 確實進入 copy-mode" \
+  grep -Fxq 1 "$TESTROOT/cm-mode-pre.txt"
+# 逾時值壓到 2 秒：防線若破了，這裡是套件唯一會撞到卡死的地方，不該讓它等滿
+# 預設窗。整個呼叫再包一層 timeout，鎖住「有限時間內返回」本身
+id39="$(env AGENT_BRIDGE_DATA="$D39" AGENT_BRIDGE_TMUX_TIMEOUT=2 PATH="$KEYSHIM:$PATH" \
+  timeout 30 "$BRIDGE" send cm39 --from alice --message hi 2>/dev/null)"
+assert "39a copy-mode：send 仍在有限時間內返回並產生任務 id" \
+  test -n "$id39"
+assert "39a copy-mode：send-keys 根本沒被呼叫（是 gate 擋下，不是逾時擋下）" \
+  test ! -f "$TESTROOT/a39-sendkeys.log"
+assert "39a copy-mode：events.log 記 notify-failed（降級而非靜默成功）" \
+  evt_grep "$D39/tasks/$id39/events.log" notify-failed
+# 39b 先驗現場沒被清掉，再由測試自己離開 mode
+tmx display -pt "$p39" '#{pane_in_mode}' > "$TESTROOT/cm-mode-post.txt" 2>/dev/null
+assert "39b 不得替人 cancel：pane 仍停在 copy-mode（捲動現場保住）" \
+  grep -Fxq 1 "$TESTROOT/cm-mode-post.txt"
+tmx send-keys -X -t "$p39" cancel 2>/dev/null || true
+# 哨兵法驗「一個按鍵都沒送」：離開 mode 後補一行哨兵，got 應恰好只有哨兵
+tmx send-keys -t "$p39" 'SENTINEL-cm' Enter
+assert "39a copy-mode：記錄機制活著（哨兵行有進 got）" \
+  wait_for 10 grep -q 'SENTINEL-cm' "$TESTROOT/cm-got.txt"
+# shellcheck disable=SC2016  # 單引號故意：$1/$2 由內層 bash 展開
+assert "39a copy-mode：got 恰好只有哨兵一行（通知文字一個按鍵都沒送達）" \
+  bash -c 'test "$(wc -l < "$1")" -eq 1 && grep -Fxq "$2" "$1"' _ "$TESTROOT/cm-got.txt" 'SENTINEL-cm'
+tmx kill-pane -t "$p39" 2>/dev/null || true
+
+# 39c 逾時兜底：send-keys 永不返回時，指令 MUST NOT 被無限鎖死。
+# 真 copy-mode 的卡死不是每個 tmux 版本／mode-keys 設定都構造得出來，改用
+# shim 直接注入「send-keys 掛住」這個終態——鎖的是逾時機制本身。
+# `exec sleep` 而非 `sleep`：被殺的必須是 sleep 本人，否則 shim 死了、孫行程
+# 還在背景睡滿 300 秒。
+D39c="$TESTROOT/d39c"
+HANGSHIM="$TESTROOT/hangshim"
+mkdir -p "$HANGSHIM"
+cat > "$HANGSHIM/tmux" <<EOF
+#!/usr/bin/env bash
+unset TMUX
+if [[ "\$1" == "send-keys" ]]; then
+  touch $(printf '%q' "$TESTROOT/c39-hang-hit")
+  exec sleep 300
+fi
+exec $(printf '%q' "$REAL_TMUX") -L $(printf '%q' "$SOCK") -f /dev/null "\$@"
+EOF
+chmod +x "$HANGSHIM/tmux"
+env AGENT_BRIDGE_DATA="$D39c" PATH="$HANGSHIM:$PATH" "$BRIDGE" \
+  register hang39 "$PANE_B" >/dev/null 2>&1
+id39c="$(env AGENT_BRIDGE_DATA="$D39c" AGENT_BRIDGE_TMUX_TIMEOUT=2 PATH="$HANGSHIM:$PATH" \
+  timeout 30 "$BRIDGE" send hang39 --from alice --message hi 2>/dev/null)"
+assert "39c 逾時兜底：send-keys 卡死時指令仍在有限時間內返回" \
+  test -n "$id39c"
+# marker 排除「PATH 沒生效、其實走了正常路徑」的偽陰性
+assert "39c 逾時兜底：shim 的 send-keys 確實被呼叫到" \
+  test -f "$TESTROOT/c39-hang-hit"
+assert "39c 逾時兜底：events.log 記 notify-failed" \
+  evt_grep "$D39c/tasks/$id39c/events.log" notify-failed
+
+# 39d mode 查不出來 → fail-closed。只讓 `#{pane_in_mode}` 查詢失敗，其餘子命令
+# 照常透傳：無法確認 pane 狀態時放行送鍵，等於整條防線被略過。
+D39d="$TESTROOT/d39d"
+MODESHIM="$TESTROOT/modeshim"
+mkdir -p "$MODESHIM"
+cat > "$MODESHIM/tmux" <<EOF
+#!/usr/bin/env bash
+unset TMUX
+for a in "\$@"; do
+  if [[ "\$a" == '#{pane_in_mode}' ]]; then
+    touch $(printf '%q' "$TESTROOT/d39-mode-hit")
+    echo "display failed (test stub)" >&2; exit 1
+  fi
+done
+if [[ "\$1" == "send-keys" ]]; then
+  { printf '%s ' "\$@"; printf '\n'; } >> $(printf '%q' "$TESTROOT/d39-sendkeys.log")
+  exit 0
+fi
+exec $(printf '%q' "$REAL_TMUX") -L $(printf '%q' "$SOCK") -f /dev/null "\$@"
+EOF
+chmod +x "$MODESHIM/tmux"
+env AGENT_BRIDGE_DATA="$D39d" PATH="$MODESHIM:$PATH" "$BRIDGE" \
+  register mode39 "$PANE_B" >/dev/null 2>&1
+id39d="$(env AGENT_BRIDGE_DATA="$D39d" PATH="$MODESHIM:$PATH" \
+  timeout 30 "$BRIDGE" send mode39 --from alice --message hi 2>/dev/null)"
+assert "39d fail-closed：mode 查詢確實被 shim 攔截" \
+  test -f "$TESTROOT/d39-mode-hit"
+assert "39d fail-closed：mode 查不出來時一個按鍵都不送" \
+  test ! -f "$TESTROOT/d39-sendkeys.log"
+assert "39d fail-closed：events.log 記 notify-failed" \
+  evt_grep "$D39d/tasks/$id39d/events.log" notify-failed
+
+# 39e 逾時上限涵蓋整條通知路徑，不只 send-keys：notify_pane 在送鍵之前還會跑
+# list-panes／display／capture-pane 三種查詢，任何一個卡住，send 照樣無限等待
+# ——只擋 send-keys 等於上限形同不存在（跨廠複核 2026-07-31 finding 1）。
+# 這裡讓 mode 查詢永不返回：它排在 send-keys 之前，逾時若沒套到查詢層就會鎖死。
+D39e="$TESTROOT/d39e"
+MODEHANGSHIM="$TESTROOT/modehangshim"
+mkdir -p "$MODEHANGSHIM"
+cat > "$MODEHANGSHIM/tmux" <<EOF
+#!/usr/bin/env bash
+unset TMUX
+for a in "\$@"; do
+  if [[ "\$a" == '#{pane_in_mode}' ]]; then
+    touch $(printf '%q' "$TESTROOT/e39-modehang-hit")
+    exec sleep 300
+  fi
+done
+exec $(printf '%q' "$REAL_TMUX") -L $(printf '%q' "$SOCK") -f /dev/null "\$@"
+EOF
+chmod +x "$MODEHANGSHIM/tmux"
+env AGENT_BRIDGE_DATA="$D39e" PATH="$MODEHANGSHIM:$PATH" "$BRIDGE" \
+  register modehang39 "$PANE_B" >/dev/null 2>&1
+id39e="$(env AGENT_BRIDGE_DATA="$D39e" AGENT_BRIDGE_TMUX_TIMEOUT=2 PATH="$MODEHANGSHIM:$PATH" \
+  timeout 30 "$BRIDGE" send modehang39 --from alice --message hi 2>/dev/null)"
+assert "39e 查詢層逾時：mode 查詢卡死時指令仍在有限時間內返回" \
+  test -n "$id39e"
+assert "39e 查詢層逾時：shim 的 mode 查詢確實被呼叫到" \
+  test -f "$TESTROOT/e39-modehang-hit"
+assert "39e 查詢層逾時：events.log 記 notify-failed" \
+  evt_grep "$D39e/tasks/$id39e/events.log" notify-failed
+
+else
+  printf 'SKIP: 39 copy-mode 送鍵防線（SRC_KIND=bash：bash 正本凍結在 M4）\n'
+fi
+
 # ---- 總結 ----
 printf '\n共 %d PASS、%d FAIL\n' "$PASS" "$FAIL"
 if (( FAIL > 0 )); then

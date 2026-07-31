@@ -1,6 +1,6 @@
 # 環境變數契約
 
-全部 14 個 `AGENT_BRIDGE_*` 變數。通則：
+全部 15 個 `AGENT_BRIDGE_*` 變數。通則：
 
 ### ENV-GEN-1 [untested]
 未設定（unset）時每個變數 MUST 取本檔載明的預設值；本檔未列的
@@ -42,6 +42,15 @@ Source: cmd_await
 `AGENT_BRIDGE_NOTIFY_DELAY`：legacy 送鍵通知中 command 與 Enter 之間的
 延遲秒數。預設 `0.3`。
 Source: notify_pane
+
+### ENV-TMUX-1 [tested: 39]
+`AGENT_BRIDGE_TMUX_TIMEOUT`：通知路徑上單次 tmux 子行程的逾時秒數。預設 `5`，
+`0` 等同不設限。逾時 MUST 殺掉子行程並視同該次呼叫失敗（走 notify-failed
+降級）。壞值 MUST 退預設而非終止：這是防止整個指令被鎖死的安全網（見
+hooks.md HOOK-NOTIFY-3），拼錯一個變數名不該把安全網拆掉。
+合法但極大的值 MUST 夾到內部上限而非 panic——溢位的期限計算會在任務**已建立
+之後**的通知階段炸掉，比不逾時更難救。
+Source: config::tmux_timeout / tmux::run_bounded
 
 ### ENV-TTL-1 [tested: 33, 34]
 `AGENT_BRIDGE_STATE_TTL`：state 檔（見 state.md STATE-CHAN-*）新鮮度秒數。
