@@ -803,9 +803,134 @@ pub fn read_response(paths: &Paths, id: &str) -> Result<ReadOutcome> {
     })
 }
 
+/// await 的兩種正常終局。**逾時必須與操作性失敗分得開**：呼叫端（evict）只在
+/// 真逾時才走「筆記沒落地仍回收」，其他非零是 await 自己壞掉——worker 可能還
+/// 活著、根本沒等到期限，這時回收等於把活的 context 當逾時殺掉。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum AwaitOutcome {
+    Terminal(String),
+    Timeout(String),
+}
+
+/// cmd_await:822 的等待主體（唯讀輪詢 status 檔，不寫 events、不取鎖）。
+/// CLI 的 `await` 與 evict 的第二段共用同一份（審查 F6：分家就會漂移）。
+///
+/// **函式內不印任何字**：逾時的呈現（CLI 印一行再 exit 124）由呼叫端決定。
+pub fn await_task(paths: &Paths, id: &str, timeout: u64) -> Result<AwaitOutcome> {
+    let dir = require_task_dir(paths, id)?;
+
+    // 輪詢間隔在進迴圈前就驗：壞值在 bash 會讓 sleep 立刻報錯、await 毫秒級
+    // 非零退出，呼叫端若把這種操作性失敗當成逾時（evict 曾如此）就會殺掉還
+    // 活著的 worker。此處同樣先驗後跑，維持「124 只等於真逾時」的契約。
+    //
+    // **`var_os` 而非 `var`**（codex 複核 2026-07-31 blocker）：`var()` 把
+    // 「已設定但非 UTF-8」壓成 `Err`→空字串→退預設 1.0，而 bash 拿到的是原始
+    // 位元組、regex 判不過就 die。差異不只多睡一秒——evict 會把這種 config
+    // 錯誤誤分類成真逾時而去 despawn 一個還活著的 worker。非 UTF-8 在這裡
+    // 走「值不合法」那條（訊息裡的值以 lossy 呈現，目的是讓人看見自己設了什麼）。
+    let raw_os = std::env::var_os(crate::config::ENV_POLL_INTERVAL).unwrap_or_default();
+    let raw = raw_os.to_string_lossy().into_owned();
+    let is_unicode = raw_os.to_str().is_some();
+    let interval: f64 = if !is_unicode {
+        return Err(Error::new(format!(
+            "AGENT_BRIDGE_POLL_INTERVAL 需為正數（秒）：{raw}"
+        )));
+    } else if raw.is_empty() {
+        1.0
+    } else {
+        let parsed = if poll_interval_shape_ok(&raw) {
+            raw.parse::<f64>().ok()
+        } else {
+            None
+        };
+        match parsed {
+            Some(v) if v.is_finite() && v > 0.0 => v,
+            Some(_) => {
+                return Err(Error::new(format!(
+                    "AGENT_BRIDGE_POLL_INTERVAL 需大於 0（否則輪詢忙迴圈）：{raw}"
+                )));
+            }
+            None => {
+                return Err(Error::new(format!(
+                    "AGENT_BRIDGE_POLL_INTERVAL 需為正數（秒）：{raw}"
+                )));
+            }
+        }
+    };
+
+    let started = std::time::Instant::now();
+    loop {
+        let st = read_status(&dir).map_err(|_| {
+            Error::new(format!(
+                "await 無法讀取 task {id} 的 status 檔（任務目錄被移走？）"
+            ))
+        })?;
+        if matches!(st.as_str(), "completed" | "failed" | "cancelled") {
+            return Ok(AwaitOutcome::Terminal(st));
+        }
+        if timeout > 0 && started.elapsed().as_secs() >= timeout {
+            return Ok(AwaitOutcome::Timeout(st));
+        }
+        std::thread::sleep(poll_sleep(interval));
+    }
+}
+
+/// 輪詢間隔（秒）→ `Duration`。
+///
+/// **`try_from_secs_f64` 而非 `from_secs_f64`**：後者對超出 `Duration` 值域的
+/// finite 值是 **panic**，而 `await_task` 的驗證只擋掉「非正數／非有限」
+/// ——`AGENT_BRIDGE_POLL_INTERVAL=1e300` 這種形狀會一路走到這裡。在 CLI 上
+/// 那是 exit 101；在 TUI 的一次性 thread 上是工人直接 unwind、evict 的終局
+/// 訊息永遠不會回來、in-flight 閘永遠不放開（codex 複核 major #3）。
+/// bash 那邊是把值交給 `sleep`，超大值就睡到天荒地老；`Duration::MAX` 是同一
+/// 個終態（處置同 `spawn::wait_ready`）。
+fn poll_sleep(interval: f64) -> std::time::Duration {
+    std::time::Duration::try_from_secs_f64(interval).unwrap_or(std::time::Duration::MAX)
+}
+
+/// 精確翻譯 bash `^([0-9]+|[0-9]*\.[0-9]+)$`（bin/agent-bridge:847-848）：
+/// 小數點後**至少一位數字**。`1.` 在 bash 被拒，Rust 的 `parse::<f64>` 卻
+/// 收得下——不特別擋就會多接受一種 bash 判為設定錯誤的值。
+fn poll_interval_shape_ok(raw: &str) -> bool {
+    match raw.split_once('.') {
+        None => !raw.is_empty() && raw.bytes().all(|b| b.is_ascii_digit()),
+        Some((int_part, frac)) => {
+            int_part.bytes().all(|b| b.is_ascii_digit())
+                && !frac.is_empty()
+                && frac.bytes().all(|b| b.is_ascii_digit())
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 極大但 finite 的輪詢間隔 MUST NOT panic（`from_secs_f64` 會）：
+    /// 那條路徑在 TUI 的一次性工人上會讓 evict 的終局訊息永遠不回來
+    /// （codex 複核 major #3）。上界一律夾到 `Duration::MAX`（＝bash 的
+    /// 「sleep 到天荒地老」）。
+    #[test]
+    fn poll_sleep_clamps_instead_of_panicking() {
+        assert_eq!(poll_sleep(0.5), std::time::Duration::from_millis(500));
+        assert_eq!(poll_sleep(2.0), std::time::Duration::from_secs(2));
+        // `AGENT_BRIDGE_POLL_INTERVAL=1e300`：形狀合法（正、有限），值域外
+        for huge in [1e300_f64, f64::MAX, 1.9e19] {
+            assert_eq!(poll_sleep(huge), std::time::Duration::MAX, "值：{huge}");
+        }
+    }
+
+    /// bash regex 的接受集合，逐點對齊（含 `1.` 這個 Rust `parse::<f64>`
+    /// 會放行、bash 會拒的形狀）。
+    #[test]
+    fn poll_interval_shape_matches_bash_regex() {
+        for good in ["1", "0", "05", "0.5", ".5", "10.25", "000"] {
+            assert!(poll_interval_shape_ok(good), "應接受：{good}");
+        }
+        for bad in ["1.", "", ".", "1.2.3", "-1", "1e3", "abc", " 1", "1 "] {
+            assert!(!poll_interval_shape_ok(bad), "應拒絕：{bad}");
+        }
+    }
 
     struct Dir {
         path: PathBuf,

@@ -4935,6 +4935,180 @@ else
   printf 'SKIP: 42 evict 入口 CAS（SRC_KIND=bash：bash 正本凍結在 M4，不含 --expect-*）\n'
 fi
 
+# ---- 43. TUI evict 證據框（CAS） ----
+# spec: CLI-UI-1 CLI-EVICT-4 CLI-EVICT-3
+# 設計正本 docs/tui-design.md §3／§5 的 `e`：
+#   (a) worker 列按 e → 證據框措辭是「派收尾任務後回收」、逐字顯示等價 CLI
+#       原文（含兩個 --expect-*），且畫面上不得出現「安全刪除」語彙
+#   (b) n／Esc 放棄 → 一個副作用都沒有
+#   (c) 開框後換代 → y 確認時**重讀 registry**判 selection stale：不建 task、
+#       pane 未 kill（TUI 側的 compare-and-act，與分組 42 的 CLI 側成對）
+#   (d) 相符 → 走下沉的 core 編排：收尾任務落地後 registry 回收、pane 被 kill
+#   (e) evict 的 await 段（預設 300s）跑在**一次性 thread** 上：期間 UI 仍收得
+#       了鍵（? 開得了合法鍵頁），同一個 worker 再按 e 只提示「進行中」
+# 與 40–42 同理只對 Rust 執行（bash 正本自 M4 凍結，不含 TUI）。
+if [[ "$SRC_KIND" == rust ]]; then
+
+D43="$TESTROOT/d43"
+mkdir -p "$D43"
+
+# 真 spawn：pane 的 start command 帶 spawn_tag，despawn 才認得出這一代
+# （手寫 registry 會讓 tag 與 pane 分家，evict 一律走 stale 路徑）
+# --window：本組跑在 40–42 之後，owner window 已被前面的分組塞滿 pane，
+# 共用視窗的 split-window 會失敗（實測）。專屬 window 讓 fixture 與前面的
+# 分組脫鉤
+pane43="$(absp "$D43" 0 spawn ev43 --runtime codex --window 2>/dev/null)"
+pane43b="$(absp "$D43" 0 spawn ev43b --runtime codex --window 2>/dev/null)"
+GEN43="$(jq -r '.spawn_tag' "$D43/agents/ev43.json")"
+GEN43B="$(jq -r '.spawn_tag' "$D43/agents/ev43b.json")"
+assert "43 前置：兩個 worker 都 spawn 成功" \
+  test -n "$pane43" -a -n "$pane43b" -a -f "$D43/agents/ev43b.json"
+assert "43 前置：spawn_tag 讀得到（證據框要顯示它）" test -n "$GEN43"
+
+TUI43="$(tmx new-window -dP -F '#{pane_id}' -t it "$pane_cmd")"
+OWN43="$(tmx display -p -t "$TUI43" '#{session_name}:#{window_id}')"
+# spawn 記的 owner 是測試腳本所在的位置，不是 TUI 的；改掛到 TUI 所在 owner，
+# 首頁（以 current owner 為根）才看得到這兩個 worker。其餘欄位一律不動
+for _w43 in ev43 ev43b; do
+  jq --arg o "$OWN43" '.owner = $o' "$D43/agents/$_w43.json" \
+    > "$TESTROOT/$_w43.owner.json"
+  mv "$TESTROOT/$_w43.owner.json" "$D43/agents/$_w43.json"
+done
+cp "$D43/agents/ev43.json" "$TESTROOT/ev43-before.json"
+
+tmx send-keys -t "$TUI43" \
+  "$(printf 'echo AB43-MAIN-SCREEN; touch %q' "$TESTROOT/tui43-ready")" Enter
+wait_for 10 test -f "$TESTROOT/tui43-ready"
+
+cap43() { tmx capture-pane -p -t "$TUI43" > "$TESTROOT/tui43-cap.txt" 2>/dev/null; }
+# shellcheck disable=SC2329  # 經 assert/wait_for 的 "$@" 間接呼叫
+ui43_shows() { cap43 && grep -qF -- "$1" "$TESTROOT/tui43-cap.txt"; }
+# shellcheck disable=SC2329  # 經 assert 的 "$@" 間接呼叫
+ui43_lacks() { cap43 && ! grep -qF -- "$1" "$TESTROOT/tui43-cap.txt"; }
+# shellcheck disable=SC2329  # 經 wait_for 間接呼叫
+pane_gone43() { ! pane_alive "$1"; }
+
+tmx send-keys -t "$TUI43" \
+  "$(printf 'env AGENT_BRIDGE_DATA=%q %q ui' "$D43" "$BRIDGE")" Enter
+assert "43 UI 起得來（WORKERS 欄看得到 ev43）" wait_for 10 ui43_shows "ev43"
+
+# 43a 證據框：措辭＋等價 CLI 原文（§2 薄殼原則／§5 顯示紀律）
+before43="$(task_count "$D43")"
+tmx send-keys -t "$TUI43" e
+assert "43a e 開證據框：措辭是「派收尾任務後回收」" \
+  wait_for 10 ui43_shows "派收尾任務後回收"
+assert "43a 證據框逐字顯示等價 CLI（含兩個 --expect-*）" \
+  ui43_shows "agent-bridge evict ev43 --expect-pane $pane43 --expect-generation $GEN43"
+assert "43a 證據框 MUST NOT 出現「安全刪除」語彙" ui43_lacks "安全刪除"
+assert "43a 開框本身沒有副作用（未建 task）" \
+  test "$(task_count "$D43")" -eq "$before43"
+
+# 43b n 放棄：不建 task、registry 不動
+tmx send-keys -t "$TUI43" n
+assert "43b n 放棄 evict（footer 明說）" wait_for 10 ui43_shows "已放棄 evict"
+assert "43b 放棄後未建任何 task" test "$(task_count "$D43")" -eq "$before43"
+assert "43b 放棄後 pane 仍在" pane_alive "$pane43"
+
+# 43c gate (c)：開框之後換代 → y 確認時重讀 registry → selection stale。
+# 「沿用輪詢快照」的實作在這裡會照樣派出收尾任務（多一個 task）
+tmx send-keys -t "$TUI43" e
+assert "43c 前置：證據框已開（顯示當時世代 $GEN43）" \
+  wait_for 10 ui43_shows "--expect-generation $GEN43"
+jq --arg t "$GEN43-NEXT" '.spawn_tag = $t' "$TESTROOT/ev43-before.json" \
+  > "$TESTROOT/ev43-next.json"
+mv "$TESTROOT/ev43-next.json" "$D43/agents/ev43.json"
+before43="$(task_count "$D43")"
+# 「無副作用」要驗得到位（codex 複核 minor #6）：換代之後、按 y 之前先取
+# registry 與審計的基準——之後的 diff 才問得到「evict 有沒有動過它」
+cp "$D43/agents/ev43.json" "$TESTROOT/ev43-stale-snapshot.json"
+audit_before43="$(wc -l < "$D43/agents.log" 2>/dev/null || printf '0')"
+tmx send-keys -t "$TUI43" y
+assert "43c 確認當下重讀 registry：判 selection stale" \
+  wait_for 10 ui43_shows "selection stale"
+assert "43c selection stale：不建 task" test "$(task_count "$D43")" -eq "$before43"
+assert "43c selection stale：pane 未被 kill" pane_alive "$pane43"
+assert "43c selection stale：registry 逐 byte 未被動" \
+  diff -q "$TESTROOT/ev43-stale-snapshot.json" "$D43/agents/ev43.json"
+assert "43c selection stale：審計未新增" \
+  test "$(wc -l < "$D43/agents.log" 2>/dev/null || printf '0')" -eq "$audit_before43"
+# 換代模擬到此為止：tag 與 pane 的 start command 已分家，留著會讓 43d 的
+# despawn 走 stale 路徑（那是 CLI-EVICT-3 的既有防線，不是本組要測的東西）
+cp "$TESTROOT/ev43-before.json" "$D43/agents/ev43.json"
+
+# 43d gate (d)：相符 → 走下沉到 ab-core 的完整編排（send → await → despawn）
+bg_reply "$D43" ev43 "收尾筆記：TUI 證據框路徑"
+tmx send-keys -t "$TUI43" e
+assert "43d 前置：證據框重開（世代已還原）" \
+  wait_for 10 ui43_shows "--expect-generation $GEN43"
+tmx send-keys -t "$TUI43" y
+assert "43d 確認後 registry 被回收（evict 完成）" \
+  wait_for 30 test ! -f "$D43/agents/ev43.json"
+assert "43d 確認後 pane 已被 kill" wait_for 10 pane_gone43 "$pane43"
+assert "43d 審計記了 evicted*" grep -qE 'evicted' "$D43/agents.log"
+assert "43d 終局回到 footer（背景一次性 thread → channel）" \
+  wait_for 10 ui43_shows "已 evict 'ev43'"
+
+# 43e gate (e)：evict 的 await 段跑在一次性 thread 上（常駐 worker 那條同時
+# 負責 liveness 輪詢，搭上去等於整整五分鐘不再刷新）。ev43b 沒有人回覆，
+# 編排會停在 await；此時 UI MUST 仍收得了鍵
+tmx send-keys -t "$TUI43" e
+assert "43e ev43b 的證據框開得起來" wait_for 10 ui43_shows "agent-bridge evict ev43b"
+tmx send-keys -t "$TUI43" y
+assert "43e 收尾任務已派出、進入等待（footer 看得到）" \
+  wait_for 15 ui43_shows "等待筆記落地"
+tmx send-keys -t "$TUI43" '?'
+assert "43e await 期間 UI 仍收得了鍵（? 開得了合法鍵頁）" \
+  wait_for 10 ui43_shows "合法鍵"
+tmx send-keys -t "$TUI43" k   # 任意鍵關閉合法鍵頁
+tmx send-keys -t "$TUI43" e
+assert "43e in-flight 閘：同一個 worker 再按 e 只提示進行中" \
+  wait_for 10 ui43_shows "進行中"
+
+tmx send-keys -t "$TUI43" q
+assert "43e q 退出（UI thread 沒被 evict 的 await 卡住）" \
+  wait_for 10 ui43_shows "AB43-MAIN-SCREEN"
+
+# 43f 窄畫面（100 欄）：evict 的等價 CLI 原文約 112 字元，截斷會把尾端的
+# generation 吃掉——而那正是人判斷「要不要按 y」的依據（codex 複核 minor #5）。
+# 200 欄的 TUI43 抓不到這條，所以另開一個 manual-size 的窄 window 再驗一次。
+TUI43N="$(tmx new-window -dP -F '#{window_id}' -t it "$pane_cmd")"
+tmx set-option -w -t "$TUI43N" window-size manual
+tmx resize-window -t "$TUI43N" -x 100 -y 40
+P43N="$(tmx list-panes -t "$TUI43N" -F '#{pane_id}' | head -1)"
+# shellcheck disable=SC2329  # 經 assert/wait_for 的 "$@" 間接呼叫
+ui43n_shows() {
+  tmx capture-pane -p -t "$P43N" > "$TESTROOT/tui43n-cap.txt" 2>/dev/null \
+    && grep -qF -- "$1" "$TESTROOT/tui43n-cap.txt"
+}
+# 證據框裡的 generation 出現在**兩處**：短的「世代 :」欄，以及長的等價 CLI
+# 原文那一行。截斷時只有前者活得下來——所以「≥2 行命中」才是「命令原文沒被
+# 截掉尾巴」的判準（只驗 ≥1 的話，把 wrap 拿掉照樣綠，實測過）
+# shellcheck disable=SC2329  # 經 assert/wait_for 的 "$@" 間接呼叫
+ui43n_tag_twice() {
+  tmx capture-pane -p -t "$P43N" > "$TESTROOT/tui43n-cap.txt" 2>/dev/null \
+    && [[ "$(grep -c -F -- "$1" "$TESTROOT/tui43n-cap.txt")" -ge 2 ]]
+}
+assert "43f 前置：窄 window 真的是 100 欄" \
+  bash -c '[[ "$1" == 100 ]]' _ "$(tmx display -p -t "$TUI43N" '#{window_width}')"
+tmx send-keys -t "$P43N" \
+  "$(printf 'env AGENT_BRIDGE_DATA=%q %q ui' "$D43" "$BRIDGE")" Enter
+assert "43f 窄畫面下 UI 起得來" wait_for 10 ui43n_shows "ev43b"
+tmx send-keys -t "$P43N" e
+assert "43f 窄畫面下證據框措辭仍在" wait_for 10 ui43n_shows "派收尾任務後回收"
+assert "43f 窄畫面下「世代」欄可見" ui43n_shows "$GEN43B"
+assert "43f 窄畫面下等價 CLI 的 generation 未被截掉（換行保留整條命令）" \
+  wait_for 10 ui43n_tag_twice "$GEN43B"
+tmx send-keys -t "$P43N" n
+tmx send-keys -t "$P43N" q
+tmx kill-window -t "$TUI43N" 2>/dev/null || true
+
+tmx kill-pane -t "$TUI43" 2>/dev/null || true
+tmx kill-pane -t "$pane43b" 2>/dev/null || true
+
+else
+  printf 'SKIP: 43 TUI evict 證據框（SRC_KIND=bash：bash 正本凍結在 M4，不含 TUI）\n'
+fi
+
 # ---- 總結 ----
 printf '\n共 %d PASS、%d FAIL\n' "$PASS" "$FAIL"
 if (( FAIL > 0 )); then

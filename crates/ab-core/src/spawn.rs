@@ -856,7 +856,7 @@ fn spawn_wait_ready(paths: &Paths, tmux: &dyn TmuxClient, name: &str, pane: &str
 
 /// despawn 的三種終局（bash `DESPAWN_RESULT`）。evict 靠 `Stale` 判斷「registry
 /// 清掉了，但那個 pane 還活著、已經不屬於這個 agent」——那不是一次回收。
-#[derive(PartialEq, Eq, Debug)]
+#[derive(Clone, PartialEq, Eq, Debug)]
 pub enum DespawnResult {
     Killed,
     Absent,

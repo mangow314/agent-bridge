@@ -240,16 +240,34 @@ pub fn notify_or_defer(
     task_id: &str,
     tag: &str,
 ) -> Result<()> {
-    match notify_or_defer_outcome(paths, tmux, agent, pane, cmdline, task_id, tag)? {
-        NotifyOutcome::Notified => {}
-        NotifyOutcome::Deferred => eprintln!(
-            "agent-bridge: 提示：{agent} 目前忙碌中，通知延後——訊息已在 mailbox，對方 turn 結束時會由 hook 自行取件"
-        ),
-        NotifyOutcome::Failed => eprintln!(
-            "agent-bridge: 警告：無法通知 {agent}（pane {pane}）；請手動在對方 session 執行：{cmdline}"
-        ),
+    let outcome = notify_or_defer_outcome(paths, tmux, agent, pane, cmdline, task_id, tag)?;
+    if let Some(msg) = outcome_message(outcome, agent, pane, cmdline) {
+        eprintln!("agent-bridge: {msg}");
     }
     Ok(())
+}
+
+/// 通知終態 → 給人看的一句話（**不含** `agent-bridge: ` 前綴）。
+///
+/// 單一正本：CLI 的 `notify_or_defer` 與 evict 編排（它走不印字的
+/// `notify_or_defer_outcome`，訊息經事件交回外殼）共用同一份文案，兩邊分家
+/// 就會有一邊悄悄漂移，而既有測試以 byte 級比對這兩行。
+/// `Notified`＝沒有話要說（成功不吵人）。
+pub fn outcome_message(
+    outcome: NotifyOutcome,
+    agent: &str,
+    pane: &str,
+    cmdline: &str,
+) -> Option<String> {
+    match outcome {
+        NotifyOutcome::Notified => None,
+        NotifyOutcome::Deferred => Some(format!(
+            "提示：{agent} 目前忙碌中，通知延後——訊息已在 mailbox，對方 turn 結束時會由 hook 自行取件"
+        )),
+        NotifyOutcome::Failed => Some(format!(
+            "警告：無法通知 {agent}（pane {pane}）；請手動在對方 session 執行：{cmdline}"
+        )),
+    }
 }
 
 #[cfg(test)]

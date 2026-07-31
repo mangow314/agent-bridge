@@ -30,10 +30,22 @@ const THREE_COL_MIN_W: u16 = OWNERS_W + MID_MIN_W + DETAIL_W;
 /// 底條模式下 DETAIL 的高度：task 細節 5 行＋空行＋`evidence:`＋2 條命令＋
 /// 上下邊框。
 const DETAIL_STRIP_H: u16 = 11;
+/// footer 一次畫得出的 sticky 警告則數（多的以「另有 N 則」帶出，見
+/// `render_footer`）。
+const WARN_ROWS: usize = 3;
 
 pub fn render(f: &mut Frame, model: &Model, live: &LiveIndex, app: &App) {
+    // footer 高度隨 sticky 警告伸縮（major #2：警告不得被單行 message 覆寫，
+    // 所以它們需要自己的行）。上限 `WARN_ROWS`，溢位以「另 N 則」帶出，
+    // 不是靜默丟掉
+    // ＋1 是「（Esc 清除警告）」那行——只在有警告時才佔位
+    let warn_rows = if app.warnings.is_empty() {
+        0
+    } else {
+        app.warnings.len().min(WARN_ROWS) as u16 + 1
+    };
     let [main, footer] =
-        Layout::vertical([Constraint::Min(3), Constraint::Length(2)]).areas(f.area());
+        Layout::vertical([Constraint::Min(3), Constraint::Length(2 + warn_rows)]).areas(f.area());
     // §2 版面：三欄＋中欄縱切。兩條硬不變量同時要守——中欄那 21 字元的
     // immutable task id MUST 永不截斷（它是 dashboard 全部「證據」語意的
     // 承重點，§2／§5），而 DETAIL 的等價 CLI 原文 MUST 完整留在畫面上
@@ -67,9 +79,11 @@ pub fn render(f: &mut Frame, model: &Model, live: &LiveIndex, app: &App) {
     render_detail(f, detail_area, model, live, app);
     render_footer(f, footer, app);
 
-    // overlay 優先序：確認框 > 全文 pager > 摘要頁 > 合法鍵
+    // overlay 優先序：確認框（cancel／evict）> 全文 pager > 摘要頁 > 合法鍵
     if let Some(id) = &app.confirm {
         render_confirm(f, id);
+    } else if let Some(p) = &app.evict_prompt {
+        render_evict_confirm(f, &p.lines);
     } else if app.pager.is_some() {
         render_pager(f, app);
     } else if let Some(lines) = &app.info {
@@ -332,12 +346,28 @@ fn render_info(f: &mut Frame, lines: &[String]) {
 }
 
 fn render_footer(f: &mut Frame, area: Rect, app: &App) {
-    let lines = vec![
+    let mut lines = vec![
         Line::from(
-            " Tab/j/k（↓↑）導航 · Enter focus · r read · i 摘要 · c 複製證據 · x cancel · ? 合法鍵 · q 離開",
+            " Tab/j/k（↓↑）導航 · Enter focus · r read · i 摘要 · c 複製證據 · x cancel · e evict · ? 合法鍵 · q 離開",
         ),
         Line::from(format!(" [poll 500ms · tmux 2s] {}", app.message)),
     ];
+    // sticky 警告（最新的在最下面，人的視線落點）。畫得下幾則就畫幾則，
+    // 剩下的以計數帶出——「被覆寫」與「畫面放不下但說得出還有幾則」是兩件事
+    let n = app.warnings.len();
+    if n > 0 {
+        let shown = n.min(WARN_ROWS);
+        let hidden = n - shown;
+        for (i, w) in app.warnings[n - shown..].iter().enumerate() {
+            let text = if i == 0 && hidden > 0 {
+                format!(" ⚠ （另有 {hidden} 則較早的警告）{w}")
+            } else {
+                format!(" ⚠ {w}")
+            };
+            lines.push(Line::from(text).style(Style::default().add_modifier(Modifier::BOLD)));
+        }
+        lines.push(Line::from(" （Esc 清除警告）"));
+    }
     f.render_widget(Paragraph::new(lines), area);
 }
 
@@ -354,6 +384,26 @@ fn render_confirm(f: &mut Frame, id: &str) {
     popup(f, w, 5, "取消任務", lines);
 }
 
+/// `e` 的證據框（§5）。內容由 `action::evict_confirm_lines` 組好，這裡只負責
+/// 畫——措辭紀律（「派收尾任務後回收」、無「安全刪除」語彙）的正本在 action 層，
+/// 兩邊各寫一份就會有一邊漂移。
+fn render_evict_confirm(f: &mut Frame, lines: &[String]) {
+    let w = lines
+        .iter()
+        .map(|l| l.chars().count() as u16 + 4)
+        .max()
+        .unwrap_or(46)
+        .max(46);
+    let h = lines.len() as u16 + 2;
+    popup(
+        f,
+        w,
+        h,
+        "evict（派收尾任務後回收）",
+        lines.iter().map(|l| Line::from(l.clone())).collect(),
+    );
+}
+
 fn render_help(f: &mut Frame, model: &Model, app: &App) {
     // `?`＝當前選中項的合法鍵（§3）
     let mut lines = vec![Line::from("Tab 換欄 · j/k（↓↑）移動 · ? 本頁 · q 離開")];
@@ -362,7 +412,7 @@ fn render_help(f: &mut Frame, model: &Model, app: &App) {
         Panel::Workers => match app.selected_row(model) {
             Some(Row::Worker(_)) => {
                 lines.push(Line::from(
-                    "worker 列：Enter focus 其 pane；x 無效（僅 task 列）",
+                    "worker 列：Enter focus 其 pane；e evict（證據框）；x 無效（僅 task 列）",
                 ));
             }
             Some(Row::Task { .. }) => {
@@ -385,7 +435,9 @@ fn render_help(f: &mut Frame, model: &Model, app: &App) {
         },
     }
     lines.push(Line::from("按任意鍵關閉"));
-    popup(f, 58, 7, "合法鍵（當前選中項）", lines);
+    // 寬度要容得下最長那行（worker 列的合法鍵，CJK 雙寬）：popup 不換行，
+    // 截半句等於畫面上沒有那條規則
+    popup(f, 74, 7, "合法鍵（當前選中項）", lines);
 }
 
 fn styled(text: String, selected: bool) -> Line<'static> {
@@ -418,6 +470,15 @@ fn scroll_offset(idx: usize, area: Rect) -> u16 {
 fn popup(f: &mut Frame, w: u16, h: u16, title: &str, lines: Vec<Line<'static>>) {
     let area = f.area();
     let w = w.min(area.width);
+    // 換行後每行可能佔多列：估一下需要幾列，免得 80／100 欄下把 evict 的
+    // 等價 CLI（約 112 字元）截掉尾端的 generation——那條命令原文是薄殼原則
+    // 的憑證，截半條等於畫面上沒有它（codex 複核 minor #5）
+    let inner = w.saturating_sub(2).max(1) as usize;
+    let rows: usize = lines
+        .iter()
+        .map(|l| l.width().div_ceil(inner).max(1))
+        .sum();
+    let h = h.max(rows as u16 + 2);
     let h = h.min(area.height);
     let rect = Rect {
         x: area.x + (area.width.saturating_sub(w)) / 2,
@@ -427,11 +488,15 @@ fn popup(f: &mut Frame, w: u16, h: u16, title: &str, lines: Vec<Line<'static>>) 
     };
     f.render_widget(Clear, rect);
     f.render_widget(
-        Paragraph::new(lines).block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title(title.to_string()),
-        ),
+        Paragraph::new(lines)
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title(title.to_string()),
+            )
+            // 窄畫面下**換行而不截斷**（同 DETAIL 欄的處置）：確認框裡的等價
+            // CLI 原文是人決定按不按 y 的依據
+            .wrap(Wrap { trim: false }),
         rect,
     );
 }

@@ -6,6 +6,10 @@ use ab_core::task::InFlight;
 
 use crate::model::{Model, Row, is_terminal_status, task_rows, worker_rows};
 
+/// footer 保留的警告則數上限（畫面是有限的，但**丟掉**與**覆寫**是兩件事：
+/// 這裡至少保證最近幾則留得住，且掉的那幾則有計數可見）。
+pub const MAX_WARNINGS: usize = 5;
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Panel {
     Owners,
@@ -74,6 +78,16 @@ pub enum Effect {
     Copy {
         payload: String,
     },
+    /// `e` 第一段：讀 registry 做出身判定＋取當下世代，開證據框
+    /// （讀檔在 run loop，狀態機不碰 FS）
+    EvictPrompt {
+        worker: String,
+    },
+    /// `e` 第二段：證據框確認後執行。**只帶證據框上顯示過的值**——expect
+    /// 參數要在確認當下重讀 registry 才算數（§5），不是沿用輪詢快照
+    Evict {
+        shown: crate::action::EvictShown,
+    },
 }
 
 pub struct App {
@@ -90,6 +104,16 @@ pub struct App {
     pub pager: Option<Pager>,
     /// `i` 的 worker 摘要頁（已組好的行；任意鍵關閉）
     pub info: Option<Vec<String>>,
+    /// `e` 的證據框：綁按 e 當下讀到的 pane／世代，y 確認時據以比對
+    pub evict_prompt: Option<crate::action::EvictPrompt>,
+    /// 已在跑的 evict（worker 名）。同一個 worker 不得重複派收尾任務——
+    /// 一次性 thread 各自獨立，沒有這道閘就會有兩條同時跑
+    pub evict_inflight: std::collections::HashSet<String>,
+    /// **警告不進 `message`**：footer 的單行 message 每則新訊息就被覆寫，
+    /// `notify-failed`／「審計未落地」會被下一行進度或成功訊息蓋掉，人再也
+    /// 看不到（codex 複核 major #2）。這裡是 sticky 的有界歷史：只 append、
+    /// 終局訊息 MUST NOT 清掉它，由人按 `Esc` 確認後才清。
+    pub warnings: Vec<String>,
     pub message: String,
     /// 呼叫者定位（worker 開場回報）：初始 owner 以此為根（§2「以 current
     /// owner 為根」）。晚到才落地，故每次磁碟重讀都重試一次。
@@ -111,10 +135,28 @@ impl App {
             help: false,
             pager: None,
             info: None,
+            evict_prompt: None,
+            evict_inflight: std::collections::HashSet::new(),
+            warnings: Vec::new(),
             message: String::new(),
             origin_owner: None,
             origin_pane: None,
             owner_touched: false,
+        }
+    }
+
+    /// 追加一則 sticky 警告（有界，滿了丟最舊的）。
+    ///
+    /// 為什麼是「丟最舊」而不是「丟最新」：新的失敗通常是舊失敗的後果，最新
+    /// 那則才是人此刻要處理的。連續重複的同一句只留一則（同一輪 evict 的
+    /// notify-failed 不必洗版）。
+    pub fn push_warning(&mut self, w: String) {
+        if self.warnings.last() == Some(&w) {
+            return;
+        }
+        self.warnings.push(w);
+        while self.warnings.len() > MAX_WARNINGS {
+            self.warnings.remove(0);
         }
     }
 
@@ -249,6 +291,23 @@ pub fn handle_key(app: &mut App, model: &Model, key: Key) -> Effect {
             _ => Effect::None,
         };
     }
+    // `e` 的證據框開著：與 `x` 同樣的模態紀律（只認 y／Enter 與 n／Esc），
+    // 其餘鍵一律吞掉。確認帶的是**框上顯示過的那組值**，執行前還要重讀比對
+    if let Some(p) = app.evict_prompt.as_ref() {
+        let shown = p.shown.clone();
+        return match key {
+            Key::Char('y') | Key::Enter => {
+                app.evict_prompt = None;
+                Effect::Evict { shown }
+            }
+            Key::Char('n') | Key::Esc => {
+                app.evict_prompt = None;
+                app.message = "已放棄 evict".to_string();
+                Effect::None
+            }
+            _ => Effect::None,
+        };
+    }
     // `r` 的 pager 開著：只認捲動與關閉。導航鍵在這裡被吞掉——overlay 期間
     // 底層 selection MUST 不動（關掉之後人才回得到原本那一列）
     if let Some(p) = app.pager.as_mut() {
@@ -270,6 +329,18 @@ pub fn handle_key(app: &mut App, model: &Model, key: Key) -> Effect {
     }
     match key {
         Key::Char('q') => Effect::Quit,
+        // Esc（無 overlay 時）＝我看過了：清掉 sticky 警告。警告 MUST 只由
+        // 人的顯式動作清除，不得被下一則訊息覆寫掉（major #2）
+        Key::Esc => {
+            if app.warnings.is_empty() {
+                Effect::None
+            } else {
+                let n = app.warnings.len();
+                app.warnings.clear();
+                app.message = format!("已清除 {n} 則警告");
+                Effect::None
+            }
+        }
         Key::Char('?') => {
             app.help = true;
             Effect::None
@@ -353,6 +424,26 @@ pub fn handle_key(app: &mut App, model: &Model, key: Key) -> Effect {
             }
             _ => {
                 app.message = "i 僅對 worker／task 列有效".to_string();
+                Effect::None
+            }
+        },
+        // `e`：evict 選中 worker（§3／§5）。合法目標**只有 worker 列**——
+        // 破壞性動作要有唯一且明確的目標，task 列上按 e 不代人推論它的 worker。
+        // 出身判定與當下世代的讀取都在 run loop（要碰 FS），這裡只發動
+        Key::Char('e') => match app.selection(model) {
+            Sel::Worker(w) => {
+                if app.evict_inflight.contains(&w.name) {
+                    app.message = format!("'{}' 的 evict 正在進行中", w.name);
+                    Effect::None
+                } else {
+                    Effect::EvictPrompt {
+                        worker: w.name.clone(),
+                    }
+                }
+            }
+            _ => {
+                app.message =
+                    "e 僅對 worker 列有效（evict 的目標是 worker，不是 task）".to_string();
                 Effect::None
             }
         },
@@ -702,6 +793,121 @@ mod tests {
         assert!(payload.contains("agent-bridge read 20260731T000001Z-aaaa"));
         app.panel = Panel::Owners;
         assert_eq!(handle_key(&mut app, &m, Key::Char('c')), Effect::None);
+    }
+
+    /// `e` 的合法目標只有 worker 列（§3／§5：破壞性動作要有唯一明確目標）；
+    /// task 列與 owner 列一律提示無效、不開證據框。
+    #[test]
+    fn evict_key_targets_worker_rows_only() {
+        let m = model();
+        let mut app = App::new();
+        assert_eq!(
+            handle_key(&mut app, &m, Key::Char('e')),
+            Effect::EvictPrompt {
+                worker: "w1".into()
+            }
+        );
+        assert!(app.evict_prompt.is_none(), "讀 registry 之前不開框");
+
+        handle_key(&mut app, &m, Key::Char('j')); // task 列
+        assert_eq!(handle_key(&mut app, &m, Key::Char('e')), Effect::None);
+        assert!(app.message.contains("worker 列"), "實際：{}", app.message);
+
+        app.panel = Panel::Owners;
+        assert_eq!(handle_key(&mut app, &m, Key::Char('e')), Effect::None);
+    }
+
+    /// in-flight 閘：同一個 worker 的 evict 還在跑時，再按 e MUST 只提示
+    /// ——一次性 thread 各自獨立，沒有這道閘就會有兩輪收尾任務同時派出去。
+    #[test]
+    fn evict_key_is_blocked_while_one_is_in_flight() {
+        let m = model();
+        let mut app = App::new();
+        app.evict_inflight.insert("w1".to_string());
+        assert_eq!(handle_key(&mut app, &m, Key::Char('e')), Effect::None);
+        assert!(app.message.contains("進行中"), "實際：{}", app.message);
+        assert!(app.evict_prompt.is_none());
+        // 別的 worker 不受影響（第三列＝w2）
+        handle_key(&mut app, &m, Key::Char('j'));
+        handle_key(&mut app, &m, Key::Char('j'));
+        assert_eq!(
+            handle_key(&mut app, &m, Key::Char('e')),
+            Effect::EvictPrompt {
+                worker: "w2".into()
+            }
+        );
+    }
+
+    /// 證據框的模態紀律（同 `x`）：y／Enter 執行且**只帶框上顯示過的值**，
+    /// n／Esc 放棄，其餘鍵一律吞掉（導航鍵不得在破壞性模態下改變 selection）。
+    #[test]
+    fn evict_prompt_is_modal_and_carries_shown_generation() {
+        let m = model();
+        let mut app = App::new();
+        let shown = crate::action::EvictShown {
+            name: "w1".into(),
+            pane: "%5".into(),
+            spawn_tag: "t-gen1".into(),
+        };
+        let prompt = || crate::action::EvictPrompt {
+            shown: shown.clone(),
+            lines: vec!["派收尾任務後回收".into()],
+        };
+
+        app.evict_prompt = Some(prompt());
+        assert_eq!(handle_key(&mut app, &m, Key::Char('j')), Effect::None);
+        assert_eq!(app.row_idx, 0, "模態下 selection 不得移動");
+        assert!(app.evict_prompt.is_some(), "其餘鍵不得關框");
+        assert_eq!(
+            handle_key(&mut app, &m, Key::Char('y')),
+            Effect::Evict {
+                shown: shown.clone()
+            }
+        );
+        assert!(app.evict_prompt.is_none());
+
+        app.evict_prompt = Some(prompt());
+        assert_eq!(handle_key(&mut app, &m, Key::Esc), Effect::None);
+        assert!(app.evict_prompt.is_none());
+        assert!(app.message.contains("已放棄 evict"), "實際：{}", app.message);
+    }
+
+    /// 警告是 sticky 的有界歷史（major #2）：**append 不覆寫**、連續重複只留
+    /// 一則、滿了丟最舊的、只有人按 Esc 才清得掉。
+    #[test]
+    fn warnings_accumulate_and_are_only_cleared_by_the_human() {
+        let m = model();
+        let mut app = App::new();
+        app.push_warning("無法通知 w1".into());
+        app.message = "evict：收尾任務已派出，等待筆記落地".to_string();
+        assert_eq!(
+            app.warnings,
+            vec!["無法通知 w1".to_string()],
+            "message 的覆寫 MUST NOT 影響警告"
+        );
+
+        // 連續重複只留一則
+        app.push_warning("無法通知 w1".into());
+        assert_eq!(app.warnings.len(), 1);
+
+        // 上限：丟最舊的（新的才是人此刻要處理的）
+        for i in 0..MAX_WARNINGS + 2 {
+            app.push_warning(format!("w{i}"));
+        }
+        assert_eq!(app.warnings.len(), MAX_WARNINGS);
+        assert_eq!(app.warnings.last().unwrap(), &format!("w{}", MAX_WARNINGS + 1));
+        assert!(
+            !app.warnings.iter().any(|w| w == "無法通知 w1"),
+            "溢位時丟的是最舊的"
+        );
+
+        // 導航／其他鍵不清警告
+        handle_key(&mut app, &m, Key::Char('j'));
+        assert_eq!(app.warnings.len(), MAX_WARNINGS);
+        // Esc（無 overlay）＝人說「我看過了」
+        assert_eq!(handle_key(&mut app, &m, Key::Esc), Effect::None);
+        assert!(app.warnings.is_empty());
+        assert!(app.message.contains("已清除"), "實際：{}", app.message);
     }
 
     /// 列表縮短後 clamp 把 selection 夾回（500ms 重讀路徑）。

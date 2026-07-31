@@ -2,6 +2,9 @@
 //! 命令。tmux 一律走 `ab-core` 的 `TmuxClient`（bounded），不直接 spawn。
 
 use ab_core::error::{Error, Result};
+use ab_core::evict::{self, EvictOutcome, EvictRequest};
+use ab_core::paths::Paths;
+use ab_core::spawn::DespawnResult;
 use ab_core::tmux::TmuxClient;
 
 use crate::app::Sel;
@@ -150,6 +153,132 @@ pub fn info_page(model: &Model, live: &LiveIndex, name: &str) -> Vec<String> {
     lines.push(String::new());
     lines.push("按任意鍵關閉".to_string());
     lines
+}
+
+/// `e` 證據框上顯示過的世代識別（tui-design §5 compare-and-act 的「compare」
+/// 那一半）。人是看著這組值按下 y 的，執行時的值 MUST 與它一致。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct EvictShown {
+    pub name: String,
+    pub pane: String,
+    pub spawn_tag: String,
+}
+
+/// `e` 的證據框（§5 顯示紀律）。
+#[derive(Debug)]
+pub struct EvictPrompt {
+    pub shown: EvictShown,
+    /// 框內逐行內容（已含等價 CLI 原文，§2 薄殼原則）
+    pub lines: Vec<String>,
+}
+
+/// 按 `e` 當下：讀 registry 做出身判定並取當下 pane／世代，組出證據框。
+///
+/// 出身規則**不在 TUI 重寫**：判定與訊息都來自 `ab_core::evict::precheck_registry`
+/// （CLI 的 evict 走同一份）。非 spawn 出身／registry 無法解析／缺 spawn_tag
+/// 一律在這裡就被拒，錯誤訊息原樣進 footer。
+pub fn evict_prompt(paths: &Paths, name: &str) -> Result<EvictPrompt> {
+    let f = paths.agents_dir.join(format!("{name}.json"));
+    let (pane, spawn_tag) = evict::precheck_registry(&f, name)?;
+    let shown = EvictShown {
+        name: name.to_string(),
+        pane,
+        spawn_tag,
+    };
+    let lines = evict_confirm_lines(&evict_request_from(&shown));
+    Ok(EvictPrompt { shown, lines })
+}
+
+/// 確認（y）當下：**重讀 registry**，以當下值組出 evict 參數。
+///
+/// 重讀是本條款的重點（tui-design §5）：沿用 500ms 前那份輪詢快照，等於把
+/// selection 到確認之間的換代一路帶進 mutation。重讀到的值與證據框上顯示的
+/// 不同時 MUST 中止——人是看著框上那組值按下 y 的，悄悄換一個目標去執行比
+/// 拒絕更糟；此時尚未產生任何副作用。
+///
+/// 相符時 expect 參數帶的是**重讀值**（與框上相等，但語意上執行的永遠是當下
+/// 讀到的那一代）；core 會在 registry 鎖內再比對一次，堵住這裡到鎖之間的
+/// 第二個窗口（CLI-EVICT-4）。
+pub fn evict_request(paths: &Paths, shown: &EvictShown) -> Result<EvictRequest> {
+    let f = paths.agents_dir.join(format!("{}.json", shown.name));
+    // 確認期**任何**取不到「與框上同一個 identity」的情況都是 selection stale
+    // ——registry 被刪、被改壞、變成人工註冊、spawn_tag 消失，都代表框上那一代
+    // 已經不在了。原始 precheck 錯誤（「未註冊的 agent」「非 spawn 出身」）在
+    // 這一刻會誤導成「這個 worker 本來就不能 evict」，而真相是「你看到的那個
+    // 已經不存在」（codex 複核 major #1）。原因保留在括號裡，不吞。
+    // 初次開框（`evict_prompt`）不套用這層：那時原始理由才是對的。
+    let (pane, spawn_tag) = evict::precheck_registry(&f, &shown.name).map_err(|e| {
+        Error::new(format!(
+            "evict 中止（selection stale）：確認當下重讀 registry，已取不到 agent '{}' 框上那一代（{}）；未建立任何任務、未通知、未回收",
+            shown.name, e.message
+        ))
+    })?;
+    if pane != shown.pane || spawn_tag != shown.spawn_tag {
+        return Err(Error::new(format!(
+            "evict 中止（selection stale）：確認當下重讀 registry，agent '{}' 現為 pane {pane}／世代 {spawn_tag}，與證據框顯示的 pane {}／世代 {} 不同；未建立任何任務、未通知、未回收",
+            shown.name, shown.pane, shown.spawn_tag
+        )));
+    }
+    Ok(evict_request_from(&EvictShown {
+        name: shown.name.clone(),
+        pane,
+        spawn_tag,
+    }))
+}
+
+/// `(name, pane, tag)` → evict 參數。TUI 一律帶滿兩個 expect：dashboard 的
+/// selection 天生落後於磁碟，不帶 expect 就是把 TOCTOU 留在原地（§5）。
+fn evict_request_from(shown: &EvictShown) -> EvictRequest {
+    let mut req = EvictRequest::new(&shown.name);
+    req.expect_pane = Some(shown.pane.clone());
+    req.expect_generation = Some(shown.spawn_tag.clone());
+    req
+}
+
+/// 證據框的內容（純函式，不經 render 可測）。
+///
+/// §5 顯示紀律：措辭 MUST 是「派收尾任務後回收」，MUST NOT 出現任何「安全
+/// 刪除」語彙——這一框的職責是把證據攤開讓人自己判斷，不是替人下判斷。
+/// 框內 MUST 逐字帶上等價 CLI 原文（§2 薄殼原則）。
+pub fn evict_confirm_lines(req: &EvictRequest) -> Vec<String> {
+    vec![
+        format!("對 worker '{}' 派收尾任務後回收：", req.name),
+        "  先派一輪收尾任務，等它把只存在於 context 裡的事實寫成筆記".to_string(),
+        "  落地（或逾時）之後才回收 pane；筆記留在 tasks/ 可事後查閱".to_string(),
+        format!("pane   : {}", req.expect_pane.as_deref().unwrap_or("-")),
+        format!(
+            "世代   : {}",
+            req.expect_generation.as_deref().unwrap_or("-")
+        ),
+        "確認後執行下列等價 CLI：".to_string(),
+        format!("$ {}", req.cmdline()),
+        "[y/Enter] 執行 · [n/Esc] 放棄".to_string(),
+    ]
+}
+
+/// evict 終局 → footer 一句話（呈現層與 core 分離，審查 F7）。
+pub fn evict_message(name: &str, res: &Result<EvictOutcome>) -> String {
+    match res {
+        Ok(o) if o.despawn == DespawnResult::Stale => format!(
+            "agent '{name}' 的註冊已清除，但 pane {} 未被回收；收尾任務 {}（{}）請自行判讀",
+            o.pane, o.task_id, o.final_status
+        ),
+        Ok(o) => match o.audit {
+            "evicted" => format!(
+                "已 evict '{name}'；收尾筆記可用：agent-bridge read {}",
+                o.task_id
+            ),
+            "evicted-unfinished" => format!(
+                "已回收 '{name}'，但收尾任務 {} 以 {} 結束，筆記未落地",
+                o.task_id, o.final_status
+            ),
+            _ => format!(
+                "已回收 '{name}'，但收尾任務 {} 逾時未回覆，筆記未落地",
+                o.task_id
+            ),
+        },
+        Err(e) => e.message.clone(),
+    }
 }
 
 /// `Enter` focus（§2）。位置以**當下重查**的 liveness 為準（不是上一輪 2s
@@ -402,6 +531,203 @@ mod tests {
         let tmux = FakeTmux::new(true);
         let err = TmuxClipboard(&tmux).set("task-id: x\n").unwrap_err();
         assert!(err.message.contains("set-buffer"), "實際：{}", err.message);
+    }
+
+    /// 臨時資料目錄（registry 檔要真的落在磁碟上，才驗得到「重讀」）。
+    struct TmpPaths {
+        paths: Paths,
+        root: std::path::PathBuf,
+    }
+
+    impl TmpPaths {
+        fn new(tag: &str) -> Self {
+            let root = std::env::temp_dir().join(format!(
+                "ab-tui-evict-{tag}-{}-{:?}",
+                std::process::id(),
+                std::thread::current().id()
+            ));
+            let _ = std::fs::remove_dir_all(&root);
+            std::fs::create_dir_all(root.join("agents")).unwrap();
+            let mut paths = Paths::resolve();
+            paths.data_dir = root.clone();
+            paths.agents_dir = root.join("agents");
+            paths.tasks_dir = root.join("tasks");
+            paths.state_dir = root.join("state");
+            paths.locks_dir = root.join("locks");
+            TmpPaths { paths, root }
+        }
+        fn write_agent(&self, name: &str, pane: &str, tag: &str) {
+            std::fs::write(
+                self.paths.agents_dir.join(format!("{name}.json")),
+                format!(
+                    r#"{{"name":"{name}","pane_id":"{pane}","spawned":true,"ready":true,"runtime":"codex","spawn_tag":"{tag}"}}"#
+                ),
+            )
+            .unwrap();
+        }
+    }
+
+    impl Drop for TmpPaths {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.root);
+        }
+    }
+
+    /// §5 顯示紀律：證據框措辭 MUST 是「派收尾任務後回收」，MUST NOT 出現
+    /// 任何「安全刪除」語彙；且 MUST 逐字帶上等價 CLI 原文（§2 薄殼原則）。
+    #[test]
+    fn evict_confirm_lines_state_wrap_up_never_safe_to_delete() {
+        let t = TmpPaths::new("prompt");
+        t.write_agent("w1", "%5", "t-gen1");
+        let p = evict_prompt(&t.paths, "w1").unwrap();
+        let text = p.lines.join("\n");
+
+        assert!(text.contains("派收尾任務後回收"), "實際：{text}");
+        for banned in ["安全刪除", "可安全", "安全回收", "可刪", "無殘值"] {
+            assert!(!text.contains(banned), "MUST NOT 出現 '{banned}'：{text}");
+        }
+        assert!(
+            text.contains("$ agent-bridge evict w1 --expect-pane %5 --expect-generation t-gen1"),
+            "MUST 逐字顯示等價 CLI：{text}"
+        );
+        assert_eq!(p.shown.pane, "%5");
+        assert_eq!(p.shown.spawn_tag, "t-gen1");
+    }
+
+    /// 出身非 spawn（人工註冊）／缺 spawn_tag：`e` MUST 在證據框之前就被拒，
+    /// 且理由沿用 core 的判定（TUI 不自己重寫規則）。
+    #[test]
+    fn evict_prompt_rejects_non_spawned_origin() {
+        let t = TmpPaths::new("origin");
+        std::fs::write(
+            t.paths.agents_dir.join("manual.json"),
+            r#"{"name":"manual","pane_id":"%9"}"#,
+        )
+        .unwrap();
+        let e = evict_prompt(&t.paths, "manual").unwrap_err();
+        assert!(e.message.contains("非 spawn 出身"), "實際：{}", e.message);
+
+        std::fs::write(
+            t.paths.agents_dir.join("notag.json"),
+            r#"{"name":"notag","pane_id":"%9","spawned":true}"#,
+        )
+        .unwrap();
+        let e = evict_prompt(&t.paths, "notag").unwrap_err();
+        assert!(e.message.contains("spawn_tag"), "實際：{}", e.message);
+    }
+
+    /// **本組的不變量測試**（tui-design §5）：確認當下 MUST 重讀 registry。
+    ///
+    /// 證據框顯示的是「按 e 當下」讀到的值；確認之間 registry 換了代，重讀就
+    /// 會看見新值 → 與框上不符 → selection stale 中止。把重讀改成沿用框上的
+    /// 快照值，這個測試就會轉綠地放行（mutant 存活），故它同時錨住兩件事：
+    /// 有沒有重讀、以及不符時有沒有中止。
+    #[test]
+    fn evict_request_rereads_registry_at_confirm_time() {
+        let t = TmpPaths::new("reread");
+        t.write_agent("w1", "%5", "t-gen1");
+        let shown = evict_prompt(&t.paths, "w1").unwrap().shown;
+
+        // 沒換代：重讀值 == 框上值 → 帶滿兩個 expect
+        let req = evict_request(&t.paths, &shown).unwrap();
+        assert_eq!(req.expect_pane.as_deref(), Some("%5"));
+        assert_eq!(req.expect_generation.as_deref(), Some("t-gen1"));
+        assert_eq!(req.name, "w1");
+
+        // 確認之前換代（respawn）：重讀 MUST 看見新值 → selection stale
+        t.write_agent("w1", "%77", "t-gen2");
+        let e = evict_request(&t.paths, &shown).unwrap_err();
+        assert!(
+            e.message.contains("selection stale"),
+            "MUST 中止並點名 selection stale：{}",
+            e.message
+        );
+        assert!(e.message.contains("%77"), "MUST 說出當下值：{}", e.message);
+        assert!(
+            e.message.contains("未建立任何任務"),
+            "MUST 說清楚沒有副作用：{}",
+            e.message
+        );
+
+        // registry 整個消失（worker 已被別人回收）／被改壞／變成人工註冊：
+        // 確認期一律是 **selection stale**，不得回「未註冊」「非 spawn 出身」
+        // 這種會被讀成「本來就不能 evict」的原始理由（codex 複核 major #1）
+        let f = t.paths.agents_dir.join("w1.json");
+        for (case, body) in [
+            ("registry 消失", None),
+            ("registry 損壞", Some("not json")),
+            (
+                "改成人工註冊",
+                Some(r#"{"name":"w1","pane_id":"%5"}"#),
+            ),
+            (
+                "spawn_tag 消失",
+                Some(r#"{"name":"w1","pane_id":"%5","spawned":true}"#),
+            ),
+        ] {
+            match body {
+                None => {
+                    let _ = std::fs::remove_file(&f);
+                }
+                Some(b) => std::fs::write(&f, b).unwrap(),
+            }
+            let e = evict_request(&t.paths, &shown).unwrap_err();
+            assert!(
+                e.message.contains("selection stale"),
+                "{case} MUST 映射成 selection stale：{}",
+                e.message
+            );
+            assert!(
+                e.message.contains("未建立任何任務"),
+                "{case} MUST 說清楚沒有副作用：{}",
+                e.message
+            );
+        }
+    }
+
+    /// 初次開框（`e`）**不**套用 stale 映射：那時原始理由（非 spawn 出身／
+    /// 缺 spawn_tag）才是對的，包成 stale 反而讓人以為只要重按一次就好。
+    #[test]
+    fn evict_prompt_keeps_original_precheck_reason() {
+        let t = TmpPaths::new("promptreason");
+        std::fs::write(
+            t.paths.agents_dir.join("manual.json"),
+            r#"{"name":"manual","pane_id":"%9"}"#,
+        )
+        .unwrap();
+        let e = evict_prompt(&t.paths, "manual").unwrap_err();
+        assert!(e.message.contains("非 spawn 出身"), "實際：{}", e.message);
+        assert!(
+            !e.message.contains("selection stale"),
+            "開框期 MUST NOT 說成 stale：{}",
+            e.message
+        );
+    }
+
+    /// evict 終局 → footer 一句話：三種審計分流各自可辨識，stale 不得說成
+    /// 「已回收」（§5：不得替人下判斷，也不得謊報發生過的事）。
+    #[test]
+    fn evict_message_distinguishes_every_outcome() {
+        let out = |audit: &'static str, despawn: DespawnResult| EvictOutcome {
+            task_id: "20260731T000009Z-dddd".into(),
+            final_status: "failed".into(),
+            audit,
+            despawn,
+            pane: "%5".into(),
+        };
+        let m = evict_message("w1", &Ok(out("evicted", DespawnResult::Killed)));
+        assert!(m.contains("已 evict 'w1'") && m.contains("agent-bridge read"));
+        let m = evict_message("w1", &Ok(out("evicted-unfinished", DespawnResult::Killed)));
+        assert!(m.contains("筆記未落地") && m.contains("failed"), "實際：{m}");
+        let m = evict_message("w1", &Ok(out("evicted-timeout", DespawnResult::Killed)));
+        assert!(m.contains("逾時") && m.contains("筆記未落地"), "實際：{m}");
+        // stale：pane 未被回收，訊息不得宣稱回收成功
+        let m = evict_message("w1", &Ok(out("evicted", DespawnResult::Stale)));
+        assert!(m.contains("未被回收"), "實際：{m}");
+        assert!(!m.contains("已 evict"), "stale MUST NOT 說成已 evict：{m}");
+        // 錯誤（含 selection stale）原樣進 footer
+        let m = evict_message("w1", &Err(Error::new("evict 中止（selection stale）：…")));
+        assert!(m.contains("selection stale"), "實際：{m}");
     }
 
     /// 確認框顯示的等價 CLI 原文（§2 薄殼原則：TUI 動作＝CLI 命令）。

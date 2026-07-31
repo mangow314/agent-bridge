@@ -11,6 +11,7 @@
 
 pub mod config;
 pub mod error;
+pub mod evict;
 pub mod fsio;
 pub mod hook;
 pub mod json;
@@ -19,6 +20,7 @@ pub mod notify;
 pub mod paths;
 pub mod proc;
 pub mod registry;
+pub mod send;
 pub mod spawn;
 pub mod task;
 pub mod time;

@@ -14,6 +14,7 @@ use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::thread;
 
 use ab_core::error::Result;
+use ab_core::evict::EvictOutcome;
 use ab_core::paths::Paths;
 use ab_core::registry;
 use ab_core::task::{self, CancelOutcome, ReadOutcome};
@@ -60,6 +61,19 @@ pub enum Msg {
     Copy {
         res: Result<()>,
     },
+    /// evict 編排的進度行（core 的 `EvictEvent`，一次性 thread 串流回來）。
+    /// `warn` 保留 core 的嚴重度：警告 MUST NOT 被後續進度／終局蓋掉
+    /// （codex 複核 major #2）
+    EvictProgress {
+        name: String,
+        line: String,
+        warn: bool,
+    },
+    /// evict 編排的終局（一次性 thread 的最後一則）
+    Evict {
+        name: String,
+        res: Result<EvictOutcome>,
+    },
 }
 
 /// UI 端持有的把手。`Drop` 時關掉請求端，worker 做完手上那件事就自行結束
@@ -68,6 +82,9 @@ pub enum Msg {
 pub struct Handle {
     tx: Sender<Req>,
     rx: Receiver<Msg>,
+    /// 一次性 thread 用的回信端（`spawn_oneshot`）。UI 只有一個收信口，
+    /// 長工與一次性工人都往這裡送。
+    msg_tx: Sender<Msg>,
 }
 
 impl Handle {
@@ -84,12 +101,57 @@ impl Handle {
             Err(TryRecvError::Empty) | Err(TryRecvError::Disconnected) => None,
         }
     }
+
+    /// 起一條**一次性** thread，結果送回同一個 mpsc。
+    ///
+    /// 為什麼 evict 不能搭常駐 worker 那條 thread：那條同時負責 liveness 輪詢，
+    /// 而 evict 預設 `--timeout 300` 會在 await 段一路等下去——搭上去等於整整
+    /// 五分鐘不再有 liveness 更新，且期間任何 focus／cancel／read 都排在它後面。
+    /// 一次性 thread 各自獨立，UI thread 兩邊都只是 non-blocking 收信。
+    ///
+    /// **不 join**（同 `Handle` 的 `Drop` 註解）：工人可能正卡在 await 上。
+    ///
+    /// 回傳 `false`＝**thread 根本沒起來**（OS 資源耗盡）。用
+    /// `thread::Builder::spawn` 而不是 `thread::spawn`：後者失敗時是 panic，
+    /// 而且無條件回 `true` 會讓呼叫端的失敗分支變成死碼——畫面於是永遠停在
+    /// 「進行中…」，in-flight 閘也永遠不會放開（codex 複核 major #3）。
+    ///
+    /// 工人自己 panic 的處置**不在這裡**：只有呼叫端知道該回哪一則終局訊息，
+    /// 故由它以 `catch_unwind` 轉成 terminal error（見 `crate::start_evict`）。
+    pub fn spawn_oneshot<F>(&self, f: F) -> bool
+    where
+        F: FnOnce(Sender<Msg>) + Send + 'static,
+    {
+        let tx = self.msg_tx.clone();
+        thread::Builder::new()
+            .name("ab-tui-oneshot".to_string())
+            .spawn(move || f(tx))
+            .is_ok()
+    }
+
+    /// 只有 channel、不起常駐 worker 的把手（測試用：驗一次性 thread 的訊息
+    /// 確實回流到 UI 的收信口）。`Receiver<Req>` 一併回傳，否則 `send` 會因
+    /// 對端已 drop 而失敗，測不到真實行為。
+    #[cfg(test)]
+    pub fn detached() -> (Handle, Receiver<Req>) {
+        let (req_tx, req_rx) = mpsc::channel::<Req>();
+        let (msg_tx, msg_rx) = mpsc::channel::<Msg>();
+        (
+            Handle {
+                tx: req_tx,
+                rx: msg_rx,
+                msg_tx,
+            },
+            req_rx,
+        )
+    }
 }
 
 /// 起一條 worker thread。開場先回報 origin 與第一輪 liveness，之後照請求做事。
 pub fn spawn<T: TmuxClient + Send + 'static>(tmux: T, paths: Paths) -> Handle {
     let (req_tx, req_rx) = mpsc::channel::<Req>();
     let (msg_tx, msg_rx) = mpsc::channel::<Msg>();
+    let oneshot_tx = msg_tx.clone();
 
     thread::spawn(move || {
         let owner = current_owner(&tmux);
@@ -139,6 +201,7 @@ pub fn spawn<T: TmuxClient + Send + 'static>(tmux: T, paths: Paths) -> Handle {
     Handle {
         tx: req_tx,
         rx: msg_rx,
+        msg_tx: oneshot_tx,
     }
 }
 
@@ -166,4 +229,43 @@ fn current_pane(tmux: &dyn TmuxClient) -> Option<String> {
     }
     tmux.exec(&["display-message", "-p", "#{pane_id}"])?
         .ok_stdout()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 一次性 thread 的訊息 MUST 回流到 UI 的同一個收信口，且**與常駐 worker
+    /// 那條 thread 無關**（evict 的 await 段一等 300s，搭上長工就是五分鐘沒有
+    /// liveness）。這裡連常駐 worker 都沒起，訊息照樣收得到。
+    #[test]
+    fn oneshot_thread_messages_reach_the_ui_channel() {
+        let (h, _req_rx) = Handle::detached();
+        let (done_tx, done_rx) = mpsc::channel::<()>();
+        assert!(h.spawn_oneshot(move |tx| {
+            tx.send(Msg::EvictProgress {
+                name: "w1".into(),
+                line: "evict：收尾任務已派出".into(),
+                warn: false,
+            })
+            .unwrap();
+            tx.send(Msg::Evict {
+                name: "w1".into(),
+                res: Err(ab_core::error::Error::new("boom")),
+            })
+            .unwrap();
+            done_tx.send(()).unwrap();
+        }));
+        done_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("一次性 thread 應完成");
+
+        let mut got = Vec::new();
+        while let Some(m) = h.try_recv() {
+            got.push(m);
+        }
+        assert_eq!(got.len(), 2, "兩則訊息都要回到 UI 的收信口");
+        assert!(matches!(got[0], Msg::EvictProgress { .. }));
+        assert!(matches!(got[1], Msg::Evict { .. }));
+    }
 }

@@ -355,7 +355,7 @@ send（收尾任務，pinned）→ await → despawn。timeout 預設 300。僅 
 出身；registry 無 `spawn_tag` MUST 拒絕（無法鎖定世代）。收尾任務文案是
 機制的一部分（要求 worker 落地 context 內殘值），MUST 內建於實作、不得
 外部檔案化。成功時 stdout 恰為收尾 task-id 一行。
-Source: cmd_evict
+Source: cmd_evict / ab_core::evict
 
 ### CLI-EVICT-2 [tested: 26, 31]
 await 結果分流 MUST 為：completed → `evicted`；failed/cancelled →
@@ -363,16 +363,16 @@ await 結果分流 MUST 為：completed → `evicted`；failed/cancelled →
 （不回話的 worker 不得永久卡死 cap）；await 其他非零（操作性失敗）MUST
 中止並保留 pane（不得把活 worker 當逾時殺）。審計事件名 MUST 如上分流，
 不得合併。不可放寬。
-Source: cmd_evict
+Source: cmd_evict / ab_core::evict
 
-### CLI-EVICT-3 [tested: 26, 29]
+### CLI-EVICT-3 [tested: 26, 29, 43]
 despawn 段 MUST 綁定 evict 起始時記下的 spawn_tag 世代：期間同名 agent
 換代 MUST 拒絕回收（失效方向＝多佔一個 cap，不誤殺新 worker）。despawn
 結果為 stale 時 MUST NOT 記任何 evicted* 審計（該 pane 未被回收）。三段
 MUST NOT 包在同一把鎖內；各段之間中斷的失效方向 MUST 不刪未落地脈絡。
 Source: cmd_evict / cmd_despawn
 
-### CLI-EVICT-4 [tested: 42]
+### CLI-EVICT-4 [tested: 42, 43]
 `evict` 的 additive 參數 `--expect-pane <pane>`／`--expect-generation <tag>`
 （compare-and-act，設計正本 `docs/tui-design.md` §5）。兩者各自獨立可用，
 MUST 只驗帶到的那一項；**兩者皆不帶時行為與現行完全相同**。
@@ -385,7 +385,7 @@ window 各有各的防線）。該鎖 MUST 只在帶了 expect 參數時取用�
 spawn／despawn 互撞）；三段整體仍 MUST NOT 共用一把鎖（CLI-EVICT-3）。
 不符 MUST 以含 `selection stale` 的訊息非 0 退出，且 MUST NOT 建立 task、
 MUST NOT 通知、MUST NOT kill pane、MUST NOT 更動 registry 或審計。
-Source: cmd_evict / check_expect
+Source: cmd_evict / ab_core::evict（check_expect）
 
 ## `hook`
 
@@ -399,7 +399,7 @@ Source: cmd_hook
 
 ## `ui`
 
-### CLI-UI-1 [tested: 40, 41]
+### CLI-UI-1 [tested: 40, 41, 43]
 `ui`：alternate-screen 全螢幕 TUI dashboard（設計正本 `docs/tui-design.md`，
 本條款對應其第一縱切 §8）。MUST 以 alternate screen 進出：退出後（正常
 `q` 退出**與** panic／錯誤退出皆然，後者由 panic hook 保證）MUST 還原
@@ -441,7 +441,32 @@ liveness MUST 維持三態（`unknown` MUST NOT 顯示為 dead）。
 **MUST NOT 含任何 mutation 子指令原文**（cancel／evict／despawn／send／
 spawn／relay／unregister／register／kill／gc）；tmux 不可用時 MUST 以訊息
 降級，MUST NOT 凍結 UI。
-Source: cmd_ui / ab_tui::run
+`e` evict 選中 worker（設計 §3／§5 P3）：合法目標**只有 worker 列**（task 列
+MUST 提示無效）。出身非 spawn 出身／registry 無法解析／缺 `spawn_tag` MUST
+拒絕，且判定與訊息 MUST 沿用 evict 的 core 判定（TUI MUST NOT 另寫一套規則）。
+確認框 MUST 逐字顯示等價 CLI 原文（含 `--expect-pane`／`--expect-generation`），
+措辭 MUST 是「派收尾任務後回收」，**MUST NOT 出現任何「安全刪除」語彙**，且
+MUST NOT 以顏色／排序暗示可刪度、MUST NOT 因 idle／disposable 預選。
+確認（`y`）當下 MUST **重讀 registry** 取當下 pane／世代（不得沿用輪詢快照）；
+確認期**任何取不到「與框上同一個 identity」的情況**（值不符、registry 消失／
+損壞、出身變成人工註冊、`spawn_tag` 消失）MUST 一律以 `selection stale` 中止
+且不建 task、不通知、不 kill、不動 registry／審計——原始理由（「未註冊」
+「非 spawn 出身」）在確認期會被讀成「這個 worker 本來就不能 evict」，而事實
+是「你看到的那一代已經不在」。初次開框（`e`）則 MUST 保留原始理由。
+等價 CLI 原文中的動態值（pane／世代／名稱）MUST 經 shell quoting——registry 是
+worker 可寫面，含空白會破壞 argv 等價、含 `;`／`$(…)` 會讓「可貼上重跑」變成
+注入面。確認框在窄畫面 MUST 換行而非截斷（截掉尾端的世代＝人失去判斷依據）。相符則以當下值帶 `--expect-*` 走 evict 的**同一份 core
+編排**（CLI-EVICT-4／CLI-EVICT-3，鎖語意不變）。
+執行段 MUST NOT 跑在常駐 worker thread 上（那條同時負責 liveness 輪詢，
+evict 的 await 段預設等 300s）：MUST 另起一次性 thread、結果經同一個 channel
+回 UI，UI thread MUST NOT 阻塞；同一個 worker 的 evict 在途時 MUST 以 in-flight
+閘擋下重複發動。**每一次發動 MUST 有終局**：thread 起不來、或工人自身 panic
+（unwind）都 MUST 轉成 terminal error 訊息回 UI，MUST NOT 讓畫面停在「進行中」
+且 in-flight 閘不放開。
+警告（core 的 `EvictEvent::Warn`、確認期 stale、非乾淨終局）MUST NOT 只寫進會
+被下一則訊息覆寫的單行 footer：MUST 以 sticky 的有界歷史呈現，由人顯式清除
+（`Esc`），且溢位 MUST 有可見計數，MUST NOT 靜默丟棄。
+Source: cmd_ui / ab_tui::run / ab_core::evict
 
 ---
 

@@ -56,6 +56,7 @@
 | 40 | TUI 第一縱切（ui dashboard） | CLI-UI-1, CLI-CANCEL-1, ENV-UI-1 |
 | 41 | TUI 四面板＋唯讀鍵 | CLI-UI-1, CLI-READ-1 |
 | 42 | evict 入口 CAS | CLI-EVICT-4, CLI-EVICT-3 |
+| 43 | TUI evict 證據框（CAS） | CLI-UI-1, CLI-EVICT-4, CLI-EVICT-3 |
 
 ## `[untested]` 缺口處置（本輪只記錄，不補測）
 
