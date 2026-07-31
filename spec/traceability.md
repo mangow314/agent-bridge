@@ -54,6 +54,7 @@
 | 38 | list --long 介入視圖 | CLI-LIST-1, CLI-LIST-2 |
 | 39 | copy-mode 送鍵防線 | HOOK-NOTIFY-3, ENV-TMUX-1 |
 | 40 | TUI 第一縱切（ui dashboard） | CLI-UI-1, CLI-CANCEL-1, ENV-UI-1 |
+| 41 | TUI 四面板＋唯讀鍵 | CLI-UI-1, CLI-READ-1 |
 
 ## `[untested]` 缺口處置（本輪只記錄，不補測）
 

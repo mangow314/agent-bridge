@@ -157,7 +157,10 @@ Source: cmd_status
 拒絕（訊息區分兩者）。stdout 恰為 response 內容；task-id／from／to 標頭走
 stderr；記 read 事件（非唯讀路徑）。讀取全程持 task 鎖（與 gc --apply 的
 刪除互斥，不得讀到被抽走一半的目錄）。
-Source: cmd_read
+鎖／狀態驗證／read 事件／payload 讀取的實作已下沉 `ab_core::task::read_response`
+（TUI 的 `r` 消費同一份，CLI-UI-1），**行為不變**：stdout／stderr 逐字輸出、
+退出碼與拒絕訊息一如既往；CLI 側只剩標頭呈現。
+Source: cmd_read / ab_core::task::read_response
 
 ## `await`
 
@@ -381,7 +384,7 @@ Source: cmd_hook
 
 ## `ui`
 
-### CLI-UI-1 [tested: 40]
+### CLI-UI-1 [tested: 40, 41]
 `ui`：alternate-screen 全螢幕 TUI dashboard（設計正本 `docs/tui-design.md`，
 本條款對應其第一縱切 §8）。MUST 以 alternate screen 進出：退出後（正常
 `q` 退出**與** panic／錯誤退出皆然，後者由 panic hook 保證）MUST 還原
@@ -403,6 +406,26 @@ registry），而非字典序第一筆。task status MUST 顯示權威狀態字�
 `AGENT_BRIDGE_UI_POPUP=1`（ENV-UI-1）宣告，此模式下 `Enter` focus 成功後
 MUST 直接正常退出（`display-popup -E` 的行程結束即關 popup，人落在目標
 pane）；未設定時 focus 後繼續執行。
+版面（設計 §2 P2）：四面板 `OWNERS｜WORKERS／TASKS｜DETAIL`。TASKS 欄是
+當前選中 owner 底下所有 worker 的任務平坦列表（**含終態**，id 反序）；
+DETAIL 欄 MUST NOT 可聚焦，永遠顯示當前聚焦面板選中項的唯讀細節。`Tab`
+MUST 在 `OWNERS → WORKERS → TASKS → OWNERS` 三欄間循環。`x` 的合法目標
+擴為 WORKERS 欄的 task 列與 TASKS 欄的**非終態**列；TASKS 欄的終態列
+MUST 提示無效且 MUST NOT 開確認框。
+唯讀鍵（三者皆 MUST NOT 改變任何 task／registry 狀態，`read` 事件除外）：
+`r` 讀選中 task 全文，MUST 走與 `read` 相同的實作（同一把 task 鎖、同一組
+拒絕訊息、同樣記 read 事件，CLI-READ-1），且 MUST 在背景 worker 上執行
+（取鎖會 block）；成功以全螢幕 overlay 呈現，失敗訊息進 footer。
+`i` 顯示選中 worker 的摘要頁（name／pane／runtime／owner／ready／
+spawn_tag／registered_at／liveness／in-flight 一覽），資料來源限於 registry
+與已載入的 read model／liveness 快照，MUST NOT 為此新增 tmux 查詢；
+liveness MUST 維持三態（`unknown` MUST NOT 顯示為 dead）。
+`c` 複製**證據**到 tmux buffer（`set-buffer`，可由 `show-buffer` 讀回），
+內容限於 `task-id:`／`pane:`／`agent-bridge read <id>`／
+`agent-bridge status <id>`（worker 列則為 `pane:`＋`agent-bridge list --long`），
+**MUST NOT 含任何 mutation 子指令原文**（cancel／evict／despawn／send／
+spawn／relay／unregister／register／kill／gc）；tmux 不可用時 MUST 以訊息
+降級，MUST NOT 凍結 UI。
 Source: cmd_ui / ab_tui::run
 
 ---

@@ -13,6 +13,11 @@ use ab_core::registry::{self, AgentSnapshot};
 use ab_core::task::{self, InFlight};
 use ab_core::tmux::TmuxClient;
 
+/// TASKS 面板一次載入的任務上限。`tasks/` 會長大而 dashboard 每 500ms 掃一
+/// 輪：截斷（在讀檔前）是這條路徑唯一的成本上限。200 列遠超過一畫面高度，
+/// 人要看更舊的請走 `list`／`gc` 那條 CLI 路徑。
+pub const RECENT_LIMIT: usize = 200;
+
 /// 磁碟 read model 的一輪快照。
 pub struct Model {
     /// 去重後的 owner 標籤（字典序）。manual worker 統一掛在 `-` 之下
@@ -20,12 +25,16 @@ pub struct Model {
     pub owners: Vec<String>,
     pub workers: Vec<AgentSnapshot>,
     pub tasks: Vec<InFlight>,
+    /// TASKS 面板用：近期任務（**含終態**），id 反序。與 `tasks` 分開存放
+    /// ——WORKERS 欄要的是 in-flight，TASKS 欄要的是「有東西可讀」的全集。
+    pub recent: Vec<InFlight>,
 }
 
 impl Model {
     pub fn load(paths: &Paths) -> Self {
         let workers = registry::snapshot(paths);
         let tasks = task::in_flight(paths);
+        let recent = task::recent_tasks(paths, RECENT_LIMIT);
         let mut owners: Vec<String> = workers.iter().map(owner_label).collect();
         owners.sort();
         owners.dedup();
@@ -33,7 +42,13 @@ impl Model {
             owners,
             workers,
             tasks,
+            recent,
         }
+    }
+
+    /// worker 名 → `workers` 索引（TASKS 欄的列要回頭找所屬 worker）。
+    pub fn worker_idx(&self, name: &str) -> Option<usize> {
+        self.workers.iter().position(|w| w.name == name)
     }
 }
 
@@ -176,6 +191,32 @@ pub fn worker_rows(model: &Model, owner: &str) -> Vec<Row> {
     rows
 }
 
+/// TASKS 欄的列：`model.recent` 的索引。只留派給「當前選中 owner 底下某個
+/// worker」的任務，順序沿用 `recent`（id 反序＝新的在上）。
+///
+/// 為什麼要含終態：`r` 讀的是回覆，而 `read` 只對 `completed`／`failed`
+/// 合法；WORKERS 欄只有 in-flight 列，沒有終態任務就沒有東西可讀。
+pub fn task_rows(model: &Model, owner: &str) -> Vec<usize> {
+    let names: Vec<&str> = model
+        .workers
+        .iter()
+        .filter(|w| owner_label(w) == owner)
+        .map(|w| w.name.as_str())
+        .collect();
+    model
+        .recent
+        .iter()
+        .enumerate()
+        .filter(|(_, t)| names.contains(&t.to.as_str()))
+        .map(|(i, _)| i)
+        .collect()
+}
+
+/// 終態判定（`x` 的合法目標判斷用）。權威字沿用 `spec/state.md`。
+pub fn is_terminal_status(st: &str) -> bool {
+    matches!(st, "completed" | "failed" | "cancelled")
+}
+
 /// `Enter` focus 的執行計畫（§2）：目標在 current session→只 select；
 /// 在別的 session→先 switch-client。linked window 多位置→優先 current
 /// session 的 location，否則取第一個 live location；不彈詢問框。
@@ -217,6 +258,8 @@ mod tests {
             runtime: "codex".to_string(),
             owner: owner.to_string(),
             ready: "ready".to_string(),
+            spawn_tag: format!("tag-{name}"),
+            registered_at: "2026-07-31T00:00:00Z".to_string(),
             spawned,
             corrupt: false,
         }
@@ -247,6 +290,7 @@ mod tests {
                 inflight("20260731T000002Z-bbbb", "w2"),
                 inflight("20260731T000003Z-cccc", "w1"),
             ],
+            recent: Vec::new(),
         };
         let rows = worker_rows(&model, "it:@1");
         assert_eq!(
@@ -260,6 +304,29 @@ mod tests {
             ]
         );
         assert_eq!(worker_rows(&model, "-"), vec![Row::Worker(2)]);
+    }
+
+    /// TASKS 欄（§2 版面新增）：含終態、id 反序、只留本 owner 底下 worker 的
+    /// 任務；別的 owner 的任務不得混入。
+    #[test]
+    fn task_rows_keep_terminal_tasks_of_this_owner_newest_first() {
+        let mut done = inflight("20260731T000009Z-dddd", "w1");
+        done.status = "completed".to_string();
+        let model = Model {
+            owners: vec!["it:@1".into(), "other:@2".into()],
+            workers: vec![snap("w1", true, "it:@1"), snap("wx", true, "other:@2")],
+            tasks: Vec::new(),
+            // recent_tasks 的輸出已是反序
+            recent: vec![
+                done,
+                inflight("20260731T000005Z-eeee", "wx"),
+                inflight("20260731T000001Z-aaaa", "w1"),
+            ],
+        };
+        assert_eq!(task_rows(&model, "it:@1"), vec![0, 2], "含終態、新的在上");
+        assert_eq!(task_rows(&model, "other:@2"), vec![1]);
+        assert!(is_terminal_status("completed") && is_terminal_status("cancelled"));
+        assert!(!is_terminal_status("running"));
     }
 
     /// §2 focus 語意逐條：current session 優先、跨 session 才 switch、

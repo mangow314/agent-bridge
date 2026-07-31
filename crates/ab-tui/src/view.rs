@@ -9,24 +9,71 @@ use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::Line;
-use ratatui::widgets::{Block, Borders, Clear, Paragraph};
+use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
 
-use crate::action::cancel_cmdline;
-use crate::app::{App, Panel};
+use crate::action::{cancel_cmdline, evidence};
+use crate::app::{App, Panel, Sel};
 use crate::model::{LiveIndex, Liveness, Model, Row, owner_liveness, pane_liveness};
+
+/// task id 的固定長度（`YYYYMMDDTHHMMSSZ-xxxx`，見 `ab_core::task`）。
+const TASK_ID_W: u16 = 21;
+/// 中欄最小寬：選中 marker（2）＋列 glyph（2）＋完整 task id ＋左右邊框（2）。
+const MID_MIN_W: u16 = 4 + TASK_ID_W + 2;
+/// OWNERS 欄：marker（2）＋游標（2）＋死活 glyph（2）＋標籤＋邊框。窄畫面下
+/// 先犧牲的是這裡（owner 標籤截斷不影響證據語意）。
+const OWNERS_W: u16 = 20;
+/// DETAIL 欄：容得下最長的等價 CLI 原文 `  $ agent-bridge read <id>`
+/// （2＋2＋18＋21＝43）＋左右邊框。
+const DETAIL_W: u16 = 43 + 2;
+/// 三欄同時成立所需的最小寬。不足時 DETAIL 改走整寬底條（見 `render`）。
+const THREE_COL_MIN_W: u16 = OWNERS_W + MID_MIN_W + DETAIL_W;
+/// 底條模式下 DETAIL 的高度：task 細節 5 行＋空行＋`evidence:`＋2 條命令＋
+/// 上下邊框。
+const DETAIL_STRIP_H: u16 = 11;
 
 pub fn render(f: &mut Frame, model: &Model, live: &LiveIndex, app: &App) {
     let [main, footer] =
         Layout::vertical([Constraint::Min(3), Constraint::Length(2)]).areas(f.area());
-    let [owners_area, workers_area] =
-        Layout::horizontal([Constraint::Length(28), Constraint::Min(24)]).areas(main);
+    // §2 版面：三欄＋中欄縱切。兩條硬不變量同時要守——中欄那 21 字元的
+    // immutable task id MUST 永不截斷（它是 dashboard 全部「證據」語意的
+    // 承重點，§2／§5），而 DETAIL 的等價 CLI 原文 MUST 完整留在畫面上
+    // （薄殼原則，§2：截半條命令等於畫面上沒有那條命令）。
+    //
+    // 三者相加要 92 欄，80 欄的終端機放不下——**寬度不足時 DETAIL 改走整寬
+    // 底條**，而不是壓縮任何一方。80 欄下底條有整整 78 欄，命令原文照樣成行；
+    // 犧牲的只是垂直空間，那是列表捲動本來就處理得了的。
+    let (owners_area, mid_area, detail_area) = if main.width >= THREE_COL_MIN_W {
+        let [o, m, d] = Layout::horizontal([
+            Constraint::Length(OWNERS_W),
+            Constraint::Min(MID_MIN_W),
+            Constraint::Length(DETAIL_W),
+        ])
+        .areas(main);
+        (o, m, d)
+    } else {
+        let [top, d] =
+            Layout::vertical([Constraint::Min(6), Constraint::Length(DETAIL_STRIP_H)]).areas(main);
+        let [o, m] =
+            Layout::horizontal([Constraint::Length(OWNERS_W), Constraint::Min(MID_MIN_W)])
+                .areas(top);
+        (o, m, d)
+    };
+    let [workers_area, tasks_area] =
+        Layout::vertical([Constraint::Percentage(50), Constraint::Percentage(50)]).areas(mid_area);
 
     render_owners(f, owners_area, model, live, app);
     render_workers(f, workers_area, model, live, app);
+    render_tasks(f, tasks_area, model, app);
+    render_detail(f, detail_area, model, live, app);
     render_footer(f, footer, app);
 
+    // overlay 優先序：確認框 > 全文 pager > 摘要頁 > 合法鍵
     if let Some(id) = &app.confirm {
         render_confirm(f, id);
+    } else if app.pager.is_some() {
+        render_pager(f, app);
+    } else if let Some(lines) = &app.info {
+        render_info(f, lines);
     } else if app.help {
         render_help(f, model, app);
     }
@@ -97,8 +144,9 @@ fn render_workers(f: &mut Frame, area: Rect, model: &Model, live: &LiveIndex, ap
             }
             Row::Task { task, .. } => {
                 let t = &model.tasks[task];
-                // status 是權威字（queued/delivered/running），不縮寫不造詞
-                format!("{}  └ {}  {}", sel_prefix(selected), t.id, t.status)
+                // status 是權威字（queued/delivered/running），不縮寫不造詞。
+                // 縮排只留 `└ `：中欄最窄（MID_MIN_W）時 task id 仍要整條進得去
+                format!("{}└ {}  {}", sel_prefix(selected), t.id, t.status)
             }
         };
         lines.push(styled(text, selected));
@@ -115,9 +163,179 @@ fn render_workers(f: &mut Frame, area: Rect, model: &Model, live: &LiveIndex, ap
     );
 }
 
+/// TASKS 欄（§2）：當前 owner 底下所有 worker 的任務平坦列表，**含終態**，
+/// id 反序。沒有這一欄，畫面上就沒有 `r` 讀得動的任務（read 只對
+/// completed／failed 合法）。
+fn render_tasks(f: &mut Frame, area: Rect, model: &Model, app: &App) {
+    let focused = app.panel == Panel::Tasks;
+    let rows = app.task_rows(model);
+    let mut lines = Vec::new();
+    for (i, &ti) in rows.iter().enumerate() {
+        let selected = focused && i == app.task_idx;
+        let t = &model.recent[ti];
+        // status 一律權威字（completed/failed/cancelled/queued/…），glyph 是
+        // 另一軸的裝飾，不取代狀態字
+        let g = match t.status.as_str() {
+            "completed" => "✓",
+            "failed" => "✗",
+            "cancelled" => "-",
+            _ => "⚙",
+        };
+        lines.push(styled(
+            format!(
+                "{}{g} {}  {}  {}",
+                sel_prefix(selected),
+                t.id,
+                t.to,
+                t.status
+            ),
+            selected,
+        ));
+    }
+    if rows.is_empty() {
+        lines.push(Line::from("  （此 owner 下沒有任務）"));
+    }
+    f.render_widget(
+        Paragraph::new(lines)
+            .block(panel_block("TASKS", focused))
+            .scroll((scroll_offset(app.task_idx, area), 0)),
+        area,
+    );
+}
+
+/// DETAIL 欄（§2）：**不可聚焦**，永遠是「當前聚焦面板選中項」的唯讀投影。
+/// evidence 區與 `c` 的 payload 共用 `action::evidence`（白名單同一份來源）。
+fn render_detail(f: &mut Frame, area: Rect, model: &Model, live: &LiveIndex, app: &App) {
+    let sel = app.selection(model);
+    let mut lines: Vec<Line> = Vec::new();
+    match &sel {
+        Sel::None => lines.push(Line::from("（無選中項）")),
+        Sel::Owner(o) => {
+            lines.push(Line::from(format!("owner : {o}")));
+            lines.push(Line::from(format!(
+                "狀態  : {}",
+                liveness_word(owner_liveness(live, o))
+            )));
+        }
+        Sel::Worker(w) => {
+            for l in worker_detail(w, live) {
+                lines.push(Line::from(l));
+            }
+        }
+        Sel::Task { task, worker } => {
+            lines.push(Line::from(format!("task-id: {}", task.id)));
+            lines.push(Line::from(format!("from   : {}", task.from)));
+            lines.push(Line::from(format!("to     : {}", task.to)));
+            lines.push(Line::from(format!("status : {}", task.status)));
+            if let Some(w) = worker {
+                lines.push(Line::from(format!(
+                    "pane   : {}  {}",
+                    if w.pane.is_empty() { "-" } else { &w.pane },
+                    liveness_word(pane_liveness(live, &w.pane))
+                )));
+            }
+        }
+    }
+    let cmds: Vec<String> = evidence(&sel)
+        .into_iter()
+        .filter(|e| e.starts_with("agent-bridge"))
+        .collect();
+    if !cmds.is_empty() {
+        lines.push(Line::from(""));
+        lines.push(Line::from("evidence:"));
+        for c in cmds {
+            lines.push(Line::from(format!("  $ {c}")));
+        }
+    }
+    // 窄畫面下**換行而不截斷**：evidence 區的等價 CLI 原文是薄殼原則的憑證
+    // （§2），截半條命令等於畫面上沒有那條命令。
+    f.render_widget(
+        Paragraph::new(lines)
+            .block(panel_block("DETAIL", false))
+            .wrap(Wrap { trim: false }),
+        area,
+    );
+}
+
+fn worker_detail(w: &ab_core::registry::AgentSnapshot, live: &LiveIndex) -> Vec<String> {
+    vec![
+        format!("name   : {}", w.name),
+        format!("pane   : {}", if w.pane.is_empty() { "-" } else { &w.pane }),
+        format!(
+            "runtime: {}",
+            if w.runtime.is_empty() {
+                "-"
+            } else {
+                &w.runtime
+            }
+        ),
+        format!("ready  : {}", w.ready),
+        format!("狀態   : {}", liveness_word(pane_liveness(live, &w.pane))),
+    ]
+}
+
+/// 三態死活的字面（`unknown` MUST NOT 寫成 dead，§5 顯示紀律）。
+fn liveness_word(l: Liveness) -> &'static str {
+    match l {
+        Liveness::Live => "live",
+        Liveness::Dead => "dead",
+        Liveness::Unknown => "unknown",
+    }
+}
+
+/// `r` 的全螢幕 pager。bytes → 字串**只在這裡**做 lossy 轉換（action 層一律
+/// 保留原始 bytes）。標頭三欄與 CLI 的 stderr 同一組欄位。
+fn render_pager(f: &mut Frame, app: &App) {
+    let Some(p) = &app.pager else { return };
+    let text = String::from_utf8_lossy(&p.bytes).into_owned();
+    let mut lines = vec![
+        Line::from(format!("task-id: {}", p.id)),
+        Line::from(format!("from: {}", p.from)),
+        Line::from(format!("to: {}", p.to)),
+        Line::from("────────"),
+    ];
+    for l in text.lines() {
+        lines.push(Line::from(l.to_string()));
+    }
+    lines.push(Line::from(""));
+    lines.push(Line::from("j/k（↓↑）捲動 · Esc/q 關閉"));
+    let area = f.area();
+    f.render_widget(Clear, area);
+    f.render_widget(
+        Paragraph::new(lines)
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title("read（唯讀全文）"),
+            )
+            .scroll((p.scroll as u16, 0)),
+        area,
+    );
+}
+
+/// `i` 的 worker 摘要頁（內容由 `action::info_page` 組好，這裡只負責畫）。
+fn render_info(f: &mut Frame, lines: &[String]) {
+    let h = (lines.len() as u16).saturating_add(2);
+    let w = lines
+        .iter()
+        .map(|l| l.chars().count() as u16 + 4)
+        .max()
+        .unwrap_or(40)
+        .max(40);
+    popup(
+        f,
+        w,
+        h,
+        "worker 摘要（唯讀）",
+        lines.iter().map(|l| Line::from(l.clone())).collect(),
+    );
+}
+
 fn render_footer(f: &mut Frame, area: Rect, app: &App) {
     let lines = vec![
-        Line::from(" Tab/j/k（↓↑）導航 · Enter focus · x cancel · ? 合法鍵 · q 離開"),
+        Line::from(
+            " Tab/j/k（↓↑）導航 · Enter focus · r read · i 摘要 · c 複製證據 · x cancel · ? 合法鍵 · q 離開",
+        ),
         Line::from(format!(" [poll 500ms · tmux 2s] {}", app.message)),
     ];
     f.render_widget(Paragraph::new(lines), area);
@@ -154,9 +372,20 @@ fn render_help(f: &mut Frame, model: &Model, app: &App) {
             }
             None => lines.push(Line::from("（無選中列）")),
         },
+        Panel::Tasks => match app.selection(model) {
+            Sel::Task { task, .. } => {
+                lines.push(Line::from("task 列：r 讀全文 · i 摘要 · c 複製證據"));
+                if crate::model::is_terminal_status(&task.status) {
+                    lines.push(Line::from("終態任務：x 無效（已無可取消的轉換）"));
+                } else {
+                    lines.push(Line::from("非終態任務：x cancel（單確認）"));
+                }
+            }
+            _ => lines.push(Line::from("（無選中列）")),
+        },
     }
     lines.push(Line::from("按任意鍵關閉"));
-    popup(f, 58, 6, "合法鍵（當前選中項）", lines);
+    popup(f, 58, 7, "合法鍵（當前選中項）", lines);
 }
 
 fn styled(text: String, selected: bool) -> Line<'static> {

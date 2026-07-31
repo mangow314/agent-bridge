@@ -692,39 +692,23 @@ fn cmd_status(paths: &Paths, args: &[String]) -> Result<()> {
 }
 
 /// cmd_read:784 — 讀回覆（completed/failed 可）。
-/// **取 task 鎖到輸出完為止**：gc --apply 刪目錄前取的就是這把鎖，不取的話
-/// 從驗完狀態到讀 response 之間目錄可被整個抽走（cmd_read:791-794）。
+/// 鎖／狀態驗證／read 事件的正本已下沉 `ab_core::task::with_response`
+/// （TUI 的 `r` 消費同一份，審查 F6）；這裡只剩呈現。
+///
+/// 走 callback 而非「拿完整 outcome 再印」：三行標頭與 payload **都要在鎖內、
+/// 且標頭在前**——`response.md` 缺檔時舊行為是標頭已印出才失敗，改成外殼呈現
+/// 就一行都不印了（跨廠審查 major #1）。
 fn cmd_read(paths: &Paths, args: &[String]) -> Result<()> {
     if args.len() != 1 {
         return Err(Error::new("用法：agent-bridge read <task-id>"));
     }
     let id = &args[0];
-    task::check_task_id(id)?;
-    let dir = task::require_task_dir(paths, id)?;
-
-    let guard = acquire_lock(paths, id)?;
-    let outcome = (|| -> Result<()> {
-        match task::read_status(&dir)?.as_str() {
-            "completed" | "failed" => {}
-            "cancelled" => {
-                return Err(Error::new(format!(
-                    "task {id} 已取消（cancelled），沒有回覆可讀"
-                )));
-            }
-            st => {
-                return Err(Error::new(format!(
-                    "task {id} 尚未回覆（狀態：{st}）；查詢進度請用 agent-bridge status {id}"
-                )));
-            }
-        }
+    task::with_response(paths, id, |h, path| {
         eprintln!("task-id: {id}");
-        eprintln!("from: {}", task::meta_str(&dir, "from")?);
-        eprintln!("to: {}", task::meta_str(&dir, "to")?);
-        task::log_event(paths, id, "read", "")?;
-        write_payload(&dir.join("response.md"))
-    })();
-    guard.release();
-    outcome
+        eprintln!("from: {}", h.from);
+        eprintln!("to: {}", h.to);
+        write_payload(path)
+    })
 }
 
 /// cmd_await:822 — 唯讀輪詢 status 檔（不寫 events、不取鎖），在只讀 sandbox
@@ -1323,12 +1307,18 @@ fn poll_interval_shape_ok(raw: &str) -> bool {
 /// payload 輸出：request/response 原文以 byte 原樣寫進 stdout，
 /// 不經 `String`／lossy 轉換（分組 6 驗 byte-for-byte 保真，架構 §3）。
 fn write_payload(path: &std::path::Path) -> Result<()> {
-    use std::io::Write;
     let bytes =
         std::fs::read(path).map_err(|e| Error::new(format!("無法讀取 {}：{e}", path.display())))?;
+    write_bytes_stdout(&bytes)
+}
+
+/// bytes → stdout 的唯一出口（`read` 的 payload 已由 core 讀進記憶體，
+/// 不再走檔案路徑）。
+fn write_bytes_stdout(bytes: &[u8]) -> Result<()> {
+    use std::io::Write;
     let stdout = std::io::stdout();
     let mut lock = stdout.lock();
-    lock.write_all(&bytes)
+    lock.write_all(bytes)
         .map_err(|e| Error::new(format!("無法寫入 stdout：{e}")))?;
     lock.flush()
         .map_err(|e| Error::new(format!("無法寫入 stdout：{e}")))

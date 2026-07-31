@@ -137,6 +137,27 @@ fn event_loop(
                     app.clamp(&model);
                     last_disk = Instant::now();
                 }
+                // `r`：成功開全螢幕 pager（保留原始 bytes，render 才 lossy）；
+                // 失敗（未回覆／已取消／損壞）逐字沿用 core 的訊息進 footer
+                Msg::Read { id, res } => match res {
+                    Ok(o) => {
+                        app.pager = Some(app::Pager {
+                            id,
+                            from: o.from,
+                            to: o.to,
+                            bytes: o.bytes,
+                            scroll: 0,
+                        });
+                        app.message.clear();
+                    }
+                    Err(e) => app.message = e.message,
+                },
+                Msg::Copy { res } => {
+                    app.message = match res {
+                        Ok(()) => "已複製證據到 tmux buffer（tmux show-buffer 可讀回）".to_string(),
+                        Err(e) => e.message,
+                    }
+                }
             }
         }
 
@@ -154,11 +175,26 @@ fn event_loop(
                         // 動作也走 worker：跨 session 的 switch-client 一樣是
                         // tmux 子行程，卡住不得凍住畫面與鍵盤
                         app.message = format!("focus '{label}' 進行中…");
-                        worker.send(Req::Focus { pane, label });
+                        dispatch(&mut app, worker, Req::Focus { pane, label });
                     }
                     Effect::Cancel { id } => {
                         app.message = format!("cancel {id} 進行中…");
-                        worker.send(Req::Cancel { id });
+                        dispatch(&mut app, worker, Req::Cancel { id });
+                    }
+                    // `r` 走背景 worker：read 會取 task 鎖，鎖被握著時在 UI
+                    // thread 上就是凍結（§4 硬條款）
+                    Effect::Read { id } => {
+                        app.message = format!("read {id} 進行中…");
+                        dispatch(&mut app, worker, Req::Read { id });
+                    }
+                    // `i` 只消費已載入的 read model／liveness 快照，不開檔也
+                    // 不查 tmux，故就地組頁（同一份快照＝同一個世代）
+                    Effect::Info { worker: name } => {
+                        app.info = Some(action::info_page(&model, &live, &name));
+                    }
+                    Effect::Copy { payload } => {
+                        app.message = "複製證據中…".to_string();
+                        dispatch(&mut app, worker, Req::Copy { payload });
                     }
                     Effect::None => {}
                 }
@@ -175,6 +211,17 @@ fn event_loop(
             live_inflight = worker.send(Req::Live);
             last_live = Instant::now();
         }
+    }
+}
+
+/// 把請求丟給背景 worker；channel 已斷就**當場給終態**。
+///
+/// `Handle::send` 用 bool 表達 disconnected，丟掉它的話畫面會永遠停在
+/// 「…進行中…」——一個不會結束的進行中比一個明確的失敗更糟，人會一直等
+/// （跨廠審查 minor #5）。
+fn dispatch(app: &mut App, worker: &worker::Handle, req: Req) {
+    if !worker.send(req) {
+        app.message = "背景 worker 已不可用（tmux 動作無法執行）；請離開重開".to_string();
     }
 }
 

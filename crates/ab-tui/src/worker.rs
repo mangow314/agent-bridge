@@ -16,7 +16,7 @@ use std::thread;
 use ab_core::error::Result;
 use ab_core::paths::Paths;
 use ab_core::registry;
-use ab_core::task::{self, CancelOutcome};
+use ab_core::task::{self, CancelOutcome, ReadOutcome};
 use ab_core::tmux::TmuxClient;
 
 use crate::model::LiveIndex;
@@ -29,6 +29,11 @@ pub enum Req {
     Focus { pane: String, label: String },
     /// 執行 cancel（正本在 `ab_core::task::cancel_task`）
     Cancel { id: String },
+    /// 讀 task 全文（正本在 `ab_core::task::read_response`）。**必須在這裡跑**
+    /// ——它會取 task 鎖，鎖被別人握著時 UI thread 上就是凍結
+    Read { id: String },
+    /// 複製證據到 tmux buffer（§3）
+    Copy { payload: String },
 }
 
 /// worker → UI 的訊息。
@@ -47,6 +52,13 @@ pub enum Msg {
     Cancel {
         id: String,
         res: Result<CancelOutcome>,
+    },
+    Read {
+        id: String,
+        res: Result<ReadOutcome>,
+    },
+    Copy {
+        res: Result<()>,
     },
 }
 
@@ -108,6 +120,14 @@ pub fn spawn<T: TmuxClient + Send + 'static>(tmux: T, paths: Paths) -> Handle {
                 Req::Cancel { id } => {
                     let res = task::cancel_task(&paths, &tmux, &id);
                     Msg::Cancel { id, res }
+                }
+                Req::Read { id } => {
+                    let res = task::read_response(&paths, &id);
+                    Msg::Read { id, res }
+                }
+                Req::Copy { payload } => {
+                    let res = crate::action::copy(&crate::action::TmuxClipboard(&tmux), &payload);
+                    Msg::Copy { res }
                 }
             };
             if msg_tx.send(msg).is_err() {

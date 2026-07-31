@@ -46,6 +46,24 @@ impl TaskState {
             TaskState::Completed | TaskState::Failed | TaskState::Cancelled
         )
     }
+
+    /// 權威狀態字 → `TaskState`；不在這六個字之內一律 `None`。
+    ///
+    /// `tasks/` 裡任何人都能寫 status 檔，而 dashboard 的 status 軸 MUST 只顯示
+    /// 權威字（tui-design.md §2：不存在 `blocked` 這個 task 狀態）。沒有這道
+    /// 驗證，一個手寫的 `blocked` 就會原字上畫面，並被當成非終態而開得了
+    /// cancel 確認框。
+    pub fn parse(s: &str) -> Option<TaskState> {
+        match s {
+            "queued" => Some(TaskState::Queued),
+            "delivered" => Some(TaskState::Delivered),
+            "running" => Some(TaskState::Running),
+            "completed" => Some(TaskState::Completed),
+            "failed" => Some(TaskState::Failed),
+            "cancelled" => Some(TaskState::Cancelled),
+            _ => None,
+        }
+    }
 }
 
 /// 訊息來源：`--message <text>`／`--message-file <path>`／`--message-file -`（stdin）。
@@ -660,6 +678,131 @@ pub fn in_flight(paths: &Paths) -> Vec<InFlight> {
     out
 }
 
+/// 近期任務（**含終態**）的唯讀快照，供 TUI 的 TASKS 面板使用
+/// （tui-design.md §2 版面）。`in_flight` 只看得到非終態，而 `read` 只對
+/// `completed`／`failed` 合法——沒有這一份，畫面上就沒有可讀的任務。
+///
+/// 紀律同 `in_flight`：唯讀、**不取鎖**、只認本工具生成形狀的目錄名、單一
+/// 損壞任務跳過而不是讓整份 dashboard 消失。
+///
+/// **先按目錄名反序排序再截到 `limit`，之後才讀 status／metadata**：`tasks/`
+/// 會長大，500ms 輪詢不能對整個目錄做 N 次檔案讀（截斷後至多 `limit` 筆 I/O）。
+/// 目錄名以時間戳起首，字典序＝時間序，故反序＝新的在前。
+pub fn recent_tasks(paths: &Paths, limit: usize) -> Vec<InFlight> {
+    let Ok(rd) = std::fs::read_dir(&paths.tasks_dir) else {
+        return Vec::new();
+    };
+    let mut names: Vec<String> = rd
+        .filter_map(|e| e.ok())
+        .filter_map(|e| e.file_name().to_str().map(|s| s.to_string()))
+        .filter(|n| is_generated_task_dirname(n))
+        .collect();
+    names.sort_by(|a, b| b.cmp(a));
+    names.truncate(limit);
+
+    let mut out = Vec::new();
+    for id in names {
+        let dir = paths.tasks_dir.join(&id);
+        let Ok(st) = read_status(&dir) else { continue };
+        // 非權威狀態字＝損壞，比照損壞目錄跳過。放行的話畫面的 status 軸就會
+        // 出現不存在的 task 狀態（§2 硬條款），且未知值會被當成非終態而開得了
+        // cancel 確認框
+        if TaskState::parse(&st).is_none() {
+            continue;
+        }
+        let Ok(content) = std::fs::read_to_string(dir.join("metadata.json")) else {
+            continue;
+        };
+        let Ok(Value::Object(fields)) = json::parse(&content) else {
+            continue;
+        };
+        out.push(InFlight {
+            id,
+            from: json::jq_raw_field(&fields, "from").unwrap_or_default(),
+            to: json::jq_raw_field(&fields, "to").unwrap_or_default(),
+            status: st,
+        });
+    }
+    out
+}
+
+/// `read` 一次執行的終態：標頭欄位＋response 的**原始位元組**
+/// （payload 邊界走 bytes 是架構 §3 的紅線，不經 `String` 中轉）。
+#[derive(Debug)]
+pub struct ReadOutcome {
+    pub from: String,
+    pub to: String,
+    pub bytes: Vec<u8>,
+}
+
+/// `read` 的標頭欄位（取自 metadata，於鎖內讀出）。
+pub struct ReadHeader {
+    pub from: String,
+    pub to: String,
+}
+
+/// cmd_read:784 的完整語意（鎖／狀態驗證／read 事件／payload 呈現），CLI 與
+/// TUI 的**單一正本**——分家就會漂移（審查 F6，同 `cancel_task` 的處置）。
+///
+/// **持鎖到呼叫端把 payload 處理完為止**，故走 callback 而不是「先讀成
+/// `Vec<u8>` 再回傳」：
+/// - gc --apply 刪目錄前取的就是這把鎖，不取的話從驗完狀態到讀 response
+///   之間目錄可被整個抽走；
+/// - 更關鍵的是**呈現順序**。CLI 舊行為是「先印三行標頭到 stderr，再串流
+///   payload 到 stdout」，兩者都在鎖內。若改成外殼拿到完整 outcome 才印，
+///   `response.md` 缺檔時就變成一行標頭都不印——那是可觀察的行為改變
+///   （跨廠審查 major #1）。
+///
+/// `read` 事件記在**呼叫 callback 之前**（順序同 bash 正本）。
+/// **函式內不印任何字**：標頭與 payload 都交給 callback 呈現。
+pub fn with_response<T>(
+    paths: &Paths,
+    id: &str,
+    f: impl FnOnce(&ReadHeader, &Path) -> Result<T>,
+) -> Result<T> {
+    check_task_id(id)?;
+    let dir = require_task_dir(paths, id)?;
+
+    let guard = crate::lock::acquire_lock(paths, id)?;
+    let outcome = (|| -> Result<T> {
+        match read_status(&dir)?.as_str() {
+            "completed" | "failed" => {}
+            "cancelled" => {
+                return Err(Error::new(format!(
+                    "task {id} 已取消（cancelled），沒有回覆可讀"
+                )));
+            }
+            st => {
+                return Err(Error::new(format!(
+                    "task {id} 尚未回覆（狀態：{st}）；查詢進度請用 agent-bridge status {id}"
+                )));
+            }
+        }
+        let header = ReadHeader {
+            from: meta_str(&dir, "from")?,
+            to: meta_str(&dir, "to")?,
+        };
+        log_event(paths, id, "read", "")?;
+        f(&header, &dir.join("response.md"))
+    })();
+    guard.release();
+    outcome
+}
+
+/// `with_response` 的 bytes 版（TUI 用：overlay pager 要的是完整位元組，
+/// 沒有串流對象）。CLI **不走這條**——它要的是「先標頭再串流」的順序。
+pub fn read_response(paths: &Paths, id: &str) -> Result<ReadOutcome> {
+    with_response(paths, id, |h, path| {
+        let bytes = std::fs::read(path)
+            .map_err(|e| Error::new(format!("無法讀取 {}：{e}", path.display())))?;
+        Ok(ReadOutcome {
+            from: h.from.clone(),
+            to: h.to.clone(),
+            bytes,
+        })
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1110,5 +1253,145 @@ mod tests {
         let id = create_task(&paths, "a", "b", &MessageSource::File(src_file), false).unwrap();
         let got = std::fs::read(task_dir(&paths, &id).join("request.md")).unwrap();
         assert_eq!(got, raw);
+    }
+
+    /// 手鋪一個終態 task（不經 send／reply，狀態確定停在指定值）。
+    fn seed_task(paths: &Paths, id: &str, status: &str, response: Option<&[u8]>) {
+        let dir = paths.tasks_dir.join(id);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("status"), format!("{status}\n")).unwrap();
+        std::fs::write(
+            dir.join("metadata.json"),
+            format!(
+                "{{\"version\":1,\"task_id\":\"{id}\",\"from\":\"alice\",\"to\":\"bob\",\"status\":\"{status}\"}}\n"
+            ),
+        )
+        .unwrap();
+        if let Some(b) = response {
+            std::fs::write(dir.join("response.md"), b).unwrap();
+        }
+    }
+
+    /// tui-design §9 P2 gate (b) 的正本：`read_response` 回的 bytes MUST **逐
+    /// byte** 等於 `response.md`（非 ASCII、trailing newline、非文字 byte 全數
+    /// 原樣），且呼叫後 events.log 多一筆 `read`（read 非唯讀路徑）。
+    #[test]
+    fn read_response_returns_verbatim_bytes_and_logs_read_event() {
+        let d = Dir::new("ab-core-read-bytes");
+        let paths = test_paths(&d);
+        let id = "20260731T000010Z-abcd";
+        let mut raw: Vec<u8> = "回覆內容 ✓\n".as_bytes().to_vec();
+        raw.push(0x00); // 非文字 byte：證明走的是 bytes 不是字串
+        raw.extend_from_slice(b"tail\n");
+        seed_task(&paths, id, "completed", Some(&raw));
+
+        let out = read_response(&paths, id).unwrap();
+        assert_eq!(out.bytes, raw, "MUST 逐 byte 等於 response.md");
+        assert_eq!((out.from.as_str(), out.to.as_str()), ("alice", "bob"));
+        let log = std::fs::read_to_string(task_dir(&paths, id).join("events.log")).unwrap();
+        assert_eq!(
+            log.lines().filter(|l| l.ends_with(" read")).count(),
+            1,
+            "實際 events.log：{log}"
+        );
+    }
+
+    /// 拒絕路徑的訊息逐字釘住（CLI-READ-1：cancelled 與未回覆兩條措辭不同，
+    /// 未來改寫會被這裡抓到——CLI 的 stderr 就是這兩條字串）。
+    #[test]
+    fn read_response_rejects_non_readable_states_verbatim() {
+        let d = Dir::new("ab-core-read-reject");
+        let paths = test_paths(&d);
+        let q = "20260731T000011Z-bbbb";
+        let c = "20260731T000012Z-cccc";
+        seed_task(&paths, q, "queued", None);
+        seed_task(&paths, c, "cancelled", None);
+        assert_eq!(
+            read_response(&paths, q).unwrap_err().message,
+            format!("task {q} 尚未回覆（狀態：queued）；查詢進度請用 agent-bridge status {q}")
+        );
+        assert_eq!(
+            read_response(&paths, c).unwrap_err().message,
+            format!("task {c} 已取消（cancelled），沒有回覆可讀")
+        );
+        // 拒絕路徑不得留下 read 事件
+        assert!(!task_dir(&paths, q).join("events.log").exists());
+    }
+
+    /// `recent_tasks`：含終態、依 id 反序（新的在上）、limit 生效、
+    /// 損壞目錄跳過而不是讓整份快照消失。
+    #[test]
+    fn recent_tasks_are_reverse_ordered_limited_and_corruption_tolerant() {
+        let d = Dir::new("ab-core-recent");
+        let paths = test_paths(&d);
+        seed_task(&paths, "20260731T000001Z-0001", "completed", Some(b"x"));
+        seed_task(&paths, "20260731T000002Z-0002", "queued", None);
+        seed_task(&paths, "20260731T000003Z-0003", "cancelled", None);
+        // 損壞（metadata 不是 JSON）與外來目錄名各一
+        let bad = paths.tasks_dir.join("20260731T000004Z-0004");
+        std::fs::create_dir(&bad).unwrap();
+        std::fs::write(bad.join("status"), "queued\n").unwrap();
+        std::fs::write(bad.join("metadata.json"), "{ not json").unwrap();
+        std::fs::create_dir(paths.tasks_dir.join("foreign-dir")).unwrap();
+
+        let rows = recent_tasks(&paths, 100);
+        let ids: Vec<&str> = rows.iter().map(|t| t.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            vec![
+                "20260731T000003Z-0003",
+                "20260731T000002Z-0002",
+                "20260731T000001Z-0001"
+            ],
+            "反序（新的在上）＋終態亦在列＋損壞者跳過"
+        );
+        assert_eq!(rows[0].status, "cancelled");
+        // limit 在**讀檔前**截斷：最新的一筆正是那個損壞目錄，limit=1 時
+        // 截斷後只剩它，讀不出東西就是空清單（證明截斷不是發生在讀檔之後）
+        assert!(
+            recent_tasks(&paths, 1).is_empty(),
+            "截斷在排序之後、讀檔之前"
+        );
+        let two = recent_tasks(&paths, 2);
+        assert_eq!(two.len(), 1);
+        assert_eq!(two[0].id, "20260731T000003Z-0003");
+    }
+
+    /// 非權威狀態字（`tasks/` 裡任何人都能寫）MUST NOT 進 read model：
+    /// 放行的話畫面的 status 軸就會出現不存在的 task 狀態，而設計正本 §2
+    /// 明訂沒有 `blocked` 這個 task 狀態（跨廠審查 major #2）。
+    #[test]
+    fn recent_tasks_reject_non_authoritative_status() {
+        let d = Dir::new("ab-core-recent-status");
+        let paths = test_paths(&d);
+        seed_task(&paths, "20260731T000001Z-000a", "completed", Some(b"x"));
+        for (id, st) in [
+            ("20260731T000002Z-000b", "blocked"),
+            ("20260731T000003Z-000c", "COMPLETED"),
+            ("20260731T000004Z-000d", ""),
+        ] {
+            seed_task(&paths, id, st, None);
+        }
+
+        let rows = recent_tasks(&paths, 100);
+        let ids: Vec<&str> = rows.iter().map(|t| t.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            vec!["20260731T000001Z-000a"],
+            "只有六個權威狀態字放行；blocked／大小寫變體／空字串一律跳過"
+        );
+
+        // 六個權威字逐一放行（避免未來收窄過頭把合法狀態也擋掉）
+        for st in [
+            "queued",
+            "delivered",
+            "running",
+            "completed",
+            "failed",
+            "cancelled",
+        ] {
+            assert!(TaskState::parse(st).is_some(), "MUST 放行：{st}");
+        }
+        assert!(TaskState::parse("blocked").is_none());
     }
 }

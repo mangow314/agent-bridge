@@ -346,12 +346,18 @@ pub fn list(paths: &Paths) -> Result<Vec<(String, String, String)>> {
 
 /// TUI read model 的一列（tui-design.md §4）。`ready` 沿用 `list` 的三值
 /// （`ready`／`starting`／`-`）；`runtime`／`owner` 缺欄位以空字串表示。
+/// `spawn_tag`／`registered_at` 也在這裡一起取：TUI 的 `i` 摘要頁需要它們當
+/// provenance 證據，而按鍵當下另外開檔重讀會把**不同世代的欄位拼成同一頁**
+/// （registry 是 atomic replace，respawn 剛好插在中間就成立）。同一次 parse
+/// 取齊才是同一份快照（跨廠審查 major #3）。
 pub struct AgentSnapshot {
     pub name: String,
     pub pane: String,
     pub runtime: String,
     pub owner: String,
     pub ready: String,
+    pub spawn_tag: String,
+    pub registered_at: String,
     pub spawned: bool,
     pub corrupt: bool,
 }
@@ -389,6 +395,8 @@ pub fn snapshot(paths: &Paths) -> Vec<AgentSnapshot> {
                     runtime: String::new(),
                     owner: String::new(),
                     ready: "?".to_string(),
+                    spawn_tag: String::new(),
+                    registered_at: String::new(),
                     spawned: false,
                     corrupt: true,
                 });
@@ -415,6 +423,8 @@ pub fn snapshot(paths: &Paths) -> Vec<AgentSnapshot> {
             runtime: json::jq_raw_field(&fields, "runtime").unwrap_or_default(),
             owner: json::jq_raw_field(&fields, "owner").unwrap_or_default(),
             ready: ready.to_string(),
+            spawn_tag: json::jq_raw_field(&fields, "spawn_tag").unwrap_or_default(),
+            registered_at: json::jq_raw_field(&fields, "registered_at").unwrap_or_default(),
             spawned,
             corrupt: false,
         });

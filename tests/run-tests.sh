@@ -4592,6 +4592,208 @@ else
   printf 'SKIP: 40 TUI 第一縱切（SRC_KIND=bash：bash 正本凍結在 M4，不含 TUI）\n'
 fi
 
+# ---- 41. TUI 四面板＋唯讀鍵（r／i／c） ----
+# spec: CLI-UI-1 CLI-READ-1
+# 設計正本 docs/tui-design.md §2 版面（四面板）與 §9 P2 的兩個 gate：
+#   (a) `c` 後 `tmux show-buffer` 的內容含 immutable 證據與唯讀命令原文，且
+#       **不含任何 mutation 子指令字串**（action 層另以假 Clipboard 斷言組裝，
+#       見 `ab_tui::action::tests::copy_payload_is_read_only_evidence_for_every_selection`）
+#   (b) `r` 的畫面側：`agent-bridge read <id>` 的 stdout 落檔，TUI 按 `r` 後
+#       capture-pane 落檔，斷言 response 的特徵行出現在畫面上。**render 層
+#       只做特徵字串比對**——alternate screen 承諾不了 byte 級不變（終審已
+#       裁定）；byte 級由 `ab_core::task::tests::read_response_returns_verbatim_bytes_and_logs_read_event`
+#       負責
+# 另含：Tab 三欄循環、TASKS 欄含終態、終態列 `x` 被拒、`i` 摘要頁、
+# 退出後 window id／layout／geometry 不變與 termios 逐字還原（沿用 40 的
+# tui40_run／stty40_same 手法）。與 35–40 同理只對 Rust 執行。
+if [[ "$SRC_KIND" == rust ]]; then
+
+D41="$TESTROOT/d41"
+mkdir -p "$D41/agents" "$D41/tasks"
+
+# fixture：1 owner／1 live worker／2 task（1 completed＋1 queued——`r` 讀得動
+# 的只有終態任務，這正是 TASKS 欄存在的理由）
+W41_WIN="$(tmx new-window -dP -F '#{window_id}' -t it "$pane_cmd")"
+P41A="$(tmx list-panes -t "$W41_WIN" -F '#{pane_id}')"
+TUI41="$(tmx new-window -dP -F '#{pane_id}' -t it "$pane_cmd")"
+OWN41="$(tmx display -p -t "$TUI41" '#{session_name}:#{window_id}')"
+printf '{"name":"tuiw41","pane_id":"%s","registered_at":"2026-07-31T04:41:00Z","spawned":true,"ready":true,"runtime":"codex","spawn_tag":"t41-gen1","owner":"%s"}\n' \
+  "$P41A" "$OWN41" > "$D41/agents/tuiw41.json"
+
+# 反序（新的在上）：completed 的 id 刻意比 queued 新，TASKS 欄第一列即可讀
+T41DONE="20260731T004142Z-41dd"
+# 後綴 MUST 是 hex：`is_generated_task_dirname` 只認 [0-9a-f]，非 hex 的目錄
+# 一律被當成「不是本工具生成的」而跳過，read model 裡根本不會出現
+T41Q="20260731T004141Z-41cc"
+mkdir -p "$D41/tasks/$T41DONE" "$D41/tasks/$T41Q"
+printf 'completed\n' > "$D41/tasks/$T41DONE/status"
+printf 'p2 fixture task\n' > "$D41/tasks/$T41DONE/request.md"
+printf 'AB41-RESPONSE-LINE 回覆全文的特徵行\n第二行\n' > "$D41/tasks/$T41DONE/response.md"
+printf '{"version":1,"task_id":"%s","from":"alice","to":"tuiw41","created_at":"2026-07-31T04:41:42Z","updated_at":"2026-07-31T04:41:42Z","working_directory":"/tmp","status":"completed"}\n' \
+  "$T41DONE" > "$D41/tasks/$T41DONE/metadata.json"
+printf 'queued\n' > "$D41/tasks/$T41Q/status"
+printf 'p2 fixture task\n' > "$D41/tasks/$T41Q/request.md"
+printf '{"version":1,"task_id":"%s","from":"alice","to":"tuiw41","created_at":"2026-07-31T04:41:41Z","updated_at":"2026-07-31T04:41:41Z","working_directory":"/tmp","status":"queued"}\n' \
+  "$T41Q" > "$D41/tasks/$T41Q/metadata.json"
+
+# gate (b) 的比對來源：CLI 側的 stdout 先落檔（同時證明下沉 ab-core 之後
+# CLI 行為不變，CLI-READ-1）
+ab "$D41" read "$T41DONE" \
+  > "$TESTROOT/t41-cli-read.out" 2> "$TESTROOT/t41-cli-read.err" || true
+assert "41 CLI read stdout 恰為 response 內容（下沉 ab-core 後行為不變）" \
+  diff -q "$D41/tasks/$T41DONE/response.md" "$TESTROOT/t41-cli-read.out"
+assert "41 CLI read 標頭走 stderr（task-id/from/to）" \
+  grep -q "^task-id: $T41DONE\$" "$TESTROOT/t41-cli-read.err"
+
+# 下沉 ab-core 後最容易漂掉的是**呈現順序**：舊行為是「先印三行標頭到 stderr，
+# 再串流 payload」，兩者都在 task 鎖內。若改成外殼拿到完整 outcome 才印，
+# response.md 缺檔時就一行標頭都不印——可觀察的行為改變（跨廠審查 major #1）
+T41NOR="20260731T004143Z-41ee"
+mkdir -p "$D41/tasks/$T41NOR"
+printf 'completed\n' > "$D41/tasks/$T41NOR/status"
+printf '{"version":1,"task_id":"%s","from":"alice","to":"tuiw41","created_at":"2026-07-31T04:41:43Z","updated_at":"2026-07-31T04:41:43Z","working_directory":"/tmp","status":"completed"}\n' \
+  "$T41NOR" > "$D41/tasks/$T41NOR/metadata.json"
+ab "$D41" read "$T41NOR" \
+  > "$TESTROOT/t41-nores.out" 2> "$TESTROOT/t41-nores.err" && rc41=0 || rc41=$?
+assert "41 response.md 缺檔：read 以非零收場" test "$rc41" -ne 0
+assert "41 response.md 缺檔：三行標頭仍先印出（順序不因下沉而改變）" \
+  grep -q "^to: tuiw41\$" "$TESTROOT/t41-nores.err"
+assert "41 response.md 缺檔：stdout 為空（payload 一個位元組都不該出）" \
+  test ! -s "$TESTROOT/t41-nores.out"
+rm -r "$D41/tasks/$T41NOR"
+
+tmx send-keys -t "$TUI41" \
+  "$(printf 'echo AB41-MAIN-SCREEN; touch %q' "$TESTROOT/tui41-ready")" Enter
+wait_for 10 test -f "$TESTROOT/tui41-ready"
+tmx list-windows -F '#{window_id} #{window_layout}' > "$TESTROOT/tui41-before.txt"
+
+# 沿用 40 的手法：同一條 shell 命令內把 stty -g 夾在前後（中間不回 prompt）
+tui41_run() {
+  local tag="$1"; shift
+  tmx send-keys -t "$TUI41" "$(printf 'stty -g > %q; env %s AGENT_BRIDGE_DATA=%q %q ui; stty -g > %q' \
+    "$TESTROOT/stty41-$tag-before" "$*" "$D41" "$BRIDGE" "$TESTROOT/stty41-$tag-after")" Enter
+}
+# shellcheck disable=SC2329  # 經 assert 的 "$@" 間接呼叫
+stty41_same() { diff -q "$TESTROOT/stty41-$1-before" "$TESTROOT/stty41-$1-after"; }
+# tmx 是本檔的 shell function，bash -c 子殼裡不存在：一律先擷取到檔案再斷言
+cap41() { tmx capture-pane -p -t "$TUI41" > "$TESTROOT/tui41-cap.txt" 2>/dev/null; }
+# shellcheck disable=SC2329  # 經 assert/wait_for 的 "$@" 間接呼叫
+ui41_shows() { cap41 && grep -qF "$1" "$TESTROOT/tui41-cap.txt"; }
+# shellcheck disable=SC2329  # 經 assert/wait_for 的 "$@" 間接呼叫
+ui41_lacks() { cap41 && ! grep -qF "$1" "$TESTROOT/tui41-cap.txt"; }
+# 面板聚焦只以文字 marker（`▶`）觀測：capture-pane 吃不到 style
+# shellcheck disable=SC2329  # 經 assert/wait_for 的 "$@" 間接呼叫
+ui41_matches() { cap41 && grep -qE "$1" "$TESTROOT/tui41-cap.txt"; }
+# `r` 是否真的又記了一筆 read 事件（CLI 側已記過一筆，故門檻是 2）
+# shellcheck disable=SC2329  # 經 assert/wait_for 的 "$@" 間接呼叫
+read_ev41_twice() {
+  (( $(grep -cE 'Z read([[:space:]]|$)' "$D41/tasks/$T41DONE/events.log" 2>/dev/null) >= 2 ))
+}
+
+tui41_run q
+# 41a 四面板都畫得出來
+assert "41a 四面板：WORKERS 欄可見" wait_for 10 ui41_shows "WORKERS"
+assert "41a 四面板：TASKS 欄可見" ui41_shows "TASKS"
+assert "41a 四面板：DETAIL 欄可見" ui41_shows "DETAIL"
+assert "41a 四面板：OWNERS 欄可見" ui41_shows "OWNERS"
+# TASKS 欄含終態（in-flight 之外的那一筆），且顯示權威狀態字
+assert "41a TASKS 欄含終態任務（$T41DONE completed）" ui41_shows "$T41DONE"
+assert "41a TASKS 欄 status 為權威字 completed" ui41_shows "completed"
+assert "41a TASKS 欄亦含 queued 任務" ui41_shows "$T41Q"
+# DETAIL 隨聚焦面板的選中項（起始＝WORKERS 的 worker 列）
+assert "41a DETAIL 顯示選中 worker 的欄位" ui41_shows "name   : tuiw41"
+assert "41a DETAIL evidence 區列唯讀等價 CLI 原文" ui41_shows "\$ agent-bridge list --long"
+assert "41a footer 補上 r／i／c 鍵位提示" ui41_shows "c 複製證據"
+
+# 41b `i`：worker 摘要頁（registry 額外欄位＋三態 liveness）
+tmx send-keys -t "$TUI41" i
+assert "41b i 摘要頁顯示 spawn_tag（世代）" wait_for 10 ui41_shows "spawn_tag    : t41-gen1"
+assert "41b i 摘要頁顯示 registered_at" ui41_shows "registered_at: 2026-07-31T04:41:00Z"
+assert "41b i 摘要頁顯示 liveness（三態，此處 live）" ui41_shows "liveness     : live"
+assert "41b i 摘要頁的 evidence 區唯讀" ui41_shows "agent-bridge list --long"
+tmx send-keys -t "$TUI41" Escape
+assert "41b 任意鍵關閉摘要頁（摘要內容從畫面消失）" wait_for 10 ui41_lacks "spawn_tag"
+assert "41b 關閉後仍在 dashboard" ui41_shows "DETAIL"
+
+# 41c Tab 三欄循環：OWNERS → WORKERS → TASKS → OWNERS（DETAIL 不可聚焦）
+assert "41c 起始聚焦 WORKERS（選中 marker 落在 worker 列）" \
+  ui41_matches "▶ ▸ tuiw41"
+tmx send-keys -t "$TUI41" Tab
+assert "41c Tab → TASKS（選中 marker 落在終態任務列）" \
+  wait_for 10 ui41_matches "▶ . $T41DONE"
+assert "41c TASKS 聚焦後 DETAIL 換成該 task 的細節" ui41_shows "task-id: $T41DONE"
+assert "41c DETAIL evidence 區為唯讀 read 命令原文" ui41_shows "\$ agent-bridge read $T41DONE"
+
+# 41d gate (a)：`c` 複製證據 → tmux buffer 讀回
+tmx send-keys -t "$TUI41" c
+assert "41d c 的結果回到 footer" wait_for 10 ui41_shows "已複製證據到 tmux buffer"
+tmx show-buffer > "$TESTROOT/t41-buffer.txt" 2>/dev/null
+assert "41d gate (a)：buffer 含 immutable task id" \
+  grep -qF "task-id: $T41DONE" "$TESTROOT/t41-buffer.txt"
+assert "41d gate (a)：buffer 含 agent-bridge read <id>" \
+  grep -qF "agent-bridge read $T41DONE" "$TESTROOT/t41-buffer.txt"
+assert "41d gate (a)：buffer 含 agent-bridge status <id>" \
+  grep -qF "agent-bridge status $T41DONE" "$TESTROOT/t41-buffer.txt"
+assert "41d gate (a)：buffer 含 pane id（介入用證據）" \
+  grep -qF "pane: $P41A" "$TESTROOT/t41-buffer.txt"
+for _m41 in cancel evict despawn send spawn relay unregister register kill gc; do
+  assert_fails "41d gate (a)：buffer MUST NOT 含 mutation 子指令 '$_m41'" \
+    grep -qF "$_m41" "$TESTROOT/t41-buffer.txt"
+done
+
+# 41e 終態任務按 x：提示無效、不開確認框、狀態不動
+tmx send-keys -t "$TUI41" x
+assert "41e 終態列按 x 被拒（提示含「終態」）" wait_for 10 ui41_shows "終態"
+assert "41e 終態列按 x 不開確認框（無等價 CLI 原文）" \
+  bash -c '! grep -qF "確認後執行下列等價 CLI" "$1"' _ "$TESTROOT/tui41-cap.txt"
+assert "41e 終態任務狀態未被動過" st_is "$D41" "$T41DONE" completed
+
+# 41f gate (b) 的畫面側：`r` 讀全文
+tmx send-keys -t "$TUI41" r
+assert "41f gate (b)：r 的 overlay 顯示 response 特徵行" \
+  wait_for 10 ui41_shows "AB41-RESPONSE-LINE"
+assert "41f gate (b)：overlay 標頭三欄同 CLI stderr（task-id/from/to）" \
+  ui41_shows "task-id: $T41DONE"
+assert "41f gate (b)：特徵行與 CLI stdout 同一份內容" \
+  grep -qF "AB41-RESPONSE-LINE" "$TESTROOT/t41-cli-read.out"
+# `r` 走的是與 CLI 同一份實作（同樣記 read 事件，CLI-READ-1）。門檻必須是
+# **第 2 筆**：同一 fixture 前面已由 CLI read 記過一筆，只驗「至少一筆」的話
+# TUI 完全沒記事件也會綠（跨廠審查 minor #4）
+assert "41f r 記 read 事件（與 CLI read 同一份實作）" \
+  wait_for 10 read_ev41_twice
+tmx send-keys -t "$TUI41" Escape
+assert "41f Esc 關閉 overlay（回到 dashboard）" wait_for 10 ui41_shows "DETAIL"
+
+# 41g 未回覆的任務按 r：逐字沿用 core 的拒絕訊息，不開 overlay
+tmx send-keys -t "$TUI41" j
+tmx send-keys -t "$TUI41" r
+assert "41g queued 任務按 r：footer 顯示 core 的拒絕訊息" \
+  wait_for 10 ui41_shows "尚未回覆"
+assert "41g 被拒時不開 overlay（dashboard 仍在）" ui41_shows "DETAIL"
+
+# 41h Tab 循環走完一圈：TASKS → OWNERS → WORKERS
+tmx send-keys -t "$TUI41" Tab
+assert "41h Tab → OWNERS（marker 落在 owner 列）" \
+  wait_for 10 ui41_matches "▶ ▸ . $OWN41"
+tmx send-keys -t "$TUI41" Tab
+assert "41h Tab → WORKERS（循環回到起點）" wait_for 10 ui41_matches "▶ ▸ tuiw41"
+
+# 41i 退出：termios 逐字還原、tmux 世界不變
+tmx send-keys -t "$TUI41" q
+assert "41i q 退出：離開 alternate screen（主畫面哨兵行回來）" \
+  wait_for 10 ui41_shows "AB41-MAIN-SCREEN"
+assert "41i q 退出：termios 逐字還原" wait_for 10 stty41_same q
+tmx list-windows -F '#{window_id} #{window_layout}' > "$TESTROOT/tui41-after.txt"
+assert "41i 退出後 window id／layout／geometry 不變" \
+  diff -q "$TESTROOT/tui41-before.txt" "$TESTROOT/tui41-after.txt"
+
+tmx kill-pane -t "$TUI41" 2>/dev/null || true
+tmx kill-window -t "$W41_WIN" 2>/dev/null || true
+
+else
+  printf 'SKIP: 41 TUI 四面板＋唯讀鍵（SRC_KIND=bash：bash 正本凍結在 M4，不含 TUI）\n'
+fi
+
 # ---- 總結 ----
 printf '\n共 %d PASS、%d FAIL\n' "$PASS" "$FAIL"
 if (( FAIL > 0 )); then
