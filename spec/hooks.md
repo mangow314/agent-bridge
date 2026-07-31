@@ -117,8 +117,10 @@ m5-proposal.md` §1；codex 為 npm node launcher fork 原生執行檔、原生�
 價值只在命中時的即時自癒，落回路徑是常態而非例外處置。
 Note: 取樣順序 MUST 是先讀自身 PPID、再走中介（如有）、最後驗 `worker_pid`
 的 starttime。反過來的話父行程若在兩次讀取之間退出，hook 會被 reparent，
-於是前一步證實了記錄中的行程、後一步卻拿到新的 PPID。走訪途中任何行程退出
-只會讓後續讀取失敗或 starttime 對不上 → 落回（TOCTOU 的失效方向安全）。
+於是前一步證實了記錄中的行程、後一步卻拿到新的 PPID。TOCTOU 的保證是
+**取樣到不一致即落回**，不是「所有 interleaving 都必落回」——worker 在走訪
+中途退成 zombie 時 starttime 仍讀得到而可能確認成功，但該 hook 確實出自其
+啟動鏈（取樣當下鏈為真），語意無害。
 registry 對同互信域的 worker 可寫，本條防的是**巢狀 runtime 意外冒用**，
 不是防具寫入權的惡意行為者——後者早已在信任模型之外（STATE-AGENT-4 Note）。
 Source: hook_owner_gate

@@ -3832,6 +3832,20 @@ hookcall_via_rt36 claude "$D36E" "ab-spawn-ije-1-aaaaaaaaaaaa" '{"session_id":"s
 assert "36e codex worker 下的 claude 形中介：不得確認" \
   cmp -s "$D36E/state/ije.json" "$TESTROOT/ije-before.json"
 
+# 36g 白名單交叉反例：claude worker 下掛一個**codex 形**的中介、其父又正好
+# 是 worker_pid——launcher 形的結構全對，但 runtime=claude 不在白名單 → MUST
+# 落回。這條架的是「runtime 白名單開關」本身：只刪 runtime guard 而保留
+# 硬編碼 codex attest 的退化，36c 照不出來（claude 形中介 attest 不中），
+# 唯獨這條會紅（codex 跨廠複核 2026-07-31 major 1）
+D36G="$TESTROOT/d36g"
+seed_fresh_foreign_state "$D36G" ijg
+write_ident_reg_rt36 "$D36G" ijg "$ME_PID" "$ME_START" claude
+cp "$D36G/state/ijg.json" "$TESTROOT/ijg-before.json"
+hookcall_via_rt36 codex "$D36G" "ab-spawn-ijg-1-aaaaaaaaaaaa" '{"session_id":"sXRT"}' \
+  >/dev/null 2>&1
+assert "36g claude worker 下的 codex 形中介（結構全對）：白名單不含 claude，不得確認" \
+  cmp -s "$D36G/state/ijg.json" "$TESTROOT/ijg-before.json"
+
 # 36f 鏈中斷：中介活著、但記錄的 worker（中介之父）已死——hook 執行時中介已
 # 被 reparent，攀不回 worker_pid。用真的行程死亡構造，不靠推論：subshell 寫完
 # registry（記自己為 worker）、背景起 codex 形中介後立即退出；中介等 subshell

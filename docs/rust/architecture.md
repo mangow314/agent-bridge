@@ -448,13 +448,18 @@ codex-hooks-probe.md` canary 節：`/new` 後 51 秒新鮮的 state 被當場接
 巢狀被誤認＝**立即奪權**（不經 TTL）。所以界線不能畫在「鏈上有沒有夾別的
 runtime」，只能畫在「鏈是否精確等於該 runtime 實測的自有啟動形狀」——
 claude 零層、codex 恰好一層同產品原生執行檔。巢狀鏈在兩個 runtime 下都更長
-（意外巢狀必經 worker 的 shell 工具，至少多一層），一律落回。與
+——claude 下多巢狀那層；codex 下任何巢狀都掛在 top native 之下，相對 registry
+記的 launcher 至少多一層——一律落回。與
 HOOK-OWNER-4 否決的界線也因此更清楚：我們從不把「鏈上找得到本尊」當證據，
 只認「你是被本尊自己的啟動鏈 fork 的」。
 
-TOCTOU 方向安全：走鏈途中任何行程退出，子代被 reparent，鏈就走不到
-`worker_pid` 或 starttime 對不上 → 落回。中介的 cmdline/starttime 依
-STATE-AGENT-4 同快照夾讀。
+TOCTOU 的保證是**取樣到不一致即落回**（不主張所有 interleaving 必落回：
+worker 走訪中途退成 zombie 時仍可能確認成功，但該 hook 確實出自其啟動鏈，
+語意無害）。中介的 cmdline/starttime 依 STATE-AGENT-4 同快照夾讀；「單次
+stat／夾讀」本身無 hermetic 注入面，屬靜態審查保障，判定條件由
+`launcher_hop_decision` 純核心的單元測試錨住（含兩邊 starttime 不等必拒）。
+registry 三欄（pid/starttime/runtime）取自同一次解析，防 respawn 置換檔案
+時湊出混版身分。
 
 驗收重心跟著風險方向換：主要斷言是**「巢狀（含 claude 巢狀、codex 巢狀）
 不被誤放行」**，不是「codex 本尊會綠」。分組 36 的反例全部用真實形狀的
@@ -464,5 +469,10 @@ STATE-AGENT-4 同快照夾讀。
 | mutation | 預期 | 實測 |
 |---|---|---|
 | 取消白名單、按記錄的 runtime 名認中介（＝草案方向） | 36c（claude 巢狀）紅 | 相符（783／1） |
+| 只刪 runtime 白名單、保留硬編碼 codex attest | 36g（claude worker 下 codex 形中介）紅 | 相符（784／1；36c 對此照不出來——跨廠複核 major 1 補的錨） |
 | 刪 launcher 分支、只比直接 PPID | 36a（codex launcher 本尊）紅 | 相符（783／1） |
 | 不驗中介之父（「恰好一層」上界拆掉） | 36d（鏈更長）紅 | 相符（783／1） |
+
+同快照等式（attest 與 stat 兩邊 starttime 相等）在分組 36 的穩定行程樹上照
+不出來，其行為錨在 Rust 單元測試
+`hook::tests::launcher_hop_decision_confirms_only_the_exact_shape`。

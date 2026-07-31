@@ -196,15 +196,24 @@ pub fn owner_gate(file: &Path, sid: &str, reg_file: &Path) -> bool {
 /// 取樣順序是 **PPID 先、中介次之、`worker_pid` 的 starttime 最後**：反過來
 /// 的話父行程若在兩次讀取之間退出，hook 會被 reparent，於是前一步證實了
 /// recorded process、後一步卻拿到新的 PPID（codex 複核 §2 blocker 2）。先讀
-/// PPID 則走訪途中任何行程退出只會讓後續讀取失敗或 starttime 對不上而落回
-/// ——TOCTOU 的失效方向安全。
+/// PPID 則後續變動的失效方向安全：**取樣到不一致即落回**。不主張所有
+/// interleaving 都必落回——worker 在走訪中途退成 zombie 時 starttime 仍讀得到
+/// 而可能確認成功，但那個 hook 確實出自該 worker 的啟動鏈，語意無害。
 fn proc_identity_confirms_self(reg_file: &Path) -> bool {
     if !crate::proc::available() {
         return false;
     }
+    // registry 三欄取自同一次讀取＋解析：分次讀的話 registry 被置換（respawn）
+    // 時三欄會分屬兩個版本，湊出一個誰都不是的身分（codex 複核 2026-07-31）
+    let Ok(content) = std::fs::read_to_string(reg_file) else {
+        return false;
+    };
+    let Ok(Value::Object(reg)) = json::parse(&content) else {
+        return false;
+    };
     let (Some(pid), Some(recorded_start)) = (
-        read_json_field(reg_file, "worker_pid"),
-        read_json_field(reg_file, "worker_starttime"),
+        json::jq_raw_field(&reg, "worker_pid"),
+        json::jq_raw_field(&reg, "worker_starttime"),
     ) else {
         return false;
     };
@@ -215,32 +224,57 @@ fn proc_identity_confirms_self(reg_file: &Path) -> bool {
     let Some(p1) = crate::proc::self_ppid() else {
         return false;
     };
-    if p1 != pid && !launcher_hop_reaches(&p1, &pid, reg_file) {
-        return false;
+    if p1 != pid {
+        let runtime = json::jq_raw_field(&reg, "runtime");
+        if !launcher_hop_reaches(&p1, &pid, runtime.as_deref()) {
+            return false;
+        }
     }
     // pid 會被回收重用：worker 得是記錄當下的那一次行程生命，才算本尊
     crate::proc::starttime(&pid).as_deref() == Some(recorded_start.as_str())
 }
 
-/// launcher 形（HOOK-OWNER-5）：`p1`（hook 的直接 PPID）是不是 `worker_pid`
-/// fork 出的同產品原生執行檔——恰好一層，只在 registry `runtime=codex` 時嘗試
-/// （實測形狀：`docs/codex-hooks-probe.md` 補測節）。
-///
-/// 對 p1 的三個讀取（cmdline、父 pid、starttime）必須釘在同一次行程生命：
-/// attest 以 starttime 夾住 cmdline，父 pid 與 starttime 出自同一次 stat 讀取，
-/// 再要求兩邊 starttime 相等。缺了這一環，p1 在兩讀之間退出且 pid 被重用時，
-/// argv 驗的是舊行程、父 pid 記的是新行程。
-fn launcher_hop_reaches(p1: &str, worker_pid: &str, reg_file: &Path) -> bool {
-    if read_json_field(reg_file, "runtime").as_deref() != Some("codex") {
+/// launcher 形（HOOK-OWNER-5）的取樣層：對 p1 的三個讀取（cmdline、父 pid、
+/// starttime）必須釘在同一次行程生命——attest 以 starttime 夾住 cmdline，父
+/// pid 與 starttime 出自同一次 stat 讀取，`launcher_hop_decision` 再要求兩邊
+/// starttime 相等。缺了這一環，p1 在兩讀之間退出且 pid 被重用時，argv 驗的是
+/// 舊行程、父 pid 記的是新行程。「單次 stat／夾讀」本身無 hermetic 注入面，
+/// 屬靜態審查保障；判定條件則由 decision 的單元測試錨住。
+fn launcher_hop_reaches(p1: &str, worker_pid: &str, runtime: Option<&str>) -> bool {
+    if runtime != Some("codex") {
+        // 白名單先擋（規則本體在 decision，這裡只是省掉多餘的 /proc 讀取）
         return false;
     }
-    let Some(attested_start) = crate::proc::attest_runtime(p1, "codex") else {
+    let attested_start = crate::proc::attest_runtime(p1, "codex");
+    let parent_snapshot = crate::proc::ppid_and_starttime(p1);
+    launcher_hop_decision(
+        runtime,
+        attested_start.as_deref(),
+        parent_snapshot
+            .as_ref()
+            .map(|(gp, st)| (gp.as_str(), st.as_str())),
+        worker_pid,
+    )
+}
+
+/// launcher 形的純判定核心（不碰 `/proc`，測試直接餵值）：registry `runtime`
+/// 必須恰為 `codex`（逐 runtime 白名單——按「記錄的 runtime 名」認中介的寫法
+/// 會讓 claude worker 下的巢狀 claude 被確認）、p1 以 codex 形 attest 成功、
+/// 父 pid 與 starttime 快照齊備、兩邊 starttime 相等（同一次 p1 生命）、且
+/// 父 pid 精確等於 `worker_pid`（恰好一層）。任一不成立→確認不了。
+fn launcher_hop_decision(
+    runtime: Option<&str>,
+    attested_start: Option<&str>,
+    parent_snapshot: Option<(&str, &str)>,
+    worker_pid: &str,
+) -> bool {
+    if runtime != Some("codex") {
         return false;
-    };
-    let Some((gp, start_now)) = crate::proc::ppid_and_starttime(p1) else {
-        return false;
-    };
-    start_now == attested_start && gp == worker_pid
+    }
+    match (attested_start, parent_snapshot) {
+        (Some(att), Some((gp, start_now))) => start_now == att && gp == worker_pid,
+        _ => false,
+    }
 }
 
 /// hook_oldest_queued:2098 — 最舊一筆 `to == agent` 且狀態為 queued 的 task-id。
@@ -637,6 +671,50 @@ mod tests {
         }
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// launcher 形判定核心的行為錨（HOOK-OWNER-5）。逐條件反證：白名單
+    /// （非 codex 一律否，含「按記錄名認中介」的退化）、attest 缺席、快照
+    /// 缺席、**兩邊 starttime 不等（p1 跨了兩次行程生命）**、父 pid 不符
+    /// （恰好一層的上界）。bash 分組 36 架的是 caller 整條路徑；這裡把純
+    /// 條件釘死，特別是同生命等式——它在分組 36 的穩定行程樹上照不出來。
+    #[test]
+    fn launcher_hop_decision_confirms_only_the_exact_shape() {
+        let ok =
+            |rt: Option<&str>| launcher_hop_decision(rt, Some("100"), Some(("42", "100")), "42");
+        // 完整形狀成立，且只對 codex 白名單成立
+        assert!(ok(Some("codex")));
+        for rt in [None, Some(""), Some("claude"), Some("gemini")] {
+            assert!(!ok(rt), "runtime={rt:?} 不在白名單，不得確認");
+        }
+        // attest／快照缺一不可
+        assert!(!launcher_hop_decision(
+            Some("codex"),
+            None,
+            Some(("42", "100")),
+            "42"
+        ));
+        assert!(!launcher_hop_decision(
+            Some("codex"),
+            Some("100"),
+            None,
+            "42"
+        ));
+        // 同生命等式：attest 到的 starttime 與 stat 快照不等＝p1 在兩讀之間
+        // 換了行程生命，必拒
+        assert!(!launcher_hop_decision(
+            Some("codex"),
+            Some("100"),
+            Some(("42", "101")),
+            "42"
+        ));
+        // 恰好一層：父 pid 不是 worker_pid 就不是本尊自有啟動鏈
+        assert!(!launcher_hop_decision(
+            Some("codex"),
+            Some("100"),
+            Some(("43", "100")),
+            "42"
+        ));
     }
 
     /// `__KEEP__` 語意：不給 last_delivered 時保留舊值，owner 照樣覆寫。

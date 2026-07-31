@@ -56,6 +56,7 @@
 | 條款 | 缺口 | 處置 |
 |---|---|---|
 | ENV-GEN-1 | 「未列變數不影響行為」無測試枚舉 | 認列不測：負面全稱句無法窮舉；由 check-contract.sh 第 1 項的集合 diff 守住新增變數必入 spec 的方向 |
+| HOOK-OWNER-5（部分） | 「同快照夾讀」的單次 stat／夾讀取樣本身無 hermetic 注入面 | 取樣層屬靜態審查保障；判定條件（含兩邊 starttime 不等必拒、runtime 白名單）由 `hook::tests::launcher_hop_decision_confirms_only_the_exact_shape` 錨住，caller 整條路徑由分組 36 錨住 |
 | STATE-GEN-2 | 原子寫入（暫存檔＋rename）無直接斷言 | 認列不測：黑箱難以斷言中間態不可見；分組 15 併發壓測為間接證據；Rust 遷移時以實作審查＋同款壓測守住 |
 
 已知「有行為無測試」的既有缺口（繼承自 notify-native 交接，非本輪新增）：
