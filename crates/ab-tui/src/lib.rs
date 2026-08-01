@@ -12,6 +12,7 @@
 mod action;
 mod app;
 mod model;
+mod theme;
 mod view;
 mod worker;
 

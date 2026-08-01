@@ -285,6 +285,7 @@ focus 跨 window 語意、CAS（cancel 綁 id）。
 | P2 四面板＋唯讀鍵 | TASKS／DETAIL＋`r`/`i`/`c` | (a) `c` 後 `tmux show-buffer` 內容斷言不含任何 mutation 子指令字串（action 層另以假 Clipboard 斷言 payload 組裝）；(b) `r` 在 **action 層**取得的 response bytes 與 `agent-bridge read` 一致（render 層另做 terminal snapshot 測試，不做逐字節比對） |
 | P3 evict CAS | 證據框＋CLI-EVICT-4 | 三則：(a) expect 相符→evict 成功；(b) **invocation 前已換代**→`selection stale` 非 0 退出，且不建 task、無通知、pane 未 kill、registry 未動；(c) 送出後→despawn 前換代（既有 window）→照舊拒收（回歸既有 CLI-EVICT-3 行為） |
 | P4 效率驗收 | 三異常定位 | 兩份**固定 replay script**（baseline：`list --long`＋合法唯讀命令序列；TUI：key 序列）＋明確成功 marker（三個異常 id 均被輸出／複製）；計數規則＝script 內按鍵／命令步數；TUI ≤ baseline 的 50%，正確率 100% |
+| P4.5 視覺樣式層 | `theme` 模組＋ANSI 16 語意色（additive 純樣式：狀態字上色但權威字原文不變、liveness／blocker 語意色、focus Thick 邊框、選取列背景色、footer 警告 Yellow——顏色編碼軸固定五種：status／liveness／blocker／focus／warning；不動 selection 起點／鍵位／面板順序） | (a) render 單元測試（ratatui `TestBackend`）：指定 cell 的 fg/bg/modifier 符合 theme 對映（每個語意色至少一條）＋buffer 字元內容仍含六個權威字原文與 ●/✗/⛔ glyph；(b) P4 replay 重跑步數不變仍達標（樣式不進 capture 計數，重跑確認非假設） |
 | P5 理解驗收 | 歸屬樹測驗 | **human judgment**：受測者 10 秒內畫出 owner→worker→in-flight task 正確歸屬樹（理由：關聯可見性是原始痛點，步數量不到它）；rubric 見下 |
 
 P4 附註：replay script 是 fixture 的一部分（固定初始 selection 與異常排序位置），
@@ -306,9 +307,12 @@ blocked prompt，量到的會是功能缺口而不是效率差距。
 3. 每個 in-flight task 都掛在正確的 worker 下？
 4. 作答時間 ≤10 秒（碼表計時）？
 
-## 10. 開放問題（定案前需使用者拍板）
+## 10. 開放問題（已全數定案；2026-08-01 使用者拍板回填）
 
-1. `i` explain 在 v1 以 status＋registry 摘要頁替代（不新增協定子指令）——可接受？
-2. manifest 化延後＋v1 matcher 契約收窄到硬編碼 blocker＋結構性 occlusion（§4／§7）——同意？
-3. 第一縱切範圍（§8，含 task 可選取列）——同意？
-4. `c` 複製後端定為 tmux buffer（不進系統剪貼簿，§3）——可接受？
+四項原為「待拍板」，對應實作已隨 P0–P3 落地；2026-08-01 使用者確認
+「已拍板，順帶回填文件」，據此改記為定案：
+
+1. `i` explain 在 v1 以 status＋registry 摘要頁替代（不新增協定子指令）——**定案：接受**
+2. manifest 化延後＋v1 matcher 契約收窄到硬編碼 blocker＋結構性 occlusion（§4／§7）——**定案：同意**
+3. 第一縱切範圍（§8，含 task 可選取列）——**定案：同意**
+4. `c` 複製後端定為 tmux buffer（不進系統剪貼簿，§3）——**定案：接受**
