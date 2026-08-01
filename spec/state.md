@@ -28,7 +28,37 @@ Source: NAME_RE（cmd_register / cmd_send 驗證）
 `{name, pane_id, registered_at}`。spawn 出身另含
 `{spawned: true, runtime, model, spawned_at, ready, spawn_tag, owner,
 worker_window}`，以及 STATE-AGENT-4 的 `{worker_pid, worker_starttime}`。
+spawn 另 MUST 寫 STATE-AGENT-5 的 lineage 兩欄。
 Source: cmd_register / cmd_spawn
+
+### STATE-AGENT-5 [tested: 16]
+spawn 出身 MUST 另記 lineage 兩欄（additive、optional、**僅 provenance／
+display**，tui-design.md §9 P4.7）：
+
+- `lineage_root`：恆有值。值為 **generation key＝canonical `spawn_tag` 全串**
+  （registry 既有存法，含 `AGENT_BRIDGE_SPAWN_TAG=` 前綴），**不是名稱**
+  ——名稱會重用，同名 respawn 是新的一代。
+- `parent_agent`：直系 parent 的 canonical `spawn_tag`。**無 parent 時整個
+  key 缺席**（MUST NOT 寫成空字串——「沒有 parent」與「欄位寫壞了」必須分得
+  出來）。
+
+繼承在既有 agents-registry 鎖內完成（lookup 與寫入同一 critical section）：
+呼叫者環境 `AGENT_BRIDGE_SPAWN_TAG` 是**裸值**，MUST 先前綴化為 canonical
+形式再與各 registry `spawn_tag` **byte-for-byte** 比對；合法 match ＝該檔是
+JSON object、`spawned == true`、`spawn_tag` 精確相等（損壞檔跳過，不算 match
+亦不報錯）。**恰一匹配**才認 parent，此時 `lineage_root` 取 parent 的同名
+欄位，缺席或空 MUST 退回 parent 自身 `spawn_tag`；0 筆＝自成根；**≥2 筆＝
+ambiguous，MUST 自成根＋可見警告，MUST NOT 依目錄序任選**。自成根形狀為
+`lineage_root` ＝子代自身 canonical tag、`parent_agent` 缺席。
+
+兩欄只在 spawn 寫入時決定一次，之後任何指令 MUST NOT 更新；`register`
+（人工註冊）MUST NOT 寫這兩欄；legacy registry **永不 backfill**。
+推導的任何失敗 MUST fail-soft（只降級成自成根＋警告），MUST NOT 改變 spawn／
+relay 成敗、cap、owner、ready 或審計等既有行為。
+Note: 兩欄 **MUST NOT 進入任何 auth／CAS 判斷**——despawn／evict 的世代綁定
+照舊只認 `spawn_tag`。理由同 STATE-AGENT-4 的 Note：本檔對同互信域的 worker
+可寫，這兩欄是身分**線索**不是憑證。
+Source: cmd_spawn（lineage 區段）／ab_core::spawn::derive_lineage
 
 ### STATE-AGENT-2 [tested: 20]
 出身判定 MUST 三態：spawn 出身／人工註冊／無法判定（JSON 損壞、非 object、

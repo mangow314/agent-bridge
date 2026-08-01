@@ -489,6 +489,185 @@ pub fn spawn(paths: &Paths, tmux: &dyn TmuxClient, req: &SpawnRequest) -> Result
     Ok(pane)
 }
 
+// ---- lineage 繼承（P4.7 切片 A；契約正本 docs/tui-design.md §9 P4.7 列＋§11）----
+
+/// registry 一列裡與 lineage 有關的欄位（已 parse）。
+///
+/// 只有這三個欄位進得來：lineage 推導**不看名稱、不看檔名**——名稱會重用
+/// （同名 respawn 是新的一代），檔名更只是名稱的別名。唯一的身分軸是
+/// canonical `spawn_tag` 全串。
+#[derive(Debug, Clone)]
+pub struct LineageRow {
+    pub spawned: bool,
+    /// canonical 形式（含 `AGENT_BRIDGE_SPAWN_TAG=` 前綴），即 registry 存法
+    pub spawn_tag: String,
+    /// 缺席（legacy／人工註冊）為 `None`
+    pub lineage_root: Option<String>,
+}
+
+/// spawn 要寫進 registry 的 lineage 兩欄，加上要印給人看的警告（若有）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Lineage {
+    /// `lineage_root`：恆有值（自成根時＝子代自身的 canonical tag）
+    pub root: String,
+    /// `parent_agent`：`None`＝**欄位缺席**（不是空字串）
+    pub parent: Option<String>,
+    /// ambiguous 等 fail-soft 情形要印到 stderr 的話；不使 spawn 失敗
+    pub warning: Option<String>,
+}
+
+/// 環境裸 tag → registry 的 canonical 形式。
+///
+/// 兩者不同構是刻意記下來的坑（P4.7 開批 B2）：環境變數 `AGENT_BRIDGE_SPAWN_TAG`
+/// 的**值**是裸 tag（`ab-spawn-…`），registry 的 `spawn_tag` 存的卻是整個
+/// assignment（`AGENT_BRIDGE_SPAWN_TAG=ab-spawn-…`，因為它同時是 despawn 比對
+/// pane 啟動指令前綴的那一串）。比對前先前綴化，兩邊才在同一個座標系上。
+pub fn canonical_spawn_tag(bare: &str) -> String {
+    format!("{}={bare}", config::ENV_SPAWN_TAG)
+}
+
+/// canonical generation key 的文法（**bash `GEN_KEY_RE` 的逐字副本**）。
+///
+/// 這裡存的是 regex **原文**，實作是下面的手寫掃描；兩者的一致性由
+/// `is_generation_key` 的測試群（逐形狀正反例）錨住，與 bash 的一致性由
+/// `gen_key_grammar_matches_the_bash_runtime` 直接對檔案比對。
+pub const GEN_KEY_RE: &str =
+    r"^AGENT_BRIDGE_SPAWN_TAG=ab-spawn-[A-Za-z0-9_-]+-[0-9]+-[0-9a-f]{12}$";
+
+/// canonical generation key 的**文法驗證**（bash `GEN_KEY_RE` 逐字同一條）：
+/// `^AGENT_BRIDGE_SPAWN_TAG=ab-spawn-[A-Za-z0-9_-]+-[0-9]+-[0-9a-f]{12}$`
+///
+/// 為什麼要驗：registry 是**worker 可寫面**（同 `PANE_RE`／`WINDOW_RE` 的
+/// 理由）。parent 的 `lineage_root` 被寫成名稱字串（`"parent-name"`）、數字
+/// 或陣列時，若原樣沿用，子代就把一個**不是 generation key 的東西**寫進自己
+/// 的 registry——整條 lineage 從此指向一個永遠比不中的值，而畫面上看起來
+/// 完全正常。
+///
+/// 不合法一律**視同缺席**：退回 parent 自身 `spawn_tag`（既有 legacy
+/// fallback 路徑，不另設分支、不另發警告——fail-soft 方向與缺欄位一致）。
+///
+/// 手寫掃描而不是 regex crate：依賴上限（§6）不為一條式子多開一個 crate。
+/// 代價是「兩 runtime 同一條文法」少了一個機器錨，故把 regex 原文留成
+/// `GEN_KEY_RE` 常數，並由 `gen_key_grammar_matches_the_bash_runtime`
+/// 對 `bin/agent-bridge.bash` 逐字比對。
+fn is_generation_key(s: &str) -> bool {
+    let Some(rest) = s.strip_prefix(&format!("{}=ab-spawn-", config::ENV_SPAWN_TAG)) else {
+        return false;
+    };
+    // 尾端固定是 `-<digits>-<12 hex>`；name 段吃掉剩下的全部，且不得為空
+    let Some((head, hex)) = rest.rsplit_once('-') else {
+        return false;
+    };
+    if hex.len() != 12
+        || !hex
+            .bytes()
+            .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+    {
+        return false;
+    }
+    let Some((name, pid)) = head.rsplit_once('-') else {
+        return false;
+    };
+    if pid.is_empty() || !pid.bytes().all(|b| b.is_ascii_digit()) {
+        return false;
+    }
+    !name.is_empty()
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+}
+
+/// lineage 兩欄的推導（**純函式**）。
+///
+/// 刻意不在函式內讀環境：呼叫端在 registry 鎖內讀好傳進來，測試因此不必動
+/// process-global env（動了就會與並行測試互相汙染）。
+///
+/// 語意（逐條對映 §9 P4.7 契約）：
+/// 1. 呼叫者裸 tag 為空 → 自成根。
+/// 2. 非空 → 前綴化後與各列 `spawn_tag` **byte-for-byte** 比對；
+///    合法 match ＝ 該列是 object（parse 得出來才會在 `rows` 裡）、
+///    `spawned == true`、`spawn_tag` 精確相等。
+/// 3. **恰一匹配**才認 parent；`lineage_root` 取 parent 的同名欄位，
+///    缺席或空 → 退 parent 自身 `spawn_tag`（legacy parent 就是這一支）。
+/// 4. 0 筆 → 自成根；**≥2 筆 → ambiguous**，同樣自成根＋警告
+///    （**不得依目錄序任選**：任選會讓 lineage 樹每次 spawn 都可能換爸爸）。
+/// 5. 自成根 ＝ `root` 為子代自身 canonical tag、`parent` 缺席。
+///
+/// 任何一步失敗都只降級成自成根，不影響 spawn 成敗（fail-soft，契約第 7 條）。
+pub fn derive_lineage(caller_tag_bare: &str, rows: &[LineageRow], self_tag: &str) -> Lineage {
+    let own_root = || Lineage {
+        root: self_tag.to_string(),
+        parent: None,
+        warning: None,
+    };
+    if caller_tag_bare.is_empty() {
+        return own_root();
+    }
+    let caller = canonical_spawn_tag(caller_tag_bare);
+    let matches: Vec<&LineageRow> = rows
+        .iter()
+        .filter(|r| r.spawned && r.spawn_tag == caller)
+        .collect();
+    match matches.as_slice() {
+        [p] => Lineage {
+            // parent 缺 `lineage_root`（legacy，永不 backfill）**或值不合
+            // generation key 文法**（registry 是 worker 可寫面）→ 它自己就是根。
+            // 兩種情形走同一條路：不合法就是「這個欄位不算數」
+            root: p
+                .lineage_root
+                .clone()
+                .filter(|s| is_generation_key(s))
+                .unwrap_or_else(|| p.spawn_tag.clone()),
+            parent: Some(p.spawn_tag.clone()),
+            warning: None,
+        },
+        [] => own_root(),
+        many => Lineage {
+            warning: Some(format!(
+                "警告：registry 有 {} 筆 spawn_tag 與呼叫者相同，lineage parent 無法唯一判定，本次以自成根登記（不依目錄序任選）",
+                many.len()
+            )),
+            ..own_root()
+        },
+    }
+}
+
+/// pane 的啟動指令：**tag assignment 必須是第一個 token**（回滾與 despawn
+/// 都以「tag＋一個空白」做 `pane_start_command` 前綴比對）。
+///
+/// 抽成函式是為了讓「白名單有沒有可能塞進第二個 tag assignment」驗得到——
+/// 內嵌在呼叫端時，那條斷言只能靠讀程式碼。
+fn tagged_command(
+    spawn_tag_env: &str,
+    env_prefix: &str,
+    runtime_cmd: &str,
+    prompt_arg: &str,
+) -> String {
+    format!("{spawn_tag_env} {env_prefix}exec {runtime_cmd} {prompt_arg}")
+}
+
+/// 從一份 registry 檔讀出 lineage 需要的欄位。
+///
+/// 損壞（讀不到／不是 JSON／不是 object）一律 `None`＝**不算 match、也不報錯**
+/// ——lineage 是 provenance，讓一份壞掉的 registry 擋下整個 spawn 不成比例。
+fn read_lineage_row(path: &Path) -> Option<LineageRow> {
+    let content = std::fs::read_to_string(path).ok()?;
+    match json::parse(&content) {
+        Ok(Value::Object(fields)) => Some(LineageRow {
+            spawned: json::bool_field_is_true(&fields, "spawned"),
+            spawn_tag: json::str_field(&fields, "spawn_tag")
+                .unwrap_or_default()
+                .to_string(),
+            // string-only 三態（同 `registry::snapshot`）：非字串讀成
+            // `Some("")`＝invalid 標記，接著在 `is_generation_key` 被擋下而
+            // 退回 parent 自身 tag。用 jq 的 `//` 語意會把 `5` 字串化成
+            // `"5"`，那是把型別錯誤偽裝成一個看似合法的值
+            lineage_root: json::string_only_field(&fields, "lineage_root"),
+        }),
+        _ => None,
+    }
+}
+
 /// 傳給鎖內主體的唯讀參數束（避免十個位置參數）。
 struct SpawnLocked<'a> {
     runtime_cmd: &'a str,
@@ -559,8 +738,17 @@ fn spawn_locked(
             env_prefix.push_str(&format!("{pv}={} ", shell_quote_os(&v)));
         }
     }
-    // 白名單延伸：只帶「已設」的變數（未設就跳過，不塞空值）
+    // 白名單延伸：只帶「已設」的變數（未設就跳過，不塞空值）。
+    // **reserved 變數先剔除**（P4.7 切片 A／B4）：它們的 assignment 會排在
+    // spawn 自己那一個之後而把它蓋掉——見 `config::RESERVED_PASS_ENV`
     for pe in config::pass_env_names()? {
+        if config::is_reserved_pass_env(&pe) {
+            let _ = writeln_stderr(&format!(
+                "警告：{} 指名的 {pe} 是保留變數（由 spawn 自行設定），已略過",
+                config::ENV_PASS_ENV
+            ));
+            continue;
+        }
         if let Some(v) = std::env::var_os(&pe) {
             env_prefix.push_str(&format!("{pe}={} ", shell_quote_os(&v)));
         }
@@ -570,11 +758,8 @@ fn spawn_locked(
         env_prefix.push_str(&format!("{}={} ", config::ENV_RELAY_DEPTH, r.depth_next));
     }
 
-    let spawn_tag_env = format!("{}={tag}", config::ENV_SPAWN_TAG);
-    let tagged_cmd = format!(
-        "{spawn_tag_env} {env_prefix}exec {} {prompt_arg}",
-        ctx.runtime_cmd
-    );
+    let spawn_tag_env = canonical_spawn_tag(&tag);
+    let tagged_cmd = tagged_command(&spawn_tag_env, &env_prefix, ctx.runtime_cmd, &prompt_arg);
     // 回滾比對的是「env 前綴＋一個空白」
     rb.tag = spawn_tag_env.clone();
 
@@ -686,6 +871,24 @@ fn spawn_locked(
     // 兩欄要嘛都有、要嘛都空——只有一半的話 hook 端無法判斷 pid 是否已被重用，
     // 而「不確定」在這條路上一律要落回時間窗
     let (worker_pid, worker_starttime) = resolve_worker_identity(tmux, &pane, &req.runtime);
+
+    // lineage 繼承（P4.7 切片 A）。**整段在既有 agents-registry 鎖內**：
+    // lookup 與下面的 registry 組裝／atomic write 是同一個 critical section，
+    // 中間不放鎖——否則 parent 可能在「查到」與「寫下」之間被 despawn 掉，
+    // 寫進去的就是一個指向已消失世代的 parent（不新增鎖，沿用現行鎖域）。
+    //
+    // 環境在這裡讀、推導交給純函式（`derive_lineage` 不碰 env）。非 UTF-8
+    // 的 tag 當成沒有——那不可能是我們自己設的值（tag 是 ASCII）。
+    let caller_tag = std::env::var(config::ENV_SPAWN_TAG).unwrap_or_default();
+    let rows: Vec<LineageRow> = registry_files(paths)
+        .iter()
+        .filter_map(|f| read_lineage_row(f))
+        .collect();
+    let lineage = derive_lineage(&caller_tag, &rows, &spawn_tag_env);
+    if let Some(w) = &lineage.warning {
+        let _ = writeln_stderr(w);
+    }
+
     let ts = now_iso();
     let doc = JsonObject::new()
         .push_str("name", name)
@@ -700,7 +903,16 @@ fn spawn_locked(
         .push_str("owner", ctx.owner)
         .push_str("worker_window", &reg_win)
         .push_str("worker_pid", &worker_pid)
-        .push_str("worker_starttime", &worker_starttime);
+        .push_str("worker_starttime", &worker_starttime)
+        // lineage 兩欄擺在最後：additive optional 欄位，舊讀者逐鍵取值不受
+        // 影響，而擺尾讓「新欄位」在 diff 與人眼裡都一望即知
+        .push_str("lineage_root", &lineage.root);
+    // **自成根時 `parent_agent` 缺席**（JSON 裡沒有這個 key），不是空字串：
+    // 空字串會讓「沒有 parent」與「parent 欄位寫壞了」在讀者眼中一模一樣
+    let doc = match &lineage.parent {
+        Some(p) => doc.push_str("parent_agent", p),
+        None => doc,
+    };
     rb.reg = Some(reg_file.clone());
     atomic_write(&reg_file, format!("{}\n", doc.render()).as_bytes())?;
     let actor = if ctx.owner.is_empty() { "-" } else { ctx.owner };
@@ -1826,5 +2038,324 @@ mod tests {
         assert!(!is_valid_model(""));
         assert!(!is_valid_model(&"a".repeat(65)));
         assert!(is_valid_model(&"a".repeat(64)));
+    }
+
+    // ---- lineage 繼承（P4.7 切片 A）----
+
+    fn row(spawned: bool, tag: &str, root: Option<&str>) -> LineageRow {
+        LineageRow {
+            spawned,
+            spawn_tag: canonical_spawn_tag(tag),
+            lineage_root: root.map(|s| s.to_string()),
+        }
+    }
+
+    /// 子代自己的 canonical tag（＝這次要寫進 registry 的那一串）。
+    fn self_tag() -> String {
+        canonical_spawn_tag("ab-spawn-child-999-cccccccccccc")
+    }
+
+    /// 有 parent（且 parent 自己有 lineage_root）：兩欄都取到、**值是 tag
+    /// 不是名稱**（名稱一個字都不該出現在這兩欄的推導裡）。
+    #[test]
+    fn lineage_inherits_the_parents_root_and_records_the_parent_tag() {
+        let rows = [
+            row(true, "ab-spawn-other-1-aaaaaaaaaaaa", None),
+            row(
+                true,
+                "ab-spawn-parent-2-bbbbbbbbbbbb",
+                Some(&canonical_spawn_tag("ab-spawn-root-0-abcdefabcdef")),
+            ),
+        ];
+        let l = derive_lineage("ab-spawn-parent-2-bbbbbbbbbbbb", &rows, &self_tag());
+        assert_eq!(
+            l.root,
+            canonical_spawn_tag("ab-spawn-root-0-abcdefabcdef"),
+            "root MUST 沿用 parent 的 lineage_root"
+        );
+        assert_eq!(
+            l.parent,
+            Some(canonical_spawn_tag("ab-spawn-parent-2-bbbbbbbbbbbb")),
+            "parent MUST 是 parent 的 canonical spawn_tag 全串"
+        );
+        assert!(l.warning.is_none());
+        // 值是 generation key，不是名稱：兩欄都以 canonical 前綴起首
+        for v in [Some(l.root.clone()), l.parent.clone()]
+            .into_iter()
+            .flatten()
+        {
+            assert!(
+                v.starts_with("AGENT_BRIDGE_SPAWN_TAG=ab-spawn-"),
+                "MUST 是 canonical tag 全串，實際：{v}"
+            );
+        }
+    }
+
+    /// legacy parent（registry 沒有 lineage_root，**永不 backfill**）：
+    /// 退回 parent 自身的 spawn_tag 當根。存在但空的值同樣退回。
+    #[test]
+    fn a_legacy_parent_becomes_the_root_itself() {
+        let tag = "ab-spawn-parent-2-bbbbbbbbbbbb";
+        for root in [None, Some("")] {
+            let rows = [row(true, tag, root)];
+            let l = derive_lineage(tag, &rows, &self_tag());
+            assert_eq!(
+                l.root,
+                canonical_spawn_tag(tag),
+                "legacy／空 lineage_root MUST 退 parent 自身 tag（root={root:?}）"
+            );
+            assert_eq!(l.parent, Some(canonical_spawn_tag(tag)));
+        }
+    }
+
+    /// 呼叫者沒有 tag（tmux 外／人工 pane 起的 orchestrator）→ 自成根：
+    /// root ＝ 自身 tag、**parent 缺席**。
+    #[test]
+    fn no_caller_tag_means_self_rooted_with_no_parent_field() {
+        let rows = [row(true, "ab-spawn-other-1-aaaaaaaaaaaa", None)];
+        let l = derive_lineage("", &rows, &self_tag());
+        assert_eq!(l.root, self_tag());
+        assert_eq!(l.parent, None, "自成根 MUST 是欄位缺席，不是空字串");
+        assert!(l.warning.is_none(), "沒有 tag 是常態，不該警告");
+
+        // 缺席在 **JSON 面**的形狀：doc 裡根本沒有這個 key
+        let doc = JsonObject::new()
+            .push_str("spawn_tag", &self_tag())
+            .push_str("lineage_root", &l.root);
+        let doc = match &l.parent {
+            Some(p) => doc.push_str("parent_agent", p),
+            None => doc,
+        };
+        let rendered = doc.render();
+        assert!(
+            !rendered.contains("parent_agent"),
+            "自成根的 registry MUST 沒有 parent_agent 這個 key，實際：{rendered}"
+        );
+        match json::parse(&rendered) {
+            Ok(Value::Object(m)) => {
+                assert!(!m.contains_key("parent_agent"));
+                assert_eq!(
+                    json::str_field(&m, "lineage_root"),
+                    Some(self_tag().as_str())
+                );
+            }
+            other => panic!("預期 object，實際 {other:?}"),
+        }
+    }
+
+    /// 有 tag 但**找不到**匹配（parent 已 despawn／registry 檔損壞被跳過）
+    /// → 自成根。fail-soft：不報錯、不擋 spawn。
+    #[test]
+    fn an_unmatched_or_corrupt_parent_falls_back_to_self_rooted() {
+        // 無匹配
+        let rows = [row(true, "ab-spawn-other-1-aaaaaaaaaaaa", None)];
+        let l = derive_lineage("ab-spawn-gone-3-dddddddddddd", &rows, &self_tag());
+        assert_eq!(l.root, self_tag());
+        assert_eq!(l.parent, None);
+
+        // 損壞檔在 `read_lineage_row` 就被濾掉，推導看不到它 → 等同無匹配
+        let f = std::env::temp_dir().join(format!("ab-lineage-broken-{}.json", std::process::id()));
+        std::fs::write(&f, "{ not json").unwrap();
+        assert!(read_lineage_row(&f).is_none(), "損壞檔 MUST 不成列");
+        // 非 object 的合法 JSON 同樣不成列
+        std::fs::write(&f, "[1,2,3]").unwrap();
+        assert!(read_lineage_row(&f).is_none(), "非 object MUST 不成列");
+        let _ = std::fs::remove_file(&f);
+        assert!(read_lineage_row(&f).is_none(), "讀不到檔 MUST 不成列");
+        let l = derive_lineage("ab-spawn-parent-2-bbbbbbbbbbbb", &[], &self_tag());
+        assert_eq!(l.parent, None);
+    }
+
+    /// **duplicate tag（≥2 筆相同 spawn_tag）→ 自成根＋警告，不得任選。**
+    ///
+    /// 任選（例如取目錄序第一筆）會讓同一條 lineage 每次 spawn 都可能換爸爸，
+    /// 而畫面上完全看不出來——這正是「不得依目錄序任選」要擋的事。
+    #[test]
+    fn duplicate_parent_tags_are_ambiguous_and_never_picked_arbitrarily() {
+        let tag = "ab-spawn-parent-2-bbbbbbbbbbbb";
+        let rows = [
+            row(
+                true,
+                tag,
+                Some(&canonical_spawn_tag("ab-spawn-rootA-0-aaaaaaaaaaaa")),
+            ),
+            row(
+                true,
+                tag,
+                Some(&canonical_spawn_tag("ab-spawn-rootB-0-bbbbbbbbbbbb")),
+            ),
+        ];
+        let l = derive_lineage(tag, &rows, &self_tag());
+        assert_eq!(l.root, self_tag(), "ambiguous MUST 自成根");
+        assert_eq!(l.parent, None, "ambiguous MUST NOT 認任何一筆當 parent");
+        let w = l.warning.expect("ambiguous MUST 有可見警告");
+        assert!(w.contains("2"), "警告要說出有幾筆：{w}");
+        // 兩個候選的 root 一個都不得出現在結果裡（＝真的沒有任選）
+        for cand in ["ab-spawn-rootA", "ab-spawn-rootB"] {
+            assert!(!l.root.contains(cand), "MUST NOT 任選：{}", l.root);
+        }
+    }
+
+    /// 同名 respawn：舊代 registry 已換 tag → **不得**被認成 parent。
+    ///
+    /// 這是兩欄存 generation key 而非名稱的理由本身：名稱一樣、世代不同。
+    #[test]
+    fn a_respawned_generation_is_not_mistaken_for_the_parent() {
+        let caller = "ab-spawn-lead-7-777777777777";
+        // registry 裡的 'lead' 已經是**新的一代**（tag 不同）
+        let rows = [row(true, "ab-spawn-lead-8-888888888888", None)];
+        let l = derive_lineage(caller, &rows, &self_tag());
+        assert_eq!(l.parent, None, "tag 不等就不是 parent（名稱相同也一樣）");
+        assert_eq!(l.root, self_tag());
+
+        // 只有**精確相等**才算：前綴／後綴相近一律不認
+        for near in [
+            "ab-spawn-lead-7-77777777777",
+            "ab-spawn-lead-7-7777777777770",
+        ] {
+            let rows = [row(true, near, None)];
+            assert_eq!(
+                derive_lineage(caller, &rows, &self_tag()).parent,
+                None,
+                "byte-for-byte 比對：{near} 不得命中"
+            );
+        }
+        // `spawned != true` 的列（人工註冊）同樣不算 parent
+        let rows = [row(false, caller, None)];
+        assert_eq!(derive_lineage(caller, &rows, &self_tag()).parent, None);
+    }
+
+    /// **F2：parent 的 `lineage_root` 沿用前 MUST 驗 generation key 文法。**
+    ///
+    /// registry 是 worker 可寫面：一個寫成名稱字串／數字／陣列的 `lineage_root`
+    /// 若被原樣沿用，子代就把一個**不是 generation key 的東西**寫進自己的
+    /// registry，整條 lineage 從此指向一個永遠比不中的值。不合法＝視同缺席，
+    /// 走既有的 legacy fallback（退 parent 自身 tag），不另設分支。
+    #[test]
+    fn a_malformed_parent_root_is_treated_as_absent() {
+        let tag = "ab-spawn-parent-2-bbbbbbbbbbbb";
+        // 三種來源型別（名稱字串／number／array）：後兩者在 `read_lineage_row`
+        // 就被 string-only 讀法標成 `Some("")`，這裡逐一餵進推導
+        for bad in [
+            "parent-name",                                       // 名稱，不是 key
+            "",                                                  // number／array 的 invalid 標記
+            "ab-spawn-parent-2-bbbbbbbbbbbb",                    // 缺 canonical 前綴
+            "AGENT_BRIDGE_SPAWN_TAG=parent-name",                // 有前綴但不是 tag 形
+            "AGENT_BRIDGE_SPAWN_TAG=ab-spawn-p-2-bbbbbbbbbbb",   // hex 只有 11 位
+            "AGENT_BRIDGE_SPAWN_TAG=ab-spawn-p-2-BBBBBBBBBBBB",  // 大寫 hex
+            "AGENT_BRIDGE_SPAWN_TAG=ab-spawn-p-x-bbbbbbbbbbbb",  // pid 非數字
+            "AGENT_BRIDGE_SPAWN_TAG=ab-spawn--2-bbbbbbbbbbbb",   // name 段為空
+            " AGENT_BRIDGE_SPAWN_TAG=ab-spawn-p-2-bbbbbbbbbbbb", // 前置空白
+            "AGENT_BRIDGE_SPAWN_TAG=ab-spawn-p-2-bbbbbbbbbbbb ", // 尾隨空白
+        ] {
+            assert!(!is_generation_key(bad), "MUST 判為不合法：{bad:?}");
+            let rows = [row(true, tag, Some(bad))];
+            let l = derive_lineage(tag, &rows, &self_tag());
+            assert_eq!(
+                l.root,
+                canonical_spawn_tag(tag),
+                "不合法的 lineage_root MUST 視同缺席（退 parent 自身 tag）：{bad:?}"
+            );
+            assert_eq!(
+                l.parent,
+                Some(canonical_spawn_tag(tag)),
+                "parent 認定不受影響"
+            );
+            assert!(l.warning.is_none(), "不另發警告（同缺欄位路徑）：{bad:?}");
+        }
+        // 正向對照：合法的就照樣沿用（否則上面在驗一個永遠成立的東西）
+        let good = canonical_spawn_tag("ab-spawn-root-0-abcdefabcdef");
+        assert!(is_generation_key(&good));
+        let rows = [row(true, tag, Some(&good))];
+        assert_eq!(derive_lineage(tag, &rows, &self_tag()).root, good);
+    }
+
+    /// **F2 的雙 runtime 錨**：Rust 的手寫掃描與 bash 的 `GEN_KEY_RE`
+    /// MUST 是同一條文法。Rust 這邊沒有 regex 引擎（依賴上限），所以把原文
+    /// 留成常數，並在這裡對 `bin/agent-bridge.bash` **逐字**比對——兩邊哪一
+    /// 側先改，這條就紅。
+    #[test]
+    fn gen_key_grammar_matches_the_bash_runtime() {
+        let bash =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../bin/agent-bridge.bash");
+        let src = std::fs::read_to_string(&bash)
+            .unwrap_or_else(|e| panic!("讀不到 {}：{e}", bash.display()));
+        let want = format!("GEN_KEY_RE='{GEN_KEY_RE}'");
+        assert!(
+            src.contains(&want),
+            "bash 的 GEN_KEY_RE MUST 與 Rust 逐字相同；預期該行為：\n{want}"
+        );
+    }
+
+    /// F2 的型別面：`lineage_root` 是 number／array／bool／null 時，
+    /// `read_lineage_row` MUST 讀成 invalid 標記（`Some("")`）而**不是**把它
+    /// 字串化成一個看似合法的值，最終一律退 parent 自身 tag。
+    #[test]
+    fn non_string_parent_roots_never_become_a_generation_key() {
+        let dir = std::env::temp_dir().join(format!("ab-lineage-types-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let f = dir.join("p.json");
+        let tag = canonical_spawn_tag("ab-spawn-parent-2-bbbbbbbbbbbb");
+        for bad in [
+            "5",
+            "true",
+            "null",
+            "[\"a\"]",
+            "{\"k\":1}",
+            "\"parent-name\"",
+        ] {
+            std::fs::write(
+                &f,
+                format!("{{\"spawned\":true,\"spawn_tag\":\"{tag}\",\"lineage_root\":{bad}}}"),
+            )
+            .unwrap();
+            let r = read_lineage_row(&f).expect("合法 object MUST 成列");
+            let l = derive_lineage("ab-spawn-parent-2-bbbbbbbbbbbb", &[r], &self_tag());
+            assert_eq!(
+                l.root, tag,
+                "lineage_root={bad} MUST 退 parent 自身 tag（不得字串化沿用）"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **PASS_ENV 的 reserved 剔除**：白名單指名 `AGENT_BRIDGE_SPAWN_TAG` 時，
+    /// 組出來的啟動指令 MUST 只有 spawn 自己那一個 tag assignment。
+    ///
+    /// 多出來的那一個會排在後面而覆蓋前者——子代於是頂著呼叫者的 tag 開起來。
+    #[test]
+    fn reserved_names_never_reach_the_launch_command() {
+        assert!(config::is_reserved_pass_env(config::ENV_SPAWN_TAG));
+        assert!(config::is_reserved_pass_env(config::ENV_RELAY_DEPTH));
+        assert!(!config::is_reserved_pass_env("CLAUDE_UNATTENDED"));
+
+        // 模擬 spawn 的組裝：reserved 被剔除、其餘照舊進 env_prefix
+        let mut env_prefix = String::new();
+        for pe in [
+            config::ENV_SPAWN_TAG,
+            "CLAUDE_UNATTENDED",
+            config::ENV_RELAY_DEPTH,
+        ] {
+            if config::is_reserved_pass_env(pe) {
+                continue;
+            }
+            env_prefix.push_str(&format!("{pe}=1 "));
+        }
+        let own = canonical_spawn_tag("ab-spawn-child-999-cccccccccccc");
+        let cmd = tagged_command(&own, &env_prefix, "codex", "--prompt x");
+        assert_eq!(
+            cmd.matches("AGENT_BRIDGE_SPAWN_TAG=").count(),
+            1,
+            "MUST 只有一個 tag assignment，實際：{cmd}"
+        );
+        assert!(
+            !cmd.contains(config::ENV_RELAY_DEPTH),
+            "RELAY_DEPTH 同樣是保留變數：{cmd}"
+        );
+        assert!(cmd.contains("CLAUDE_UNATTENDED=1"), "非保留者照舊穿透");
+        assert!(
+            cmd.starts_with(&format!("{own} ")),
+            "tag MUST 維持第一個 token（回滾／despawn 以此前綴比對）"
+        );
     }
 }

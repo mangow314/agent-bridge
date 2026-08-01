@@ -71,6 +71,25 @@ pub fn jq_alt(fields: &Map<String, Value>, key: &str) -> Option<String> {
     }
 }
 
+/// **string-only 的三態讀法**（P4.7 lineage 兩欄）：
+///
+/// - 缺欄位 → `None`（欄位不存在，例如 legacy registry）
+/// - 存在且是字串 → `Some(原值)`（**空字串照樣是 `Some("")`**）
+/// - 存在但不是字串（`null`／布林／數字／陣列／物件）→ `Some(String::new())`
+///   ＝**invalid 標記**：欄位在，但值不是這個欄位該有的型別
+///
+/// 與 `jq_alt`／`jq_raw_field` 的分工：那兩支模擬 jq 的 `//` 語意，會把
+/// 數字／布林**字串化**（`5` 變 `"5"`）、把 `null`／`false` 併進「沒有值」。
+/// 對「值必須是某個文法的字串」的欄位，兩種壓平都會失真——一個把型別錯誤
+/// 偽裝成合法值，另一個把型別錯誤偽裝成欄位不存在。這裡三態分開，呼叫端
+/// 才有得選（審查 F4）。
+pub fn string_only_field(fields: &Map<String, Value>, key: &str) -> Option<String> {
+    match fields.get(key)? {
+        Value::String(s) => Some(s.clone()),
+        _ => Some(String::new()),
+    }
+}
+
 /// 讀取 object 內某個布林欄位是否「明確為 true」；缺欄位／型別不符都回
 /// `false`（對映 `jq -e '.spawned == true'` 的比較語意——`null`、字串、數字
 /// 一律不算 true）。

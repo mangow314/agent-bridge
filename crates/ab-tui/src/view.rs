@@ -1088,6 +1088,9 @@ mod tests {
             registered_at: "2026-08-01T00:00:00Z".to_string(),
             spawned,
             corrupt: false,
+            // P4.7 切片 A：lineage 兩欄對這些 fixture 無關（None＝欄位缺席）
+            lineage_root: None,
+            parent_agent: None,
         }
     }
 

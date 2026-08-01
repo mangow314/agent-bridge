@@ -110,6 +110,11 @@ Source: ab_tui::run（event_loop）
 ### ENV-PASS-1 [tested: 16]
 `AGENT_BRIDGE_PASS_ENV`：逗號分隔的變數名清單，spawn/relay 時穿透給 worker。
 任一名稱不符合合法變數名文法時 MUST 以錯誤終止。預設空（不穿透）。
+**reserved 變數 MUST 排除**（`AGENT_BRIDGE_SPAWN_TAG`、`AGENT_BRIDGE_RELAY_DEPTH`
+——由 spawn 自行設定）：兩者若獲穿透，其 assignment 會排在 spawn 自己那一個
+之後而覆蓋它，子代於是頂著呼叫者的 tag 開起來（despawn 殺錯世代、lineage 跳錯
+parent、relay 深度重置）。排除採**靜默剔除＋stderr 警告**，MUST NOT 使 spawn
+失敗。雙 runtime 同步（tui-design.md §9 P4.7／§11 B4）。
 Source: cmd_spawn（pass_list）
 
 ### ENV-DEPTH-1 [tested: 23]

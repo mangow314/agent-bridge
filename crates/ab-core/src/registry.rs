@@ -360,6 +360,20 @@ pub struct AgentSnapshot {
     pub registered_at: String,
     pub spawned: bool,
     pub corrupt: bool,
+    /// lineage 的根（P4.7 切片 A）：**值是 generation key＝canonical
+    /// `spawn_tag` 全串**（含 `AGENT_BRIDGE_SPAWN_TAG=` 前綴），不是名稱。
+    ///
+    /// `Option` 是**契約的一部分**：`None`＝這一列根本沒有這個欄位（legacy
+    /// registry，永不 backfill；或人工 `register`），`Some("")`＝欄位在但值
+    /// 是空的（寫壞了）。壓成一個空字串會讓「舊資料」與「壞資料」長得一樣，
+    /// 而 TUI 的歸組要靠前者存在與否分流。
+    pub lineage_root: Option<String>,
+    /// 直系 parent 的 canonical `spawn_tag`（同上，值是 generation key）。
+    /// 自成根時**欄位缺席**（`None`），不是空字串。
+    ///
+    /// 僅 provenance／display：**MUST NOT 進入任何 auth／CAS 判斷**
+    /// （despawn／evict 的世代綁定照舊只認 `spawn_tag`）。
+    pub parent_agent: Option<String>,
 }
 
 /// registry 全池唯讀快照（TUI read model，tui-design.md §4）。
@@ -399,6 +413,10 @@ pub fn snapshot(paths: &Paths) -> Vec<AgentSnapshot> {
                     registered_at: String::new(),
                     spawned: false,
                     corrupt: true,
+                    // 損壞檔沒有可信的 lineage 可言——缺席不是「它自成根」，
+                    // 是「這一列什麼都證明不了」
+                    lineage_root: None,
+                    parent_agent: None,
                 });
                 continue;
             }
@@ -427,6 +445,17 @@ pub fn snapshot(paths: &Paths) -> Vec<AgentSnapshot> {
             registered_at: json::jq_raw_field(&fields, "registered_at").unwrap_or_default(),
             spawned,
             corrupt: false,
+            // **同一次 parse 取齊**（不另開一次讀檔）：registry 是 atomic
+            // replace，分兩次讀會把不同世代的欄位拼進同一列。
+            //
+            // 走 `string_only_field`：這兩欄的值**必須是字串**（canonical
+            // generation key），型別錯誤既不是「沒有這個欄位」也不是一個合法
+            // 值。三態＝缺席（`None`）／字串（`Some(原值)`，含空字串）／
+            // 非字串（`Some("")`＝invalid 標記）。用 `jq_alt` 會把 `5` 字串
+            // 化成 `"5"`、把 `null` 併進缺席——兩種壓平都讓壞資料看起來像
+            // 另一種正常狀態（審查 F4）。
+            lineage_root: json::string_only_field(&fields, "lineage_root"),
+            parent_agent: json::string_only_field(&fields, "parent_agent"),
         });
     }
     out
@@ -573,5 +602,140 @@ mod tests {
         assert!(matches!(read_provenance(&f), Provenance::Undetermined));
         std::fs::remove_file(&f).unwrap();
         assert!(matches!(read_provenance(&f), Provenance::Undetermined));
+    }
+
+    /// **lineage 兩欄的三態**（P4.7 切片 A）：缺席（legacy／人工註冊）、
+    /// 存在且有值、存在但空——`Option<String>` MUST 把前兩者與第三者分開。
+    ///
+    /// 壓成 `unwrap_or_default()` 的話，legacy 列與「欄位寫成空字串」在讀者
+    /// 眼中一模一樣，而 TUI 的歸組正要靠「有沒有這個欄位」分流。
+    #[test]
+    fn snapshot_keeps_lineage_fields_three_valued() {
+        let d = Dir::new("ab-core-registry-lineage");
+        let paths = test_paths(&d);
+        let root = "AGENT_BRIDGE_SPAWN_TAG=ab-spawn-root-1-aaaaaaaaaaaa";
+        let parent = "AGENT_BRIDGE_SPAWN_TAG=ab-spawn-parent-2-bbbbbbbbbbbb";
+
+        // (a) legacy：spawn 出身但根本沒有這兩個欄位
+        std::fs::write(
+            paths.agents_dir.join("a-legacy.json"),
+            "{\"name\":\"a-legacy\",\"spawned\":true,\"spawn_tag\":\"t-legacy\"}",
+        )
+        .unwrap();
+        // (b) 新式：兩欄都在
+        std::fs::write(
+            paths.agents_dir.join("b-child.json"),
+            format!(
+                "{{\"name\":\"b-child\",\"spawned\":true,\"spawn_tag\":\"t-child\",\
+                 \"lineage_root\":\"{root}\",\"parent_agent\":\"{parent}\"}}"
+            ),
+        )
+        .unwrap();
+        // (c) 自成根：lineage_root 在、parent_agent **缺席**
+        std::fs::write(
+            paths.agents_dir.join("c-root.json"),
+            format!(
+                "{{\"name\":\"c-root\",\"spawned\":true,\"spawn_tag\":\"t-root\",\
+                 \"lineage_root\":\"{root}\"}}"
+            ),
+        )
+        .unwrap();
+        // (d) 寫壞了：欄位在、值是空字串
+        std::fs::write(
+            paths.agents_dir.join("d-empty.json"),
+            "{\"name\":\"d-empty\",\"spawned\":true,\"spawn_tag\":\"t-empty\",\
+             \"lineage_root\":\"\",\"parent_agent\":\"\"}",
+        )
+        .unwrap();
+        // (e) 人工註冊：register 不寫這兩欄
+        std::fs::write(
+            paths.agents_dir.join("e-manual.json"),
+            "{\"name\":\"e-manual\",\"pane_id\":\"%9\"}",
+        )
+        .unwrap();
+        // (f) 損壞
+        std::fs::write(paths.agents_dir.join("f-broken.json"), "{ not json").unwrap();
+        // (g)-(j) **型別錯誤**：欄位在，但值不是字串（審查 F4）
+        for (n, v) in [
+            ("g-null", "null"),
+            ("h-false", "false"),
+            ("i-number", "5"),
+            ("j-array", "[\"x\"]"),
+        ] {
+            std::fs::write(
+                paths.agents_dir.join(format!("{n}.json")),
+                format!(
+                    "{{\"name\":\"{n}\",\"spawned\":true,\"spawn_tag\":\"t-{n}\",\
+                     \"lineage_root\":{v},\"parent_agent\":{v}}}"
+                ),
+            )
+            .unwrap();
+        }
+
+        let snap = snapshot(&paths);
+        let get = |n: &str| {
+            snap.iter()
+                .find(|w| w.name == n)
+                .unwrap_or_else(|| panic!("快照缺 {n}"))
+        };
+
+        let legacy = get("a-legacy");
+        assert_eq!(
+            legacy.lineage_root, None,
+            "legacy MUST 是缺席（永不 backfill）"
+        );
+        assert_eq!(legacy.parent_agent, None);
+
+        let child = get("b-child");
+        assert_eq!(child.lineage_root.as_deref(), Some(root));
+        assert_eq!(child.parent_agent.as_deref(), Some(parent));
+
+        let self_rooted = get("c-root");
+        assert_eq!(self_rooted.lineage_root.as_deref(), Some(root));
+        assert_eq!(
+            self_rooted.parent_agent, None,
+            "自成根 MUST 讀成缺席（不是空字串）"
+        );
+
+        let empty = get("d-empty");
+        assert_eq!(
+            empty.lineage_root.as_deref(),
+            Some(""),
+            "存在但空 MUST 與缺席分得出來"
+        );
+        assert_eq!(empty.parent_agent.as_deref(), Some(""));
+        assert_ne!(
+            empty.parent_agent, self_rooted.parent_agent,
+            "「寫壞了」與「自成根」MUST NOT 壓成同一態"
+        );
+
+        assert_eq!(get("e-manual").lineage_root, None, "register 不寫兩欄");
+        assert_eq!(get("e-manual").parent_agent, None);
+
+        let broken = get("f-broken");
+        assert!(broken.corrupt);
+        assert_eq!(broken.lineage_root, None, "損壞列什麼都證明不了");
+        assert_eq!(broken.parent_agent, None);
+
+        // 型別錯誤 MUST 讀成 invalid 標記（`Some("")`）——**不是** `None`
+        // （那會謊稱欄位不存在），也**不是**字串化的值（`5` → `"5"` 會讓型別
+        // 錯誤看起來像一個合法的 key）
+        for n in ["g-null", "h-false", "i-number", "j-array"] {
+            let w = get(n);
+            assert_eq!(
+                w.lineage_root.as_deref(),
+                Some(""),
+                "{n}：非字串 MUST 是 invalid 標記，不得壓成缺席或字串化"
+            );
+            assert_eq!(
+                w.parent_agent.as_deref(),
+                Some(""),
+                "{n}：parent_agent 同理"
+            );
+            assert_ne!(
+                w.lineage_root, legacy.lineage_root,
+                "{n}：MUST 與缺席分得開"
+            );
+        }
     }
 }

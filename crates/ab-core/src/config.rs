@@ -309,6 +309,22 @@ pub fn pass_env_names() -> Result<Vec<String>> {
     Ok(out)
 }
 
+/// `AGENT_BRIDGE_PASS_ENV` **不得穿透**的保留變數（P4.7 切片 A／B4）。
+///
+/// 這兩個變數是 spawn 自己拼進啟動指令的：`SPAWN_TAG` 是子代的世代身分
+/// （despawn／回滾／lineage 全靠它），`RELAY_DEPTH` 是接力鏈的棒次。白名單
+/// 若放它們過去，assignment 會排在 spawn 自己那一個**之後**——同一條命令列
+/// 上後項覆蓋前項，子代於是頂著**呼叫者的** tag 開起來：despawn 會殺錯世代、
+/// lineage 會把自己認成自己的 parent、relay 深度會被重置。
+///
+/// 處置是**靜默剔除＋stderr 警告**，不使 spawn 失敗：呼叫端多半是把整份環境
+/// 名單抄過來，讓 spawn 硬失敗只會逼人拆名單，而剔除之後的行為正是他要的。
+pub const RESERVED_PASS_ENV: [&str; 2] = [ENV_SPAWN_TAG, ENV_RELAY_DEPTH];
+
+pub fn is_reserved_pass_env(name: &str) -> bool {
+    RESERVED_PASS_ENV.contains(&name)
+}
+
 /// 接力鏈深度（cmd_relay:1438-1445）。bash 用 `${VAR-0}` 而非 `${VAR:-0}`：
 /// **「已設但為空」不吃預設**，會落進格式檢查被拒——否則
 /// `AGENT_BRIDGE_RELAY_DEPTH=''` 會靜默把鏈深度重置成 0，cap 形同虛設。

@@ -347,7 +347,10 @@ agent-bridge despawn worker-1                          # 任務收尾：kill pan
   旗標——例如 cron wrapper 設的 `CLAUDE_UNATTENDED=1`，若不跟著過去，接手者 pane
   會靜默退回有人值守的寬鬆姿態，而靜默降級比明確失敗難察覺得多。規則與 proxy
   相同：只帶**有設定的**變數（未設的不塞空值）、`printf %q` 跳脫；變數名逐個驗
-  格式，不合法就 fail-closed。
+  格式，不合法就 fail-closed。**保留變數會被剔除**：`AGENT_BRIDGE_SPAWN_TAG`
+  與 `AGENT_BRIDGE_RELAY_DEPTH` 是 spawn 自己拼進啟動指令的，白名單放它們過去
+  只會讓後項 assignment 蓋掉前者（子代頂著呼叫者的 tag 開起來，despawn 殺錯
+  世代、lineage 跳錯 parent）。處置是靜默剔除＋一行警告，不使 spawn 失敗。
   例：`AGENT_BRIDGE_PASS_ENV=CLAUDE_UNATTENDED agent-bridge relay …`
   **不要拿來傳秘密**：值會出現在 pane 的啟動指令裡（`pane_start_command`），任何
   能操作這台 tmux 的人都看得到。白名單本身也只能由可信的 orchestrator 設定——

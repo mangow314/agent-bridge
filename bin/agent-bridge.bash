@@ -31,6 +31,14 @@ PANE_RE='^%[0-9]+$'
 # registry 的 worker_window 同樣是不可信輸入且會被餵給 tmux（split-window -t），
 # 與 PANE_RE 同一套理由；@id 形式以外一律不採用
 WINDOW_RE='^@[0-9]+$'
+# lineage 兩欄的 **generation key 文法**（P4.7 切片 A）：canonical spawn_tag
+# 全串。registry 與 PANE_RE／WINDOW_RE 同級——是 worker 可寫面，`lineage_root`
+# 被寫成名稱字串（`"parent-name"`）、數字或陣列時，沿用它等於讓子代把一個
+# **不是 generation key 的東西**寫進自己的 registry，整條 lineage 從此指向
+# 一個永遠比不中的值。不合法一律**視同缺席**（退 parent 自身 spawn_tag，走
+# 既有 legacy fallback），fail-soft 方向與缺欄位一致。
+# 形狀對齊 tag 的產生規則：`ab-spawn-<name>-<pid>-<12 hex>`
+GEN_KEY_RE='^AGENT_BRIDGE_SPAWN_TAG=ab-spawn-[A-Za-z0-9_-]+-[0-9]+-[0-9a-f]{12}$'
 # --model 的值會被拼進 tagged_cmd（pane 的啟動命令字串），與 brief 路徑同級的
 # 暴露面，兩類都要擋：(1) 命令注入——字元集排除空白、引號、`;`、`$` 等 sh 與
 # tmux 的分隔符；(2) 旗標走私——首字元強制英數，否則 `--model --bare` 這種值
@@ -1238,10 +1246,22 @@ cmd_spawn() {
   local pass_env="" pe
   local -a pass_list=()
   IFS=',' read -ra pass_list <<<"${AGENT_BRIDGE_PASS_ENV:-}"
+  # reserved 變數 MUST 剔除（P4.7 切片 A／B4）：AGENT_BRIDGE_SPAWN_TAG 與
+  # AGENT_BRIDGE_RELAY_DEPTH 是 spawn 自己拼進啟動指令的，白名單放它們過去
+  # 會讓 assignment 排在 spawn 那一個**之後**——同一條命令列上後項覆蓋前項，
+  # 子代於是頂著呼叫者的 tag 開起來：despawn 殺錯世代、lineage 跳錯 parent、
+  # relay 深度被重置。靜默剔除＋警告，不使 spawn 失敗
   for pe in "${pass_list[@]}"; do
     [[ -n "$pe" ]] || continue
     [[ "$pe" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] \
       || die "AGENT_BRIDGE_PASS_ENV 含不合法的變數名：$pe"
+    case "$pe" in
+      AGENT_BRIDGE_SPAWN_TAG|AGENT_BRIDGE_RELAY_DEPTH)
+        # `|| true` 同 lineage 警告：剔除是 fail-soft 處置，stderr 寫不出去
+        # （關閉／EPIPE）不得在 `set -e` 下把 spawn 帶走
+        err "警告：AGENT_BRIDGE_PASS_ENV 指名的 $pe 是保留變數（由 spawn 自行設定），已略過" || true
+        continue ;;
+    esac
     [[ -n "${!pe+x}" ]] && pass_env+="$pe=$(printf %q "${!pe}") "
   done
   # 接力鏈深度只在 relay 路徑下傳：spawn 出來的 worker 不是接力鏈的一環。
@@ -1345,6 +1365,49 @@ cmd_spawn() {
     tmux set-option -w -t "$pane" pane-border-status top 2>/dev/null || true
   fi
 
+  # ---- lineage 繼承（P4.7 切片 A；契約正本 docs/tui-design.md §9 P4.7 列）----
+  # 兩欄的值是 **generation key＝canonical spawn_tag 全串**（registry 既有存法，
+  # 含 AGENT_BRIDGE_SPAWN_TAG= 前綴），不是名稱：名稱會重用，同名 respawn 是
+  # 新的一代。整段在既有 agents-registry 鎖內（與下面的 atomic_write 同一個
+  # critical section，不另開鎖）。
+  #
+  # 呼叫者環境裡的是**裸值**（$AGENT_BRIDGE_SPAWN_TAG），registry 存的是整個
+  # assignment（$SPAWN_RB_TAG 的形式）——比對前先前綴化，兩邊才在同一座標系。
+  # 恰一匹配才認 parent：0 筆＝自成根，≥2 筆＝ambiguous 亦自成根＋警告
+  # （不得依目錄序任選）。推導任一步失敗只降級成自成根，不影響 spawn 成敗。
+  local lineage_root="$SPAWN_RB_TAG" parent_agent="" caller_tag_canon=""
+  local lin_matches=0 lf lf_root=""
+  if [[ -n "${AGENT_BRIDGE_SPAWN_TAG:-}" ]]; then
+    caller_tag_canon="AGENT_BRIDGE_SPAWN_TAG=${AGENT_BRIDGE_SPAWN_TAG}"
+    for lf in "$AGENTS_DIR"/*.json; do
+      [[ -e "$lf" ]] || continue
+      # 合法 match：是 object、spawned == true、spawn_tag 精確相等。
+      # 損壞檔（jq 非零／非 object）跳過——不算 match，也不報錯
+      jq -e --arg t "$caller_tag_canon" \
+        '(type == "object") and (.spawned == true) and (.spawn_tag == $t)' \
+        "$lf" >/dev/null 2>&1 || continue
+      lin_matches=$((lin_matches + 1))
+      # **先清再讀**：日後若放寬匹配數，殘留值會被下一輪誤用（verifier 建議）
+      lf_root=""
+      # `--arg` 取字串型別，非字串（number／array／object／null）一律拿到空
+      # 字串——連同下面的文法驗證，構成「不是 generation key 就視同缺席」
+      lf_root="$(jq -r 'if (.lineage_root | type) == "string" then .lineage_root else "" end' \
+        "$lf" 2>/dev/null)" || lf_root=""
+      # 文法不合就當它不存在（不另設分支、不另發警告，同缺欄位路徑）
+      [[ "$lf_root" =~ $GEN_KEY_RE ]] || lf_root=""
+    done
+    if (( lin_matches == 1 )); then
+      parent_agent="$caller_tag_canon"
+      # parent 缺 lineage_root（legacy，永不 backfill）／值不合文法 → 它自己就是根
+      if [[ -n "$lf_root" ]]; then lineage_root="$lf_root"; else lineage_root="$caller_tag_canon"; fi
+    elif (( lin_matches >= 2 )); then
+      # `|| true`：`set -e` 下裸 err 在 stderr 關閉／EPIPE 時會讓整個 spawn
+      # 中止，而這裡已經在 pane 建好之後——EXIT trap 會回滾一個其實成功的
+      # spawn。lineage 是 provenance，MUST NOT 影響 spawn 成敗（契約第 7 條）
+      err "警告：registry 有 $lin_matches 筆 spawn_tag 與呼叫者相同，lineage parent 無法唯一判定，本次以自成根登記（不依目錄序任選）" || true
+    fi
+  fi
+
   local ts doc
   ts="$(now_iso)"
   # spawn_tag 一併存進 registry：pane id 會被 tmux 重用（不同 server、server
@@ -1354,12 +1417,18 @@ cmd_spawn() {
   # evict）與事後追查（這個 worker 當時跑什麼模型）都用得到
   # owner／worker_window 一併入 registry：owner 是 per-owner window 回查與審計
   # 行為者的依據；空字串＝tmux 外 spawn（舊行為落點，無主）
+  # lineage_root 恆有值（自成根時＝子代自身的 tag）；parent_agent 在自成根時
+  # **整個 key 缺席**（不是空字串）——空字串會讓「沒有 parent」與「欄位寫壞了」
+  # 長得一樣。additive optional，擺在最後
   doc="$(jq -n --arg name "$name" --arg pane "$pane" --arg ts "$ts" --arg rt "$runtime" \
               --arg tag "$SPAWN_RB_TAG" --arg model "$model" \
               --arg owner "$owner" --arg wwin "$reg_win" \
+              --arg lroot "$lineage_root" --arg parent "$parent_agent" \
     '{name: $name, pane_id: $pane, registered_at: $ts,
       spawned: true, runtime: $rt, model: $model, spawned_at: $ts, ready: false,
-      spawn_tag: $tag, owner: $owner, worker_window: $wwin}')"
+      spawn_tag: $tag, owner: $owner, worker_window: $wwin,
+      lineage_root: $lroot}
+     + (if $parent == "" then {} else {parent_agent: $parent} end)')"
   SPAWN_RB_REG="$AGENTS_DIR/$name.json"
   printf '%s\n' "$doc" | atomic_write "$AGENTS_DIR/$name.json"
   log_agent_event spawned "$name" "$pane" "$runtime" "${owner:--}"

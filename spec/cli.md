@@ -214,7 +214,9 @@ worker pane 的啟動命令 MUST 以 `AGENT_BRIDGE_SPAWN_TAG=<tag>` 為第一個
 token（tag 文法見 ENV-TAG-1，含 48 位熵與 agent 名）；tag 同時寫入
 registry 的 `spawn_tag` 欄。它是 despawn／回滾辨識 pane 出身的唯一證據。
 呼叫者環境的標準 proxy 變數 MUST 穿透給 worker；`AGENT_BRIDGE_PASS_ENV`
-指名的變數 MUST 只在「已設」時穿透（不塞空值）。
+指名的變數 MUST 只在「已設」時穿透（不塞空值），且 **reserved 變數
+（`AGENT_BRIDGE_SPAWN_TAG`／`AGENT_BRIDGE_RELAY_DEPTH`）MUST 剔除**——它們
+的 assignment 會排在 spawn 自己那一個之後而覆蓋它（詳 ENV-PASS-1）。
 Source: cmd_spawn
 
 ### CLI-SPAWN-5 [tested: 32]

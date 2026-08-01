@@ -868,7 +868,7 @@ all_ids13_ok() {
 assert "併發 send：10 個 task 目錄皆存在且狀態合法" all_ids13_ok
 
 # ---- 16. spawn：核心＋cap＋原子回滾（Phase 1） ----
-# spec: CLI-SPAWN-1 CLI-SPAWN-2 CLI-SPAWN-3 CLI-SPAWN-4 ENV-SPAWN-1 ENV-HOOKS-1 ENV-PASS-1 ENV-TAG-1 HOOK-BIND-1 STATE-AGENT-1
+# spec: CLI-SPAWN-1 CLI-SPAWN-2 CLI-SPAWN-3 CLI-SPAWN-4 ENV-SPAWN-1 ENV-HOOKS-1 ENV-PASS-1 ENV-TAG-1 HOOK-BIND-1 STATE-AGENT-1 STATE-AGENT-5
 
 # 16a. 快樂路徑：假 codex 啟動期吃輸入 2 秒，首發探針必被吃，
 # ready 仍翻 true ＝ 探針重送機制生效（Phase 2 gate 一併覆蓋）
@@ -1118,6 +1118,163 @@ assert "UserPromptSubmit 對應裸指令 agent-bridge hook prompt-submit" \
 assert "Notification 對應裸指令 agent-bridge hook notification" \
   jq -e '.hooks.Notification[0].hooks[0].command == "agent-bridge hook notification" and .hooks.Notification[0].hooks[0].type == "command"' \
   "$HOOKS_JSON"
+
+# 16a7. lineage 繼承（P4.7 切片 A；契約 STATE-AGENT-5）。兩欄的值是
+# **generation key＝canonical spawn_tag 全串**，不是名稱——名稱會重用，同名
+# respawn 是新的一代。兩 runtime 對等由 SRC_KIND 雙跑天然覆蓋。
+#
+# 本段自己開一個資料目錄：lineage 要在乾淨的 registry 上驗「恰一匹配」，
+# $DSPAWN 裡殘留的 worker 會讓匹配數不可預期。
+DLIN="$TESTROOT/dlin"
+mkdir -p "$DLIN/agents" "$DLIN/locks" "$DLIN/tasks"   # 先建出資料目錄（list 唯讀不建）
+# canonical generation key 的文法（與 bin/agent-bridge 的 GEN_KEY_RE、
+# ab_core::spawn::is_generation_key **逐字同一條**）
+LIN_KEY_RE='^AGENT_BRIDGE_SPAWN_TAG=ab-spawn-[A-Za-z0-9_-]+-[0-9]+-[0-9a-f]{12}$'
+
+# 16a7-1：繼承鏈 root→A→B。A 由「帶 root tag 的環境」spawn（模擬 root worker
+# 自己在呼叫 spawn），B 再由 A 的 tag spawn——lineage_root MUST 一路傳下去，
+# 而 parent_agent 每一代都指向**直系** parent 的 tag
+pane_la="$(env AGENT_BRIDGE_DATA="$DLIN" AGENT_BRIDGE_READY_TIMEOUT=0 AGENT_BRIDGE_MAX_SPAWN=20 PATH="$SHIM:$PATH" \
+  "$BRIDGE" spawn lroot --runtime codex --window 2>/dev/null)"
+assert "lineage：root worker spawn 成功" pane_alive "$pane_la"
+lroot_tag="$(jq -r '.spawn_tag' "$DLIN/agents/lroot.json")"
+assert "lineage：無 tag spawn 的 lineage_root ＝自身 spawn_tag（自成根）" \
+  jq -e '.lineage_root == .spawn_tag' "$DLIN/agents/lroot.json"
+assert "lineage：自成根的 registry **沒有** parent_agent 這個 key" \
+  jq -e 'has("parent_agent") | not' "$DLIN/agents/lroot.json"
+assert "lineage：lineage_root 是 canonical generation key 形" \
+  bash -c "[[ \"\$(jq -r '.lineage_root' '$DLIN/agents/lroot.json')\" =~ $LIN_KEY_RE ]]"
+
+# A：呼叫者環境帶 root 的**裸值** tag（registry 存的是含前綴的形式，故要剝）
+lroot_bare="${lroot_tag#AGENT_BRIDGE_SPAWN_TAG=}"
+env AGENT_BRIDGE_DATA="$DLIN" AGENT_BRIDGE_READY_TIMEOUT=0 AGENT_BRIDGE_MAX_SPAWN=20 PATH="$SHIM:$PATH" \
+    AGENT_BRIDGE_SPAWN_TAG="$lroot_bare" \
+  "$BRIDGE" spawn lchildA --runtime codex --window >/dev/null 2>&1; rc=$?
+assert "lineage：帶 parent tag 的 spawn 成功" test "$rc" -eq 0
+assert "lineage：A 的 parent_agent ＝ parent 的 canonical spawn_tag（值是 tag 非名稱）" \
+  jq -e --arg t "$lroot_tag" '.parent_agent == $t' "$DLIN/agents/lchildA.json"
+assert "lineage：A 的 lineage_root 沿用 root 的 lineage_root" \
+  jq -e --arg r "$lroot_tag" '.lineage_root == $r' "$DLIN/agents/lchildA.json"
+assert "lineage：A 的兩欄都不是名稱（不得等於 agent 名）" \
+  jq -e '(.parent_agent != "lroot") and (.lineage_root != "lroot")' "$DLIN/agents/lchildA.json"
+
+# B：由 A 的 tag spawn——root 再傳一代，parent 換成 A
+la_tag="$(jq -r '.spawn_tag' "$DLIN/agents/lchildA.json")"
+env AGENT_BRIDGE_DATA="$DLIN" AGENT_BRIDGE_READY_TIMEOUT=0 AGENT_BRIDGE_MAX_SPAWN=20 PATH="$SHIM:$PATH" \
+    AGENT_BRIDGE_SPAWN_TAG="${la_tag#AGENT_BRIDGE_SPAWN_TAG=}" \
+  "$BRIDGE" spawn lchildB --runtime codex --window >/dev/null 2>&1; rc=$?
+assert "lineage：第三代 spawn 成功" test "$rc" -eq 0
+assert "lineage：B 的 lineage_root 仍是 root 的 key（跨兩代傳遞）" \
+  jq -e --arg r "$lroot_tag" '.lineage_root == $r' "$DLIN/agents/lchildB.json"
+assert "lineage：B 的 parent_agent 是 A 的 tag（直系，不是 root）" \
+  jq -e --arg a "$la_tag" --arg r "$lroot_tag" \
+  '.parent_agent == $a and .parent_agent != $r' "$DLIN/agents/lchildB.json"
+
+# 16a7-2：legacy parent（registry 無 lineage_root，永不 backfill）→ 子代退回
+# parent 自身的 spawn_tag 當根
+jq 'del(.lineage_root, .parent_agent)' "$DLIN/agents/lchildA.json" \
+  > "$TESTROOT/legacy.json" && mv "$TESTROOT/legacy.json" "$DLIN/agents/lchildA.json"
+assert "lineage（前提）：A 已被改成 legacy 形（無 lineage_root）" \
+  jq -e 'has("lineage_root") | not' "$DLIN/agents/lchildA.json"
+env AGENT_BRIDGE_DATA="$DLIN" AGENT_BRIDGE_READY_TIMEOUT=0 AGENT_BRIDGE_MAX_SPAWN=20 PATH="$SHIM:$PATH" \
+    AGENT_BRIDGE_SPAWN_TAG="${la_tag#AGENT_BRIDGE_SPAWN_TAG=}" \
+  "$BRIDGE" spawn llegacy --runtime codex --window >/dev/null 2>&1; rc=$?
+assert "lineage：legacy parent 下 spawn 仍成功" test "$rc" -eq 0
+assert "lineage：legacy parent → lineage_root 退回 parent 自身 spawn_tag" \
+  jq -e --arg a "$la_tag" '.lineage_root == $a and .parent_agent == $a' \
+  "$DLIN/agents/llegacy.json"
+
+# 16a7-3：malformed lineage_root（worker 可寫面被塞了非 generation key）→
+# **視同缺席**，退回 parent 自身 tag（不另設分支、不另發警告）
+jq --arg bad 'parent-name' '.lineage_root = $bad' "$DLIN/agents/lchildA.json" \
+  > "$TESTROOT/bad.json" && mv "$TESTROOT/bad.json" "$DLIN/agents/lchildA.json"
+env AGENT_BRIDGE_DATA="$DLIN" AGENT_BRIDGE_READY_TIMEOUT=0 AGENT_BRIDGE_MAX_SPAWN=20 PATH="$SHIM:$PATH" \
+    AGENT_BRIDGE_SPAWN_TAG="${la_tag#AGENT_BRIDGE_SPAWN_TAG=}" \
+  "$BRIDGE" spawn lbadroot --runtime codex --window >/dev/null 2>&1; rc=$?
+assert "lineage：malformed lineage_root 下 spawn 仍成功（fail-soft）" test "$rc" -eq 0
+assert "lineage：malformed lineage_root 視同缺席 → 退 parent 自身 tag" \
+  jq -e --arg a "$la_tag" '.lineage_root == $a' "$DLIN/agents/lbadroot.json"
+assert "lineage：子代寫入的 lineage_root 恆為合法 generation key" \
+  bash -c "[[ \"\$(jq -r '.lineage_root' '$DLIN/agents/lbadroot.json')\" =~ $LIN_KEY_RE ]]"
+# 非字串型別（number）同樣不得被字串化沿用
+jq '.lineage_root = 5' "$DLIN/agents/lchildA.json" \
+  > "$TESTROOT/num.json" && mv "$TESTROOT/num.json" "$DLIN/agents/lchildA.json"
+env AGENT_BRIDGE_DATA="$DLIN" AGENT_BRIDGE_READY_TIMEOUT=0 AGENT_BRIDGE_MAX_SPAWN=20 PATH="$SHIM:$PATH" \
+    AGENT_BRIDGE_SPAWN_TAG="${la_tag#AGENT_BRIDGE_SPAWN_TAG=}" \
+  "$BRIDGE" spawn lnumroot --runtime codex --window >/dev/null 2>&1
+assert "lineage：非字串 lineage_root（number）同樣退 parent 自身 tag" \
+  jq -e --arg a "$la_tag" '.lineage_root == $a' "$DLIN/agents/lnumroot.json"
+
+# 16a7-4：duplicate tag（兩筆 registry 有相同 spawn_tag）→ ambiguous：
+# 自成根＋stderr 警告，**MUST NOT 依目錄序任選**
+DDUP="$TESTROOT/ddup"
+mkdir -p "$DDUP/agents" "$DDUP/locks" "$DDUP/tasks"
+dup_tag='AGENT_BRIDGE_SPAWN_TAG=ab-spawn-dupparent-4242-0123456789ab'
+for n in dupa dupb; do
+  jq -n --arg n "$n" --arg t "$dup_tag" --arg r "$dup_tag" \
+    '{name: $n, pane_id: "%999", registered_at: "2026-08-02T00:00:00Z", spawned: true,
+      runtime: "codex", model: "", spawned_at: "2026-08-02T00:00:00Z", ready: true,
+      spawn_tag: $t, owner: "", worker_window: "", lineage_root: $r}' \
+    > "$DDUP/agents/$n.json"
+done
+env AGENT_BRIDGE_DATA="$DDUP" AGENT_BRIDGE_READY_TIMEOUT=0 AGENT_BRIDGE_MAX_SPAWN=20 PATH="$SHIM:$PATH" \
+    AGENT_BRIDGE_SPAWN_TAG="${dup_tag#AGENT_BRIDGE_SPAWN_TAG=}" \
+  "$BRIDGE" spawn ldup --runtime codex --window >/dev/null 2>"$TESTROOT/ldup.err"; rc=$?
+assert "lineage：duplicate tag 下 spawn 仍成功（ambiguous 不擋 spawn）" test "$rc" -eq 0
+assert "lineage：duplicate tag → 自成根（lineage_root ＝自身 spawn_tag）" \
+  jq -e '.lineage_root == .spawn_tag' "$DDUP/agents/ldup.json"
+assert "lineage：duplicate tag → parent_agent 缺席（不任選任何一筆）" \
+  jq -e 'has("parent_agent") | not' "$DDUP/agents/ldup.json"
+assert "lineage：duplicate tag → stderr 有可見警告" \
+  grep -q '無法唯一判定' "$TESTROOT/ldup.err"
+
+# 16a7-5：fail-soft 迴歸（F1）——stderr 關閉（2>&-）時，ambiguous 這條會印
+# 警告的路徑 MUST 仍然 spawn 成功。裸 `err` 在 set -e 下遇 EPIPE 會中止整支，
+# 而此時 pane 已建好，EXIT trap 會回滾一個其實成功的 spawn
+env AGENT_BRIDGE_DATA="$DDUP" AGENT_BRIDGE_READY_TIMEOUT=0 AGENT_BRIDGE_MAX_SPAWN=20 PATH="$SHIM:$PATH" \
+    AGENT_BRIDGE_SPAWN_TAG="${dup_tag#AGENT_BRIDGE_SPAWN_TAG=}" \
+  "$BRIDGE" spawn ldupq --runtime codex --window >/dev/null 2>&-; rc=$?
+assert "lineage：stderr 關閉下 ambiguous 路徑仍 spawn 成功（fail-soft）" test "$rc" -eq 0
+assert "lineage：stderr 關閉下 registry 照樣落地" test -e "$DDUP/agents/ldupq.json"
+
+# 16a7-6：reserved PASS_ENV（B4）——白名單指名 AGENT_BRIDGE_SPAWN_TAG 時
+# MUST 剔除：spawn 成功、有警告，且 pane 啟動指令**只有一個** tag assignment
+# （多出來的那個排在後面會覆蓋前者，子代於是頂著呼叫者的 tag 開起來）
+pane_lres="$(env AGENT_BRIDGE_DATA="$DLIN" AGENT_BRIDGE_READY_TIMEOUT=0 AGENT_BRIDGE_MAX_SPAWN=20 PATH="$SHIM:$PATH" \
+    AGENT_BRIDGE_PASS_ENV='AGENT_BRIDGE_SPAWN_TAG,AGENT_BRIDGE_RELAY_DEPTH,PE_OK' \
+    AGENT_BRIDGE_SPAWN_TAG="$lroot_bare" AGENT_BRIDGE_RELAY_DEPTH=3 PE_OK=keepme \
+  "$BRIDGE" spawn lres --runtime codex --window 2>"$TESTROOT/lres.err")"; rc=$?
+assert "PASS_ENV reserved：spawn 仍成功（靜默剔除，不是 fail-closed）" test "$rc" -eq 0
+assert "PASS_ENV reserved：stderr 有剔除警告" \
+  grep -q '保留變數' "$TESTROOT/lres.err"
+lres_cmd="$(tmx display -pt "$pane_lres" '#{pane_start_command}')"
+assert "PASS_ENV reserved：pane 啟動指令只有一個 AGENT_BRIDGE_SPAWN_TAG= assignment" \
+  bash -c "c=${lres_cmd@Q}; n=\$(grep -o 'AGENT_BRIDGE_SPAWN_TAG=' <<<\"\$c\" | wc -l); (( n == 1 ))"
+assert "PASS_ENV reserved：RELAY_DEPTH 沒被白名單帶進啟動指令" \
+  bash -c "c=${lres_cmd@Q}; [[ \"\$c\" != *AGENT_BRIDGE_RELAY_DEPTH=* ]]"
+assert "PASS_ENV reserved：非保留變數照舊穿透（證明不是整份白名單被丟掉）" \
+  bash -c "c=${lres_cmd@Q}; [[ \"\$c\" == *' PE_OK=keepme '* ]]"
+assert "PASS_ENV reserved：子代 lineage 仍認得出真正的 parent（tag 沒被蓋掉）" \
+  jq -e --arg t "$lroot_tag" '.parent_agent == $t' "$DLIN/agents/lres.json"
+# fail-soft 迴歸（F1 的另一半）：stderr 關閉下剔除路徑一樣不得帶走 spawn
+env AGENT_BRIDGE_DATA="$DLIN" AGENT_BRIDGE_READY_TIMEOUT=0 AGENT_BRIDGE_MAX_SPAWN=20 PATH="$SHIM:$PATH" \
+    AGENT_BRIDGE_PASS_ENV='AGENT_BRIDGE_SPAWN_TAG' \
+  "$BRIDGE" spawn lresq --runtime codex --window >/dev/null 2>&-; rc=$?
+assert "PASS_ENV reserved：stderr 關閉下剔除路徑仍 spawn 成功（fail-soft）" test "$rc" -eq 0
+
+# 16a7-7：register（人工註冊）MUST NOT 寫這兩欄
+ab "$DLIN" register lmanual "$PANE_A" >/dev/null 2>&1
+assert "lineage：register 不寫 lineage_root／parent_agent" \
+  jq -e '(has("lineage_root") | not) and (has("parent_agent") | not)' \
+  "$DLIN/agents/lmanual.json"
+
+# 收尾：本段開的 worker 全部回收（避免佔用後續測例的 pane／cap）
+for n in lroot lchildA lchildB llegacy lbadroot lnumroot lres lresq; do
+  ab "$DLIN" despawn "$n" >/dev/null 2>&1 || true
+done
+for n in ldup ldupq; do
+  ab "$DDUP" despawn "$n" >/dev/null 2>&1 || true
+done
 
 # 16b. 參數與名稱衝突拒絕
 assert_fails "spawn 已註冊（spawned）名稱被拒" absp "$DSPAWN" 0 spawn w1 --runtime codex

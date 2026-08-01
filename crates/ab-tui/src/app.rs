@@ -886,6 +886,9 @@ mod tests {
                     registered_at: "2026-07-31T00:00:00Z".into(),
                     spawned: true,
                     corrupt: false,
+                    // P4.7 切片 A：lineage 兩欄對這些 fixture 無關（None＝欄位缺席）
+                    lineage_root: None,
+                    parent_agent: None,
                 },
                 AgentSnapshot {
                     name: "w2".into(),
@@ -897,6 +900,9 @@ mod tests {
                     registered_at: "2026-07-31T00:00:00Z".into(),
                     spawned: true,
                     corrupt: false,
+                    // P4.7 切片 A：lineage 兩欄對這些 fixture 無關（None＝欄位缺席）
+                    lineage_root: None,
+                    parent_agent: None,
                 },
             ],
             tasks: vec![task("20260731T000001Z-aaaa", "w1", "queued")],
@@ -1020,6 +1026,9 @@ mod tests {
                     registered_at: "2026-07-31T00:00:00Z".into(),
                     spawned: true,
                     corrupt: false,
+                    // P4.7 切片 A：lineage 兩欄對這些 fixture 無關（None＝欄位缺席）
+                    lineage_root: None,
+                    parent_agent: None,
                 },
                 AgentSnapshot {
                     name: "wz".into(),
@@ -1031,6 +1040,9 @@ mod tests {
                     registered_at: "2026-07-31T00:00:00Z".into(),
                     spawned: true,
                     corrupt: false,
+                    // P4.7 切片 A：lineage 兩欄對這些 fixture 無關（None＝欄位缺席）
+                    lineage_root: None,
+                    parent_agent: None,
                 },
             ],
             tasks: Vec::new(),
@@ -1514,6 +1526,9 @@ mod tests {
                 registered_at: "2026-07-31T00:00:00Z".into(),
                 spawned: true,
                 corrupt: false,
+                // P4.7 切片 A：lineage 兩欄對這些 fixture 無關（None＝欄位缺席）
+                lineage_root: None,
+                parent_agent: None,
             },
         );
         app.relocate(&m2);
@@ -1636,6 +1651,9 @@ mod tests {
                 registered_at: "2026-07-31T00:00:00Z".into(),
                 spawned: true,
                 corrupt: false,
+                // P4.7 切片 A：lineage 兩欄對這些 fixture 無關（None＝欄位缺席）
+                lineage_root: None,
+                parent_agent: None,
             }],
             tasks: Vec::new(),
             recent: Vec::new(),
@@ -1692,6 +1710,9 @@ mod tests {
                     registered_at: "2026-07-31T00:00:00Z".into(),
                     spawned: true,
                     corrupt: false,
+                    // P4.7 切片 A：lineage 兩欄對這些 fixture 無關（None＝欄位缺席）
+                    lineage_root: None,
+                    parent_agent: None,
                 })
                 .collect(),
             tasks: Vec::new(),
@@ -1810,6 +1831,9 @@ mod tests {
                 registered_at: "2026-07-31T00:00:00Z".into(),
                 spawned: true,
                 corrupt: false,
+                // P4.7 切片 A：lineage 兩欄對這些 fixture 無關（None＝欄位缺席）
+                lineage_root: None,
+                parent_agent: None,
             },
         );
         app.relocate(&m2);
