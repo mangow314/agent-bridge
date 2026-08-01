@@ -521,26 +521,251 @@ fn liveness_word(l: Liveness) -> &'static str {
     }
 }
 
-/// `r` 的全螢幕 pager。bytes → 字串**只在這裡**做 lossy 轉換（action 層一律
-/// 保留原始 bytes）。標頭三欄與 CLI 的 stderr 同一組欄位。
+/// `r` 的全螢幕 pager。內容列由 `action::pager_lines` 組好（bytes → 字串的
+/// lossy 轉換在那裡做一次），這裡只負責**樣式投影**與畫。
 fn render_pager(f: &mut Frame, app: &App) {
     let Some(p) = &app.pager else { return };
-    let lines: Vec<Line> = crate::action::pager_lines(p)
-        .into_iter()
-        .map(Line::from)
-        .collect();
     let area = f.area();
     f.render_widget(Clear, area);
     f.render_widget(
-        Paragraph::new(lines)
-            .block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .title("read (read-only, full text)"),
-            )
-            .scroll((p.scroll as u16, 0)),
+        pager_widget(p, highlight_pager(&crate::action::pager_lines(p))),
         area,
     );
+}
+
+/// pager 的外框與捲動位置。**高亮與不高亮共用這一份**：gate (e) 的字元層
+/// 比對要能把「同一份 bytes、只差樣式」這件事驗到底，兩條路徑各寫一份外框
+/// 就會比到別的東西（見 `highlighting_never_changes_the_character_layer`）。
+fn pager_widget(p: &crate::app::Pager, lines: Vec<Line<'static>>) -> Paragraph<'static> {
+    Paragraph::new(lines)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title("read (read-only, full text)"),
+        )
+        .scroll((p.scroll as u16, 0))
+}
+
+/// 一段 fenced code block 的開場圍籬。
+struct Fence {
+    /// 圍籬字元（`` ` `` 或 `~`）：**閉合必須用同一種**，否則
+    /// ` ```rust ` 段落裡的 `~~~` 會把它提早關掉
+    ch: u8,
+    /// 開場圍籬長度：閉合圍籬 MUST 不短於它（CommonMark）
+    len: usize,
+    /// info string 是不是 `diff`（唯二會染 `+`／`-` 的情境之一）
+    diff: bool,
+}
+
+/// pager 的 **markdown-lite 樣式投影**（P4.6 切片 D，gate (e)）。
+///
+/// 契約只有一條、但是硬的：**只加樣式，不動字元**。每一列切出的 span 逐段
+/// 都是原字串的切片，串起來與原列**逐字相同**（含空白與 tab）。不插入、不
+/// 刪除、不重排——P2 的 read bytes gate 依賴這件事。
+///
+/// 「lite」的意思是**逐行判定＋一個 fence 狀態機**，不引入 markdown parser：
+/// 這裡要的是「一眼看出結構」，不是正確渲染 markdown。判不出來就不上色，
+/// 上錯色比不上色糟。
+///
+/// diff 染色**嚴格設界**在兩種情境（gate (e) 明文）：
+/// 1. ` ```diff ` 圍起來的段落內
+/// 2. 出現 `diff --git` 或 `@@ … @@` hunk 標頭之後的明確 diff 區段
+///
+/// 散文的行首 `+`／`-` **MUST NOT** 染色——清單用 `-` 開頭是常態，把它染成
+/// 「刪除行」是直接的誤導。
+pub(crate) fn highlight_pager(lines: &[String]) -> Vec<Line<'static>> {
+    let mut out = Vec::with_capacity(lines.len());
+    let mut fence: Option<Fence> = None;
+    let mut in_diff = false;
+
+    for raw in lines {
+        let line = raw.as_str();
+
+        // ---- 1. fence 內：整段 code，只認閉合圍籬 ----
+        if let Some(f) = &fence {
+            let closing = fence_marker(line)
+                .is_some_and(|(ch, len, info)| ch == f.ch && len >= f.len && info.is_empty());
+            // 未閉合的 fence **不得把剩餘全文吃掉**：ATX 標題與中繼標頭是強
+            // 結構訊號，撞上就視為段落已經結束。這是刻意偏離 CommonMark
+            // （那裡未閉合的 fence 吃到文件結尾）——一個落單的 ``` 把整份回覆
+            // 連同底下的鍵位提示都染成 code，損害遠大於「少染幾行」。
+            if !closing && (heading_hashes(line).is_some() || meta_key_len(line).is_some()) {
+                fence = None;
+            } else {
+                let spans = match diff_style(line) {
+                    Some(st) if f.diff && !closing => vec![Span::styled(line.to_string(), st)],
+                    _ => vec![Span::styled(line.to_string(), theme::md_code_style())],
+                };
+                if closing {
+                    fence = None;
+                }
+                out.push(Line::from(spans));
+                continue;
+            }
+        }
+
+        // ---- 2. diff 區段的進出 ----
+        if is_diff_header(line) {
+            in_diff = true;
+        } else if in_diff && !continues_diff(line) {
+            // 區段結束：這一列照散文規則重新判定（下面的分支會處理）
+            in_diff = false;
+        }
+
+        // ---- 3. 逐行判定（順序即優先序）----
+        let spans = if let Some((ch, len, info)) = fence_marker(line) {
+            fence = Some(Fence {
+                ch,
+                len,
+                diff: info.eq_ignore_ascii_case("diff"),
+            });
+            in_diff = false;
+            vec![Span::styled(line.to_string(), theme::md_code_style())]
+        } else if heading_hashes(line).is_some() {
+            in_diff = false;
+            vec![Span::styled(line.to_string(), theme::md_heading_style())]
+        } else if let Some(n) = meta_key_len(line) {
+            in_diff = false;
+            split_styled(line, 0, n, theme::md_meta_key_style())
+        } else if let Some(st) = diff_style(line).filter(|_| in_diff) {
+            vec![Span::styled(line.to_string(), st)]
+        } else if let Some((start, end)) = list_marker(line) {
+            split_styled(line, start, end, theme::md_list_marker_style())
+        } else {
+            vec![Span::raw(line.to_string())]
+        };
+        out.push(Line::from(spans));
+    }
+    out
+}
+
+/// `line[start..end]` 上色、其餘原色。**三段都是原字串的切片**，串起來逐字
+/// 等於 `line`（空段落不產生 span，只是少一個空 `Span`，字元層不變）。
+fn split_styled(
+    line: &str,
+    start: usize,
+    end: usize,
+    style: ratatui::style::Style,
+) -> Vec<Span<'static>> {
+    let mut spans = Vec::with_capacity(3);
+    if start > 0 {
+        spans.push(Span::raw(line[..start].to_string()));
+    }
+    spans.push(Span::styled(line[start..end].to_string(), style));
+    if end < line.len() {
+        spans.push(Span::raw(line[end..].to_string()));
+    }
+    spans
+}
+
+/// 行首的 fence 標記 → `(圍籬字元, 長度, info string)`。
+///
+/// CommonMark 允許最多三格縮排、圍籬至少三個字元。反引號圍籬的 info string
+/// 不得再含反引號——沒有這條，一列 `` `a` 與 `b` `` 就會被當成 fence 開場。
+fn fence_marker(line: &str) -> Option<(u8, usize, &str)> {
+    let indent = line.len() - line.trim_start_matches(' ').len();
+    if indent > 3 {
+        return None;
+    }
+    let rest = &line[indent..];
+    let ch = match rest.as_bytes().first()? {
+        b'`' => b'`',
+        b'~' => b'~',
+        _ => return None,
+    };
+    let len = rest.bytes().take_while(|&b| b == ch).count();
+    if len < 3 {
+        return None;
+    }
+    let info = rest[len..].trim();
+    if ch == b'`' && info.contains('`') {
+        return None;
+    }
+    Some((ch, len, info))
+}
+
+/// ATX 標題的 `#` 個數。**須行首**（不吃縮排）且 `#` 之後必須是空白或行尾
+/// ——`#hashtag` 不是標題，`a # b` 更不是。
+fn heading_hashes(line: &str) -> Option<usize> {
+    if !line.starts_with('#') {
+        return None;
+    }
+    let n = line.bytes().take_while(|&b| b == b'#').count();
+    if n > 6 {
+        return None;
+    }
+    match line.as_bytes().get(n) {
+        None | Some(b' ') | Some(b'\t') => Some(n),
+        _ => None,
+    }
+}
+
+/// `agent-bridge read`／`receive` 標頭列的 key 白名單。
+///
+/// 用白名單而不是「任何 `word:` 開頭」：後者會把散文的 `note: 見下` 一起染，
+/// 而中繼標頭的重點正是「這幾行不是內文」。
+const META_KEYS: [&str; 4] = ["task-id", "from", "to", "working_directory"];
+
+/// 中繼標頭 key（含冒號）的長度。**須行首**，冒號後必須是空白或行尾。
+fn meta_key_len(line: &str) -> Option<usize> {
+    META_KEYS.iter().find_map(|k| {
+        let n = k.len() + 1;
+        let head = line.get(..n)?;
+        if !head.starts_with(k) || !head.ends_with(':') {
+            return None;
+        }
+        match line.as_bytes().get(n) {
+            None | Some(b' ') | Some(b'\t') => Some(n),
+            _ => None,
+        }
+    })
+}
+
+/// 清單 marker 的 `(起, 迄)`（不含其後的空白）。`- ` / `* ` / `+ ` 與
+/// `1.` / `1)` 兩族；marker 後**必須**有空白，否則 `-5 度` 這種散文會中招。
+fn list_marker(line: &str) -> Option<(usize, usize)> {
+    let indent = line.len() - line.trim_start_matches(' ').len();
+    let rest = &line[indent..];
+    let b = rest.as_bytes();
+    if matches!(b.first(), Some(b'-' | b'*' | b'+')) && b.get(1) == Some(&b' ') {
+        return Some((indent, indent + 1));
+    }
+    let digits = rest.bytes().take_while(|c| c.is_ascii_digit()).count();
+    if digits > 0 && matches!(b.get(digits), Some(b'.' | b')')) && b.get(digits + 1) == Some(&b' ')
+    {
+        return Some((indent, indent + digits + 1));
+    }
+    None
+}
+
+/// 明確的 diff 區段起點：`diff --git` 或 `@@ … @@` hunk 標頭。
+fn is_diff_header(line: &str) -> bool {
+    line.starts_with("diff --git") || (line.starts_with("@@") && line[2..].contains("@@"))
+}
+
+/// 這一列還在 diff 區段裡嗎。
+///
+/// unified diff 的每一列都帶前綴（context 是空格、新增 `+`、刪除 `-`、hunk
+/// `@@`、`\ No newline` 是反斜線）。**空行視為區段結束**：git 的 context 行
+/// 即使內容是空的也會帶一個空格，真正的空行代表 diff 貼完了。判錯的方向是
+/// 「少染」——那正是這一項要的保守方向。
+fn continues_diff(line: &str) -> bool {
+    if line.is_empty() {
+        return false;
+    }
+    matches!(line.as_bytes()[0], b' ' | b'+' | b'-' | b'@' | b'\\')
+        || line.starts_with("diff --git")
+        || line.starts_with("index ")
+}
+
+/// 行首 `+`／`-` 的 diff 色。**呼叫端負責先確認情境**（fence info 是 diff，
+/// 或已在明確 diff 區段內）——這個函式本身不判斷情境。
+fn diff_style(line: &str) -> Option<ratatui::style::Style> {
+    match line.as_bytes().first()? {
+        b'+' => Some(theme::diff_add_style()),
+        b'-' => Some(theme::diff_del_style()),
+        _ => None,
+    }
 }
 
 /// `i` 的 worker 摘要頁（內容由 `action::info_page` 組好，這裡只負責畫）。
@@ -1775,5 +2000,198 @@ mod tests {
         // 同一張畫面上，pager 自己的 chrome（標題、捲動提示）仍是英文
         find(&buf, "read (read-only, full text)");
         find(&buf, "Esc/q close");
+    }
+
+    // ---- P4.6 切片 D：pager 的 markdown-lite 高亮（gate (e)）----
+
+    /// 一份內文開一個 pager。
+    fn pager_of(body: &str) -> crate::app::Pager {
+        crate::app::Pager {
+            id: "20260801T000000Z-aaaa".into(),
+            from: "boss".into(),
+            to: "alive-w".into(),
+            bytes: body.as_bytes().to_vec(),
+            scroll: 0,
+        }
+    }
+
+    /// 內文逐列的樣式（跳過 `pager_lines` 的四列標頭），供逐條斷言。
+    fn body_styles(body: &str) -> Vec<ratatui::style::Style> {
+        let p = pager_of(body);
+        let lines = highlight_pager(&crate::action::pager_lines(&p));
+        lines[4..lines.len() - 2]
+            .iter()
+            .map(|l| {
+                // 一列可能切成多段（marker／meta key）：取**第一個有樣式的**
+                // span，沒有就回 default
+                l.spans
+                    .iter()
+                    .map(|s| s.style)
+                    .find(|s| *s != ratatui::style::Style::default())
+                    .unwrap_or_default()
+            })
+            .collect()
+    }
+
+    /// **gate (e) 第一句：bytes 不變。**
+    ///
+    /// 高亮純粹是樣式投影——同一份 bytes 進去，buffer 的**字元層必須逐格
+    /// 完全相同**，只有 Style 不同。兩條路徑共用 `pager_widget`（同一個外框、
+    /// 同一個捲動位置），比到的差異只可能來自高亮本身。
+    #[test]
+    fn highlighting_never_changes_the_character_layer() {
+        let body = "# Title\n\nprose - not a list\n- item one\n  1. nested\n\n```rust\nfn main() {}\n- inside code\n```\n\ndiff --git a/x b/x\n@@ -1,2 +1,2 @@\n-old line\n+new line\n\ntask-id: 20260801T000000Z-bbbb\nsee: below\n\t tabbed  and  spaced \n";
+        let p = pager_of(body);
+        let raw = crate::action::pager_lines(&p);
+
+        let render_into = |lines: Vec<Line<'static>>| {
+            let mut t = Terminal::new(TestBackend::new(120, 40)).unwrap();
+            t.draw(|f| {
+                let area = f.area();
+                f.render_widget(Clear, area);
+                f.render_widget(pager_widget(&p, lines), area);
+            })
+            .unwrap();
+            t.backend().buffer().clone()
+        };
+        let plain = render_into(raw.iter().map(|s| Line::from(s.clone())).collect());
+        let highlighted = render_into(highlight_pager(&raw));
+
+        assert_eq!(plain.area(), highlighted.area());
+        let area = *plain.area();
+        let mut styled_cells = 0;
+        for y in 0..area.height {
+            for x in 0..area.width {
+                assert_eq!(
+                    plain[(x, y)].symbol(),
+                    highlighted[(x, y)].symbol(),
+                    "字元層 MUST 逐格相同（({x},{y}) 高亮後變了）"
+                );
+                if plain[(x, y)].style() != highlighted[(x, y)].style() {
+                    styled_cells += 1;
+                }
+            }
+        }
+        assert!(
+            styled_cells > 0,
+            "前提：這份輸入真的有東西被上色（否則上一條在驗空氣）"
+        );
+
+        // 逐列再驗一次不變式的來源：每一列的 span 串起來 MUST 逐字等於原列
+        for (l, r) in highlight_pager(&raw).iter().zip(raw.iter()) {
+            let joined: String = l.spans.iter().map(|s| s.content.as_ref()).collect();
+            assert_eq!(&joined, r, "span 串接 MUST 逐字等於原列");
+        }
+    }
+
+    /// fence：` ```rust ` 段內整段是 code、閉合後恢復；**未閉合的 fence 不得
+    /// 把剩餘全文吃掉**（撞上強結構訊號就結束）。
+    #[test]
+    fn fenced_code_blocks_start_and_stop_where_the_fence_says() {
+        let code = theme::md_code_style();
+        let st = body_styles("before\n```rust\nfn main() {}\n```\nafter\n");
+        assert_ne!(st[0], code, "fence 之前是散文");
+        assert_eq!(st[1], code, "開場圍籬本身算 code");
+        assert_eq!(st[2], code, "段內是 code");
+        assert_eq!(st[3], code, "閉合圍籬本身算 code");
+        assert_ne!(st[4], code, "閉合之後 MUST 恢復");
+
+        // 圍籬字元不同族不得提早關掉（`~~~` 關不掉 ``` 段）
+        let st = body_styles("```\n~~~\nstill code\n```\nout\n");
+        assert_eq!(st[1], code, "不同族的圍籬 MUST NOT 關掉這一段");
+        assert_eq!(st[2], code);
+        assert_ne!(st[4], code, "同族圍籬才關得掉");
+
+        // 未閉合：ATX 標題與中繼標頭都是強結構訊號，撞上即結束
+        let st = body_styles("```\ncode here\n# Heading\nprose again\n");
+        assert_eq!(st[1], code);
+        assert_eq!(
+            st[2],
+            theme::md_heading_style(),
+            "未閉合的 fence MUST NOT 把標題也吃掉"
+        );
+        assert_ne!(st[3], code, "標題之後的散文 MUST NOT 還是 code");
+    }
+
+    /// 標題：`#`…`######` 須**行首**且後接空白；`a # b`／`#hashtag` 不得誤染。
+    #[test]
+    fn atx_headings_match_only_at_line_start() {
+        let h = theme::md_heading_style();
+        let st = body_styles("# One\n### Three\n####### Seven\na # b\n#hashtag\n  # indented\n");
+        assert_eq!(st[0], h, "`# ` 是標題");
+        assert_eq!(st[1], h, "`### ` 是標題");
+        assert_ne!(st[2], h, "七個 `#` 超過 ATX 上限");
+        assert_ne!(st[3], h, "行首不是 `#` 就不是標題");
+        assert_ne!(st[4], h, "`#hashtag` 沒有空白，不是標題");
+        assert_ne!(st[5], h, "須行首：縮排過的 `#` 不算");
+    }
+
+    /// **gate (e) 的核心一條：散文的行首 `+`／`-` MUST NOT 染 diff 色。**
+    ///
+    /// 清單用 `-` 開頭是常態，染成「刪除行」是直接的誤導。同一份內容放進
+    /// ` ```diff ` 之後才 MUST 染。
+    #[test]
+    fn prose_plus_and_minus_are_never_coloured_as_diff() {
+        let (add, del) = (theme::diff_add_style(), theme::diff_del_style());
+        let st = body_styles("- item one\n+ item two\n-5 度是散文\n+1 也是\n");
+        for (i, s) in st.iter().enumerate() {
+            assert_ne!(*s, del, "第 {i} 列是散文，MUST NOT 染刪除色");
+            assert_ne!(*s, add, "第 {i} 列是散文，MUST NOT 染新增色");
+        }
+        // 前兩列是清單：只有 marker 上色，內文不上色
+        assert_eq!(st[0], theme::md_list_marker_style());
+        assert_eq!(st[1], theme::md_list_marker_style());
+
+        // 同一份內容進 ```diff → MUST 染
+        let st = body_styles("```diff\n- item one\n+ item two\n```\n- back to prose\n");
+        assert_eq!(st[1], del, "```diff 段內的 `-` MUST 染刪除色");
+        assert_eq!(st[2], add, "```diff 段內的 `+` MUST 染新增色");
+        assert_eq!(st[4], theme::md_list_marker_style(), "出了 fence 就是清單");
+
+        // 明確 diff 區段（`diff --git`／`@@`）：染；空行結束區段之後不再染
+        let st = body_styles("diff --git a/x b/x\n@@ -1,2 +1,2 @@\n-old\n+new\n\n- next steps\n");
+        assert_eq!(st[2], del);
+        assert_eq!(st[3], add);
+        assert_eq!(
+            st[5],
+            theme::md_list_marker_style(),
+            "空行結束 diff 區段：後面的 `-` 是清單，不是刪除行"
+        );
+    }
+
+    /// 只染 marker、不染內文（清單）；中繼標頭只染 key、不染值。
+    #[test]
+    fn list_markers_and_meta_keys_colour_only_their_own_span() {
+        let p = pager_of("- item one\ntask-id: 20260801T000000Z-bbbb\nsee: below\n");
+        let lines = highlight_pager(&crate::action::pager_lines(&p));
+
+        // 標頭四列之後：清單列切成 `-`（上色）＋` item one`（原色）
+        let list = &lines[4];
+        assert_eq!(list.spans[0].content.as_ref(), "-");
+        assert_eq!(list.spans[0].style, theme::md_list_marker_style());
+        assert_eq!(list.spans[1].content.as_ref(), " item one");
+        assert_eq!(
+            list.spans[1].style,
+            ratatui::style::Style::default(),
+            "清單內文 MUST NOT 上色"
+        );
+
+        let meta = &lines[5];
+        assert_eq!(meta.spans[0].content.as_ref(), "task-id:");
+        assert_eq!(meta.spans[0].style, theme::md_meta_key_style());
+        assert_eq!(
+            meta.spans[1].style,
+            ratatui::style::Style::default(),
+            "值是證據，MUST NOT 上色"
+        );
+
+        // 內文冒號不是中繼標頭（白名單之外）
+        let prose = &lines[6];
+        assert_eq!(prose.spans.len(), 1);
+        assert_eq!(
+            prose.spans[0].style,
+            ratatui::style::Style::default(),
+            "`see:` 不在白名單，MUST NOT 誤染"
+        );
     }
 }

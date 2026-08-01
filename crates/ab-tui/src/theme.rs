@@ -9,7 +9,9 @@
 //! - **只加樣式，不動字元**：既有 shell 測試分組全部是 `capture-pane` 的字元
 //!   比對，`Style` 吃不進 capture 的字元層。任何 cell 的字元 MUST 與上色前
 //!   逐字相同（含空白對齊）。
-//! - **顏色只編碼五種語意**：status／liveness／blocker／focus／warning。
+//! - **顏色只編碼六種語意**：status／liveness／blocker／focus／warning，加上
+//!   P4.6 切片 D 的 **content-syntax**（pager 的 markdown-lite，見本檔末）。
+//!   第六軸只活在 `r` 的全螢幕 overlay 裡，與前五軸永不同框。
 //!   **MUST NOT** 用顏色暗示「可刪度」——idle worker 不上任何暗示色
 //!   （tui-design.md §5：「沒有任何訊號」≠「可安全刪除」）。
 //!   （warning 是核准計畫裡的第五軸；早期註解只列四軸，與 `warning_style`
@@ -137,4 +139,52 @@ pub fn warning_style() -> Style {
     Style::default()
         .fg(Color::Yellow)
         .add_modifier(Modifier::BOLD)
+}
+
+// ---- 第六軸：content-syntax（P4.6 切片 D，pager 的 markdown-lite）----
+//
+// 這一軸與前五軸（status／liveness／blocker／focus／warning）**在畫面上永不
+// 共存**：它只作用在 `r` 的全螢幕 pager overlay 裡，而那張畫面上沒有任何
+// status／liveness／blocker span，也不套 `selected_row_style`。因此顏色與前五
+// 軸重用不會產生「同一格兩種語意」或「fg 撞 bg 而字消失」的問題——這是刻意
+// 的取捨：ANSI 16 色盤裝不下六個互斥的軸，而互斥只在同一張畫面上才有意義。
+//
+// 這一軸講的是**內容的語法結構**，不是狀態、不是嚴重度，更不是可刪度。
+
+/// ATX 標題（`#`…`######`）。整列上色：標題是分段訊號，人靠它掃過長回覆。
+pub fn md_heading_style() -> Style {
+    Style::default()
+        .fg(Color::Magenta)
+        .add_modifier(Modifier::BOLD)
+}
+
+/// fenced code block（含圍籬那兩列）。整段上色，人才看得出「這裡是原文，
+/// 不是敘述」。
+pub fn md_code_style() -> Style {
+    Style::default().fg(Color::Cyan)
+}
+
+/// 清單項目的 marker（`-` / `*` / `+` / `1.`）。**只染 marker，不染內文**：
+/// 整列上色會讓清單本身變成一片色塊，反而讀不出層次。
+pub fn md_list_marker_style() -> Style {
+    Style::default().fg(Color::Yellow)
+}
+
+/// `agent-bridge read` 標頭列的 key（`task-id:` 那組）。它是中繼資料，不是
+/// 內文——染 key 不染值，值本身是證據（id／agent 名），維持原色。
+pub fn md_meta_key_style() -> Style {
+    Style::default()
+        .fg(Color::Blue)
+        .add_modifier(Modifier::BOLD)
+}
+
+/// diff 的新增／刪除行。**只在明確的 diff 情境下使用**（見
+/// `view::highlight_pager`）：散文的行首 `-` 是清單常態，染成「刪除行」是
+/// 直接的誤導（gate (e) 明文）。
+pub fn diff_add_style() -> Style {
+    Style::default().fg(Color::Green)
+}
+
+pub fn diff_del_style() -> Style {
+    Style::default().fg(Color::Red)
 }
