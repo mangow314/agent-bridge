@@ -25,6 +25,53 @@ pub fn is_valid_pane(pane: &str) -> bool {
     }
 }
 
+/// 比對前先把窗內空白（含換行）摺疊成單一空格，對映 `tr -s '[:space:]' ' '`：
+/// TUI 的 word-wrap 與 tmux 軟折行會把特徵片段拆到兩行，逐行比對必偽陰性
+/// （漏判＝放行誤批的 Enter，是最壞方向）。Rust 的 `char::is_whitespace` 涵蓋
+/// Unicode 空白、比 C locale 的 `[:space:]` 寬，差異只會讓更多片段被拼接
+/// 起來——偽陽性方向，落在 bash 註解既定的 fail-closed 偏攔代價內。
+fn fold_whitespace(s: &str) -> String {
+    let mut norm = String::with_capacity(s.len());
+    let mut prev_ws = false;
+    for c in s.chars() {
+        if c.is_whitespace() {
+            if !prev_ws {
+                norm.push(' ');
+            }
+            prev_ws = true;
+        } else {
+            norm.push(c);
+            prev_ws = false;
+        }
+    }
+    norm
+}
+
+/// 只掃畫面**下緣**這麼多行：權限框永遠貼著 pane 底部，助理輸出／指令回顯不會。
+///
+/// 取值 14 是量出來的，不是拍的（2026-08-01 實測，記錄見 docs/tui-design.md §4）：
+/// - 真權限框（Claude Code v2.1.220，33×143 pane）：框出現時**取代**輸入框與
+///   statusline，整框貼底——`Esc to cancel` 距底 0 行、`Do you want to proceed?`
+///   距底 5 行、框頂分隔線距底 13 行。agy 的框（docs/agy-probe.md 實測十行）
+///   header 距底 9 行。故真陽性所需的最深片段是 9。
+/// - 誤判語料（19 個 coordinator 誤判幀，poll-133-*）：命中片段最淺的一個距底
+///   **16** 行——那是 `rg` 指令回顯與散文引用，都在畫面上半部。
+///
+/// 14 行的窗涵蓋距底 0–13（含）。兩側餘裕的**精確語意**：
+/// - 真框側：所需最深片段在 9，還能再深 4 行仍被涵蓋；**第 5 行開始漏判**。
+/// - 誤判側：語料最淺的一幀在 16，要再往下移 3 行（到 13）才會重新被掃到。
+///
+/// 窗**不得**越過下緣區往上吃（早期版本讓鄰近窗跨出區界，19 個誤判幀有 12 個
+/// 照樣命中）。
+const TAIL_LINES: usize = 14;
+
+/// 同一特徵組的片段必須落在這麼多行內，而不是「同屏任意處」。
+///
+/// 取值 12 的下界來自真框跨距：agy 框 header→footer 距 9 行、claude 框
+/// `Do you want to proceed?`→`Esc to cancel` 距 5 行；12 對前者留 2 行餘裕。
+/// 上界是 `TAIL_LINES`——比它大就退化成「整個下緣區同屏比對」，鄰近條件失效。
+const PROXIMITY_LINES: usize = 12;
+
 /// screen_has_prompt:318 — 一屏可見文字裡是否有會被 Enter 誤批的確認對話框。
 /// 前兩組特徵（claude 權限框／plan mode 退出框）依 bash 逐字。
 ///
@@ -37,40 +84,73 @@ pub fn is_valid_pane(pane: &str) -> bool {
 ///
 /// 錨用 agy 獨有的 `Requesting permission for:` 而非放寬 `esc` 的大小寫：
 /// agy 執行中 footer 常駐小寫 `esc to cancel`，只放寬大小寫會讓「助理輸出
-/// 自己寫出 Do you want to …」湊成誤判。誤判方向是漏送通知（任務仍在
-/// mailbox），比誤批權限框輕，但沒有理由白收。
+/// 自己寫出 Do you want to …」湊成誤判。
 ///
 /// **header 單錨不夠**（跨廠複核 2026-07-31 的 blocker）：掃描只看可見一屏
 /// （`capture-pane -pJ`，不取 scrollback），而預設 worker 會進共用 window 並
 /// `tiled` 均分——pane 一多就矮，框的 header 會被捲出畫面、只剩下緣的
 /// 選項與 footer。那時 header 錨失效、claude 那組又因大寫 `Esc` 不命中，
 /// 送鍵的 Enter 就落在 `1. Yes`。故第四組是下緣備援：完整句
-/// `Do you want to proceed?` ＋小寫 `esc to cancel` 成對。成對要求把誤判面
-/// 壓回「助理輸出剛好整句寫出那個問句」的窄縫，而不是任何含 esc 的畫面。
+/// `Do you want to proceed?` ＋小寫 `esc to cancel` 成對。
 ///
-/// 比對前先把整屏空白（含換行）摺疊成單一空格，對映 `tr -s '[:space:]' ' '`：
-/// TUI 的 word-wrap 與 tmux 軟折行會把特徵片段拆到兩行，逐行比對必偽陰性
-/// （漏判＝放行誤批的 Enter，是最壞方向）。Rust 的 `char::is_whitespace` 涵蓋
-/// Unicode 空白、比 C locale 的 `[:space:]` 寬，差異只會讓更多片段被拼接
-/// 起來——偽陽性方向，落在 bash 註解既定的 fail-closed 偏攔代價內。
+/// **位置有錨＋單錨降級**（2026-08-01 收窄，量化依據見 `TAIL_LINES`）：原本
+/// 是整屏無錨 substring，於是任何**談論**權限框的畫面都會命中——實測一個正常
+/// 工作中的 coordinator pane 被誤判 19/24≈79%，`rg 'Requesting permission
+/// for:|Do you want to proceed'` 這行指令回顯自己就湊齊三組特徵。三道收窄：
+/// ①只掃下緣 `TAIL_LINES` 行；②組內片段須落在 `PROXIMITY_LINES` 行的鄰近窗內；
+/// ③`Requesting permission for:` 單錨降級——MUST 與同框的選項行／footer 成對。
+/// 誤判方向是漏送通知（任務仍在 mailbox）＋TUI 假警報，比誤批權限框輕；但
+/// 收窄同時把漏判風險壓在量出來的餘裕內，不是拿安全換乾淨。
 pub fn screen_has_prompt(screen: &str) -> bool {
-    let mut norm = String::with_capacity(screen.len());
-    let mut prev_ws = false;
-    for c in screen.chars() {
-        if c.is_whitespace() {
-            if !prev_ws {
-                norm.push(' ');
-            }
-            prev_ws = true;
-        } else {
-            norm.push(c);
-            prev_ws = false;
+    // 特徵組：**組內全部片段**都要落在同一個鄰近窗內才算命中。
+    let groups: [&[&str]; 3] = [
+        &["Do you want to ", "Esc to cancel"],
+        &["has written up a plan", "Would you like to proceed"],
+        &["Do you want to proceed?", "esc to cancel"],
+    ];
+    // 單錨降級後的伴隨特徵：同框的問句、footer、或第一個選項行，任一即可。
+    let companions: [&str; 4] = [
+        "Do you want to ",
+        "esc to cancel",
+        "Esc to cancel",
+        "1. Yes",
+    ];
+    for window in tail_windows(screen) {
+        let hit = groups
+            .iter()
+            .any(|g| g.iter().all(|frag| window.contains(frag)))
+            || (window.contains("Requesting permission for:")
+                && companions.iter().any(|c| window.contains(c)));
+        if hit {
+            return true;
         }
     }
-    (norm.contains("Do you want to ") && norm.contains("Esc to cancel"))
-        || (norm.contains("has written up a plan") && norm.contains("Would you like to proceed"))
-        || norm.contains("Requesting permission for:")
-        || (norm.contains("Do you want to proceed?") && norm.contains("esc to cancel"))
+    false
+}
+
+/// 下緣區內的鄰近窗序列（每個窗已摺疊空白，可直接 `contains`）。
+///
+/// 尾端全空白行先剝掉：`capture-pane` 會把 pane 底部沒寫到的列補成空行，
+/// 不剝的話「距底幾行」會被這些空行整批推高，下緣錨等於白設。
+///
+/// 窗一律**夾在下緣區內**（`start` 不小於 `tail_start`）：讓窗往上越界，
+/// 等於把上半部的指令回顯又拉回比對範圍，收窄失效。
+fn tail_windows(screen: &str) -> Vec<String> {
+    let mut lines: Vec<&str> = screen.split('\n').collect();
+    while lines.last().is_some_and(|l| l.trim().is_empty()) {
+        lines.pop();
+    }
+    if lines.is_empty() {
+        return Vec::new();
+    }
+    let tail_start = lines.len().saturating_sub(TAIL_LINES);
+    let tail = &lines[tail_start..];
+    (0..tail.len())
+        .map(|end| {
+            let start = end.saturating_sub(PROXIMITY_LINES - 1);
+            fold_whitespace(&tail[start..=end].join("\n"))
+        })
+        .collect()
 }
 
 /// 送鍵前的兩道畫面關卡，`notify_pane` 在送文字前與送 Enter 前各跑一次。
@@ -90,13 +170,58 @@ pub fn screen_has_prompt(screen: &str) -> bool {
 ///
 /// 兩道都 fail-closed（讀不出來一律回 `false`）：無法確認 pane 狀態時放行送
 /// 鍵，等於整條防線被略過。
-fn pane_accepts_keys(tmux: &dyn TmuxClient, pane: &str) -> bool {
-    if tmux.pane_in_mode(pane) != Some(false) {
-        return false;
+fn pane_accepts_keys(
+    tmux: &dyn TmuxClient,
+    pane: &str,
+) -> std::result::Result<(), NotifyFailReason> {
+    match tmux.pane_in_mode(pane) {
+        Some(false) => {}
+        Some(true) => return Err(NotifyFailReason::CopyMode),
+        // mode 查不到＝tmux 查詢失敗／逾時／pane 已不在，fail-closed 同 capture 失敗
+        None => return Err(NotifyFailReason::PaneGone),
     }
     match tmux.capture_pane(pane) {
-        Some(screen) => !screen_has_prompt(&screen),
-        None => false,
+        Some(screen) if screen_has_prompt(&screen) => Err(NotifyFailReason::Prompt),
+        Some(_) => Ok(()),
+        None => Err(NotifyFailReason::PaneGone),
+    }
+}
+
+/// 一次送鍵失敗的**原因分類**，寫進 events.log 的 `notify-failed … reason=<v>`。
+///
+/// 存在的理由：四個關卡原本共用同一個 `false`，事後只剩「失敗了」三個字，
+/// 誰擋的分不出來。2026-08-01 那次 matcher 誤判調查最大的阻力就是這個缺口
+/// ——只能靠「哪些 runtime／哪些 cmd 失敗率高」的事後統計反推根因。
+///
+/// 四個值是**分類桶**，不是關卡的一對一映射：`PaneGone` 同時吃下「pane 真的
+/// 不在」與「pane 狀態查不到」（無效 pane id、tmux 起不來、mode／capture 查詢
+/// 回 None）——兩者對呼叫端的處置相同（fail-closed，訊息留 mailbox），硬拆只會
+/// 讓消費端多分支卻分不出可行動的差別。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum NotifyFailReason {
+    /// pane 停在 tmux copy-mode（AB-COPYMODE-1）
+    CopyMode,
+    /// 畫面停在權限／計畫確認框（HOOK-NOTIFY-2）
+    Prompt,
+    /// `send-keys` 這一步失敗。**不等於逾時**：`send_keys()` 只回 bool，
+    /// 逾時（ENV-TMUX-1 的 bounded 上限）、非零退出、pane 在 TOCTOU 空窗裡
+    /// 消失、tmux 子行程根本沒起來，全都塌成同一個 `false`——從這裡分不出
+    /// 根因，所以字面值 MUST 是 `send-keys-failed` 而不是 `-timeout`，
+    /// 免得事後分析把「pane 剛好消失」誤讀成「tmux 卡住」。
+    SendKeysFailed,
+    /// pane 不存在、pane id 非法、tmux 不可用，或 pane 狀態查不到
+    PaneGone,
+}
+
+impl NotifyFailReason {
+    /// events.log 用的字面值（**穩定契約**：消費端據此分類，改動要同步 spec）
+    pub fn as_str(self) -> &'static str {
+        match self {
+            NotifyFailReason::CopyMode => "copy-mode",
+            NotifyFailReason::Prompt => "prompt",
+            NotifyFailReason::SendKeysFailed => "send-keys-failed",
+            NotifyFailReason::PaneGone => "pane-gone",
+        }
     }
 }
 
@@ -104,20 +229,29 @@ fn pane_accepts_keys(tmux: &dyn TmuxClient, pane: &str) -> bool {
 /// 任一關卡失敗都回 `false`（呼叫端走 notify-failed 降級：訊息仍在 mailbox，
 /// 可復原）。
 pub fn notify_pane(tmux: &dyn TmuxClient, pane: &str, cmd: &str) -> bool {
+    notify_pane_reason(tmux, pane, cmd).is_ok()
+}
+
+/// `notify_pane` 的帶原因版本：成功回 `Ok(())`，失敗回擋下它的關卡。
+///
+/// 兩者同一份流程（`notify_pane` 只是丟掉原因的薄殼），避免兩條路徑各自漂移。
+pub fn notify_pane_reason(
+    tmux: &dyn TmuxClient,
+    pane: &str,
+    cmd: &str,
+) -> std::result::Result<(), NotifyFailReason> {
     if !is_valid_pane(pane) {
-        return false;
+        return Err(NotifyFailReason::PaneGone);
     }
     if !tmux.available() {
-        return false;
+        return Err(NotifyFailReason::PaneGone);
     }
     if !tmux.pane_exists(pane) {
-        return false;
+        return Err(NotifyFailReason::PaneGone);
     }
-    if !pane_accepts_keys(tmux, pane) {
-        return false;
-    }
+    pane_accepts_keys(tmux, pane)?;
     if !tmux.send_keys(pane, cmd) {
-        return false;
+        return Err(NotifyFailReason::SendKeysFailed);
     }
     sleep_notify_delay();
     // 送 Enter 前再過一次同樣的關卡：worker 可能在這段延遲內才彈框，人也可能
@@ -125,10 +259,11 @@ pub fn notify_pane(tmux: &dyn TmuxClient, pane: &str, cmd: &str) -> bool {
     // send-keys 之間的微小空窗，tmux 給不了 pane-side 原子性）——那道空窗由
     // `send_keys` 自身的逾時兜底（tmux.rs `wait_with_timeout`），不會變成
     // 永久鎖死。
-    if !pane_accepts_keys(tmux, pane) {
-        return false;
+    pane_accepts_keys(tmux, pane)?;
+    if !tmux.send_keys(pane, "Enter") {
+        return Err(NotifyFailReason::SendKeysFailed);
     }
-    tmux.send_keys(pane, "Enter")
+    Ok(())
 }
 
 /// `sleep "${AGENT_BRIDGE_NOTIFY_DELAY:-0.3}"`：agent REPL 會把同批抵達的
@@ -210,22 +345,27 @@ pub fn notify_or_defer_outcome(
         return Ok(NotifyOutcome::Deferred);
     }
 
-    if notify_pane(tmux, pane, cmdline) {
-        log_event(
-            paths,
-            task_id,
-            "notified",
-            &format!("pane={pane} cmd={tag}"),
-        )?;
-        Ok(NotifyOutcome::Notified)
-    } else {
-        log_event(
-            paths,
-            task_id,
-            "notify-failed",
-            &format!("pane={pane} cmd={tag}"),
-        )?;
-        Ok(NotifyOutcome::Failed)
+    match notify_pane_reason(tmux, pane, cmdline) {
+        Ok(()) => {
+            log_event(
+                paths,
+                task_id,
+                "notified",
+                &format!("pane={pane} cmd={tag}"),
+            )?;
+            Ok(NotifyOutcome::Notified)
+        }
+        Err(reason) => {
+            // `reason=` **append 在既有欄位之後**：現有解析（測試、hook、人眼）
+            // 都是前綴比對或 grep，加在尾端不會挪動 pane=／cmd= 的位置。
+            log_event(
+                paths,
+                task_id,
+                "notify-failed",
+                &format!("pane={pane} cmd={tag} reason={}", reason.as_str()),
+            )?;
+            Ok(NotifyOutcome::Failed)
+        }
     }
 }
 
@@ -285,6 +425,9 @@ mod tests {
         mode_calls: std::cell::Cell<usize>,
         screen: Option<&'static str>,
         sent: RefCell<Vec<String>>,
+        /// `send_keys` 的回傳。`false` 對映實作拿得到的全部送鍵失敗
+        /// （逾時／非零退出／pane 剛好消失／子行程沒起來）。
+        send_ok: bool,
     }
 
     impl FakeTmux {
@@ -298,7 +441,15 @@ mod tests {
                 mode_calls: std::cell::Cell::new(0),
                 screen,
                 sent: RefCell::new(Vec::new()),
+                send_ok: true,
             }
+        }
+
+        /// 送鍵一律失敗的替身（唯一構造得出 `SendKeysFailed` 的路徑）。
+        fn with_failing_send_keys(screen: Option<&'static str>) -> Self {
+            let mut f = Self::new(Some(false), screen);
+            f.send_ok = false;
+            f
         }
     }
 
@@ -325,7 +476,7 @@ mod tests {
         }
         fn send_keys(&self, _p: &str, keys: &str) -> bool {
             self.sent.borrow_mut().push(keys.to_string());
-            true
+            self.send_ok
         }
     }
 
@@ -408,8 +559,14 @@ mod tests {
              ────────\n\nRequesting permission for:\n   ./bin/agent-bridge receive t1\n\n\
              Do you want to proceed?\n> 1. Yes\n  4. No\n\nesc to cancel";
         assert!(screen_has_prompt(screen));
-        // header 錨單獨成立即可
-        assert!(screen_has_prompt("Requesting permission for:"));
+        // **單錨降級**（2026-08-01）：header 自己不再成立，MUST 與同框的問句／
+        // 選項行／footer 成對。這條原本是正向斷言——它正是 19/24 誤判的主因，
+        // 任何「談論」權限框的畫面都會踩中它。
+        assert!(!screen_has_prompt("Requesting permission for:"));
+        // 成對即命中（header ＋ 同框選項行）
+        assert!(screen_has_prompt(
+            "Requesting permission for:\n   ./bin/ab receive t1\n> 1. Yes\n  4. No"
+        ));
         // 矮 pane：header 被捲出一屏，只剩框的下緣——備援錨要接住
         assert!(screen_has_prompt(
             "Do you want to proceed?\n> 1. Yes\n  4. No\n\nesc to cancel"
@@ -452,5 +609,265 @@ mod tests {
         // 單獨一個片段不構成特徵
         assert!(!screen_has_prompt("Do you want to know more?"));
         assert!(!screen_has_prompt("Esc to cancel"));
+    }
+
+    /// 一個 coordinator pane 的**下緣**長相：輸入框＋statusline，共 14 行。
+    /// 誤判語料裡的命中片段全部落在這塊之上（最淺的距底 16 行）。
+    fn coordinator_footer() -> String {
+        [
+            "✻ Brewed for 4s",
+            "                                              41282 tokens",
+            "────────────────────────────────────────────────────────",
+            "❯ ",
+            "────────────────────────────────────────────────────────",
+            "   Opus 5 [1M] │ ⛁ ⛶⛶⛶⛶ 19% │  agent-bridge (rust/m0.5)",
+            "   $27.57 / $451.50 │  8h 59m │ 󰓅 99%",
+            "   5H ━━━───────────────────  11% ↻ 1:00pm",
+            "   7D ━━━━━━━━━─────────────  31% ↻ aug 6 2:00am",
+            "  -- INSERT -- ⏵⏵ auto mode on · ← 1 agent",
+            "                                                     /rc",
+            "",
+            "  ◯ main",
+            "  ● ✓ opus-5[1m]  [查通知失敗根因] 78.5kt 8h52m",
+        ]
+        .join("\n")
+    }
+
+    /// 誤判回歸（2026-08-01 語料，19/24≈79%）——**談論**權限框的畫面 MUST NOT
+    /// 命中。兩類都從真實幀萃取最小合成行（原始截圖不進 repo）：
+    ///
+    /// - class B：一行 `rg` 指令回顯同時湊齊三組特徵（poll-133-8/9/10，距底 16）
+    /// - class A：散文引用 header 單錨（poll-133-20..24，距底 27）
+    ///
+    /// 沒有這條，把 `TAIL_LINES` 改回整屏（或讓鄰近窗越過下緣區界）就會靜默
+    /// 回到 79% 誤判——那正是 P4 之後 TUI 常駐假 `⛔blocked` 的來源。
+    #[test]
+    fn talking_about_a_permission_box_is_not_a_permission_box() {
+        // class B：指令回顯，四個片段擠在同一行
+        let echo_line = "● Bash(rg -n \"Requesting permission for:|Do you want to \
+             proceed|esc to cancel|Esc to cancel\" $D/notify-captures/poll-133-1.txt)";
+        let screen_b = format!(
+            "{}\n{}\n{}",
+            "  上半部的工作內容\n".repeat(14).trim_end(),
+            echo_line,
+            coordinator_footer()
+        );
+        assert!(!screen_has_prompt(&screen_b));
+
+        // class A：散文引用 header 單錨
+        let prose =
+            "  ……；P3 的 Requesting permission for: 單錨應降級為必須與同框的選項行或 footer 成對。";
+        let screen_a = format!(
+            "{}\n{}\n{}",
+            "  修法建議（一段話，未實作）\n".repeat(12).trim_end(),
+            prose,
+            coordinator_footer()
+        );
+        assert!(!screen_has_prompt(&screen_a));
+
+        // class C：錨**落在下緣區內**但沒有同框伴隨特徵——位置錨擋不住它，
+        // 只有單錨降級擋得住。語料裡的 class A 錨在距底 27 行，被位置錨先攔下，
+        // 於是降級那條規則沒有獨立守衛；這條補上（突變驗證 e 的缺口）。
+        let screen_c = "worker log: skipping Requesting permission for: probes\n\
+             tail line 1\ntail line 2\ntail line 3";
+        assert!(!screen_has_prompt(screen_c));
+    }
+
+    /// frag 代碼 → 字面值。**單一正本**：資料表只存代碼，字面值只在這裡，
+    /// 兩邊不會各自漂移。
+    fn frag_literal(code: &str) -> &'static str {
+        match code {
+            "P1a" => "Do you want to ",
+            "P1b" => "Esc to cancel",
+            "P2a" => "has written up a plan",
+            "P2b" => "Would you like to proceed",
+            "P3" => "Requesting permission for:",
+            "P4a" => "Do you want to proceed?",
+            "P4b" => "esc to cancel",
+            other => panic!("資料表用了未知的 frag 代碼：{other}"),
+        }
+    }
+
+    /// 收窄**前**的判定（整屏無錨 substring），逐字照 2081887 的實作。
+    /// 只用來證明資料表每一列在收窄前真的會命中——沒有這個對照，一列
+    /// 「本來就不命中」的資料混進表裡也會全綠，gate 等於沒設。
+    fn whole_screen_hit(screen: &str) -> bool {
+        let n = fold_whitespace(screen);
+        (n.contains("Do you want to ") && n.contains("Esc to cancel"))
+            || (n.contains("has written up a plan") && n.contains("Would you like to proceed"))
+            || n.contains("Requesting permission for:")
+            || (n.contains("Do you want to proceed?") && n.contains("esc to cancel"))
+    }
+
+    /// 19 幀誤判語料的**持久 gate**（tests/fixtures/matcher-false-positives.tsv）。
+    ///
+    /// 原始截圖不入庫（含工作內容）；表裡只留 matcher 實際依賴的兩件事——哪些
+    /// 特徵片段出現、各自距底幾行。這裡逐幀重建等價畫面再斷言 no-hit。
+    ///
+    /// 每一列都先過 `whole_screen_hit`：那是收窄前的實作。收窄前 MUST 命中、
+    /// 收窄後 MUST NOT 命中——雙向都鎖住，才叫回歸 gate 而不是一堆恆真斷言。
+    #[test]
+    fn false_positive_corpus_is_a_persistent_gate() {
+        let table = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../tests/fixtures/matcher-false-positives.tsv"
+        ));
+        let mut checked = 0;
+        for line in table.lines() {
+            if line.trim().is_empty() || line.starts_with('#') {
+                continue;
+            }
+            let mut cols = line.split('\t');
+            let frame = cols.next().expect("frame 欄");
+            let total: usize = cols
+                .next()
+                .expect("lines 欄")
+                .parse()
+                .expect("lines 是數字");
+            let placements = cols.next().expect("placements 欄");
+
+            // 依「距底行數」把片段放回等價畫面，其餘填無關內容
+            let mut lines: Vec<String> = vec!["  ordinary worker output".to_string(); total];
+            for p in placements.split(';') {
+                let (code, depth) = p.split_once('@').expect("frag@from_bottom");
+                let depth: usize = depth.parse().expect("from_bottom 是數字");
+                let idx = total - 1 - depth;
+                let lit = frag_literal(code);
+                // 同一距底＝同一行：既有內容後面接著放，重現「一行湊齊多個特徵」
+                if lines[idx].starts_with("  ordinary") {
+                    lines[idx] = format!("  {lit}");
+                } else {
+                    lines[idx] = format!("{} {lit}", lines[idx]);
+                }
+            }
+            let screen = lines.join("\n");
+
+            assert!(
+                whole_screen_hit(&screen),
+                "{frame}：重建畫面在收窄前不命中——這列資料沒有代表性，gate 是假的"
+            );
+            assert!(
+                !screen_has_prompt(&screen),
+                "{frame}：收窄後仍誤判（距底 {placements}）"
+            );
+            checked += 1;
+        }
+        assert_eq!(checked, 19, "語料表應為 19 幀，實得 {checked}");
+    }
+
+    /// 收窄的反面：真框在下緣時 MUST 照樣命中，**即使**畫面上半部塞滿雜訊。
+    /// 幾何取自 2026-08-01 實測（Claude Code v2.1.220，33×143）：框出現時取代
+    /// 輸入框與 statusline，`Esc to cancel` 距底 0 行、問句距底 5 行。
+    #[test]
+    fn a_real_box_at_the_bottom_still_hits_under_noise() {
+        let screen = format!(
+            "{}\n{}",
+            "  上半部的工作內容\n".repeat(18).trim_end(),
+            [
+                "─────────────────────────────────────────",
+                " Bash command",
+                "",
+                "   perl -e 'print qq{ok}'",
+                "   Print ok via perl one-liner",
+                "",
+                " This command requires approval",
+                "",
+                " Do you want to proceed?",
+                " ❯ 1. Yes",
+                "   2. Yes, and don't ask again for: perl *",
+                "   3. No",
+                "",
+                " Esc to cancel · Tab to amend · ctrl+e to explain",
+            ]
+            .join("\n")
+        );
+        assert!(screen_has_prompt(&screen));
+    }
+
+    /// `capture-pane` 會把 pane 底部沒寫到的列補成空行。不剝掉的話，「距底幾行」
+    /// 會被整批推高、下緣錨等於白設——真框反而漏判（最壞方向）。
+    #[test]
+    fn trailing_blank_padding_does_not_push_the_box_out_of_the_tail() {
+        let screen = format!(
+            "{}\nDo you want to proceed?\n❯ 1. Yes\nEsc to cancel{}",
+            "noise\n".repeat(20).trim_end(),
+            "\n".repeat(12)
+        );
+        assert!(screen_has_prompt(&screen));
+    }
+
+    /// 鄰近條件：同一組的兩個片段隔得太遠（仍同在下緣區內）MUST NOT 湊成命中。
+    #[test]
+    fn fragments_too_far_apart_do_not_pair() {
+        // 中間墊 n 行雜訊 → 兩個片段相距 n+1 行
+        let build = |gap: usize| {
+            let mut lines = vec!["Do you want to proceed?".to_string()];
+            lines.extend(std::iter::repeat_n("……無關內容……".to_string(), gap));
+            lines.push("Esc to cancel".to_string());
+            lines.join("\n")
+        };
+        // 相距 PROXIMITY_LINES 行：超出鄰近窗，MUST NOT 成對
+        assert!(!screen_has_prompt(&build(PROXIMITY_LINES - 1)));
+        // 相距 PROXIMITY_LINES-1 行：剛好同窗，MUST 命中
+        assert!(screen_has_prompt(&build(PROXIMITY_LINES - 2)));
+    }
+
+    /// notify-failed 的 reason 分類：四個關卡各自可辨。
+    #[test]
+    fn notify_failure_reasons_are_distinguishable() {
+        let copy = FakeTmux::new(Some(true), Some("$ ls\n"));
+        assert_eq!(
+            notify_pane_reason(&copy, "%1", "x"),
+            Err(NotifyFailReason::CopyMode)
+        );
+
+        let prompt = FakeTmux::new(Some(false), Some("Do you want to proceed?\nEsc to cancel"));
+        assert_eq!(
+            notify_pane_reason(&prompt, "%1", "x"),
+            Err(NotifyFailReason::Prompt)
+        );
+
+        // pane 狀態查不到與 pane id 非法同歸 pane-gone（分類桶，見 enum 註解）
+        let unknown = FakeTmux::new(None, Some("$ ls\n"));
+        assert_eq!(
+            notify_pane_reason(&unknown, "%1", "x"),
+            Err(NotifyFailReason::PaneGone)
+        );
+        let bad = FakeTmux::new(Some(false), Some("$ ls\n"));
+        assert_eq!(
+            notify_pane_reason(&bad, "%1 ; kill-server", "x"),
+            Err(NotifyFailReason::PaneGone)
+        );
+
+        // capture 讀不出來也是 pane-gone
+        let nocap = FakeTmux::new(Some(false), None);
+        assert_eq!(
+            notify_pane_reason(&nocap, "%1", "x"),
+            Err(NotifyFailReason::PaneGone)
+        );
+
+        // 前兩道關卡都過、卡在送鍵本身 → send-keys-failed（唯一走得到的路徑）
+        let nosend = FakeTmux::with_failing_send_keys(Some("$ ls\n"));
+        assert_eq!(
+            notify_pane_reason(&nosend, "%1", "x"),
+            Err(NotifyFailReason::SendKeysFailed)
+        );
+        // 失敗的是第一次送鍵（文字），Enter MUST NOT 補送
+        assert_eq!(*nosend.sent.borrow(), vec!["x".to_string()]);
+
+        let ok = FakeTmux::new(Some(false), Some("$ ls\n"));
+        assert_eq!(notify_pane_reason(&ok, "%1", "x"), Ok(()));
+    }
+
+    /// 字面值是寫進 events.log 的穩定契約（spec/hooks.md HOOK-NOTIFY-4）。
+    #[test]
+    fn reason_wire_values_are_stable() {
+        assert_eq!(NotifyFailReason::CopyMode.as_str(), "copy-mode");
+        assert_eq!(NotifyFailReason::Prompt.as_str(), "prompt");
+        assert_eq!(
+            NotifyFailReason::SendKeysFailed.as_str(),
+            "send-keys-failed"
+        );
+        assert_eq!(NotifyFailReason::PaneGone.as_str(), "pane-gone");
     }
 }

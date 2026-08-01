@@ -417,6 +417,11 @@ MUST NOT 取代 task status、MUST NOT 造出權威字以外的 task 狀態。v1
 `pane_in_mode`，非畫面比對）。三態 MUST 保留：查不到＝`unknown`，
 **MUST NOT 顯示成「沒有 blocker」**（顯示紀律 §5）。查詢與 liveness 同一輪
 節流、同樣 bounded、同樣 MUST NOT 在 UI thread 上執行。
+screen-matcher 來源的 `prompt` MUST 去抖：**連續 2 輪命中才升旗**，未達門檻
+顯示為「沒有可見 blocker」而 **MUST NOT** 謊報成 `unknown`（該輪畫面確實讀到
+了）；降旗 MUST 即時（一輪未命中即撤）。結構性的 `occluded` **MUST NOT** 去抖
+——它不是字串比對，沒有單幀誤判面。去抖狀態只存 TUI 記憶體，MUST NOT 寫 FS。
+代價：升旗＝首次命中後再一輪，以 2s 節流計，**自框出現算起最壞未滿 4s**。
 read model 為磁碟輪詢（500ms）＋tmux 節流查詢（2s）；每條 tmux 查詢
 MUST bounded（ENV-TMUX-1）**且 MUST NOT 在 UI thread 上執行**（背景 worker
 ＋channel），逾時該欄降級 unknown、動作顯示進行中，MUST NOT 凍結 UI——

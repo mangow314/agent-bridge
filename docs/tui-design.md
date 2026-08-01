@@ -142,6 +142,56 @@ v1 只承諾兩件事，全部有現成實作來源：
 版本紀錄就算不出 hit-rate）：per-runtime hit-rate canary 與 `matcher-stale(runtime vX)`
 標示、transcript 檢視的 occlusion、協定外活動偵測。
 
+### matcher 收窄（2026-08-01，使用者裁定立案；§7 manifest 化條款不動）
+
+P4 把 BLOCKER 軸接進 TUI 之後，`screen_has_prompt` 的誤判從「偶爾漏送一則
+通知」升級成「500ms／2s 輪詢下的常駐假 `⛔blocked`」。實測分母：一個正常
+工作中的 coordinator pane，24 輪抽樣誤判 **19 次（79%）**；192 個真實畫面
+樣本中 copy-mode 命中 0 次（第一道關卡不是通案原因）。根因是**整屏無錨
+substring**——任何**談論**權限框的畫面都會命中，一行
+`rg 'Requesting permission for:|Do you want to proceed'` 的指令回顯自己就
+湊齊三組特徵。
+
+收窄三條（實作在 `ab_core::notify`）：
+
+1. **位置有錨**：只掃畫面下緣 `TAIL_LINES=14` 行
+2. **鄰近成對**：同一特徵組的片段須落在 `PROXIMITY_LINES=12` 行的窗內
+3. **單錨降級**：`Requesting permission for:` MUST 與同框的問句／選項行／
+   footer 成對
+
+兩個常數是量出來的，不是拍的：
+
+| 來源 | 量測 | 距底行數 |
+| --- | --- | --- |
+| 真框（Claude Code v2.1.220，33×143） | 框出現時**取代**輸入框與 statusline，整框貼底 | `Esc to cancel` 0、問句 5、框頂 13 |
+| 真框（agy，docs/agy-probe.md 十行框） | header 在框頂、footer 貼底 | header 9 |
+| 誤判語料（19 幀，poll-133-*） | 指令回顯與散文引用，都在畫面上半部 | 最淺的一個 **16** |
+
+`TAIL_LINES=14` 涵蓋距底 0–13（含）。兩側餘裕的**精確語意**（避免 off-by-one
+誤讀）：真框側所需最深片段在 9，**還能再深 4 行仍被涵蓋、第 5 行開始漏判**；
+誤判側語料最淺的一幀在 16，**要再往下移 3 行（到 13）才會重新被掃到**。
+`PROXIMITY_LINES=12` 的下界是 agy 框的 header→footer 跨距 9。
+
+**踩過的坑**：鄰近窗若允許越過下緣區界往上吃，19 個誤判幀有 12 個照樣命中
+（窗結束在下緣區、起點卻回到上半部）。窗一律夾在下緣區內。另外
+`capture-pane` 會把 pane 底部沒寫到的列補成空行，尾端空白行必須先剝掉，
+否則「距底幾行」被整批推高、下緣錨等於白設——那個方向是**漏判**。
+
+**TUI 側去抖**：screen-matcher 來源的 `Prompt` 連續 `K=2` 輪命中才升旗，
+未達門檻顯示為「沒有可見 blocker」（**不是** unknown——該輪畫面確實讀到了，
+謊報成沒訊號會讓 §5 三態語意失真）；降旗即時。結構性的 `occluded`
+（`pane_in_mode`）**不去抖**：它沒有單幀誤判面，去抖只會白白延後。
+延遲代價要照實說：升旗是「**首次命中後再等一輪**」。以 2s 一輪計，框可能剛好
+在一輪剛掃完之後才出現，**自框出現算起最壞未滿 4s**（≈一輪等到首次命中，
+再一輪確認），不是 2s。假警報則最多閃一輪就消失。worker 停在權限框是分鐘級
+的等待，4s 對人的判斷沒有影響——但低報成 2s 會讓下一個人以為餘裕比實際多一倍。
+
+**留下的風險（誠實記錄）**：兩個常數是對「這套 statusline ＋ 33 列 pane」
+的量測；換一套更高的 footer、或框本身變高，餘裕會被吃掉。方向是**漏判**
+（最壞方向），故未來若要再調，應以真框幾何為準、而非以乾淨度為準。
+`notify-failed` 現在帶 `reason=`（spec HOOK-NOTIFY-4），下次要重驗這件事
+不必再靠事後統計反推。
+
 ### bounded-read 硬條款（終審補入）
 
 **TUI read model 消費的每一條 tmux 查詢 MUST 有上限**（`run_bounded`／

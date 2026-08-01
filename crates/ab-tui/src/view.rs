@@ -322,7 +322,7 @@ fn worker_detail(w: &ab_core::registry::AgentSnapshot, live: &LiveIndex) -> Vec<
 /// 必須落在字元層才驗得到（同 selection marker 的理由，§2）。
 /// `Unknown` 一律**不畫**：沒有訊號 ≠ 沒有 blocker，畫成空白比畫成「無」誠實
 /// （DETAIL 欄仍逐字寫出 unknown）。
-fn blocker_mark(b: Blocker) -> &'static str {
+pub(crate) fn blocker_mark(b: Blocker) -> &'static str {
     match b {
         Blocker::Prompt => "  ⛔blocked",
         Blocker::Occluded => "  👁copy-mode",

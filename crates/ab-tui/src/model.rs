@@ -169,6 +169,68 @@ impl BlockerIndex {
     }
 }
 
+/// screen-matcher 來源的 blocker 要**連續命中這麼多輪**才升旗。
+///
+/// 理由：`Prompt` 靠畫面字串比對，單幀就可能是助理輸出剛好寫出那些字
+/// （2026-08-01 語料：一行 `rg` 指令回顯就湊齊三組特徵）。matcher 收窄後
+/// 這類幀已大幅減少，但畫面比對本質上沒有上層可否決——去抖是第二道。
+/// 延遲代價照實記：升旗是「**首次命中後再等一輪**」。以 2s 一輪計，框可能
+/// 剛好在一輪剛掃完之後才出現，**自框出現算起最壞未滿 4s**（一輪等到首次
+/// 命中、再一輪確認），**不是 2s**——低報一半會讓下一個人以為餘裕比實際多。
+/// 假警報則最多閃一輪就消失。worker 停在權限框是**分鐘級**的等待，4s 對人的
+/// 判斷沒有影響。
+///
+/// 結構性判定（`Occluded`／`pane_in_mode`）**不去抖**：它不是字串比對，
+/// 沒有單幀誤判面，去抖只會白白延後。
+const BLOCKER_DEBOUNCE_ROUNDS: u32 = 2;
+
+/// 跨輪去抖狀態：pane → 連續命中輪數。**只存 TUI 記憶體**（同 §4 的 occluded
+/// 前值紀律），重開從零起算。
+#[derive(Default)]
+pub struct BlockerDebounce {
+    streak: HashMap<String, u32>,
+}
+
+impl BlockerDebounce {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// 把一輪原始判定過一次去抖，回傳要拿去顯示的索引。
+    ///
+    /// - `Prompt`：連續第 `BLOCKER_DEBOUNCE_ROUNDS` 輪起才放行；在那之前回
+    ///   `None`（「查得到、沒有可見 blocker」）。**不是** `Unknown`——這一輪
+    ///   畫面確實讀到了，謊報成「沒訊號」會讓 §5 的三態語意失真。
+    /// - 其餘（`None`／`Occluded`／`Unknown`）原樣通過，並把連勝歸零：
+    ///   **降旗即時**，一輪沒命中就撤，不欠人一個「還要再等一輪」。
+    /// - 不在本輪索引裡的 pane 會被丟掉，streak 不會無界成長。
+    pub fn apply(&mut self, raw: BlockerIndex) -> BlockerIndex {
+        let Some(panes) = raw.panes else {
+            // 整層查不到：連勝全清（下一輪重新起算），維持 unknown
+            self.streak.clear();
+            return BlockerIndex { panes: None };
+        };
+        let mut next = HashMap::with_capacity(panes.len());
+        let mut out = HashMap::with_capacity(panes.len());
+        for (pane, blocker) in panes {
+            let shown = if blocker == Blocker::Prompt {
+                let n = self.streak.get(&pane).copied().unwrap_or(0) + 1;
+                next.insert(pane.clone(), n);
+                if n >= BLOCKER_DEBOUNCE_ROUNDS {
+                    Blocker::Prompt
+                } else {
+                    Blocker::None
+                }
+            } else {
+                blocker
+            };
+            out.insert(pane, shown);
+        }
+        self.streak = next;
+        BlockerIndex { panes: Some(out) }
+    }
+}
+
 /// 單一 pane 的 blocker 判定（純粹是兩次 bounded 查詢的組合，可用假件單測）。
 ///
 /// 先問結構性的 copy-mode 再看畫面：copy-mode 下的 `capture-pane` 拿到的是
@@ -528,5 +590,88 @@ mod tests {
         // manual（`-`）與 `?` 沒有死活可言
         assert!(matches!(owner_liveness(&live, "-"), Liveness::Unknown));
         assert!(matches!(owner_liveness(&live, "?"), Liveness::Unknown));
+    }
+
+    fn idx(pane: &str, b: Blocker) -> BlockerIndex {
+        let mut m = HashMap::new();
+        m.insert(pane.to_string(), b);
+        BlockerIndex { panes: Some(m) }
+    }
+
+    /// 去抖升旗：screen-matcher 來源的 `Prompt` MUST 連續 K 輪才升起。
+    ///
+    /// 沒有這條，把 `BLOCKER_DEBOUNCE_ROUNDS` 改成 1 一樣全綠——而那正是
+    /// 「單幀指令回顯 → 常駐假 ⛔blocked」的回歸。
+    #[test]
+    fn prompt_blocker_needs_consecutive_rounds_to_raise() {
+        let mut d = BlockerDebounce::new();
+        // 第一輪命中：還不升旗（顯示成「沒有可見 blocker」，不是 unknown）
+        assert_eq!(d.apply(idx("%1", Blocker::Prompt)).get("%1"), Blocker::None);
+        // 第二輪仍命中：升旗
+        assert_eq!(
+            d.apply(idx("%1", Blocker::Prompt)).get("%1"),
+            Blocker::Prompt
+        );
+        // 持續命中維持升旗
+        assert_eq!(
+            d.apply(idx("%1", Blocker::Prompt)).get("%1"),
+            Blocker::Prompt
+        );
+    }
+
+    /// 單輪閃現不升旗，且連勝會被中斷的那一輪歸零（不得累加跨越間斷）。
+    #[test]
+    fn a_single_frame_never_raises_and_streaks_do_not_carry_over() {
+        let mut d = BlockerDebounce::new();
+        assert_eq!(d.apply(idx("%1", Blocker::Prompt)).get("%1"), Blocker::None);
+        assert_eq!(d.apply(idx("%1", Blocker::None)).get("%1"), Blocker::None);
+        // 歸零後再命中一次仍不足以升旗
+        assert_eq!(d.apply(idx("%1", Blocker::Prompt)).get("%1"), Blocker::None);
+    }
+
+    /// 降旗**即時**：升旗後一輪未命中就撤，不欠人一個「再等一輪」。
+    #[test]
+    fn lowering_the_flag_is_immediate() {
+        let mut d = BlockerDebounce::new();
+        d.apply(idx("%1", Blocker::Prompt));
+        assert_eq!(
+            d.apply(idx("%1", Blocker::Prompt)).get("%1"),
+            Blocker::Prompt
+        );
+        assert_eq!(d.apply(idx("%1", Blocker::None)).get("%1"), Blocker::None);
+    }
+
+    /// 結構性判定不受去抖影響：`Occluded`（`pane_in_mode`）第一輪就要顯示，
+    /// `Unknown` 也 MUST NOT 被去抖改寫成 `None`（§5：沒有訊號 ≠ 沒有 blocker）。
+    #[test]
+    fn structural_verdicts_bypass_the_debounce() {
+        let mut d = BlockerDebounce::new();
+        assert_eq!(
+            d.apply(idx("%1", Blocker::Occluded)).get("%1"),
+            Blocker::Occluded
+        );
+        assert_eq!(
+            d.apply(idx("%2", Blocker::Unknown)).get("%2"),
+            Blocker::Unknown
+        );
+        // 整層查不到時維持 unknown
+        assert_eq!(d.apply(BlockerIndex::unknown()).get("%1"), Blocker::Unknown);
+    }
+
+    /// 每個 pane 各自計數：一個 pane 的連勝不得幫另一個 pane 升旗。
+    #[test]
+    fn debounce_streaks_are_per_pane() {
+        let mut d = BlockerDebounce::new();
+        let mut m = HashMap::new();
+        m.insert("%1".to_string(), Blocker::Prompt);
+        m.insert("%2".to_string(), Blocker::None);
+        d.apply(BlockerIndex { panes: Some(m) });
+
+        let mut m2 = HashMap::new();
+        m2.insert("%1".to_string(), Blocker::Prompt);
+        m2.insert("%2".to_string(), Blocker::Prompt);
+        let out = d.apply(BlockerIndex { panes: Some(m2) });
+        assert_eq!(out.get("%1"), Blocker::Prompt); // 連續兩輪
+        assert_eq!(out.get("%2"), Blocker::None); // 才第一輪
     }
 }

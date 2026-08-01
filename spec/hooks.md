@@ -170,7 +170,27 @@ legacy 送鍵前 MUST 偵測目標 pane 一屏可見文字是否停在 runtime �
 notify-failed 警告；pane 已死、capture 失敗同走 notify-failed，任務仍在
 mailbox 不遺失。偵測是 best-effort 字串特徵比對，特徵字串 MUST 與現裝
 runtime 實際文案保持一致（有 canary 測試守著）。
+比對 MUST **位置有錨**（2026-08-01 收窄，量化依據見 docs/tui-design.md §4）：
+①只掃畫面下緣固定行數——權限框貼底，指令回顯與助理輸出不會；②同一特徵組的
+片段 MUST 落在鄰近行內，而非同屏任意處；③`Requesting permission for:` 單錨
+MUST 降級——必須與同框的問句／選項行／footer 成對。整屏無錨比對 MUST NOT
+回歸：實測一個正常工作中的 coordinator pane 因此被誤判 19/24≈79%。
+收窄後仍 MUST 守住原方向：矮 pane 只剩框下緣、特徵被折行拆散時 MUST 照樣命中
+（漏判＝替 worker 按下批准，是最壞方向）。
 Source: notify_pane / screen_has_prompt
+
+### HOOK-NOTIFY-4 [tested: 8a, 39]
+notify-failed 事件 MUST 帶 `reason=<copy-mode|prompt|send-keys-failed|
+pane-gone>`，值域即此四者。欄位 MUST **additive**（append 在既有 `pane=`／
+`cmd=` 之後，不得挪動既有欄位順序）。沒有這個欄位，四個關卡在事後只剩同一個
+notify-failed，根因只能靠統計反推（2026-08-01 誤判調查的最大阻力）。
+兩個值是**分類桶**，命名 MUST 誠實反映這件事，不得暗示未經證實的根因：
+`pane-gone` 涵蓋「pane 真的不在」與「pane 狀態查不到」（無效 pane id、tmux
+不可用、mode／capture 查詢失敗）；`send-keys-failed` 涵蓋 `send-keys` 這步
+的**所有**失敗——逾時、非零退出、TOCTOU 空窗內 pane 消失、子行程沒起來——
+實作只拿得到一個 bool，**MUST NOT** 命名成 `send-keys-timeout`。
+bash 正本自 M4 凍結、不實作本條款，SRC_KIND=bash 下相關斷言顯式 SKIP。
+Source: notify_or_defer_outcome / notify_pane_reason
 
 ### HOOK-NOTIFY-3 [tested: 39]
 legacy 送鍵前 MUST 確認目標 pane 不在 tmux 的 copy-mode，是則 MUST NOT 送鍵，

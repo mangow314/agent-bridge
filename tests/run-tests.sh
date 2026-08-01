@@ -111,6 +111,28 @@ evt_grep() {
   grep -qE "Z ${ev}([[:space:]]|\$)" "$log"
 }
 
+# evt_reason <events.log> <reason>：notify-failed 行帶 reason=<v>（HOOK-NOTIFY-4）。
+# 四個關卡原本共用同一個 notify-failed，事後分不出誰擋的。
+#
+# 比對**整行**而非「行內某處有 reason=」：reason 的契約是 additive——append 在
+# `pane=`／`cmd=` 之後、既有欄位順序不動。鬆散比對下，把欄位重排成
+# `reason=… pane=… cmd=…` 照樣全綠，additive 那半條契約等於沒鎖。
+# shellcheck disable=SC2329  # 經 assert 的 "$@" 間接呼叫
+evt_reason() {
+  local log="$1" r="$2"
+  grep -qE "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9:]+Z notify-failed pane=[^[:space:]]+ cmd=[^[:space:]]+ reason=${r}\$" "$log"
+}
+
+# assert_reason <desc> <events.log> <reason>：bash 正本自 M4 凍結、不記 reason，
+# 故 SRC_KIND=bash 顯式 SKIP（不計 PASS／FAIL，bash 側總數不變）。
+assert_reason() {
+  if [[ "$SRC_KIND" == bash ]]; then
+    printf 'SKIP: %s（bash 正本凍結，未實作 reason 欄位）\n' "$1"
+  else
+    assert "$1" evt_reason "$2" "$3"
+  fi
+}
+
 # ---- shim：讓 bridge 內部的 tmux 呼叫走測試 socket ----
 SHIM="$TESTROOT/shim"
 FAILSHIM="$TESTROOT/failshim"
@@ -392,6 +414,8 @@ assert "對話框偵測(Bash 框)：got 恰好只有哨兵一行（通知的文�
   bash -c 'test "$(wc -l < "$1")" -eq 1 && grep -Fxq "$2" "$1"' _ "$TESTROOT/ask1-got.txt" 'SENTINEL-ask1'
 assert "對話框偵測(Bash 框)：events.log 記 notify-failed" \
   evt_grep "$D5a/tasks/$id5a/events.log" notify-failed
+assert_reason "對話框偵測(Bash 框)：notify-failed 標 reason=prompt" \
+  "$D5a/tasks/$id5a/events.log" prompt
 assert "對話框偵測(Bash 框)：stderr 有含 task-id 的警告" \
   grep -q "$id5a" "$TESTROOT/d5a-send.err"
 tmx kill-pane -t "$p_ask" 2>/dev/null || true
@@ -431,6 +455,34 @@ assert_fails "非對話框畫面：通知未降級（events.log 不記 notify-fa
   evt_grep "$D5b/tasks/$id5b/events.log" notify-failed
 tmx kill-pane -t "$p_ok" 2>/dev/null || true
 
+# 8a③b matcher 位置有錨（2026-08-01 收窄）：畫面**上半部**出現特徵字串、下緣是
+# 正常內容時，MUST 照送。這是 production 形狀而非人造刁難——一個正在調查這個
+# bug 的 coordinator，pane 上就有 `rg 'Requesting permission for:|Do you want to
+# proceed'` 的指令回顯，一行湊齊三組特徵；實測誤判 19/24≈79%，且 P4 之後同一
+# matcher 餵給 TUI 的 BLOCKER 軸，會變成常駐假 ⛔blocked。
+# bash 正本自 M4 凍結（仍是整屏無錨比對，會誤判），故 SRC_KIND=bash 顯式 SKIP。
+if [[ "$SRC_KIND" == bash ]]; then
+  printf 'SKIP: 8a③b matcher 下緣錨（bash 正本凍結，仍是整屏無錨比對）\n'
+else
+  D5j="$TESTROOT/d5j"
+  p_talk="$(tmx split-window -dP -F '#{pane_id}' -t it "$pane_cmd")"
+  ab "$D5j" register tata "$p_talk" 2>/dev/null
+  # 特徵行在上，其後 20 行正常內容把它推出下緣掃描區
+  tmx send-keys -t "$p_talk" \
+    "printf '%s\n' 'rg \"Requesting permission for:|Do you want to proceed?|esc to cancel|Esc to cancel\" notes.md' ; for i in \$(seq 1 20) ; do printf 'ordinary worker output line %s\n' \"\$i\" ; done ; touch $TESTROOT/talk-ready ; while IFS= read -r l ; do printf '%s\n' \"\$l\" >> $TESTROOT/talk-got.txt ; done" Enter
+  wait_for 10 test -f "$TESTROOT/talk-ready"
+  # 前置斷言：特徵字串真的還在可見一屏內（否則本組退化成 8a③ 的複本）
+  tmx capture-pane -pJ -t "$p_talk" > "$TESTROOT/talk-screen.txt"
+  assert "8a③b 前置：特徵字串確實在可見一屏（只是不在下緣）" \
+    grep -qF -- 'Requesting permission for:' "$TESTROOT/talk-screen.txt"
+  id5j="$(ab "$D5j" send tata --from alice --message hi 2>/dev/null)"
+  assert "8a③b 談論權限框的畫面：pane 收到通知文字（不再誤判）" \
+    wait_for 10 grep -q "$id5j" "$TESTROOT/talk-got.txt"
+  assert_fails "8a③b 談論權限框的畫面：events.log 不記 notify-failed" \
+    evt_grep "$D5j/tasks/$id5j/events.log" notify-failed
+  tmx kill-pane -t "$p_talk" 2>/dev/null || true
+fi
+
 # 8a④ B1 regression（有狀態 shim）：「capture-pane 失敗但 send-keys 可用」在真
 # tmux 幾乎構造不出來（pane 活著時 capture 不會失敗），shim 讓 capture 一律非零、
 # send-keys 只記 argv 不透傳。鎖住 fail-closed 方向：查不到 pane 狀態必須整個放棄
@@ -465,6 +517,9 @@ assert "capture 失敗 fail-closed(B1)：send-keys 一次都沒被呼叫" \
   test ! -e "$TESTROOT/b1-sendkeys.log"
 assert "capture 失敗 fail-closed(B1)：events.log 記 notify-failed" \
   evt_grep "$D5d/tasks/$id5d/events.log" notify-failed
+# capture 讀不出來歸 pane-gone 桶（「pane 狀態查不到」與「pane 真的不在」同處置）
+assert_reason "capture 失敗 fail-closed(B1)：notify-failed 標 reason=pane-gone" \
+  "$D5d/tasks/$id5d/events.log" pane-gone
 
 # 8a⑤ B3 regression（有狀態 shim）：第一次掃描時畫面乾淨、通知文字送出後的延遲
 # 期間 worker 才彈出權限框——真 tmux 難穩定構造這個時序，shim 用計數檔讓第一次
@@ -4236,6 +4291,8 @@ assert "39a copy-mode：send-keys 根本沒被呼叫（是 gate 擋下，不是�
   test ! -f "$TESTROOT/a39-sendkeys.log"
 assert "39a copy-mode：events.log 記 notify-failed（降級而非靜默成功）" \
   evt_grep "$D39/tasks/$id39/events.log" notify-failed
+assert_reason "39a copy-mode：notify-failed 標 reason=copy-mode" \
+  "$D39/tasks/$id39/events.log" copy-mode
 # 39b 先驗現場沒被清掉，再由測試自己離開 mode
 tmx display -pt "$p39" '#{pane_in_mode}' > "$TESTROOT/cm-mode-post.txt" 2>/dev/null
 assert "39b 不得替人 cancel：pane 仍停在 copy-mode（捲動現場保住）" \
@@ -4279,6 +4336,9 @@ assert "39c 逾時兜底：shim 的 send-keys 確實被呼叫到" \
   test -f "$TESTROOT/c39-hang-hit"
 assert "39c 逾時兜底：events.log 記 notify-failed" \
   evt_grep "$D39c/tasks/$id39c/events.log" notify-failed
+# 這是唯一走得到 send-keys-failed 桶的真實佈景（前兩道關卡都過、卡在送鍵本身）
+assert_reason "39c 逾時兜底：notify-failed 標 reason=send-keys-failed" \
+  "$D39c/tasks/$id39c/events.log" send-keys-failed
 
 # 39d mode 查不出來 → fail-closed。只讓 `#{pane_in_mode}` 查詢失敗，其餘子命令
 # 照常透傳：無法確認 pane 狀態時放行送鍵，等於整條防線被略過。
@@ -4311,6 +4371,9 @@ assert "39d fail-closed：mode 查不出來時一個按鍵都不送" \
   test ! -f "$TESTROOT/d39-sendkeys.log"
 assert "39d fail-closed：events.log 記 notify-failed" \
   evt_grep "$D39d/tasks/$id39d/events.log" notify-failed
+# mode 查不出來歸 pane-gone 桶（「pane 狀態查不到」與「pane 真的不在」同處置）
+assert_reason "39d fail-closed：notify-failed 標 reason=pane-gone" \
+  "$D39d/tasks/$id39d/events.log" pane-gone
 
 # 39e 逾時上限涵蓋整條通知路徑，不只 send-keys：notify_pane 在送鍵之前還會跑
 # list-panes／display／capture-pane 三種查詢，任何一個卡住，send 照樣無限等待
@@ -4341,6 +4404,10 @@ assert "39e 查詢層逾時：shim 的 mode 查詢確實被呼叫到" \
   test -f "$TESTROOT/e39-modehang-hit"
 assert "39e 查詢層逾時：events.log 記 notify-failed" \
   evt_grep "$D39e/tasks/$id39e/events.log" notify-failed
+# mode 查詢卡到逾時＝查不出狀態，同樣落在 pane-gone 桶（不是 send-keys-failed
+# ——那時根本還沒走到送鍵；桶分錯會讓事後分析把關卡歸錯）
+assert_reason "39e 查詢層逾時：notify-failed 標 reason=pane-gone" \
+  "$D39e/tasks/$id39e/events.log" pane-gone
 
 else
   printf 'SKIP: 39 copy-mode 送鍵防線（SRC_KIND=bash：bash 正本凍結在 M4）\n'

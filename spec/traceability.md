@@ -16,7 +16,7 @@
 | 6 | 特殊字元 byte-for-byte 保真 | CLI-SEND-1 |
 | 7 | reply / read / 重複 reply | CLI-REPLY-1, CLI-READ-1, STATE-TASK-4 |
 | 8 | 通知失敗路徑（pane 已死） | CLI-SEND-3 |
-| 8a | 權限對話框時不得送鍵 | HOOK-NOTIFY-2, ENV-NOTIFY-1 |
+| 8a | 權限對話框時不得送鍵 | HOOK-NOTIFY-2, HOOK-NOTIFY-4, ENV-NOTIFY-1 |
 | 8b | 鎖失敗路徑 | STATE-LOCK-1 |
 | 9 | unregister | CLI-UNREGISTER-1 |
 | 10 | start | CLI-START-1 |
@@ -52,7 +52,7 @@
 | 36 | codex launcher 形（HOOK-OWNER-5 自癒擴充） | HOOK-OWNER-5 |
 | 37 | agy runtime（Antigravity CLI） | CLI-SPAWN-1, HOOK-NOTIFY-2 |
 | 38 | list --long 介入視圖 | CLI-LIST-1, CLI-LIST-2 |
-| 39 | copy-mode 送鍵防線 | HOOK-NOTIFY-3, ENV-TMUX-1 |
+| 39 | copy-mode 送鍵防線 | HOOK-NOTIFY-3, HOOK-NOTIFY-4, ENV-TMUX-1 |
 | 40 | TUI 第一縱切（ui dashboard） | CLI-UI-1, CLI-CANCEL-1, ENV-UI-1 |
 | 41 | TUI 四面板＋唯讀鍵 | CLI-UI-1, CLI-READ-1 |
 | 42 | evict 入口 CAS | CLI-EVICT-4, CLI-EVICT-3 |

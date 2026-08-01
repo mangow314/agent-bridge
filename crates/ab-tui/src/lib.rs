@@ -23,7 +23,7 @@ use ab_core::tmux::SubprocessTmux;
 use crossterm::event::{self, Event, KeyCode, KeyEventKind};
 
 use app::{App, Effect, Key};
-use model::{BlockerIndex, LiveIndex, Model};
+use model::{BlockerDebounce, BlockerIndex, LiveIndex, Model};
 use worker::{Msg, Req};
 
 /// 磁碟 read model 的輪詢節奏（§4：500ms；tmux liveness 另以 2s 節流）。
@@ -90,6 +90,9 @@ fn event_loop(
     let mut live = LiveIndex::unknown();
     // blocker 軸同樣起始 unknown：unknown MUST NOT 顯示成「沒有 blocker」（§5）
     let mut blockers = BlockerIndex::unknown();
+    // screen-matcher 來源的 blocker 需連續命中才升旗（§4 去抖）；狀態跨輪，
+    // 故活在主迴圈而不是每輪重建的 BlockerIndex 裡
+    let mut debounce = BlockerDebounce::new();
     let mut app = App::new();
     let mut last_disk = Instant::now();
     let mut last_live = Instant::now();
@@ -116,8 +119,7 @@ fn event_loop(
                     app.apply_origin(&model);
                 }
                 Msg::Live(l, b) => {
-                    live = l;
-                    blockers = b;
+                    apply_live(&mut live, &mut blockers, &mut debounce, l, b);
                     live_inflight = false;
                 }
                 Msg::Focus { label, pane, res } => match res {
@@ -404,10 +406,28 @@ fn translate(code: KeyCode) -> Option<Key> {
     }
 }
 
+/// 一則 `Msg::Live` 落進 read model 的**唯一路徑**。
+///
+/// 抽成函式而不是內嵌在主迴圈裡，是為了讓「blocker 有沒有真的過去抖」可被
+/// 測試殺掉：內嵌時把 `debounce.apply(b)` 改回 `b` 全套照樣綠——去抖等於裸奔。
+/// liveness 直接覆蓋（它沒有單幀誤判面），blocker MUST 過 `debounce`。
+fn apply_live(
+    live: &mut LiveIndex,
+    blockers: &mut BlockerIndex,
+    debounce: &mut BlockerDebounce,
+    l: LiveIndex,
+    b: BlockerIndex,
+) {
+    *live = l;
+    *blockers = debounce.apply(b);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use model::Blocker;
     use std::cell::Cell;
+    use std::collections::HashMap;
 
     /// init 半途失敗（raw mode 已開、進 alt screen 失敗）：MUST best-effort
     /// 還原，不得把 raw mode 留給呼叫者的 shell（審查 F8）。
@@ -526,5 +546,49 @@ mod tests {
         let v = init_terminal(|| Ok(7u8), || restored.set(true)).unwrap();
         assert_eq!(v, 7);
         assert!(!restored.get());
+    }
+
+    fn prompt_round() -> BlockerIndex {
+        let mut m = HashMap::new();
+        m.insert("%1".to_string(), Blocker::Prompt);
+        BlockerIndex { panes: Some(m) }
+    }
+
+    /// **wiring 測試**：`Msg::Live` 的 blocker MUST 經過去抖才進畫面。
+    ///
+    /// 斷言落在 `view::blocker_mark` 的輸出（人真正看到的那串），而不是只看
+    /// 索引值：第一輪畫面上 MUST 沒有 `⛔blocked`，第二輪才有。
+    /// 沒有這條，把 `apply_live` 裡的 `debounce.apply(b)` 改回 `b` 全套照樣綠。
+    #[test]
+    fn live_message_routes_blockers_through_the_debounce() {
+        let mut live = LiveIndex::unknown();
+        let mut blockers = BlockerIndex::unknown();
+        let mut debounce = BlockerDebounce::new();
+
+        apply_live(
+            &mut live,
+            &mut blockers,
+            &mut debounce,
+            LiveIndex::unknown(),
+            prompt_round(),
+        );
+        assert_eq!(
+            view::blocker_mark(blockers.get("%1")),
+            "",
+            "第一輪命中就升旗＝單幀回顯會變成常駐假警報"
+        );
+
+        apply_live(
+            &mut live,
+            &mut blockers,
+            &mut debounce,
+            LiveIndex::unknown(),
+            prompt_round(),
+        );
+        assert_eq!(
+            view::blocker_mark(blockers.get("%1")),
+            "  ⛔blocked",
+            "連續第二輪 MUST 升旗"
+        );
     }
 }
