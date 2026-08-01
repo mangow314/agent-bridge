@@ -289,7 +289,7 @@ focus 跨 window 語意、CAS（cancel 綁 id）。
 | P4 效率驗收 | 三異常定位 | 兩份**固定 replay script**（baseline：`list --long`＋合法唯讀命令序列；TUI：key 序列）＋明確成功 marker（三個異常 id 均被輸出／複製）；計數規則＝script 內按鍵／命令步數；TUI ≤ baseline 的 50%，正確率 100% |
 | P4.5 視覺樣式層 | `theme` 模組＋ANSI 16 語意色（additive 純樣式：狀態字上色但權威字原文不變、liveness／blocker 語意色、focus Thick 邊框、選取列背景色、footer 警告 Yellow——顏色編碼軸固定五種：status／liveness／blocker／focus／warning；不動 selection 起點／鍵位／面板順序）**［P4.6 起為六種：增 content-syntax，見 P4.6 列］** | (a) render 單元測試（ratatui `TestBackend`）：指定 cell 的 fg/bg/modifier 符合 theme 對映（每個語意色至少一條）＋buffer 字元內容仍含六個權威字原文與 ●/✗/⛔ glyph；(b) P4 replay 重跑步數不變仍達標（樣式不進 capture 計數，重跑確認非假設） |
 | P4.6 UX truthfulness | 使用者實跑回饋（2026-08-01，9 題）第一段：ORIGINS 平坦視圖取代假 owner 樹（origin 誠實標籤 `session:window-name`＋live/gone/unknown，不做推測分組）；DETAIL 拆 agent state／origin window 兩列；Enter 分面板（OWNERS→WORKERS、worker→focus、task→read，`r` 保留）＋contextual footer；chrome 全英文；TASKS scrollbar＋`N/total`＋PgUp/PgDn/Home/End；pager markdown-lite 高亮（標題/fence/清單/中繼標頭；diff 僅限明確 diff 區段；bytes 不變，色彩契約加第六軸 content-syntax）；selection 改存 stable key（task id／(name,spawn_tag)）；freshness 顯示（disk/tmux age，逾時 stale 降級）。零協定改動 | (a) P1 gate 重跑（Enter matrix 動 focus 語意）；(b) P2 read bytes gate 重跑；(c) P4 replay 依新鍵位/文字重寫後 TUI ≤ baseline 50% 且正確率 100%；(d) render 測試新增斷言：英文 chrome（buffer 無中文 chrome 字元）、origin 標籤三態、scrollbar 首/中/末 thumb、reload 重排後 selection 依 stable key 不跳列、stale 降級顯示；(e) pager 高亮測試：同一 bytes 前後字元層完全相同＋fence/標題命中＋散文 +/- 不染 |
-| P4.7 lineage provenance | 第二段（**待 P4.6 收斂後使用者再批**）：registry additive optional 欄位 `lineage_root`＋`parent_agent`（spawn 依 SPAWN_TAG 精確繼承；legacy 標示不 backfill；欄位僅 provenance/display，不升格 auth/CAS）；TUI 依 lineage 分組＋DETAIL breadcrumb；`/` literal filter；copy-mode info banner；`L` 尾行預覽（one-shot、行/byte/時間三重有界）；TASKS All/Unattached scope | (a) lineage fixture root→A→B→C：移除 A/B registry 後 C 及其 tasks 仍歸同一 lineage、breadcrumb 留 tombstone、不得由 task from 推導；(b) 新舊 registry 混合：缺欄位列標 legacy 不誤併，既有 owner／spawn／evict／CAS 行為逐字不變；(c) P4 fixture 異常定義重寫（dead owner 已失真）後重量 ≤50%；(d) filter/L/banner 各自 bounded 斷言 |
+| P4.7 lineage provenance | 第二段（**2026-08-02 開批**；契約經 codex plan-stage 審查＋使用者兩裁定細化，見 §11）：registry additive optional 欄位 `lineage_root`＋`parent_agent`——**值為 generation key（canonical `spawn_tag` 全串，非名稱）**；spawn 於既有 agents-registry 鎖內，將呼叫者環境 tag 前綴化後與各 registry `spawn_tag` byte-for-byte 比對，**恰一匹配**才認 parent（0 筆＝自成根；≥2 筆＝ambiguous→自成根＋可見警告，不得依目錄序任選）；parent 缺 `lineage_root` 退 parent 自身 `spawn_tag`；無 parent 時 `parent_agent` **缺席**（非空字串）、`lineage_root`＝自身 `spawn_tag`；`register` 不寫兩欄、legacy 不 backfill；兩欄僅 provenance/display，不升格 auth/CAS；`AGENT_BRIDGE_PASS_ENV` 排除 reserved 變數（`SPAWN_TAG`／`RELAY_DEPTH`，雙 runtime＋spec 同步）；TUI 依 lineage 分組（**唯一邏輯軸**：WORKERS 分組與 TASKS scope 皆以 lineage generation key 為準，ORIGINS 面板退場、物理位置留 DETAIL）＋DETAIL breadcrumb `root → … → parent† → self`（僅由兩欄重建：缺席節點 tombstone、中間斷層省略號；traversal 具 cycle／最大 hop／invalid 防護，invalid 列 standalone）；`/` literal filter；copy-mode info banner（消費既有 bounded `pane_in_mode` 三態）；`L` 尾行預覽（one-shot、行/byte/時間三重有界，bounded 必須成立於資料取得路徑）；TASKS All/Unattached scope（僅由當前同世代證據可唯一連結者入組；同名 respawn 不自動附掛歷史 task） | (a) lineage fixture root→A→B→C：移除 A/B registry 後 C 及其 tasks 仍歸同一 lineage（generation key 比對）、breadcrumb 為 `root → … → B† → C`（A 無資料＝省略號、B 留 tombstone；使用者 2026-08-02 裁定不擴充 lineage_path）、不得由 task `from` 推導（負向 case 含同名誘惑）；(b) 新舊 registry 混合：legacy 列不誤併（僅自身 `spawn_tag` 等於某 lineage root key 者歸該組）、既有 owner／spawn／evict／CAS 行為逐字不變、雙 runtime 以同組 golden case 驗語意對等；(c) P4 fixture 異常定義重寫（scope 軸改 lineage）後重量 ≤50%；(d) filter（regex metachar 當 literal）／`L`（hanging tmux、超長行、selection 換代晚到）／banner（三態）各自 bounded 斷言 |
 | P5 理解驗收 | 歸屬樹測驗（**順延至 P4.7 之後**，rubric 改驗 lineage→worker→task 歸屬；2026-08-01 使用者裁定） | **human judgment**：受測者 10 秒內畫出 lineage→worker→in-flight task 正確歸屬樹（理由：關聯可見性是原始痛點，步數量不到它）；rubric 見下（P4.7 落地時同步改寫） |
 
 P4 附註：replay script 是 fixture 的一部分（固定初始 selection 與異常排序位置），
@@ -343,6 +343,21 @@ liveness／blocker span、亦不套 `selected_row_style`，故不存在「同一
 或 fg 撞 bg；互斥只在同框時才有意義。硬條款：**render projection only**——
 同一份 bytes 前後字元層 MUST 逐字相同（P2 read bytes gate 不得動搖），
 且散文行首 `+`／`-` MUST NOT 染成 diff（清單以 `-` 起首是常態）。
+
+**P4.7 開批裁決（2026-08-02）**：codex plan-stage 審查提出 6 blocker，
+處置如下——(B1/B3) 兩欄值改存 generation key（spawn_tag 全串）而非名稱，
+同時解同名 respawn 誤併與 legacy 歸組矛盾（legacy 不 backfill，TUI 以
+「legacy 自身 spawn_tag ＝ 某 lineage root key」歸組，證據在子代側）；
+(B2) 環境裸 tag 與 registry 前綴形式不同構——canonical 形式定為 registry
+既有存法，比對前先前綴化；(B4) `PASS_ENV` 排除 reserved 變數，堵住
+「後項 assignment 蓋掉子代 tag → relay 跳錯 parent」；(B5) 使用者裁定
+lineage 為唯一邏輯軸（ORIGINS 面板退場）；(B6) breadcrumb traversal 加
+cycle／hop 上限／invalid 防護。使用者兩裁定：**兩欄＋省略號**（不擴充
+lineage_path）、**lineage 唯一軸**。切片改為 A0（本記錄＋契約回寫，主線）
+／A schema＋繼承（雙 runtime）／B 分組＋breadcrumb＋P5 rubric 改寫／
+C filter＋TASKS scope＋banner／D `L` 尾行預覽；gate (a)(b) 拆 A（資料面）
+與 B（render 面）兩段驗，gate (c) 於 B 建立新 fixture 後首跑、C/D 動鍵位
+後重跑。
 
 **Backlog（非相位項）**：`notify-failed` 的 `pane-gone` 桶混淆「tmux 查詢失敗」
 與「pane 真不存在」（codex sandbox 擋 tmux socket 時誤報 pane-gone，實例
