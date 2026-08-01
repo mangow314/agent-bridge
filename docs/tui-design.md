@@ -286,7 +286,9 @@ focus 跨 window 語意、CAS（cancel 綁 id）。
 | P3 evict CAS | 證據框＋CLI-EVICT-4 | 三則：(a) expect 相符→evict 成功；(b) **invocation 前已換代**→`selection stale` 非 0 退出，且不建 task、無通知、pane 未 kill、registry 未動；(c) 送出後→despawn 前換代（既有 window）→照舊拒收（回歸既有 CLI-EVICT-3 行為） |
 | P4 效率驗收 | 三異常定位 | 兩份**固定 replay script**（baseline：`list --long`＋合法唯讀命令序列；TUI：key 序列）＋明確成功 marker（三個異常 id 均被輸出／複製）；計數規則＝script 內按鍵／命令步數；TUI ≤ baseline 的 50%，正確率 100% |
 | P4.5 視覺樣式層 | `theme` 模組＋ANSI 16 語意色（additive 純樣式：狀態字上色但權威字原文不變、liveness／blocker 語意色、focus Thick 邊框、選取列背景色、footer 警告 Yellow——顏色編碼軸固定五種：status／liveness／blocker／focus／warning；不動 selection 起點／鍵位／面板順序） | (a) render 單元測試（ratatui `TestBackend`）：指定 cell 的 fg/bg/modifier 符合 theme 對映（每個語意色至少一條）＋buffer 字元內容仍含六個權威字原文與 ●/✗/⛔ glyph；(b) P4 replay 重跑步數不變仍達標（樣式不進 capture 計數，重跑確認非假設） |
-| P5 理解驗收 | 歸屬樹測驗 | **human judgment**：受測者 10 秒內畫出 owner→worker→in-flight task 正確歸屬樹（理由：關聯可見性是原始痛點，步數量不到它）；rubric 見下 |
+| P4.6 UX truthfulness | 使用者實跑回饋（2026-08-01，9 題）第一段：ORIGINS 平坦視圖取代假 owner 樹（origin 誠實標籤 `session:window-name`＋live/gone/unknown，不做推測分組）；DETAIL 拆 agent state／origin window 兩列；Enter 分面板（OWNERS→WORKERS、worker→focus、task→read，`r` 保留）＋contextual footer；chrome 全英文；TASKS scrollbar＋`N/total`＋PgUp/PgDn/Home/End；pager markdown-lite 高亮（標題/fence/清單/中繼標頭；diff 僅限明確 diff 區段；bytes 不變，色彩契約加第六軸 content-syntax）；selection 改存 stable key（task id／(name,spawn_tag)）；freshness 顯示（disk/tmux age，逾時 stale 降級）。零協定改動 | (a) P1 gate 重跑（Enter matrix 動 focus 語意）；(b) P2 read bytes gate 重跑；(c) P4 replay 依新鍵位/文字重寫後 TUI ≤ baseline 50% 且正確率 100%；(d) render 測試新增斷言：英文 chrome（buffer 無中文 chrome 字元）、origin 標籤三態、scrollbar 首/中/末 thumb、reload 重排後 selection 依 stable key 不跳列、stale 降級顯示；(e) pager 高亮測試：同一 bytes 前後字元層完全相同＋fence/標題命中＋散文 +/- 不染 |
+| P4.7 lineage provenance | 第二段（**待 P4.6 收斂後使用者再批**）：registry additive optional 欄位 `lineage_root`＋`parent_agent`（spawn 依 SPAWN_TAG 精確繼承；legacy 標示不 backfill；欄位僅 provenance/display，不升格 auth/CAS）；TUI 依 lineage 分組＋DETAIL breadcrumb；`/` literal filter；copy-mode info banner；`L` 尾行預覽（one-shot、行/byte/時間三重有界）；TASKS All/Unattached scope | (a) lineage fixture root→A→B→C：移除 A/B registry 後 C 及其 tasks 仍歸同一 lineage、breadcrumb 留 tombstone、不得由 task from 推導；(b) 新舊 registry 混合：缺欄位列標 legacy 不誤併，既有 owner／spawn／evict／CAS 行為逐字不變；(c) P4 fixture 異常定義重寫（dead owner 已失真）後重量 ≤50%；(d) filter/L/banner 各自 bounded 斷言 |
+| P5 理解驗收 | 歸屬樹測驗（**順延至 P4.7 之後**，rubric 改驗 lineage→worker→task 歸屬；2026-08-01 使用者裁定） | **human judgment**：受測者 10 秒內畫出 lineage→worker→in-flight task 正確歸屬樹（理由：關聯可見性是原始痛點，步數量不到它）；rubric 見下（P4.7 落地時同步改寫） |
 
 P4 附註：replay script 是 fixture 的一部分（固定初始 selection 與異常排序位置），
 量的是「固定操作序列下的步數差」，不宣稱量到任意操作者的自由行為。
@@ -316,3 +318,15 @@ blocked prompt，量到的會是功能缺口而不是效率差距。
 2. manifest 化延後＋v1 matcher 契約收窄到硬編碼 blocker＋結構性 occlusion（§4／§7）——**定案：同意**
 3. 第一縱切範圍（§8，含 task 可選取列）——**定案：同意**
 4. `c` 複製後端定為 tmux buffer（不進系統剪貼簿，§3）——**定案：接受**
+
+## 11. P4.6/P4.7 立案記錄（2026-08-01）
+
+使用者實跑後給 9 題回饋；經 codex＋agy 兩廠獨立提案＋交叉輪（2/5 輪收斂）
+成 §9 的 P4.6/P4.7。根因判定：registry `owner`＝spawn 當下 window id，是物理
+位置非邏輯 principal，relay 鏈使其斷裂（題 2/5/7 同根）。使用者四裁定：
+P4.6 先行（P4.7 待其收斂後再批）／chrome 全英文／`L` peek 進 P4.7／
+P5 順延至 P4.7 後。全文：session scratchpad `ui-feedback-proposal.md`。
+
+**Backlog（非相位項）**：`notify-failed` 的 `pane-gone` 桶混淆「tmux 查詢失敗」
+與「pane 真不存在」（codex sandbox 擋 tmux socket 時誤報 pane-gone，實例
+2026-08-01T13:03:58Z pane=%139 活著）——建議拆出 `query-failed` reason。
