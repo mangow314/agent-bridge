@@ -12,7 +12,7 @@ pub const MAX_WARNINGS: usize = 5;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Panel {
-    Owners,
+    Origins,
     Workers,
     Tasks,
 }
@@ -21,7 +21,7 @@ pub enum Panel {
 /// DETAIL 本身不可聚焦——它永遠顯示「當前聚焦面板的選中項」。
 pub enum Sel<'m> {
     None,
-    Owner(&'m str),
+    Origin(&'m str),
     Worker(&'m AgentSnapshot),
     Task {
         task: &'m InFlight,
@@ -94,7 +94,7 @@ pub enum Effect {
 
 pub struct App {
     pub panel: Panel,
-    pub owner_idx: usize,
+    pub origin_idx: usize,
     pub row_idx: usize,
     /// TASKS 欄的選中列（`task_rows` 的索引）
     pub task_idx: usize,
@@ -117,20 +117,20 @@ pub struct App {
     /// 終局訊息 MUST NOT 清掉它，由人按 `Esc` 確認後才清。
     pub warnings: Vec<String>,
     pub message: String,
-    /// 呼叫者定位（worker 開場回報）：初始 owner 以此為根（§2「以 current
-    /// owner 為根」）。晚到才落地，故每次磁碟重讀都重試一次。
-    pub origin_owner: Option<String>,
-    pub origin_pane: Option<String>,
-    /// 使用者是否已自行動過 OWNERS 欄：動過之後 origin 不得再搶 selection
+    /// 呼叫者定位（worker 開場回報）：初始 selection 以此為根（§2「以 current
+    /// origin 為根」）。晚到才落地，故每次磁碟重讀都重試一次。
+    pub caller_origin: Option<String>,
+    pub caller_pane: Option<String>,
+    /// 使用者是否已自行動過 ORIGINS 欄：動過之後 origin 不得再搶 selection
     /// （晚到的定位把人拉走比選錯還糟）。
-    pub owner_touched: bool,
+    pub origin_touched: bool,
 }
 
 impl App {
     pub fn new() -> Self {
         App {
             panel: Panel::Workers,
-            owner_idx: 0,
+            origin_idx: 0,
             row_idx: 0,
             task_idx: 0,
             confirm: None,
@@ -141,9 +141,9 @@ impl App {
             evict_inflight: std::collections::HashSet::new(),
             warnings: Vec::new(),
             message: String::new(),
-            origin_owner: None,
-            origin_pane: None,
-            owner_touched: false,
+            caller_origin: None,
+            caller_pane: None,
+            origin_touched: false,
         }
     }
 
@@ -162,19 +162,20 @@ impl App {
         }
     }
 
-    /// 把 selection 落到 current owner（§2）。人動過 OWNERS 欄之後就不再套用；
-    /// 找不到對應 owner 時**維持字典序第 0 筆**（不猜、不新增假列）。
+    /// 把 selection 落到 current origin（§2）。人動過 ORIGINS 欄之後就不再
+    /// 套用；找不到對應 origin 時**維持第 0 筆（synthetic `ALL`）**——不猜、
+    /// 不新增假列。
     pub fn apply_origin(&mut self, model: &Model) {
-        if self.owner_touched {
+        if self.origin_touched {
             return;
         }
-        if let Some(i) = origin_owner_idx(
+        if let Some(i) = caller_origin_idx(
             model,
-            self.origin_owner.as_deref(),
-            self.origin_pane.as_deref(),
-        ) && i != self.owner_idx
+            self.caller_origin.as_deref(),
+            self.caller_pane.as_deref(),
+        ) && i != self.origin_idx
         {
-            self.owner_idx = i;
+            self.origin_idx = i;
             self.row_idx = 0;
             self.task_idx = 0;
         }
@@ -182,8 +183,8 @@ impl App {
 
     /// 磁碟重讀後把 selection 夾回合法範圍（列數可能縮短）。
     pub fn clamp(&mut self, model: &Model) {
-        if self.owner_idx >= model.owners.len() {
-            self.owner_idx = model.owners.len().saturating_sub(1);
+        if self.origin_idx >= model.origins.len() {
+            self.origin_idx = model.origins.len().saturating_sub(1);
         }
         let n = self.rows(model).len();
         if self.row_idx >= n {
@@ -195,13 +196,13 @@ impl App {
         }
     }
 
-    pub fn selected_owner<'m>(&self, model: &'m Model) -> Option<&'m str> {
-        model.owners.get(self.owner_idx).map(|s| s.as_str())
+    pub fn selected_scope<'m>(&self, model: &'m Model) -> Option<&'m str> {
+        model.origins.get(self.origin_idx).map(|s| s.as_str())
     }
 
     pub fn rows(&self, model: &Model) -> Vec<Row> {
-        match self.selected_owner(model) {
-            Some(owner) => worker_rows(model, owner),
+        match self.selected_scope(model) {
+            Some(scope) => worker_rows(model, scope),
             None => Vec::new(),
         }
     }
@@ -212,8 +213,8 @@ impl App {
 
     /// TASKS 欄的列（`model.recent` 的索引，含終態）。
     pub fn task_rows(&self, model: &Model) -> Vec<usize> {
-        match self.selected_owner(model) {
-            Some(owner) => task_rows(model, owner),
+        match self.selected_scope(model) {
+            Some(scope) => task_rows(model, scope),
             None => Vec::new(),
         }
     }
@@ -222,8 +223,8 @@ impl App {
     /// 免得每個鍵各寫一份索引運算）。
     pub fn selection<'m>(&self, model: &'m Model) -> Sel<'m> {
         match self.panel {
-            Panel::Owners => match self.selected_owner(model) {
-                Some(o) => Sel::Owner(o),
+            Panel::Origins => match self.selected_scope(model) {
+                Some(o) => Sel::Origin(o),
                 None => Sel::None,
             },
             Panel::Workers => match self.selected_row(model) {
@@ -254,15 +255,16 @@ impl Default for App {
     }
 }
 
-/// current owner 在 OWNERS 欄的索引（純函式，可單測）。兩段式反查：
-/// 1. 呼叫者所在 window 的 owner 標籤 `session:@window` 直接對上一列
+/// current origin 在 ORIGINS 欄的索引（純函式，可單測）。兩段式反查：
+/// 1. 呼叫者所在 window 的 origin 標籤 `session:@window` 直接對上一列
 /// 2. 對不上時（例如 TUI 開在某個 worker 自己的 pane 裡）以 current pane
-///    在 registry 快照中反查該 worker 的 owner
+///    在 registry 快照中反查該 worker 的 origin
 ///
-/// 都對不上→`None`，呼叫端維持既有 selection（字典序第 0 筆）。
-pub fn origin_owner_idx(model: &Model, owner: Option<&str>, pane: Option<&str>) -> Option<usize> {
-    if let Some(o) = owner
-        && let Some(i) = model.owners.iter().position(|x| x == o)
+/// 都對不上→`None`，呼叫端維持既有 selection（第 0 筆＝synthetic `ALL`，
+/// 那是「不分組地看全部」而不是某個猜出來的 origin）。
+pub fn caller_origin_idx(model: &Model, origin: Option<&str>, pane: Option<&str>) -> Option<usize> {
+    if let Some(o) = origin
+        && let Some(i) = model.origins.iter().position(|x| x == o)
     {
         return Some(i);
     }
@@ -271,8 +273,8 @@ pub fn origin_owner_idx(model: &Model, owner: Option<&str>, pane: Option<&str>) 
         return None;
     }
     let w = model.workers.iter().find(|w| w.pane == p)?;
-    let label = crate::model::owner_label(w);
-    model.owners.iter().position(|x| *x == label)
+    let label = crate::model::origin_label(w);
+    model.origins.iter().position(|x| *x == label)
 }
 
 /// 鍵位表（§3 中屬第一縱切的子集）。回傳待執行的副作用。
@@ -287,7 +289,7 @@ pub fn handle_key(app: &mut App, model: &Model, key: Key) -> Effect {
             }
             Key::Char('n') | Key::Esc => {
                 app.confirm = None;
-                app.message = "已放棄 cancel".to_string();
+                app.message = "cancel aborted".to_string();
                 Effect::None
             }
             _ => Effect::None,
@@ -304,7 +306,7 @@ pub fn handle_key(app: &mut App, model: &Model, key: Key) -> Effect {
             }
             Key::Char('n') | Key::Esc => {
                 app.evict_prompt = None;
-                app.message = "已放棄 evict".to_string();
+                app.message = "evict aborted".to_string();
                 Effect::None
             }
             _ => Effect::None,
@@ -339,7 +341,7 @@ pub fn handle_key(app: &mut App, model: &Model, key: Key) -> Effect {
             } else {
                 let n = app.warnings.len();
                 app.warnings.clear();
-                app.message = format!("已清除 {n} 則警告");
+                app.message = format!("cleared {n} warning(s)");
                 Effect::None
             }
         }
@@ -350,9 +352,9 @@ pub fn handle_key(app: &mut App, model: &Model, key: Key) -> Effect {
         // 三欄循環（DETAIL 不可聚焦：它只是選中項的投影）
         Key::Tab => {
             app.panel = match app.panel {
-                Panel::Owners => Panel::Workers,
+                Panel::Origins => Panel::Workers,
                 Panel::Workers => Panel::Tasks,
-                Panel::Tasks => Panel::Owners,
+                Panel::Tasks => Panel::Origins,
             };
             Effect::None
         }
@@ -363,8 +365,8 @@ pub fn handle_key(app: &mut App, model: &Model, key: Key) -> Effect {
         // 不動 selection 起點、不動任何協定語意。
         Key::BackTab => {
             app.panel = match app.panel {
-                Panel::Owners => Panel::Tasks,
-                Panel::Workers => Panel::Owners,
+                Panel::Origins => Panel::Tasks,
+                Panel::Workers => Panel::Origins,
                 Panel::Tasks => Panel::Workers,
             };
             Effect::None
@@ -378,8 +380,8 @@ pub fn handle_key(app: &mut App, model: &Model, key: Key) -> Effect {
             Effect::None
         }
         Key::Enter => match app.panel {
-            Panel::Owners | Panel::Tasks => {
-                app.message = "Enter 僅對 WORKERS 欄的 worker／task 列有效".to_string();
+            Panel::Origins | Panel::Tasks => {
+                app.message = "Enter only acts on WORKERS rows (worker / task)".to_string();
                 Effect::None
             }
             Panel::Workers => match app.selected_row(model) {
@@ -399,8 +401,10 @@ pub fn handle_key(app: &mut App, model: &Model, key: Key) -> Effect {
         Key::Char('x') => match app.selection(model) {
             Sel::Task { task, .. } => {
                 if is_terminal_status(&task.status) {
-                    app.message =
-                        format!("task {} 已是終態（{}），無法 cancel", task.id, task.status);
+                    app.message = format!(
+                        "task {} is already terminal ({}); nothing to cancel",
+                        task.id, task.status
+                    );
                 } else {
                     app.confirm = Some(task.id.clone());
                 }
@@ -408,7 +412,7 @@ pub fn handle_key(app: &mut App, model: &Model, key: Key) -> Effect {
             }
             _ => {
                 app.message =
-                    "x 僅對 task 列有效（cancel 需要唯一 task id；worker 列不可 x）".to_string();
+                    "x only acts on task rows (cancel needs a unique task id)".to_string();
                 Effect::None
             }
         },
@@ -419,7 +423,7 @@ pub fn handle_key(app: &mut App, model: &Model, key: Key) -> Effect {
                 id: task.id.clone(),
             },
             _ => {
-                app.message = "r 僅對 task 列有效（read 需要唯一 task id）".to_string();
+                app.message = "r only acts on task rows (read needs a unique task id)".to_string();
                 Effect::None
             }
         },
@@ -434,11 +438,11 @@ pub fn handle_key(app: &mut App, model: &Model, key: Key) -> Effect {
                 worker: w.name.clone(),
             },
             Sel::Task { task, worker: None } => {
-                app.message = format!("registry 已無 '{}'，沒有摘要可看", task.to);
+                app.message = format!("'{}' is gone from the registry; no info to show", task.to);
                 Effect::None
             }
             _ => {
-                app.message = "i 僅對 worker／task 列有效".to_string();
+                app.message = "i only acts on worker / task rows".to_string();
                 Effect::None
             }
         },
@@ -448,7 +452,7 @@ pub fn handle_key(app: &mut App, model: &Model, key: Key) -> Effect {
         Key::Char('e') => match app.selection(model) {
             Sel::Worker(w) => {
                 if app.evict_inflight.contains(&w.name) {
-                    app.message = format!("'{}' 的 evict 正在進行中", w.name);
+                    app.message = format!("evict of '{}' is already in progress", w.name);
                     Effect::None
                 } else {
                     Effect::EvictPrompt {
@@ -458,7 +462,7 @@ pub fn handle_key(app: &mut App, model: &Model, key: Key) -> Effect {
             }
             _ => {
                 app.message =
-                    "e 僅對 worker 列有效（evict 的目標是 worker，不是 task）".to_string();
+                    "e only acts on worker rows (evict targets a worker, not a task)".to_string();
                 Effect::None
             }
         },
@@ -467,7 +471,8 @@ pub fn handle_key(app: &mut App, model: &Model, key: Key) -> Effect {
         Key::Char('c') => {
             let payload = crate::action::copy_payload(&app.selection(model));
             if payload.is_empty() {
-                app.message = "c 僅對 worker／task 列有效（owner 列無證據可複製）".to_string();
+                app.message =
+                    "c only acts on worker / task rows (origin rows carry no evidence)".to_string();
                 Effect::None
             } else {
                 Effect::Copy { payload }
@@ -479,7 +484,7 @@ pub fn handle_key(app: &mut App, model: &Model, key: Key) -> Effect {
 
 fn move_sel(app: &mut App, model: &Model, delta: i64) {
     let (idx, len) = match app.panel {
-        Panel::Owners => (&mut app.owner_idx, model.owners.len()),
+        Panel::Origins => (&mut app.origin_idx, model.origins.len()),
         Panel::Workers => {
             let n = app.rows(model).len();
             (&mut app.row_idx, n)
@@ -494,12 +499,12 @@ fn move_sel(app: &mut App, model: &Model, delta: i64) {
     }
     let cur = *idx as i64 + delta;
     *idx = cur.clamp(0, len as i64 - 1) as usize;
-    if matches!(app.panel, Panel::Owners) {
-        // 換 owner 後 WORKERS／TASKS 欄都從頭選起
+    if matches!(app.panel, Panel::Origins) {
+        // 換 scope 後 WORKERS／TASKS 欄都從頭選起
         app.row_idx = 0;
         app.task_idx = 0;
-        // 人自己選過 owner 之後，晚到的 origin 不得再改 selection
-        app.owner_touched = true;
+        // 人自己選過 origin 之後，晚到的定位不得再改 selection
+        app.origin_touched = true;
     }
 }
 
@@ -509,7 +514,7 @@ mod tests {
 
     fn model() -> Model {
         Model {
-            owners: vec!["it:@1".into()],
+            origins: vec![crate::model::ALL_SCOPE.into(), "it:@1".into()],
             workers: vec![
                 AgentSnapshot {
                     name: "w1".into(),
@@ -560,7 +565,7 @@ mod tests {
         let mut app = App::new();
         assert_eq!(handle_key(&mut app, &m, Key::Char('x')), Effect::None);
         assert!(app.confirm.is_none(), "worker 列不得開確認框");
-        assert!(app.message.contains("task 列"), "實際：{}", app.message);
+        assert!(app.message.contains("task rows"), "實際：{}", app.message);
     }
 
     /// task 列上 x → 確認框綁 immutable id；y 執行、n 放棄（§5 單確認）。
@@ -619,7 +624,7 @@ mod tests {
                 label: "w2".into()
             }
         );
-        // OWNERS 欄按 Enter：提示、無副作用
+        // ORIGINS 欄按 Enter：提示、無副作用
         handle_key(&mut app, &m, Key::Tab);
         assert_eq!(handle_key(&mut app, &m, Key::Enter), Effect::None);
         assert!(app.message.contains("WORKERS"));
@@ -644,12 +649,16 @@ mod tests {
         assert_eq!(handle_key(&mut app, &m, Key::Char('q')), Effect::Quit);
     }
 
-    /// §2「以 current owner 為根」：首頁 selection 落在呼叫者所在的 owner，
-    /// 而不是字典序第 0 筆（審查 F2）。三條路徑各驗一次。
+    /// §2「以 current origin 為根」：首頁 selection 落在呼叫者所在的 origin，
+    /// 而不是第 0 筆（審查 F2）。三條路徑各驗一次。
     #[test]
-    fn initial_owner_is_current_owner_not_first_alphabetically() {
+    fn initial_origin_is_current_origin_not_the_all_row() {
         let m = Model {
-            owners: vec!["aaa:@1".into(), "zzz:@9".into()],
+            origins: vec![
+                crate::model::ALL_SCOPE.into(),
+                "aaa:@1".into(),
+                "zzz:@9".into(),
+            ],
             workers: vec![
                 AgentSnapshot {
                     name: "wa".into(),
@@ -677,30 +686,30 @@ mod tests {
             tasks: Vec::new(),
             recent: Vec::new(),
         };
-        // (1) owner 標籤直接對上：字典序在前的 aaa:@1 不是 current
-        assert_eq!(origin_owner_idx(&m, Some("zzz:@9"), None), Some(1));
+        // (1) origin 標籤直接對上：字典序在前的 aaa:@1 不是 current
+        assert_eq!(caller_origin_idx(&m, Some("zzz:@9"), None), Some(2));
         // (2) 標籤對不上（例如 TUI 開在 worker 自己的 pane 裡）→ 以 pane 反查
-        assert_eq!(origin_owner_idx(&m, Some("nope:@0"), Some("%2")), Some(1));
+        assert_eq!(caller_origin_idx(&m, Some("nope:@0"), Some("%2")), Some(2));
         // (3) 都對不上 → None（呼叫端維持第 0 筆，不猜）
-        assert_eq!(origin_owner_idx(&m, Some("nope:@0"), Some("%404")), None);
-        assert_eq!(origin_owner_idx(&m, None, None), None);
+        assert_eq!(caller_origin_idx(&m, Some("nope:@0"), Some("%404")), None);
+        assert_eq!(caller_origin_idx(&m, None, None), None);
 
         // apply_origin 落地；人動過 OWNERS 欄之後不得再被 origin 拉走
         let mut app = App::new();
-        app.origin_owner = Some("zzz:@9".into());
+        app.caller_origin = Some("zzz:@9".into());
         app.apply_origin(&m);
-        assert_eq!(app.owner_idx, 1, "首頁根 MUST 是 current owner");
+        assert_eq!(app.origin_idx, 2, "首頁根 MUST 是 current origin");
 
         let mut app2 = App::new();
-        app2.panel = Panel::Owners;
+        app2.panel = Panel::Origins;
         handle_key(&mut app2, &m, Key::Char('j'));
-        handle_key(&mut app2, &m, Key::Char('k')); // 人自己選回第 0 筆
-        app2.origin_owner = Some("zzz:@9".into());
+        handle_key(&mut app2, &m, Key::Char('k')); // 人自己選回第 0 筆（ALL）
+        app2.caller_origin = Some("zzz:@9".into());
         app2.apply_origin(&m);
-        assert_eq!(app2.owner_idx, 0, "人動過之後 origin 不得搶 selection");
+        assert_eq!(app2.origin_idx, 0, "人動過之後定位不得搶 selection");
     }
 
-    /// Tab 三欄循環：OWNERS → WORKERS → TASKS → OWNERS。DETAIL 不在循環裡
+    /// Tab 三欄循環：ORIGINS → WORKERS → TASKS → ORIGINS。DETAIL 不在循環裡
     /// （它只是選中項的投影，§2）。
     #[test]
     fn tab_cycles_three_panels_only() {
@@ -710,12 +719,12 @@ mod tests {
         handle_key(&mut app, &m, Key::Tab);
         assert_eq!(app.panel, Panel::Tasks);
         handle_key(&mut app, &m, Key::Tab);
-        assert_eq!(app.panel, Panel::Owners);
+        assert_eq!(app.panel, Panel::Origins);
         handle_key(&mut app, &m, Key::Tab);
         assert_eq!(app.panel, Panel::Workers);
     }
 
-    /// `Shift+Tab` 反向循環：OWNERS → TASKS → WORKERS → OWNERS，且與 `Tab`
+    /// `Shift+Tab` 反向循環：ORIGINS → TASKS → WORKERS → ORIGINS，且與 `Tab`
     /// 互為逆運算（P4 效率量測驅動的 additive 補入；DETAIL 仍不在循環裡）。
     #[test]
     fn backtab_cycles_three_panels_in_reverse() {
@@ -723,14 +732,18 @@ mod tests {
         let mut app = App::new();
         assert_eq!(app.panel, Panel::Workers);
         handle_key(&mut app, &m, Key::BackTab);
-        assert_eq!(app.panel, Panel::Owners, "初始 WORKERS 反向一步就到 OWNERS");
+        assert_eq!(
+            app.panel,
+            Panel::Origins,
+            "初始 WORKERS 反向一步就到 ORIGINS"
+        );
         handle_key(&mut app, &m, Key::BackTab);
         assert_eq!(app.panel, Panel::Tasks);
         handle_key(&mut app, &m, Key::BackTab);
         assert_eq!(app.panel, Panel::Workers);
 
         // 與 Tab 互為逆運算（三個起點各驗一次）
-        for start in [Panel::Owners, Panel::Workers, Panel::Tasks] {
+        for start in [Panel::Origins, Panel::Workers, Panel::Tasks] {
             app.panel = start;
             handle_key(&mut app, &m, Key::Tab);
             handle_key(&mut app, &m, Key::BackTab);
@@ -754,7 +767,7 @@ mod tests {
         app.panel = Panel::Tasks; // 第 0 列＝completed（反序，新的在上）
         assert_eq!(handle_key(&mut app, &m, Key::Char('x')), Effect::None);
         assert!(app.confirm.is_none(), "終態列不得開確認框");
-        assert!(app.message.contains("終態"), "實際：{}", app.message);
+        assert!(app.message.contains("terminal"), "實際：{}", app.message);
 
         handle_key(&mut app, &m, Key::Char('j')); // 第 1 列＝queued
         handle_key(&mut app, &m, Key::Char('x'));
@@ -768,7 +781,7 @@ mod tests {
         let mut app = App::new();
         // WORKERS 欄的 worker 列：r 無效、i 合法
         assert_eq!(handle_key(&mut app, &m, Key::Char('r')), Effect::None);
-        assert!(app.message.contains("task 列"), "實際：{}", app.message);
+        assert!(app.message.contains("task rows"), "實際：{}", app.message);
         assert_eq!(
             handle_key(&mut app, &m, Key::Char('i')),
             Effect::Info {
@@ -792,8 +805,8 @@ mod tests {
                 id: "20260731T000009Z-dddd".into()
             }
         );
-        // OWNERS 欄：r／i 都無效
-        app.panel = Panel::Owners;
+        // ORIGINS 欄：r／i 都無效
+        app.panel = Panel::Origins;
         assert_eq!(handle_key(&mut app, &m, Key::Char('i')), Effect::None);
         assert!(app.message.contains("worker"), "實際：{}", app.message);
         assert_eq!(handle_key(&mut app, &m, Key::Char('r')), Effect::None);
@@ -826,7 +839,7 @@ mod tests {
         assert_eq!(app.row_idx, 1);
     }
 
-    /// `c`：payload 交給 Effect（組裝正本在 action 層），OWNERS 欄則提示無效。
+    /// `c`：payload 交給 Effect（組裝正本在 action 層），ORIGINS 欄則提示無效。
     #[test]
     fn copy_key_emits_payload_for_task_rows() {
         let m = model();
@@ -836,12 +849,12 @@ mod tests {
             panic!("task 列按 c 應產生 Copy");
         };
         assert!(payload.contains("agent-bridge read 20260731T000001Z-aaaa"));
-        app.panel = Panel::Owners;
+        app.panel = Panel::Origins;
         assert_eq!(handle_key(&mut app, &m, Key::Char('c')), Effect::None);
     }
 
     /// `e` 的合法目標只有 worker 列（§3／§5：破壞性動作要有唯一明確目標）；
-    /// task 列與 owner 列一律提示無效、不開證據框。
+    /// task 列與 origin 列一律提示無效、不開證據框。
     #[test]
     fn evict_key_targets_worker_rows_only() {
         let m = model();
@@ -856,9 +869,9 @@ mod tests {
 
         handle_key(&mut app, &m, Key::Char('j')); // task 列
         assert_eq!(handle_key(&mut app, &m, Key::Char('e')), Effect::None);
-        assert!(app.message.contains("worker 列"), "實際：{}", app.message);
+        assert!(app.message.contains("worker rows"), "實際：{}", app.message);
 
-        app.panel = Panel::Owners;
+        app.panel = Panel::Origins;
         assert_eq!(handle_key(&mut app, &m, Key::Char('e')), Effect::None);
     }
 
@@ -870,7 +883,7 @@ mod tests {
         let mut app = App::new();
         app.evict_inflight.insert("w1".to_string());
         assert_eq!(handle_key(&mut app, &m, Key::Char('e')), Effect::None);
-        assert!(app.message.contains("進行中"), "實際：{}", app.message);
+        assert!(app.message.contains("in progress"), "實際：{}", app.message);
         assert!(app.evict_prompt.is_none());
         // 別的 worker 不受影響（第三列＝w2）
         handle_key(&mut app, &m, Key::Char('j'));
@@ -896,7 +909,7 @@ mod tests {
         };
         let prompt = || crate::action::EvictPrompt {
             shown: shown.clone(),
-            lines: vec!["派收尾任務後回收".into()],
+            lines: vec!["wrap-up task, then reclaim".into()],
         };
 
         app.evict_prompt = Some(prompt());
@@ -915,7 +928,7 @@ mod tests {
         assert_eq!(handle_key(&mut app, &m, Key::Esc), Effect::None);
         assert!(app.evict_prompt.is_none());
         assert!(
-            app.message.contains("已放棄 evict"),
+            app.message.contains("evict aborted"),
             "實際：{}",
             app.message
         );
@@ -959,7 +972,7 @@ mod tests {
         // Esc（無 overlay）＝人說「我看過了」
         assert_eq!(handle_key(&mut app, &m, Key::Esc), Effect::None);
         assert!(app.warnings.is_empty());
-        assert!(app.message.contains("已清除"), "實際：{}", app.message);
+        assert!(app.message.contains("cleared"), "實際：{}", app.message);
     }
 
     /// 列表縮短後 clamp 把 selection 夾回（500ms 重讀路徑）。
@@ -969,7 +982,7 @@ mod tests {
         let mut app = App::new();
         app.row_idx = 2;
         let empty = Model {
-            owners: vec!["it:@1".into()],
+            origins: vec![crate::model::ALL_SCOPE.into(), "it:@1".into()],
             workers: Vec::new(),
             tasks: Vec::new(),
             recent: Vec::new(),

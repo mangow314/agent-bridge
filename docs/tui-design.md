@@ -236,7 +236,9 @@ herdr 實測 idle→working 1.56s，500ms 輪詢的體感已優於競品，
 
 這條管**顯示**不管**行動**：禁止任何欄位替人下判斷，不禁止人看完證據後自己決定。
 
-- evict 確認框措辭 MUST 是「派收尾任務後回收」，MUST NOT 出現任何「安全刪除」語彙
+- evict 確認框措辭 MUST 表達「派收尾任務後回收」語意（P4.6 起 chrome 為英文，
+  正典短語：`wrap-up task, then reclaim`），MUST NOT 出現任何語言的「安全刪除」
+  語彙（測試同時擋中英兩套）
 - 不得以顏色／排序暗示可刪度；不得因 idle／disposable 預選；不做批次自動清理
 - `c` 只複製 immutable 證據，MUST NOT 複製 mutation 命令
 

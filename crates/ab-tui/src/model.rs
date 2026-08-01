@@ -18,11 +18,19 @@ use ab_core::tmux::TmuxClient;
 /// 人要看更舊的請走 `list`／`gc` 那條 CLI 路徑。
 pub const RECENT_LIMIT: usize = 200;
 
+/// ORIGINS 欄頂端的 synthetic scope：選中它＝WORKERS／TASKS 不做 origin 過濾
+/// （P4.6 §9：origin 是**物理位置**不是邏輯 principal，relay 鏈會讓它斷裂，
+/// 所以「不分組地看全部」必須是一個隨手可達的視圖，而不是走訪每一列）。
+///
+/// 與真實 origin 標籤不會相撞：後者恆為 `session:@winid`／`-`／`?`。
+pub const ALL_SCOPE: &str = "ALL";
+
 /// 磁碟 read model 的一輪快照。
 pub struct Model {
-    /// 去重後的 owner 標籤（字典序）。manual worker 統一掛在 `-` 之下
-    /// （沿用 `list --long` 的 owner 欄慣例：人工註冊者沒有 owner 概念）。
-    pub owners: Vec<String>,
+    /// ORIGINS 欄的列：第 0 筆恆為 `ALL_SCOPE`，其後是去重後的 origin 標籤
+    /// （字典序）。manual worker 統一掛在 `-` 之下（沿用 `list --long` 的
+    /// owner 欄慣例：人工註冊者沒有 origin 概念）。
+    pub origins: Vec<String>,
     pub workers: Vec<AgentSnapshot>,
     pub tasks: Vec<InFlight>,
     /// TASKS 面板用：近期任務（**含終態**），id 反序。與 `tasks` 分開存放
@@ -35,11 +43,13 @@ impl Model {
         let workers = registry::snapshot(paths);
         let tasks = task::in_flight(paths);
         let recent = task::recent_tasks(paths, RECENT_LIMIT);
-        let mut owners: Vec<String> = workers.iter().map(owner_label).collect();
-        owners.sort();
-        owners.dedup();
+        let mut labels: Vec<String> = workers.iter().map(origin_label).collect();
+        labels.sort();
+        labels.dedup();
+        let mut origins = vec![ALL_SCOPE.to_string()];
+        origins.extend(labels);
         Model {
-            owners,
+            origins,
             workers,
             tasks,
             recent,
@@ -52,9 +62,12 @@ impl Model {
     }
 }
 
-/// worker 的歸屬標籤：spawned 且有 owner 欄→其字面值；manual→`-`；
+/// worker 的 origin 標籤：spawned 且有 owner 欄→其字面值；manual→`-`；
 /// spawned 但 owner 缺失（或 registry 損壞）→`?`。
-pub fn owner_label(w: &AgentSnapshot) -> String {
+///
+/// 名字是 origin 不是 owner：registry 的 `owner` 欄是 **spawn 當下的 window
+/// id**，是物理位置而非邏輯 principal（P4.6 §11 根因判定）。
+pub fn origin_label(w: &AgentSnapshot) -> String {
     if w.corrupt {
         "?".to_string()
     } else if !w.spawned {
@@ -72,8 +85,18 @@ pub struct LiveIndex {
     /// pane id → 所有出現位置 `(session_name, window_id)`（linked window 下
     /// 同一 pane 可出現多次，cardinality 不可丟——§2 focus 語意要用）。
     pub panes: Option<HashMap<String, Vec<(String, String)>>>,
-    /// 現存 window id 集合（owner 死活判定）。
-    pub windows: Option<Vec<String>>,
+    /// 現存 window id → 其**全部**出現位置 `(session_name, window_name)`。
+    ///
+    /// 帶 name 是 P4.6 題 1：origin 列要顯示人看得懂的 `session:window-name`，
+    /// 而不是 `@108` 這種只有 tmux 認得的 id。**沿用既有那一條 list-windows
+    /// 查詢、只擴 format**（§4 bounded-read：不新增 round trip）。
+    ///
+    /// 為什麼是 `Vec` 而不是單筆：window 可同時 linked 到多個 session
+    /// （`man tmux`「Windows may be linked to multiple sessions」），`-a` 列表
+    /// 因此對同一個 `@id` 出現多次。存單筆＝依 tmux 列序任選最後一筆，那正是
+    /// CLI-LIST-2「cardinality 不可丟」擋下的事（`spawn.rs::live_label` 同一
+    /// 條紀律）。
+    pub windows: Option<HashMap<String, Vec<(String, String)>>>,
 }
 
 impl LiveIndex {
@@ -99,9 +122,33 @@ impl LiveIndex {
                 map
             });
         let windows = tmux
-            .exec(&["list-windows", "-a", "-F", "#{window_id}"])
+            .exec(&[
+                "list-windows",
+                "-a",
+                "-F",
+                "#{session_name}\t#{window_id}\t#{window_name}",
+            ])
             .and_then(|o| o.ok_stdout())
-            .map(|out| out.lines().map(|l| l.to_string()).collect());
+            .map(|out| {
+                let mut map: HashMap<String, Vec<(String, String)>> = HashMap::new();
+                for line in out.lines() {
+                    let mut it = line.splitn(3, '\t');
+                    // window name 可以是空字串（tmux 允許），但欄位本身必須在
+                    // ——少一欄代表這行不是我們要的形狀，寧可整行丟掉也不猜
+                    if let (Some(s), Some(w), Some(n)) = (it.next(), it.next(), it.next()) {
+                        map.entry(w.to_string())
+                            .or_default()
+                            .push((s.to_string(), n.to_string()));
+                    }
+                }
+                // 同一位置重複列出（linked window 的 name 在各 session 相同）
+                // 不該被算成兩個位置：排序去重之後剩下的才是真正的 cardinality
+                for locs in map.values_mut() {
+                    locs.sort();
+                    locs.dedup();
+                }
+                map
+            });
         LiveIndex { panes, windows }
     }
 
@@ -251,7 +298,7 @@ pub fn blocker_of(tmux: &dyn TmuxClient, pane: &str) -> Blocker {
 
 /// 三態死活：查不到（tmux 逾時／不可用）≠ 查了但不在（同 `list --long` 的
 /// 顯示紀律：誤標 dead 會讓人以為該回收）。
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Liveness {
     Live,
     Dead,
@@ -274,24 +321,115 @@ pub fn pane_liveness(live: &LiveIndex, pane: &str) -> Liveness {
     }
 }
 
-/// owner 標籤形如 `<session>:@<winid>` 時以 window id 判死活；其他形
-/// （`-`／`?`）無死活可言→Unknown。
-pub fn owner_liveness(live: &LiveIndex, label: &str) -> Liveness {
-    let Some((_, win)) = label.rsplit_once(':') else {
-        return Liveness::Unknown;
-    };
-    if !win.starts_with('@') {
-        return Liveness::Unknown;
+/// origin 標籤所指 window 的狀態（P4.6 題 1／題 2）。
+///
+/// **這不是 agent 死活**：window 沒了不代表底下的 worker 沒了，反之亦然
+/// （§11 根因判定）。故它只用文字進 DETAIL，不在 origin 列上畫 ●／✗
+/// ——那個 glyph 正是「window 死活冒充 agent 死活」的來源。
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum WindowState {
+    /// window 還在、且位置唯一：`(session_name, window_name)`，兩者都是
+    /// **此刻查到的**
+    Live(String, String),
+    /// window 還在，但 linked 到多個 session 而**消歧義不出唯一的一筆**。
+    /// 帶著全部位置——任選一筆就是冒名（CLI-LIST-2）。
+    Ambiguous(Vec<(String, String)>),
+    /// 查得到 window 集合、但這一個不在裡面。**不猜舊名**：只有 id 說得出口
+    Gone,
+    /// tmux 查不到（逾時／不可用）
+    Unknown,
+    /// 標籤根本不是 window 形（`-`＝manual、`?`＝registry 缺 owner 欄，
+    /// 或 `s:@garbage` 這種**壞掉的** registry 值）
+    NotAWindow,
+}
+
+/// origin 標籤 → `(session_prefix, window_id)`；不是 `<session>:@<digits>`
+/// 形就回 `None`。
+///
+/// 形狀檢查與 `spawn.rs::is_valid_window_id` 同一套（`@` 後必須全是 ASCII
+/// 數字、session 非空）：registry 是**人可手改的不可信輸入**，`s:@garbage`
+/// 是資料損壞，不是「這個 window 沒了」——標成 Gone 會讓人以為東西曾經在。
+fn split_origin(label: &str) -> Option<(&str, &str)> {
+    let (sess, win) = label.rsplit_once(':')?;
+    if sess.is_empty() {
+        return None;
     }
-    match &live.windows {
-        None => Liveness::Unknown,
-        Some(ws) => {
-            if ws.iter().any(|w| w == win) {
-                Liveness::Live
-            } else {
-                Liveness::Dead
-            }
+    let digits = win.strip_prefix('@')?;
+    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    Some((sess, win))
+}
+
+/// `label` 所指 window 此刻的狀態。
+///
+/// linked window（同一 `@id` 出現在多個 session）以 origin 標籤記的 session
+/// 名消歧義；**配不出唯一的一筆就 MUST NOT 任選**（`spawn.rs::live_label`
+/// 同一條紀律）——顯示層據此降級成原始標籤，不冒用任何一個 session 的名字。
+pub fn window_state(live: &LiveIndex, label: &str) -> WindowState {
+    let Some((sess, win)) = split_origin(label) else {
+        return WindowState::NotAWindow;
+    };
+    let Some(ws) = &live.windows else {
+        return WindowState::Unknown;
+    };
+    let locs = match ws.get(win) {
+        Some(v) if !v.is_empty() => v,
+        _ => return WindowState::Gone,
+    };
+    if let [(s, n)] = locs.as_slice() {
+        return WindowState::Live(s.clone(), n.clone());
+    }
+    // 判定錨在不可變的 `@id`，session 名只拿來消歧義（它可被 rename）
+    let mut matched = locs.iter().filter(|(s, _)| s == sess);
+    match (matched.next(), matched.next()) {
+        (Some((s, n)), None) => WindowState::Live(s.clone(), n.clone()),
+        _ => WindowState::Ambiguous(locs.clone()),
+    }
+}
+
+/// ORIGINS 欄那一列的字面（短版，欄寬有限）。
+///
+/// - live → `session:window-name`（人看得懂的那個）
+/// - gone → `session:@id (gone)`——**沿用標籤原本的 session 與 id，不猜舊名**
+/// - unknown → `session:@id`（查不到就照原樣，不加任何暗示）
+/// - ambiguous（linked window 消歧義不出唯一位置）→ 同樣照原樣：這一欄太窄，
+///   放不下位置清單，而**冒用其中一個 session 的名字比不說更糟**（完整位置
+///   由 `window_detail` 在 DETAIL 攤開）
+/// - 非 window 形（`-`／`?`／`ALL`）→ 原樣
+pub fn origin_row_label(live: &LiveIndex, label: &str) -> String {
+    match window_state(live, label) {
+        WindowState::Live(sess, name) => format!("{sess}:{name}"),
+        WindowState::Gone => format!("{label} (gone)"),
+        WindowState::Ambiguous(_) | WindowState::Unknown | WindowState::NotAWindow => {
+            label.to_string()
         }
+    }
+}
+
+/// DETAIL 欄的 window 行（長版：**完整 `@id` MUST 留著**，它才是介入時能拿去
+/// 對 tmux 下命令的那個識別）。
+///
+/// - live → `session:window-name (@id, live)`
+/// - ambiguous → `session:@id (linked: a:name, b:name)`——歧義**顯形**，
+///   不替人挑一個（CLI-LIST-2 的 `a:1,b:1` 同一手法）
+/// - gone → `session:@id (gone)`
+/// - unknown → `session:@id (unknown)`
+/// - 非 window 形 → `<label> (n/a)`（`-`／`?`／壞掉的 `@garbage` 沒有 window
+///   可言，寫成 unknown 會被讀成「查不到」——那是另一回事）
+pub fn window_detail(live: &LiveIndex, label: &str) -> String {
+    match window_state(live, label) {
+        WindowState::Live(sess, name) => {
+            let win = split_origin(label).map(|(_, w)| w).unwrap_or("-");
+            format!("{sess}:{name} ({win}, live)")
+        }
+        WindowState::Ambiguous(locs) => {
+            let all: Vec<String> = locs.iter().map(|(s, n)| format!("{s}:{n}")).collect();
+            format!("{label} (linked: {})", all.join(", "))
+        }
+        WindowState::Gone => format!("{label} (gone)"),
+        WindowState::Unknown => format!("{label} (unknown)"),
+        WindowState::NotAWindow => format!("{label} (n/a)"),
     }
 }
 
@@ -304,12 +442,17 @@ pub enum Row {
     Task { worker: usize, task: usize },
 }
 
-/// 攤平選中 owner 之下的 worker／task 列。worker 依 snapshot 序（檔名字典
-/// 序），task 依 id 序（in_flight 已排序）。
-pub fn worker_rows(model: &Model, owner: &str) -> Vec<Row> {
+/// 選中的 ORIGINS 列是否為 synthetic `ALL`（＝不過濾）。
+fn in_scope(scope: &str, w: &AgentSnapshot) -> bool {
+    scope == ALL_SCOPE || origin_label(w) == scope
+}
+
+/// 攤平選中 scope 之下的 worker／task 列。worker 依 snapshot 序（檔名字典
+/// 序），task 依 id 序（in_flight 已排序）。`scope == ALL_SCOPE` 時不過濾。
+pub fn worker_rows(model: &Model, scope: &str) -> Vec<Row> {
     let mut rows = Vec::new();
     for (wi, w) in model.workers.iter().enumerate() {
-        if owner_label(w) != owner {
+        if !in_scope(scope, w) {
             continue;
         }
         rows.push(Row::Worker(wi));
@@ -325,16 +468,22 @@ pub fn worker_rows(model: &Model, owner: &str) -> Vec<Row> {
     rows
 }
 
-/// TASKS 欄的列：`model.recent` 的索引。只留派給「當前選中 owner 底下某個
-/// worker」的任務，順序沿用 `recent`（id 反序＝新的在上）。
+/// TASKS 欄的列：`model.recent` 的索引。只留派給「當前 scope 底下某個
+/// worker」的任務，順序沿用 `recent`（id 反序＝新的在上）；`ALL_SCOPE` 不過濾。
 ///
 /// 為什麼要含終態：`r` 讀的是回覆，而 `read` 只對 `completed`／`failed`
 /// 合法；WORKERS 欄只有 in-flight 列，沒有終態任務就沒有東西可讀。
-pub fn task_rows(model: &Model, owner: &str) -> Vec<usize> {
+pub fn task_rows(model: &Model, scope: &str) -> Vec<usize> {
+    // ALL＝「全部」的字面意思：連收件人已不在 registry 的任務也留著。過濾掉
+    // 它們等於讓 worker 被回收之後、它的任務從畫面上人間蒸發——而那正是人在
+    // ALL 這個視圖裡最想找回來的東西
+    if scope == ALL_SCOPE {
+        return (0..model.recent.len()).collect();
+    }
     let names: Vec<&str> = model
         .workers
         .iter()
-        .filter(|w| owner_label(w) == owner)
+        .filter(|w| in_scope(scope, w))
         .map(|w| w.name.as_str())
         .collect();
     model
@@ -409,11 +558,11 @@ mod tests {
     }
 
     /// selection model（§2）：worker 列與其 in-flight task 列皆為可選取列，
-    /// task 緊接在所屬 worker 之後；別的 owner 的 worker 不得混入。
+    /// task 緊接在所屬 worker 之後；別的 origin 的 worker 不得混入。
     #[test]
     fn worker_rows_interleave_tasks_under_their_worker() {
         let model = Model {
-            owners: vec!["-".into(), "it:@1".into()],
+            origins: vec![ALL_SCOPE.into(), "-".into(), "it:@1".into()],
             workers: vec![
                 snap("w1", true, "it:@1"),
                 snap("w2", true, "it:@1"),
@@ -440,14 +589,53 @@ mod tests {
         assert_eq!(worker_rows(&model, "-"), vec![Row::Worker(2)]);
     }
 
-    /// TASKS 欄（§2 版面新增）：含終態、id 反序、只留本 owner 底下 worker 的
-    /// 任務；別的 owner 的任務不得混入。
+    /// synthetic `ALL`（P4.6 題 2）：跨 origin 聚合，且**每個 worker 的 task
+    /// 仍緊接在自己那一列之下**（ALL 不是把列表重排成兩段）。
+    #[test]
+    fn all_scope_aggregates_every_origin_without_reordering() {
+        let model = Model {
+            origins: vec![ALL_SCOPE.into(), "-".into(), "it:@1".into()],
+            workers: vec![
+                snap("w1", true, "it:@1"),
+                snap("manual", false, ""),
+                snap("wx", true, "other:@2"),
+            ],
+            tasks: vec![
+                inflight("20260731T000001Z-aaaa", "w1"),
+                inflight("20260731T000002Z-bbbb", "wx"),
+            ],
+            recent: vec![
+                inflight("20260731T000002Z-bbbb", "wx"),
+                inflight("20260731T000001Z-aaaa", "w1"),
+                // 收件人已不在 registry：ALL MUST 仍留著它（worker 被回收之後
+                // 它的任務不該從畫面上人間蒸發）
+                inflight("20260731T000000Z-zzzz", "gone-w"),
+            ],
+        };
+        assert_eq!(
+            worker_rows(&model, ALL_SCOPE),
+            vec![
+                Row::Worker(0),
+                Row::Task { worker: 0, task: 0 },
+                Row::Worker(1),
+                Row::Worker(2),
+                Row::Task { worker: 2, task: 1 },
+            ]
+        );
+        assert_eq!(task_rows(&model, ALL_SCOPE), vec![0, 1, 2]);
+        // 單一 origin 仍然只看自己那一份（ALL 不得汙染既有過濾）
+        assert_eq!(worker_rows(&model, "it:@1").len(), 2);
+        assert_eq!(task_rows(&model, "it:@1"), vec![1]);
+    }
+
+    /// TASKS 欄（§2 版面新增）：含終態、id 反序、只留本 origin 底下 worker 的
+    /// 任務；別的 origin 的任務不得混入。
     #[test]
     fn task_rows_keep_terminal_tasks_of_this_owner_newest_first() {
         let mut done = inflight("20260731T000009Z-dddd", "w1");
         done.status = "completed".to_string();
         let model = Model {
-            owners: vec!["it:@1".into(), "other:@2".into()],
+            origins: vec![ALL_SCOPE.into(), "it:@1".into(), "other:@2".into()],
             workers: vec![snap("w1", true, "it:@1"), snap("wx", true, "other:@2")],
             tasks: Vec::new(),
             // recent_tasks 的輸出已是反序
@@ -567,29 +755,249 @@ mod tests {
         assert_eq!(BlockerIndex::unknown().get("%1"), Blocker::Unknown);
     }
 
+    /// 便利建構：`(session, @id, name)` 逐列 → window 索引（同 id 多列＝
+    /// linked window）。
+    fn win_index(rows: &[(&str, &str, &str)]) -> HashMap<String, Vec<(String, String)>> {
+        let mut map: HashMap<String, Vec<(String, String)>> = HashMap::new();
+        for (s, w, n) in rows {
+            map.entry(w.to_string())
+                .or_default()
+                .push((s.to_string(), n.to_string()));
+        }
+        for locs in map.values_mut() {
+            locs.sort();
+            locs.dedup();
+        }
+        map
+    }
+
     /// 三態死活：查不到 ≠ 不在（顯示紀律，tui-design §5）。
     #[test]
     fn liveness_keeps_unknown_distinct_from_dead() {
         let unknown = LiveIndex::unknown();
         assert!(matches!(pane_liveness(&unknown, "%1"), Liveness::Unknown));
-        assert!(matches!(
-            owner_liveness(&unknown, "it:@1"),
-            Liveness::Unknown
-        ));
+        assert_eq!(window_state(&unknown, "it:@1"), WindowState::Unknown);
 
         let mut panes = HashMap::new();
         panes.insert("%1".to_string(), vec![("it".to_string(), "@1".to_string())]);
         let live = LiveIndex {
             panes: Some(panes),
-            windows: Some(vec!["@1".to_string()]),
+            windows: Some(win_index(&[("it", "@1", "main")])),
         };
         assert!(matches!(pane_liveness(&live, "%1"), Liveness::Live));
         assert!(matches!(pane_liveness(&live, "%9"), Liveness::Dead));
-        assert!(matches!(owner_liveness(&live, "it:@1"), Liveness::Live));
-        assert!(matches!(owner_liveness(&live, "it:@9"), Liveness::Dead));
-        // manual（`-`）與 `?` 沒有死活可言
-        assert!(matches!(owner_liveness(&live, "-"), Liveness::Unknown));
-        assert!(matches!(owner_liveness(&live, "?"), Liveness::Unknown));
+        assert_eq!(
+            window_state(&live, "it:@1"),
+            WindowState::Live("it".into(), "main".into())
+        );
+        assert_eq!(window_state(&live, "it:@9"), WindowState::Gone);
+        // manual（`-`）與 `?` 不是 window 形：**與 unknown 分開**（前者是
+        // 「沒有 window 可言」，後者是「查不到」）
+        assert_eq!(window_state(&live, "-"), WindowState::NotAWindow);
+        assert_eq!(window_state(&live, "?"), WindowState::NotAWindow);
+    }
+
+    /// P4.6 題 1：origin 標籤誠實化。三態各自的字面都要驗到——
+    /// **gone MUST NOT 猜舊名**（只說得出 id），unknown MUST NOT 說成 gone。
+    #[test]
+    fn origin_labels_tell_the_truth_in_all_three_window_states() {
+        let live = LiveIndex {
+            panes: None,
+            windows: Some(win_index(&[("scratch", "@108", "main")])),
+        };
+        // live：人看得懂的 session:window-name；DETAIL 仍留完整 @id
+        assert_eq!(origin_row_label(&live, "scratch:@108"), "scratch:main");
+        assert_eq!(
+            window_detail(&live, "scratch:@108"),
+            "scratch:main (@108, live)"
+        );
+        // gone：沿用原標籤（session＋@id），一個字的舊名都不猜
+        assert_eq!(origin_row_label(&live, "old:@9"), "old:@9 (gone)");
+        assert_eq!(window_detail(&live, "old:@9"), "old:@9 (gone)");
+        // unknown（tmux 查不到）MUST NOT 被寫成 gone
+        let unknown = LiveIndex::unknown();
+        assert_eq!(origin_row_label(&unknown, "old:@9"), "old:@9");
+        assert_eq!(window_detail(&unknown, "old:@9"), "old:@9 (unknown)");
+        // 非 window 形：列上原樣，DETAIL 標 n/a（不是「查不到」）
+        for label in ["-", "?", ALL_SCOPE] {
+            assert_eq!(origin_row_label(&live, label), label);
+            assert_eq!(window_detail(&live, label), format!("{label} (n/a)"));
+        }
+    }
+
+    /// **linked window（CLI-LIST-2「cardinality 不可丟」）**：同一個 `@id`
+    /// 出現在多個 session 時，MUST 以 origin 標籤記的 session 消歧義；配不出
+    /// 唯一的一筆就 MUST NOT 任選——顯示降級成原始標籤，並在 DETAIL 把全部
+    /// 位置攤開。
+    ///
+    /// 存單筆 `(session, name)` 的實作在這裡會依 tmux 列序任選最後一筆，
+    /// 三個 case 至少中一個。
+    #[test]
+    fn linked_windows_are_disambiguated_by_session_never_guessed() {
+        let live = LiveIndex {
+            panes: None,
+            windows: Some(win_index(&[
+                ("alpha", "@7", "work"),
+                ("beta", "@7", "work-linked"),
+                ("solo", "@8", "only"),
+            ])),
+        };
+
+        // (a) 標籤的 session 與其中恰一筆相符 → 取那一筆（不是列序最後一筆）
+        assert_eq!(
+            window_state(&live, "alpha:@7"),
+            WindowState::Live("alpha".into(), "work".into())
+        );
+        assert_eq!(origin_row_label(&live, "alpha:@7"), "alpha:work");
+        assert_eq!(
+            window_state(&live, "beta:@7"),
+            WindowState::Live("beta".into(), "work-linked".into())
+        );
+
+        // (b) 標籤的 session 誰都配不上（session 被 rename／registry 記的是
+        //     舊名）→ **不得任選**
+        let amb = window_state(&live, "gamma:@7");
+        assert_eq!(
+            amb,
+            WindowState::Ambiguous(vec![
+                ("alpha".into(), "work".into()),
+                ("beta".into(), "work-linked".into()),
+            ])
+        );
+        assert_eq!(
+            origin_row_label(&live, "gamma:@7"),
+            "gamma:@7",
+            "消歧義不出來時 MUST 照原樣，MUST NOT 冒用任一 session 的名字"
+        );
+        let detail = window_detail(&live, "gamma:@7");
+        assert!(
+            detail.contains("alpha:work") && detail.contains("beta:work-linked"),
+            "DETAIL MUST 讓歧義顯形（全部位置攤開）：{detail}"
+        );
+        for banned in ["(live)", "(gone)", "(unknown)"] {
+            assert!(
+                !detail.contains(banned),
+                "歧義 MUST NOT 被說成 {banned}：{detail}"
+            );
+        }
+
+        // (c) 同一 session 出現兩次（同 id、同 session、不同名——理論上的
+        //     畸形輸入）：仍是配不出唯一，照樣不猜
+        let dup = LiveIndex {
+            panes: None,
+            windows: Some(win_index(&[("alpha", "@9", "a"), ("alpha", "@9", "b")])),
+        };
+        assert!(matches!(
+            window_state(&dup, "alpha:@9"),
+            WindowState::Ambiguous(_)
+        ));
+
+        // 單一位置照舊直接 Live（消歧義只在多位置時才發動）
+        assert_eq!(
+            window_state(&live, "whatever:@8"),
+            WindowState::Live("solo".into(), "only".into())
+        );
+
+        // 同一位置被列兩次（linked window 在兩個 session 名字相同）不算兩個
+        // 位置：去重之後仍是唯一
+        let same = LiveIndex {
+            panes: None,
+            windows: Some(win_index(&[
+                ("alpha", "@7", "work"),
+                ("alpha", "@7", "work"),
+            ])),
+        };
+        assert_eq!(
+            window_state(&same, "alpha:@7"),
+            WindowState::Live("alpha".into(), "work".into())
+        );
+    }
+
+    /// 畸形 origin 標籤是**資料損壞**，不是「window 沒了」：`@` 後必須至少
+    /// 一位 ASCII 數字、session 非空（形狀檢查與 `spawn.rs::is_valid_window_id`
+    /// 同一套）。標成 Gone 會讓人以為東西曾經在、現在沒了。
+    #[test]
+    fn malformed_origin_labels_are_not_a_window_never_gone() {
+        let live = LiveIndex {
+            panes: None,
+            windows: Some(win_index(&[("s", "@1", "main")])),
+        };
+        for bad in [
+            "s:@",
+            "s:@garbage",
+            ":@1",
+            "s:@1x",
+            "@1",
+            "-",
+            "?",
+            ALL_SCOPE,
+        ] {
+            assert_eq!(
+                window_state(&live, bad),
+                WindowState::NotAWindow,
+                "畸形／非 window 形標籤「{bad}」"
+            );
+            assert_eq!(origin_row_label(&live, bad), bad);
+            assert_eq!(window_detail(&live, bad), format!("{bad} (n/a)"));
+        }
+        // 對照組：形狀合法但不存在 → 這才是 Gone
+        assert_eq!(window_state(&live, "s:@2"), WindowState::Gone);
+    }
+
+    /// window 名稱由**同一條** list-windows 查詢帶回（§4 bounded-read：不新增
+    /// round trip）。假件記下所有呼叫，斷言恰好兩條查詢且 format 帶了三欄。
+    #[test]
+    fn live_index_reads_window_names_without_an_extra_round_trip() {
+        struct RecordingTmux(std::sync::Mutex<Vec<Vec<String>>>);
+        impl TmuxClient for RecordingTmux {
+            fn exec(&self, args: &[&str]) -> Option<ab_core::tmux::TmuxOutput> {
+                self.0
+                    .lock()
+                    .unwrap()
+                    .push(args.iter().map(|s| s.to_string()).collect());
+                let stdout = if args.contains(&"list-windows") {
+                    "scratch\t@108\tmain\nit\t@2\tside\n".to_string()
+                } else {
+                    "%1\tscratch\t@108\n".to_string()
+                };
+                Some(ab_core::tmux::TmuxOutput {
+                    status_ok: true,
+                    stdout,
+                    stderr: String::new(),
+                })
+            }
+            fn available(&self) -> bool {
+                true
+            }
+            fn resolve_pane(&self, _t: &str) -> Option<String> {
+                None
+            }
+            fn pane_exists(&self, _p: &str) -> bool {
+                true
+            }
+            fn capture_pane(&self, _p: &str) -> Option<String> {
+                None
+            }
+            fn pane_in_mode(&self, _p: &str) -> Option<bool> {
+                None
+            }
+            fn send_keys(&self, _p: &str, _k: &str) -> bool {
+                false
+            }
+        }
+        let tmux = RecordingTmux(std::sync::Mutex::new(Vec::new()));
+        let live = LiveIndex::query(&tmux);
+        let calls = tmux.0.lock().unwrap();
+        assert_eq!(calls.len(), 2, "MUST 仍只有兩條 tmux 查詢：{calls:?}");
+        assert!(
+            calls.iter().any(|c| c
+                .iter()
+                .any(|a| a == "#{session_name}\t#{window_id}\t#{window_name}")),
+            "list-windows 的 format MUST 一次帶回三欄：{calls:?}"
+        );
+        assert_eq!(origin_row_label(&live, "scratch:@108"), "scratch:main");
+        assert_eq!(origin_row_label(&live, "it:@2"), "it:side");
+        assert_eq!(pane_liveness(&live, "%1"), Liveness::Live);
     }
 
     fn idx(pane: &str, b: Blocker) -> BlockerIndex {

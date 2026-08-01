@@ -68,7 +68,7 @@ where
         Ok(t) => Ok(t),
         Err(e) => {
             restore();
-            Err(Error::new(format!("無法初始化 terminal：{e}")))
+            Err(Error::new(format!("cannot initialise terminal: {e}")))
         }
     }
 }
@@ -103,20 +103,22 @@ fn event_loop(
     loop {
         terminal
             .draw(|f| view::render(f, &model, &live, &blockers, &app))
-            .map_err(|e| Error::new(format!("畫面繪製失敗：{e}")))?;
+            .map_err(|e| Error::new(format!("draw failed: {e}")))?;
         if selftest_panic {
-            panic!("AB_TUI_SELFTEST_PANIC：測試觸發的錯誤退出（驗 terminal 還原）");
+            panic!("AB_TUI_SELFTEST_PANIC: test-triggered panic exit (terminal restore check)");
         }
         if selftest_err {
-            return Err(Error::new("AB_TUI_SELFTEST_ERR：測試觸發的錯誤返回"));
+            return Err(Error::new(
+                "AB_TUI_SELFTEST_ERR: test-triggered error return",
+            ));
         }
 
         // worker 回信：non-blocking drain，一則都不等
         while let Some(msg) = worker.try_recv() {
             match msg {
                 Msg::Origin { owner, pane } => {
-                    app.origin_owner = owner;
-                    app.origin_pane = pane;
+                    app.caller_origin = owner;
+                    app.caller_pane = pane;
                     app.apply_origin(&model);
                 }
                 Msg::Live(l, b) => {
@@ -129,13 +131,13 @@ fn event_loop(
                         if popup {
                             return Ok(());
                         }
-                        app.message = format!("已 focus '{label}'（{pane}）");
+                        app.message = format!("focused '{label}' ({pane})");
                     }
                     Err(e) => app.message = e.message,
                 },
                 Msg::Cancel { id, res } => {
                     app.message = match res {
-                        Ok(o) => format!("已取消 task {id}（cancelled）{}", notify_suffix(&o)),
+                        Ok(o) => format!("cancelled task {id}{}", notify_suffix(&o)),
                         Err(e) => e.message,
                     };
                     // 取消結果下一幀就要看得到
@@ -158,19 +160,22 @@ fn event_loop(
                     }
                     Err(e) => app.message = e.message,
                 },
-                Msg::Copy { res } => {
-                    app.message = match res {
-                        Ok(()) => "已複製證據到 tmux buffer（tmux show-buffer 可讀回）".to_string(),
-                        Err(e) => e.message,
+                Msg::Copy { res } => app.message = match res {
+                    Ok(()) => {
+                        "evidence copied to the tmux buffer (read it back with tmux show-buffer)"
+                            .to_string()
                     }
-                }
+                    Err(e) => e.message,
+                },
                 // evict 的編排事件（core 不印字）：串流進 footer，人才看得到
                 // 「已派收尾任務、等待中」這段長達數分鐘的過程。
                 // **警告走 sticky 區、進度才覆寫單行 message**：兩者混用一個
                 // 欄位時，`notify-failed` 會被下一行「等待筆記落地」蓋掉
                 // （codex 複核 major #2）
                 Msg::EvictProgress { name, line, warn } => {
-                    let text = format!("evict '{name}'：{line}");
+                    // `line` 是 **core 的編排事件原文**，不是 TUI chrome
+                    // （題 9 只管 chrome）——照抄不譯，兩邊各譯一份會漂移
+                    let text = format!("evict '{name}': {line}");
                     if warn {
                         app.push_warning(text);
                     } else {
@@ -196,9 +201,9 @@ fn event_loop(
         }
 
         let has_event =
-            event::poll(EVENT_TICK).map_err(|e| Error::new(format!("事件輪詢失敗：{e}")))?;
+            event::poll(EVENT_TICK).map_err(|e| Error::new(format!("event poll failed: {e}")))?;
         if has_event {
-            let ev = event::read().map_err(|e| Error::new(format!("事件讀取失敗：{e}")))?;
+            let ev = event::read().map_err(|e| Error::new(format!("event read failed: {e}")))?;
             if let Event::Key(k) = ev
                 && k.kind == KeyEventKind::Press
                 && let Some(key) = translate(k.code)
@@ -208,17 +213,17 @@ fn event_loop(
                     Effect::Focus { pane, label } => {
                         // 動作也走 worker：跨 session 的 switch-client 一樣是
                         // tmux 子行程，卡住不得凍住畫面與鍵盤
-                        app.message = format!("focus '{label}' 進行中…");
+                        app.message = format!("focus '{label}' in progress…");
                         dispatch(&mut app, worker, Req::Focus { pane, label });
                     }
                     Effect::Cancel { id } => {
-                        app.message = format!("cancel {id} 進行中…");
+                        app.message = format!("cancel {id} in progress…");
                         dispatch(&mut app, worker, Req::Cancel { id });
                     }
                     // `r` 走背景 worker：read 會取 task 鎖，鎖被握著時在 UI
                     // thread 上就是凍結（§4 硬條款）
                     Effect::Read { id } => {
-                        app.message = format!("read {id} 進行中…");
+                        app.message = format!("read {id} in progress…");
                         dispatch(&mut app, worker, Req::Read { id });
                     }
                     // `i` 只消費已載入的 read model／liveness 快照，不開檔也
@@ -227,7 +232,7 @@ fn event_loop(
                         app.info = Some(action::info_page(&model, &live, &blockers, &name));
                     }
                     Effect::Copy { payload } => {
-                        app.message = "複製證據中…".to_string();
+                        app.message = "copying evidence…".to_string();
                         dispatch(&mut app, worker, Req::Copy { payload });
                     }
                     // `e` 第一段：讀 registry（小 JSON、不取鎖）做出身判定並
@@ -282,7 +287,7 @@ fn panic_text(p: &(dyn std::any::Any + Send)) -> String {
     } else if let Some(s) = p.downcast_ref::<String>() {
         s.clone()
     } else {
-        "未知 panic".to_string()
+        "unknown panic".to_string()
     }
 }
 
@@ -294,7 +299,7 @@ fn panic_text(p: &(dyn std::any::Any + Send)) -> String {
 fn guard_panic<T>(f: impl FnOnce() -> ab_core::error::Result<T>) -> ab_core::error::Result<T> {
     std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)).unwrap_or_else(|p| {
         Err(ab_core::error::Error::new(format!(
-            "evict 背景工人異常結束（{}）：請以 agent-bridge list --long 確認實際狀態",
+            "the evict background worker died unexpectedly ({}): check the real state with agent-bridge list --long",
             panic_text(p.as_ref())
         )))
     })
@@ -307,7 +312,7 @@ fn guard_panic<T>(f: impl FnOnce() -> ab_core::error::Result<T>) -> ab_core::err
 /// 阻塞）。
 fn start_evict(app: &mut App, worker: &worker::Handle, paths: &Paths, shown: action::EvictShown) {
     if app.evict_inflight.contains(&shown.name) {
-        app.message = format!("'{}' 的 evict 正在進行中", shown.name);
+        app.message = format!("evict of '{}' is already in progress", shown.name);
         return;
     }
     let req = match action::evict_request(paths, &shown) {
@@ -352,12 +357,12 @@ fn start_evict(app: &mut App, worker: &worker::Handle, paths: &Paths, shown: act
     });
     if started {
         app.evict_inflight.insert(name.clone());
-        app.message = format!("evict '{name}' 進行中…（派收尾任務後回收）");
+        app.message = format!("evict '{name}' in progress… (wrap-up task, then reclaim)");
     } else {
         // thread 起不來（`Builder::spawn` 失敗）：當場給終態，別讓畫面停在
         // 一個不會結束的「進行中」
         app.push_warning(format!(
-            "evict '{name}' 無法啟動（背景工人起不來）；請改用 CLI：{cmdline}"
+            "evict '{name}' could not start (background worker failed to spawn); run it from the CLI instead: {cmdline}"
         ));
     }
 }
@@ -369,7 +374,8 @@ fn start_evict(app: &mut App, worker: &worker::Handle, paths: &Paths, shown: act
 /// （跨廠審查 minor #5）。
 fn dispatch(app: &mut App, worker: &worker::Handle, req: Req) {
     if !worker.send(req) {
-        app.message = "背景 worker 已不可用（tmux 動作無法執行）；請離開重開".to_string();
+        app.message =
+            "background worker is gone (tmux actions cannot run); quit and reopen".to_string();
     }
 }
 
@@ -379,15 +385,15 @@ fn notify_suffix(o: &ab_core::task::CancelOutcome) -> String {
     use ab_core::notify::NotifyOutcome;
     match o.notify {
         None => String::new(),
-        Some(NotifyOutcome::Notified) => format!("；已通知 {}", o.to),
+        Some(NotifyOutcome::Notified) => format!("; notified {}", o.to),
         Some(NotifyOutcome::Deferred) => {
             format!(
-                "；{} 忙碌中，通知延後（對方 turn 結束時由 hook 取件）",
+                "; {} is busy, notification deferred (its hook picks it up at turn end)",
                 o.to
             )
         }
         Some(NotifyOutcome::Failed) => format!(
-            "；無法通知 {}（pane {}）：請手動執行 {}",
+            "; could not notify {} (pane {}): run {} by hand",
             o.to, o.pane, o.cmdline
         ),
     }
@@ -461,7 +467,11 @@ mod tests {
         std::panic::set_hook(prev);
 
         for (e, needle) in [(e, "boom-str"), (e2, "boom-string")] {
-            assert!(e.message.contains("異常結束"), "實際：{}", e.message);
+            assert!(
+                e.message.contains("died unexpectedly"),
+                "實際：{}",
+                e.message
+            );
             assert!(
                 e.message.contains(needle),
                 "MUST 帶 panic 原因：{}",
@@ -473,6 +483,23 @@ mod tests {
                 e.message
             );
         }
+    }
+
+    /// 非 `&str`／`String` 的 panic payload（`panic_any`）：fallback 那一支
+    /// 也是 chrome，MUST 是英文，且訊息其餘部分照樣完整（原因說不出來時，
+    /// 「下一步怎麼查」更不能少）。
+    #[test]
+    fn guard_panic_falls_back_to_english_for_opaque_payloads() {
+        let prev = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        let e = guard_panic::<u8>(|| std::panic::panic_any(42u32)).unwrap_err();
+        std::panic::set_hook(prev);
+        assert_eq!(
+            e.message,
+            "the evict background worker died unexpectedly (unknown panic): \
+             check the real state with agent-bridge list --long",
+            "fallback 訊息 MUST 逐字如此（英文、且保留下一步）"
+        );
     }
 
     /// panic 之後**終局訊息仍要回到 UI 的收信口**（in-flight 閘靠它清除）。
@@ -500,7 +527,11 @@ mod tests {
             Some(Msg::Evict { name, res }) => {
                 assert_eq!(name, "w1");
                 let e = res.unwrap_err();
-                assert!(e.message.contains("異常結束"), "實際：{}", e.message);
+                assert!(
+                    e.message.contains("died unexpectedly"),
+                    "實際：{}",
+                    e.message
+                );
             }
             _ => panic!("panic 之後 MUST 仍送出 Msg::Evict 終局"),
         }

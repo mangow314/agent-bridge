@@ -45,7 +45,7 @@ pub fn evidence(sel: &Sel) -> Vec<String> {
             ));
             out.push("agent-bridge list --long".to_string());
         }
-        Sel::Owner(_) | Sel::None => {}
+        Sel::Origin(_) | Sel::None => {}
     }
     out
 }
@@ -83,7 +83,7 @@ impl Clipboard for TmuxClipboard<'_> {
             Ok(())
         } else {
             Err(Error::new(
-                "複製失敗：tmux set-buffer 不可用（tmux 不在或逾時）",
+                "copy failed: tmux set-buffer unavailable (tmux missing or timed out)",
             ))
         }
     }
@@ -115,7 +115,7 @@ pub fn info_page(
     name: &str,
 ) -> Vec<String> {
     let Some(w) = model.workers.iter().find(|w| w.name == name) else {
-        return vec![format!("registry 已無 '{name}'")];
+        return vec![format!("'{name}' is gone from the registry")];
     };
     let dash = |s: &str| {
         if s.is_empty() {
@@ -145,8 +145,8 @@ pub fn info_page(
             "blocker      : {}",
             match blockers.get(&w.pane) {
                 Blocker::None => "none",
-                Blocker::Prompt => "permission/plan prompt（blocked）",
-                Blocker::Occluded => "occluded（copy-mode）",
+                Blocker::Prompt => "permission/plan prompt (blocked)",
+                Blocker::Occluded => "occluded (copy-mode)",
                 Blocker::Unknown => "unknown",
             }
         ),
@@ -160,7 +160,7 @@ pub fn info_page(
         any = true;
     }
     if !any {
-        lines.push("  （無）".to_string());
+        lines.push("  (none)".to_string());
     }
     lines.push(String::new());
     lines.push("evidence:".to_string());
@@ -168,7 +168,7 @@ pub fn info_page(
         lines.push(format!("  {e}"));
     }
     lines.push(String::new());
-    lines.push("按任意鍵關閉".to_string());
+    lines.push("press any key to close".to_string());
     lines
 }
 
@@ -254,22 +254,24 @@ fn evict_request_from(shown: &EvictShown) -> EvictRequest {
 
 /// 證據框的內容（純函式，不經 render 可測）。
 ///
-/// §5 顯示紀律：措辭 MUST 是「派收尾任務後回收」，MUST NOT 出現任何「安全
-/// 刪除」語彙——這一框的職責是把證據攤開讓人自己判斷，不是替人下判斷。
-/// 框內 MUST 逐字帶上等價 CLI 原文（§2 薄殼原則）。
+/// §5 顯示紀律：措辭 MUST 是「派收尾任務後回收」（P4.6 題 9 英文化之後即
+/// `wrap-up task, then reclaim`），MUST NOT 出現任何「安全刪除」語彙
+/// （`safe to delete`／`safe to remove`…）——這一框的職責是把證據攤開讓人
+/// 自己判斷，不是替人下判斷。框內 MUST 逐字帶上等價 CLI 原文（§2 薄殼原則）。
 pub fn evict_confirm_lines(req: &EvictRequest) -> Vec<String> {
     vec![
-        format!("對 worker '{}' 派收尾任務後回收：", req.name),
-        "  先派一輪收尾任務，等它把只存在於 context 裡的事實寫成筆記".to_string(),
-        "  落地（或逾時）之後才回收 pane；筆記留在 tasks/ 可事後查閱".to_string(),
-        format!("pane   : {}", req.expect_pane.as_deref().unwrap_or("-")),
+        format!("worker '{}': wrap-up task, then reclaim", req.name),
+        "  first dispatch one wrap-up task so it can write down the facts".to_string(),
+        "  that exist only in its context; the pane is reclaimed only after".to_string(),
+        "  those notes land (or time out). Notes stay in tasks/ to re-read.".to_string(),
+        format!("pane      : {}", req.expect_pane.as_deref().unwrap_or("-")),
         format!(
-            "世代   : {}",
+            "generation: {}",
             req.expect_generation.as_deref().unwrap_or("-")
         ),
-        "確認後執行下列等價 CLI：".to_string(),
+        "Confirm to run the equivalent CLI:".to_string(),
         format!("$ {}", req.cmdline()),
-        "[y/Enter] 執行 · [n/Esc] 放棄".to_string(),
+        "[y/Enter] run \u{b7} [n/Esc] abort".to_string(),
     ]
 }
 
@@ -277,20 +279,20 @@ pub fn evict_confirm_lines(req: &EvictRequest) -> Vec<String> {
 pub fn evict_message(name: &str, res: &Result<EvictOutcome>) -> String {
     match res {
         Ok(o) if o.despawn == DespawnResult::Stale => format!(
-            "agent '{name}' 的註冊已清除，但 pane {} 未被回收；收尾任務 {}（{}）請自行判讀",
+            "registration of agent '{name}' was cleared, but pane {} was NOT reclaimed; judge the wrap-up task {} ({}) yourself",
             o.pane, o.task_id, o.final_status
         ),
         Ok(o) => match o.audit {
             "evicted" => format!(
-                "已 evict '{name}'；收尾筆記可用：agent-bridge read {}",
+                "evicted '{name}'; wrap-up notes are available: agent-bridge read {}",
                 o.task_id
             ),
             "evicted-unfinished" => format!(
-                "已回收 '{name}'，但收尾任務 {} 以 {} 結束，筆記未落地",
+                "reclaimed '{name}', but the wrap-up task {} ended as {}; notes did not land",
                 o.task_id, o.final_status
             ),
             _ => format!(
-                "已回收 '{name}'，但收尾任務 {} 逾時未回覆，筆記未落地",
+                "reclaimed '{name}', but the wrap-up task {} timed out; notes did not land",
                 o.task_id
             ),
         },
@@ -304,7 +306,7 @@ pub fn evict_message(name: &str, res: &Result<EvictOutcome>) -> String {
 pub fn focus(tmux: &dyn TmuxClient, pane: &str, current_session: Option<&str>) -> Result<()> {
     if pane.is_empty() {
         return Err(Error::new(
-            "此列沒有 pane id 可 focus（registry 缺 pane_id）",
+            "this row has no pane id to focus (registry has no pane_id)",
         ));
     }
     let live = LiveIndex::query(tmux);
@@ -313,7 +315,7 @@ pub fn focus(tmux: &dyn TmuxClient, pane: &str, current_session: Option<&str>) -
         current_session,
     ) else {
         return Err(Error::new(format!(
-            "找不到 pane {pane} 的位置（已死或 tmux 查詢失敗）"
+            "cannot locate pane {pane} (it is gone, or the tmux query failed)"
         )));
     };
     exec_focus(tmux, &plan, pane)
@@ -328,7 +330,7 @@ fn exec_focus(tmux: &dyn TmuxClient, plan: &FocusPlan, pane: &str) -> Result<()>
             .unwrap_or(false);
         if !ok {
             return Err(Error::new(format!(
-                "switch-client 失敗（目標 session：{sess}）"
+                "switch-client failed (target session: {sess})"
             )));
         }
     }
@@ -338,7 +340,10 @@ fn exec_focus(tmux: &dyn TmuxClient, plan: &FocusPlan, pane: &str) -> Result<()>
     ] {
         let ok = tmux.exec(&args).map(|o| o.status_ok).unwrap_or(false);
         if !ok {
-            return Err(Error::new(format!("{} 失敗（目標：{}）", args[0], args[2])));
+            return Err(Error::new(format!(
+                "{} failed (target: {})",
+                args[0], args[2]
+            )));
         }
     }
     Ok(())
@@ -516,7 +521,7 @@ mod tests {
             assert!(!payload.starts_with('-'), "payload 首字元不得是 -");
         }
         // owner 列／無選中項：沒有證據可複製（呼叫端據此提示無效）
-        assert!(copy_payload(&Sel::Owner("it:@1")).is_empty());
+        assert!(copy_payload(&Sel::Origin("it:@1")).is_empty());
         assert!(copy_payload(&Sel::None).is_empty());
     }
 
@@ -599,8 +604,21 @@ mod tests {
         let p = evict_prompt(&t.paths, "w1").unwrap();
         let text = p.lines.join("\n");
 
-        assert!(text.contains("派收尾任務後回收"), "實際：{text}");
-        for banned in ["安全刪除", "可安全", "安全回收", "可刪", "無殘值"] {
+        assert!(text.contains("wrap-up task, then reclaim"), "實際：{text}");
+        // 措辭紅線（§5）：中英兩套「安全刪除」語彙都不得出現——英文化之後只擋
+        // 中文等於把這條紀律翻掉了
+        for banned in [
+            "安全刪除",
+            "可安全",
+            "安全回收",
+            "可刪",
+            "無殘值",
+            "safe to delete",
+            "safe to remove",
+            "safe to reclaim",
+            "no longer needed",
+            "disposable",
+        ] {
             assert!(!text.contains(banned), "MUST NOT 出現 '{banned}'：{text}");
         }
         assert!(
@@ -730,18 +748,24 @@ mod tests {
             pane: "%5".into(),
         };
         let m = evict_message("w1", &Ok(out("evicted", DespawnResult::Killed)));
-        assert!(m.contains("已 evict 'w1'") && m.contains("agent-bridge read"));
+        assert!(m.contains("evicted 'w1'") && m.contains("agent-bridge read"));
         let m = evict_message("w1", &Ok(out("evicted-unfinished", DespawnResult::Killed)));
         assert!(
-            m.contains("筆記未落地") && m.contains("failed"),
+            m.contains("notes did not land") && m.contains("failed"),
             "實際：{m}"
         );
         let m = evict_message("w1", &Ok(out("evicted-timeout", DespawnResult::Killed)));
-        assert!(m.contains("逾時") && m.contains("筆記未落地"), "實際：{m}");
+        assert!(
+            m.contains("timed out") && m.contains("notes did not land"),
+            "實際：{m}"
+        );
         // stale：pane 未被回收，訊息不得宣稱回收成功
         let m = evict_message("w1", &Ok(out("evicted", DespawnResult::Stale)));
-        assert!(m.contains("未被回收"), "實際：{m}");
-        assert!(!m.contains("已 evict"), "stale MUST NOT 說成已 evict：{m}");
+        assert!(m.contains("NOT reclaimed"), "實際：{m}");
+        assert!(
+            !m.contains("evicted 'w1'"),
+            "stale MUST NOT 說成 evicted：{m}"
+        );
         // 錯誤（含 selection stale）原樣進 footer
         let m = evict_message("w1", &Err(Error::new("evict 中止（selection stale）：…")));
         assert!(m.contains("selection stale"), "實際：{m}");

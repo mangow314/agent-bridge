@@ -4446,11 +4446,19 @@ tmx kill-pane -t "$P40B"
 # TUI 跑在自己 window 的 bash 裡（不是直接當 window command）：退出後 pane
 # 仍在，才驗得了「退出還原、terminal 可用」
 TUI40="$(tmx new-window -dP -F '#{pane_id}' -t it "$pane_cmd")"
-# current owner＝TUI 自己所在的 window（§2「以 current owner 為根」）
+# current origin＝TUI 自己所在的 window（§2「以 current origin 為根」）
 OWN40="$(tmx display -p -t "$TUI40" '#{session_name}:#{window_id}')"
-# 第二個 owner，字典序**刻意排在 current 之前**（`aaa:` < `it:`）：首頁若退
-# 回字典序第 0 筆，這一列的 worker 就會出現在 WORKERS 欄 → F2 回歸抓得到
-OWN40X="aaa:@1"
+SESS40="${OWN40%%:*}"
+# P4.6 題 1：ORIGINS 欄顯示的是 window **名稱**。給它一個固定名字，斷言才有
+# 可預期的字面（預設名是啟動命令，會隨 $pane_cmd 漂移）
+WIN40NAME=ab40
+tmx rename-window -t "$TUI40" "$WIN40NAME"
+# 第二個 origin，字典序**刻意排在 current 之前**（`aaa:` < `it:`）：首頁若退
+# 回第 0 筆（P4.6 之後是 synthetic `ALL`），這一列的 worker 就會出現在 WORKERS
+# 欄 → F2 回歸抓得到。window id 取一個**確定不存在**的值：P4.6 之後 origin 列
+# 顯示的是 `session:window-name`，只有已消失的 window 才會原樣留著 `@id`，
+# 這一列的字面才在 tmux 活著／掛住兩種情況下都可預期
+OWN40X="aaa:@94001"
 printf '{"name":"tuiw1","pane_id":"%s","registered_at":"2026-07-31T00:00:00Z","spawned":true,"ready":true,"runtime":"codex","spawn_tag":"t40-1","owner":"%s"}\n' \
   "$P40A" "$OWN40" > "$D40/agents/tuiw1.json"
 printf '{"name":"tuiw2","pane_id":"%s","registered_at":"2026-07-31T00:00:00Z","spawned":true,"ready":true,"runtime":"claude","spawn_tag":"t40-2","owner":"%s"}\n' \
@@ -4520,8 +4528,17 @@ tui40_run q
 # 40a 讀模型→畫面：owner／兩 worker／兩 task 列（權威狀態字）都在
 assert "40a UI 起畫面：worker 列 tuiw1 可見" wait_for 10 ui_shows "tuiw1"
 assert "40a UI：dead worker tuiw2 亦在列（不毒死畫面）" ui_shows "tuiw2"
-assert "40a UI：owner 標籤（$OWN40）在 OWNERS 欄" ui_shows "$OWN40"
-assert "40a UI：另一個 owner（$OWN40X）亦在 OWNERS 欄" ui_shows "$OWN40X"
+# P4.6 題 1／題 2：ORIGINS 欄顯示 `session:window-name`（不是 `session:@id`），
+# 已消失的 window 才保留原 `@id` 並標 `(gone)`——**不猜舊名**
+# **要等**：origin 標籤的誠實化吃的是 liveness 那一輪（2s 節流、走背景
+# worker），磁碟 read model 先到、window 索引後到——不等就是在驗第一幀的
+# unknown 降級態
+assert "40a UI：current origin 以 session:window-name 顯示（非 @id）" \
+  wait_for 10 ui_shows "$SESS40:$WIN40NAME"
+assert "40a UI：origin 列不再出現 window id（誠實標籤，題 1）" ui_lacks "$OWN40"
+assert "40a UI：已消失 window 的 origin 標 (gone)、且不猜舊名" \
+  ui_shows "$OWN40X (gone)"
+assert "40a UI：ORIGINS 欄頂端有 synthetic ALL 列（題 2）" ui_shows "ALL"
 # §2「以 current owner 為根」：字典序第 0 筆是 aaa:@1，首頁若退字典序就會顯示
 # 它底下的 tuiwother——WORKERS 欄看不到它，才證明根是 current owner（審查 F2）
 assert "40a 首頁根＝current owner（非字典序第一筆）" wait_for 10 ui_lacks "tuiwother"
@@ -4535,12 +4552,14 @@ assert "40a alternate screen：主畫面內容已被覆蓋" \
 
 # 40b ?＝當前選中項的合法鍵；任意鍵關閉
 tmx send-keys -t "$TUI40" '?'
-assert "40b ? 顯示當前選中項合法鍵" wait_for 10 ui_shows "合法鍵"
+assert "40b ? 顯示當前選中項合法鍵（chrome 全英文，題 9）" \
+  wait_for 10 ui_shows "keys (current selection)"
 tmx send-keys -t "$TUI40" k
 
 # 40c x 的合法目標只有 task 列：worker 列上按 x 無效並提示
 tmx send-keys -t "$TUI40" x
-assert "40c worker 列按 x：提示無效、不開確認框" wait_for 10 ui_shows "僅對 task 列有效"
+assert "40c worker 列按 x：提示無效、不開確認框" \
+  wait_for 10 ui_shows "x only acts on task rows"
 
 # 40d gate (c)：Enter focus 跨 window。前置：真 client 不在目標 window 上
 tmx display -p -c "$CLIENT40" '#{window_id}' > "$TESTROOT/tui40-curwin.txt"
@@ -4552,7 +4571,7 @@ assert "40d Enter focus：真 client 的 session:window.pane 等於目標" \
 # focus 走背景 worker（審查 F1）：結果經 channel 回到 footer，且**UI 沒退出**
 # ——非 popup 模式 focus 後繼續跑（與 40j 的 popup 協定成對）
 assert "40d focus 結果回到 footer（背景 worker → channel）" \
-  wait_for 10 ui_shows "已 focus 'tuiw1'"
+  wait_for 10 ui_shows "focused 'tuiw1'"
 
 # 40e gate (a)：導航到第一個 task 列，x → 確認框顯示等價 CLI 原文 → y 執行
 tmx send-keys -t "$TUI40" j
@@ -4569,7 +4588,7 @@ assert "40e events.log 記 cancelled 事件" evt_grep "$D40/tasks/$T40A/events.l
 assert "40e 通知語意與 CLI 一致（notified／notify-deferred／notify-failed 之一）" \
   wait_for 10 evt_grep "$D40/tasks/$T40A/events.log" '(notified|notify-deferred|notify-failed)'
 assert "40e cancel 結果回到 footer（背景 worker → channel，不印 stderr）" \
-  wait_for 10 ui_shows "已取消 task $T40A"
+  wait_for 10 ui_shows "cancelled task $T40A"
 assert "40e 另一個 task 不受波及（仍 queued）" st_is "$D40" "$T40B" queued
 
 # 40f gate (b) 正常退出：q 後回主畫面、termios 逐字還原、tmux 世界不變
@@ -4622,13 +4641,16 @@ chmod +x "$HANG40/tmux"
 tui40_run hang "AGENT_BRIDGE_TMUX_TIMEOUT=0 PATH=$(printf '%q' "$HANG40:$PATH")"
 # 注意：tmux 掛住時連 current owner 都查不到，首頁只能退字典序第 0 筆
 # （$OWN40X）——這正是「該欄降級、UI 照跑」的正確終態，故斷言挑
-# owner-independent 的證據：OWNERS 欄仍列得出磁碟上的 owner 標籤
+# origin-independent 的證據：ORIGINS 欄仍列得出磁碟上的 origin 標籤
+# tmux 掛住時 window 索引整層 unknown：origin 標籤 MUST 退回原樣的
+# `session:@id`，且 **MUST NOT** 標成 `(gone)`（查不到 ≠ 不在，§5 三態）
 assert "40i 無界 tmux 下 UI 照樣畫得出磁碟 read model" \
   wait_for 10 ui_shows "$OWN40"
 assert "40i 無界 tmux 下 liveness 降級（不凍結、照畫）" ui_shows "$OWN40X"
+assert "40i 無界 tmux 下 unknown MUST NOT 被寫成 gone" ui_lacks "(gone)"
 tmx send-keys -t "$TUI40" '?'
 assert "40i 無界 tmux 下鍵盤仍活（? 開得了合法鍵頁）" \
-  wait_for 10 ui_shows "合法鍵"
+  wait_for 10 ui_shows "keys (current selection)"
 tmx send-keys -t "$TUI40" k
 tmx send-keys -t "$TUI40" q
 # 退出證據用檔案不用畫面：畫面只有可見區，連跑多輪後哨兵行會捲出去
@@ -4684,6 +4706,10 @@ W41_WIN="$(tmx new-window -dP -F '#{window_id}' -t it "$pane_cmd")"
 P41A="$(tmx list-panes -t "$W41_WIN" -F '#{pane_id}')"
 TUI41="$(tmx new-window -dP -F '#{pane_id}' -t it "$pane_cmd")"
 OWN41="$(tmx display -p -t "$TUI41" '#{session_name}:#{window_id}')"
+SESS41="${OWN41%%:*}"
+# P4.6 題 1：origin 列顯示 window 名稱，給它固定名字才驗得準
+WIN41NAME=ab41
+tmx rename-window -t "$TUI41" "$WIN41NAME"
 printf '{"name":"tuiw41","pane_id":"%s","registered_at":"2026-07-31T04:41:00Z","spawned":true,"ready":true,"runtime":"codex","spawn_tag":"t41-gen1","owner":"%s"}\n' \
   "$P41A" "$OWN41" > "$D41/agents/tuiw41.json"
 
@@ -4762,7 +4788,7 @@ tui41_run q
 assert "41a 四面板：WORKERS 欄可見" wait_for 10 ui41_shows "WORKERS"
 assert "41a 四面板：TASKS 欄可見" ui41_shows "TASKS"
 assert "41a 四面板：DETAIL 欄可見" ui41_shows "DETAIL"
-assert "41a 四面板：OWNERS 欄可見" ui41_shows "OWNERS"
+assert "41a 四面板：ORIGINS 欄可見（P4.6 題 2 改名）" ui41_shows "ORIGINS"
 # TASKS 欄含終態（in-flight 之外的那一筆），且顯示權威狀態字
 assert "41a TASKS 欄含終態任務（$T41DONE completed）" ui41_shows "$T41DONE"
 assert "41a TASKS 欄 status 為權威字 completed" ui41_shows "completed"
@@ -4770,7 +4796,11 @@ assert "41a TASKS 欄亦含 queued 任務" ui41_shows "$T41Q"
 # DETAIL 隨聚焦面板的選中項（起始＝WORKERS 的 worker 列）
 assert "41a DETAIL 顯示選中 worker 的欄位" ui41_shows "name   : tuiw41"
 assert "41a DETAIL evidence 區列唯讀等價 CLI 原文" ui41_shows "\$ agent-bridge list --long"
-assert "41a footer 補上 r／i／c 鍵位提示" ui41_shows "c 複製證據"
+assert "41a footer 補上 r／i／c 鍵位提示（英文 chrome）" ui41_shows "c copy evidence"
+# 題 3：worker DETAIL 把 origin window 與 agent 自己的死活拆成兩列
+assert "41a DETAIL 有 origin 列（window 名稱＋@id＋三態）" \
+  ui41_shows "origin : $SESS41:$WIN41NAME ("
+assert "41a DETAIL 的 agent 死活是另一列" ui41_shows "state  : live"
 
 # 41b `i`：worker 摘要頁（registry 額外欄位＋三態 liveness）
 tmx send-keys -t "$TUI41" i
@@ -4782,7 +4812,7 @@ tmx send-keys -t "$TUI41" Escape
 assert "41b 任意鍵關閉摘要頁（摘要內容從畫面消失）" wait_for 10 ui41_lacks "spawn_tag"
 assert "41b 關閉後仍在 dashboard" ui41_shows "DETAIL"
 
-# 41c Tab 三欄循環：OWNERS → WORKERS → TASKS → OWNERS（DETAIL 不可聚焦）
+# 41c Tab 三欄循環：ORIGINS → WORKERS → TASKS → ORIGINS（DETAIL 不可聚焦）
 assert "41c 起始聚焦 WORKERS（選中 marker 落在 worker 列）" \
   ui41_matches "▶ ▸ tuiw41"
 tmx send-keys -t "$TUI41" Tab
@@ -4793,7 +4823,8 @@ assert "41c DETAIL evidence 區為唯讀 read 命令原文" ui41_shows "\$ agent
 
 # 41d gate (a)：`c` 複製證據 → tmux buffer 讀回
 tmx send-keys -t "$TUI41" c
-assert "41d c 的結果回到 footer" wait_for 10 ui41_shows "已複製證據到 tmux buffer"
+assert "41d c 的結果回到 footer" \
+  wait_for 10 ui41_shows "evidence copied to the tmux buffer"
 tmx show-buffer > "$TESTROOT/t41-buffer.txt" 2>/dev/null
 assert "41d gate (a)：buffer 含 immutable task id" \
   grep -qF "task-id: $T41DONE" "$TESTROOT/t41-buffer.txt"
@@ -4810,9 +4841,10 @@ done
 
 # 41e 終態任務按 x：提示無效、不開確認框、狀態不動
 tmx send-keys -t "$TUI41" x
-assert "41e 終態列按 x 被拒（提示含「終態」）" wait_for 10 ui41_shows "終態"
+assert "41e 終態列按 x 被拒（提示含 terminal）" \
+  wait_for 10 ui41_shows "is already terminal"
 assert "41e 終態列按 x 不開確認框（無等價 CLI 原文）" \
-  bash -c '! grep -qF "確認後執行下列等價 CLI" "$1"' _ "$TESTROOT/tui41-cap.txt"
+  bash -c '! grep -qF "Confirm to run the equivalent CLI" "$1"' _ "$TESTROOT/tui41-cap.txt"
 assert "41e 終態任務狀態未被動過" st_is "$D41" "$T41DONE" completed
 
 # 41f gate (b) 的畫面側：`r` 讀全文
@@ -4838,10 +4870,11 @@ assert "41g queued 任務按 r：footer 顯示 core 的拒絕訊息" \
   wait_for 10 ui41_shows "尚未回覆"
 assert "41g 被拒時不開 overlay（dashboard 仍在）" ui41_shows "DETAIL"
 
-# 41h Tab 循環走完一圈：TASKS → OWNERS → WORKERS
+# 41h Tab 循環走完一圈：TASKS → ORIGINS → WORKERS
 tmx send-keys -t "$TUI41" Tab
-assert "41h Tab → OWNERS（marker 落在 owner 列）" \
-  wait_for 10 ui41_matches "▶ ▸ . $OWN41"
+# P4.6 題 2：origin 列不再有 ●／✗ glyph，marker 之後直接是誠實標籤
+assert "41h Tab → ORIGINS（marker 落在 origin 列，無 liveness glyph）" \
+  wait_for 10 ui41_matches "▶ ▸ $SESS41:$WIN41NAME"
 tmx send-keys -t "$TUI41" Tab
 assert "41h Tab → WORKERS（循環回到起點）" wait_for 10 ui41_matches "▶ ▸ tuiw41"
 
@@ -5005,8 +5038,9 @@ fi
 # ---- 43. TUI evict 證據框（CAS） ----
 # spec: CLI-UI-1 CLI-EVICT-4 CLI-EVICT-3
 # 設計正本 docs/tui-design.md §3／§5 的 `e`：
-#   (a) worker 列按 e → 證據框措辭是「派收尾任務後回收」、逐字顯示等價 CLI
-#       原文（含兩個 --expect-*），且畫面上不得出現「安全刪除」語彙
+#   (a) worker 列按 e → 證據框措辭是「派收尾任務後回收」（P4.6 題 9 英文化後
+#       即 `wrap-up task, then reclaim`）、逐字顯示等價 CLI 原文（含兩個
+#       --expect-*），且畫面上不得出現任何「安全刪除」語彙（中英兩套都擋）
 #   (b) n／Esc 放棄 → 一個副作用都沒有
 #   (c) 開框後換代 → y 確認時**重讀 registry**判 selection stale：不建 task、
 #       pane 未 kill（TUI 側的 compare-and-act，與分組 42 的 CLI 側成對）
@@ -5062,17 +5096,18 @@ assert "43 UI 起得來（WORKERS 欄看得到 ev43）" wait_for 10 ui43_shows "
 # 43a 證據框：措辭＋等價 CLI 原文（§2 薄殼原則／§5 顯示紀律）
 before43="$(task_count "$D43")"
 tmx send-keys -t "$TUI43" e
-assert "43a e 開證據框：措辭是「派收尾任務後回收」" \
-  wait_for 10 ui43_shows "派收尾任務後回收"
+assert "43a e 開證據框：措辭是「派收尾任務後回收」（英文 chrome）" \
+  wait_for 10 ui43_shows "wrap-up task, then reclaim"
 assert "43a 證據框逐字顯示等價 CLI（含兩個 --expect-*）" \
   ui43_shows "agent-bridge evict ev43 --expect-pane $pane43 --expect-generation $GEN43"
 assert "43a 證據框 MUST NOT 出現「安全刪除」語彙" ui43_lacks "安全刪除"
+assert "43a 證據框 MUST NOT 出現英文的「安全刪除」語彙" ui43_lacks "safe to delete"
 assert "43a 開框本身沒有副作用（未建 task）" \
   test "$(task_count "$D43")" -eq "$before43"
 
 # 43b n 放棄：不建 task、registry 不動
 tmx send-keys -t "$TUI43" n
-assert "43b n 放棄 evict（footer 明說）" wait_for 10 ui43_shows "已放棄 evict"
+assert "43b n 放棄 evict（footer 明說）" wait_for 10 ui43_shows "evict aborted"
 assert "43b 放棄後未建任何 task" test "$(task_count "$D43")" -eq "$before43"
 assert "43b 放棄後 pane 仍在" pane_alive "$pane43"
 
@@ -5113,7 +5148,7 @@ assert "43d 確認後 registry 被回收（evict 完成）" \
 assert "43d 確認後 pane 已被 kill" wait_for 10 pane_gone43 "$pane43"
 assert "43d 審計記了 evicted*" grep -qE 'evicted' "$D43/agents.log"
 assert "43d 終局回到 footer（背景一次性 thread → channel）" \
-  wait_for 10 ui43_shows "已 evict 'ev43'"
+  wait_for 10 ui43_shows "evicted 'ev43'"
 
 # 43e gate (e)：evict 的 await 段跑在一次性 thread 上（常駐 worker 那條同時
 # 負責 liveness 輪詢，搭上去等於整整五分鐘不再刷新）。ev43b 沒有人回覆，
@@ -5125,11 +5160,11 @@ assert "43e 收尾任務已派出、進入等待（footer 看得到）" \
   wait_for 15 ui43_shows "等待筆記落地"
 tmx send-keys -t "$TUI43" '?'
 assert "43e await 期間 UI 仍收得了鍵（? 開得了合法鍵頁）" \
-  wait_for 10 ui43_shows "合法鍵"
+  wait_for 10 ui43_shows "keys (current selection)"
 tmx send-keys -t "$TUI43" k   # 任意鍵關閉合法鍵頁
 tmx send-keys -t "$TUI43" e
 assert "43e in-flight 閘：同一個 worker 再按 e 只提示進行中" \
-  wait_for 10 ui43_shows "進行中"
+  wait_for 10 ui43_shows "already in progress"
 
 tmx send-keys -t "$TUI43" q
 assert "43e q 退出（UI thread 沒被 evict 的 await 卡住）" \
@@ -5161,8 +5196,9 @@ tmx send-keys -t "$P43N" \
   "$(printf 'env AGENT_BRIDGE_DATA=%q %q ui' "$D43" "$BRIDGE")" Enter
 assert "43f 窄畫面下 UI 起得來" wait_for 10 ui43n_shows "ev43b"
 tmx send-keys -t "$P43N" e
-assert "43f 窄畫面下證據框措辭仍在" wait_for 10 ui43n_shows "派收尾任務後回收"
-assert "43f 窄畫面下「世代」欄可見" ui43n_shows "$GEN43B"
+assert "43f 窄畫面下證據框措辭仍在" \
+  wait_for 10 ui43n_shows "wrap-up task, then reclaim"
+assert "43f 窄畫面下 generation 欄可見" ui43n_shows "$GEN43B"
 assert "43f 窄畫面下等價 CLI 的 generation 未被截掉（換行保留整條命令）" \
   wait_for 10 ui43n_tag_twice "$GEN43B"
 tmx send-keys -t "$P43N" n
@@ -5211,6 +5247,11 @@ ab_p4() { env AGENT_BRIDGE_DATA="$D44" PATH="$SHIM:$PATH" "$BRIDGE" "$@"; }
 W44A="$(tmx new-window -dP -F '#{window_id}' -t it "$pane_cmd")"
 TUI44="$(tmx list-panes -t "$W44A" -F '#{pane_id}' | head -1)"
 OWN44A="$(tmx display -p -t "$TUI44" '#{session_name}:#{window_id}')"
+# P4.6 題 1：ORIGINS 欄顯示的是 window **名稱**。owner A／B 的 window 都活著，
+# 標籤裡的假 session 名（`zzb:`）在顯示時會被**當下查到的**真 session 名取代
+# ——所以兩者要靠 window 名字才分得開（否則畫面上都是 `it:<預設名>`）
+W44ANAME=p4a
+tmx rename-window -t "$W44A" "$W44ANAME"
 # owner A 的 6 個 worker pane（p4w01..p4w06）
 W44P="$(tmx new-window -dP -F '#{window_id}' -t it "$pane_cmd")"
 P4P01="$(tmx list-panes -t "$W44P" -F '#{pane_id}' | head -1)"
@@ -5223,9 +5264,12 @@ tmx select-layout -t "$W44P" even-vertical
 
 # owner B／C 的標籤用**受控的 session 名**＋真實 window id：owner 欄的死活
 # 只看 `@winid`（`owner_liveness`／`list --long` 都是），而 session 名決定
-# OWNERS 欄的字典序。`it:@N` < `zzb:…` < `zzc:…`，三個 owner 的排序因此固定
+# ORIGINS 欄的字典序（**排序看標籤不看顯示字面**）。`it:@N` < `zzb:…` <
+# `zzc:…`，三個 origin 的排序因此固定
 # ——那是 replay script 的一部分（設計 §9 P4 附註：固定異常排序位置）。
 W44B="$(tmx new-window -dP -F '#{window_id}' -t it "$pane_cmd")"
+W44BNAME=p4b
+tmx rename-window -t "$W44B" "$W44BNAME"
 P4P07="$(tmx list-panes -t "$W44B" -F '#{pane_id}' | head -1)"
 P4P08="$(tmx split-window -dP -F '#{pane_id}' -t "$W44B" "$pane_cmd")"
 P4P10="$(tmx split-window -dP -F '#{pane_id}' -t "$W44B" "$pane_cmd")"
@@ -5420,21 +5464,21 @@ assert "44 TUI：成功送出的按鍵數＝script 導出的步數（$_k vs $STE
 # （不同幀分開 grep 等於允許兩個互不相干的畫面湊出一個結論），而且不能只驗
 # 「有命中」——多餘的誤標也必須讓斷言紅（codex 複核 major #3）。
 #
-# 做法：逐幀抽事實三元組 `<worker> <mark> <owner死活> <owner>`——
-#   - owner 取該幀 OWNERS 欄帶 `▸` 的那一列（＝當前選中 owner，含其死活 glyph）
+# 做法：逐幀抽事實三元組 `<worker>\t<mark>\t<origin 標籤>`——
+#   - origin 取該幀 ORIGINS 欄帶 `▸` 的那一列。**P4.6 之後這一列不再有 ●／✗
+#     glyph**（window 死活不再冒充 agent 死活）；window 已消失的事實改由標籤
+#     自己說：`session:@id (gone)`。origin 列 `▸ <session>:<…>` 與 worker 列
+#     `▸ p4wNN`／`ALL` 列天然分得開（worker 名與 ALL 都不含 `:`）
 #   - worker 列以 `▸ p4wNN` 起頭、切到欄邊框 `│` 為止（DETAIL 欄也會出現
 #     `blocked` 字樣，不切欄就會把它算進來）
 # 然後**只留下異常**（有標記，或 owner 已死）去重排序，與期望的三行 exact-diff。
 p4_frame_facts() {
-  local f="$1" og glyph owner line name mark
-  og="$(grep -oE '▸ (●|✗|\?) [^│ ]+' "$f" | head -1)"
-  [[ -z "$og" ]] && return 0
-  case "$og" in
-    *'●'*) glyph=live ;;
-    *'✗'*) glyph=dead ;;
-    *) glyph=unknown ;;
-  esac
-  owner="${og##* }"
+  local f="$1" origin line name mark
+  # 邊框字元**兩種都要當終止符**：focus 的面板畫的是粗框 `┃`，只擋 `│` 的話
+  # ORIGINS 一聚焦，這個擷取就會一路吃進 WORKERS 欄
+  origin="$(grep -oE '▸ [a-z]+:[^│┃]*' "$f" | head -1 \
+    | sed -e 's/^▸ //' -e 's/[[:space:]]*$//')"
+  [[ -z "$origin" ]] && return 0
   while IFS= read -r line; do
     name="$(printf '%s' "$line" | grep -oE 'p4w[0-9]{2}' | head -1)"
     [[ -z "$name" ]] && continue
@@ -5444,23 +5488,46 @@ p4_frame_facts() {
       *'✗dead'*) mark=dead ;;
       *copy-mode*) mark=occluded ;;
     esac
-    printf '%s %s %s %s\n' "$name" "$mark" "$glyph" "$owner"
-  done < <(grep -oE '▸ p4w[0-9]{2}[^│]*' "$f")
+    printf '%s\t%s\t%s\n' "$name" "$mark" "$origin"
+    # 同上：worker 列的終止符也必須含粗框。WORKERS 一聚焦，右框是 `┃`，
+    # 只擋 `│` 的話這一段會一路吃到 DETAIL 欄的左框——而 DETAIL 正好會投影
+    # 出 `blocked`／`copy-mode` 字樣，於是憑空長出一個假標記
+  done < <(grep -oE '▸ p4w[0-9]{2}[^│┃]*' "$f")
 }
+
+# parser regression：worker 列的擷取 MUST 終止在 **WORKERS 面板自己的右框**，
+# 不論它是細框還是粗框（聚焦時是 `┃`）。
+#
+# 誠實記錄適用範圍：現行三欄版面上 `┃` 後面緊接著就是 DETAIL 的細框 `│`
+# （DETAIL 永不聚焦），所以舊規則 `[^│]*` 實際上也停得住、量不出假事實
+# ——這條鎖的是**規則的意圖**，不是一個現存的可觸發缺陷。版面一旦變動
+# （DETAIL 可聚焦、或兩欄之間多出任何字），舊規則就會把隔壁欄的
+# `blocked`／`copy-mode` 算進來，而那是靜默的假事實。
+# 本條不碰 TUI、純驗 parser，故不計入 P4 步數。
+P4PARSE="$P4OUT/parser-regression.cap"
+printf '│  ▸ zzq:fake  ┃  ▸ p4w77  codex  %%1  ready   ┃ blocker: blocked\n' \
+  > "$P4PARSE"
+p4_frame_facts "$P4PARSE" > "$P4OUT/parser-regression.out"
+printf 'p4w77\tnone\tzzq:fake\n' > "$P4OUT/parser-regression.expect"
+assert "44 parser：worker 列擷取終止於自己的右框（粗框亦然），不吃隔壁欄" \
+  diff -q "$P4OUT/parser-regression.expect" "$P4OUT/parser-regression.out"
 : > "$P4OUT/tui.facts"
 for _f in "$P4OUT"/tui-step[0-9]*.cap; do
   p4_frame_facts "$_f" >> "$P4OUT/tui.facts"
 done
-# 異常＝worker 自己帶標記，或它掛在已死的 owner 下。其餘（正常 worker）
+# 異常＝worker 自己帶標記，或它的 origin window 已消失。其餘（正常 worker）
 # 一律不得出現在答案裡——誤標會多一行，漏標會少一行，兩邊都紅
-awk '$2 != "none" || $3 == "dead"' "$P4OUT/tui.facts" | sort -u > "$P4OUT/tui.answer"
-# p4w12 的 pane 隨著 owner 的 window 一起消失，所以它自己也帶 dead 標記——
-# 「worker 的 pane 死了」與「它掛在死掉的 owner 下」是兩個獨立的軸，這一行
-# 同時滿足兩者（orphan 的 p4w09 則是 pane 死、owner 活）
-printf '%s\n' \
-  "p4w06 blocked live $OWN44A" \
-  "p4w09 dead live $OWN44B" \
-  "p4w12 dead dead $OWN44C" | sort > "$P4OUT/tui.expect"
+awk -F'\t' '$2 != "none" || $3 ~ /\(gone\)/' "$P4OUT/tui.facts" | sort -u \
+  > "$P4OUT/tui.answer"
+# p4w12 的 pane 隨著它的 origin window 一起消失，所以它自己也帶 dead 標記——
+# 「worker 的 pane 死了」與「它的 origin window 沒了」是兩個獨立的軸，這一行
+# 同時滿足兩者（orphan 的 p4w09 則是 pane 死、origin window 還在）。
+# origin 欄是 P4.6 的誠實標籤：window 活著顯示 `session:window-name`
+# （session 取當下查到的真值），消失則保留原 `session:@id` 並標 (gone)
+printf '%s\t%s\t%s\n' \
+  p4w06 blocked "it:$W44ANAME" \
+  p4w09 dead "it:$W44BNAME" \
+  p4w12 dead "$OWN44C (gone)" | sort > "$P4OUT/tui.expect"
 printf '  [P4] TUI canonical answer：\n'
 sed 's/^/    /' "$P4OUT/tui.answer"
 assert "44 TUI：三個異常的 canonical answer 逐幀綁定、無多餘命中" \
@@ -5471,7 +5538,7 @@ assert "44 TUI：三個異常的 canonical answer 逐幀綁定、無多餘命中
 # 這是上一輪自己標記的覆蓋缺口——occlusion 先前只有單元測試，沒有畫面驗證。
 # 手法沿用分組 39（真 copy-mode，不是模擬）。
 tmx send-keys -t "$TUI44" k
-tmx send-keys -t "$TUI44" k   # OWNERS 欄回到 owner A（p4w01 在它底下）
+tmx send-keys -t "$TUI44" k   # ORIGINS 欄回到 origin A（p4w01 在它底下）
 tmx copy-mode -t "$P4P01"
 tmx display -pt "$P4P01" '#{pane_in_mode}' > "$TESTROOT/p44-mode.txt" 2>/dev/null
 assert "44g 前置：pane 確實進入 copy-mode（不驗這條可能在沒進 mode 的畫面上假綠）" \

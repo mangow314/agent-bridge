@@ -1,9 +1,13 @@
-//! render 層（tui-design.md §2 版面的第一縱切子集：OWNERS｜WORKERS 兩欄）。
+//! render 層（tui-design.md §2 版面：ORIGINS｜WORKERS／TASKS｜DETAIL）。
 //!
 //! 顯示紀律（§2／§5）：task status 一律顯示權威字（queued/delivered/running
 //! ——不存在 `blocked`）；selection 以文字 marker `▶` 呈現（`capture-pane`
 //! 的特徵字串斷言吃不到 style，marker 必須落在字元層）；不得以顏色／排序
 //! 暗示可刪度。
+//!
+//! chrome 一律英文（P4.6 題 9）：欄位名、footer、空清單 placeholder、警告、
+//! 確認框、pager 標題、`?` 頁。**不譯的東西**：payload 原文、agent 名、
+//! 權威 status 字、CLI 命令原文——那些不是 chrome，是證據。
 
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
@@ -13,7 +17,8 @@ use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
 use crate::action::{cancel_cmdline, evidence};
 use crate::app::{App, Panel, Sel};
 use crate::model::{
-    Blocker, BlockerIndex, LiveIndex, Liveness, Model, Row, owner_liveness, pane_liveness,
+    ALL_SCOPE, Blocker, BlockerIndex, LiveIndex, Liveness, Model, Row, origin_label,
+    origin_row_label, pane_liveness, window_detail,
 };
 use crate::theme;
 
@@ -21,14 +26,17 @@ use crate::theme;
 const TASK_ID_W: u16 = 21;
 /// 中欄最小寬：選中 marker（2）＋列 glyph（2）＋完整 task id ＋左右邊框（2）。
 const MID_MIN_W: u16 = 4 + TASK_ID_W + 2;
-/// OWNERS 欄：marker（2）＋游標（2）＋死活 glyph（2）＋標籤＋邊框。窄畫面下
-/// 先犧牲的是這裡（owner 標籤截斷不影響證據語意）。
-const OWNERS_W: u16 = 20;
+/// ORIGINS 欄：marker（2）＋游標（2）＋標籤＋邊框。
+///
+/// 24 而不是 P4.5 的 20：P4.6 之後這一欄要放得下 `session:@108 (gone)`
+/// （最長的那一種標籤）——截掉 `(gone)` 等於把「這個 window 已經不在了」
+/// 這件事從畫面上抹掉，而那正是本欄改版要說的話。
+const ORIGINS_W: u16 = 24;
 /// DETAIL 欄：容得下最長的等價 CLI 原文 `  $ agent-bridge read <id>`
 /// （2＋2＋18＋21＝43）＋左右邊框。
 const DETAIL_W: u16 = 43 + 2;
 /// 三欄同時成立所需的最小寬。不足時 DETAIL 改走整寬底條（見 `render`）。
-const THREE_COL_MIN_W: u16 = OWNERS_W + MID_MIN_W + DETAIL_W;
+const THREE_COL_MIN_W: u16 = ORIGINS_W + MID_MIN_W + DETAIL_W;
 /// 底條模式下 DETAIL 的高度：task 細節 5 行＋空行＋`evidence:`＋2 條命令＋
 /// 上下邊框。
 const DETAIL_STRIP_H: u16 = 11;
@@ -56,9 +64,9 @@ pub fn render(f: &mut Frame, model: &Model, live: &LiveIndex, blockers: &Blocker
     // 三者相加要 92 欄，80 欄的終端機放不下——**寬度不足時 DETAIL 改走整寬
     // 底條**，而不是壓縮任何一方。80 欄下底條有整整 78 欄，命令原文照樣成行；
     // 犧牲的只是垂直空間，那是列表捲動本來就處理得了的。
-    let (owners_area, mid_area, detail_area) = if main.width >= THREE_COL_MIN_W {
+    let (origins_area, mid_area, detail_area) = if main.width >= THREE_COL_MIN_W {
         let [o, m, d] = Layout::horizontal([
-            Constraint::Length(OWNERS_W),
+            Constraint::Length(ORIGINS_W),
             Constraint::Min(MID_MIN_W),
             Constraint::Length(DETAIL_W),
         ])
@@ -67,14 +75,15 @@ pub fn render(f: &mut Frame, model: &Model, live: &LiveIndex, blockers: &Blocker
     } else {
         let [top, d] =
             Layout::vertical([Constraint::Min(6), Constraint::Length(DETAIL_STRIP_H)]).areas(main);
-        let [o, m] = Layout::horizontal([Constraint::Length(OWNERS_W), Constraint::Min(MID_MIN_W)])
-            .areas(top);
+        let [o, m] =
+            Layout::horizontal([Constraint::Length(ORIGINS_W), Constraint::Min(MID_MIN_W)])
+                .areas(top);
         (o, m, d)
     };
     let [workers_area, tasks_area] =
         Layout::vertical([Constraint::Percentage(50), Constraint::Percentage(50)]).areas(mid_area);
 
-    render_owners(f, owners_area, model, live, app);
+    render_origins(f, origins_area, model, live, app);
     render_workers(f, workers_area, model, live, blockers, app);
     render_tasks(f, tasks_area, model, app);
     render_detail(f, detail_area, model, live, blockers, app);
@@ -94,41 +103,40 @@ pub fn render(f: &mut Frame, model: &Model, live: &LiveIndex, blockers: &Blocker
     }
 }
 
-fn glyph(l: Liveness) -> &'static str {
-    match l {
-        Liveness::Live => "●",
-        Liveness::Dead => "✗",
-        Liveness::Unknown => "?",
-    }
-}
-
 fn sel_prefix(selected: bool) -> &'static str {
     if selected { "▶ " } else { "  " }
 }
 
-fn render_owners(f: &mut Frame, area: Rect, model: &Model, live: &LiveIndex, app: &App) {
-    let focused = app.panel == Panel::Owners;
+/// ORIGINS 欄（P4.6 題 2）。
+///
+/// 兩件事與 P4.5 不同，兩件都是「別替人下判斷」的直接後果：
+/// - **列上不再有 ●／✗ liveness glyph**：那個 glyph 判的是 origin 標籤裡那個
+///   window 的死活，而 window 死活 **不等於** 底下 agent 的死活（§11 根因）。
+///   window 三態改以文字進 DETAIL，一個字都不上色。
+/// - 標籤誠實化：window 還在就顯示 `session:window-name`，不在就顯示原
+///   `session:@id (gone)`（**不猜舊名**），查不到就原樣。
+///
+/// 第 0 列是 synthetic `ALL`（不過濾），與真實 origin 同一套列語意。
+fn render_origins(f: &mut Frame, area: Rect, model: &Model, live: &LiveIndex, app: &App) {
+    let focused = app.panel == Panel::Origins;
     let mut lines = Vec::new();
-    for (i, o) in model.owners.iter().enumerate() {
-        let selected = focused && i == app.owner_idx;
-        let marker = if i == app.owner_idx { "▸" } else { " " };
-        // 拆 Span 只為了讓死活 glyph 單獨上色；**字元逐字等同**原本的
-        // `format!("{}{marker} {} {o}", …)`，capture-pane 的字元斷言不受影響
-        let l = owner_liveness(live, o);
+    for (i, o) in model.origins.iter().enumerate() {
+        let selected = focused && i == app.origin_idx;
+        let marker = if i == app.origin_idx { "▸" } else { " " };
         lines.push(styled(
-            vec![
-                Span::raw(format!("{}{marker} ", sel_prefix(selected))),
-                Span::styled(glyph(l), theme::liveness_style(l)),
-                Span::raw(format!(" {o}")),
-            ],
+            vec![Span::raw(format!(
+                "{}{marker} {}",
+                sel_prefix(selected),
+                origin_row_label(live, o)
+            ))],
             selected,
         ));
     }
-    let block = panel_block("OWNERS", focused);
+    let block = panel_block("ORIGINS", focused);
     f.render_widget(
         Paragraph::new(lines)
             .block(block)
-            .scroll((scroll_offset(app.owner_idx, area), 0)),
+            .scroll((scroll_offset(app.origin_idx, area), 0)),
         area,
     );
 }
@@ -196,7 +204,7 @@ fn render_workers(
         lines.push(styled(spans, selected));
     }
     if rows.is_empty() {
-        lines.push(Line::from("  （此 owner 下沒有 worker）"));
+        lines.push(Line::from("  (no workers in this scope)"));
     }
     let block = panel_block("WORKERS", focused);
     f.render_widget(
@@ -239,7 +247,7 @@ fn render_tasks(f: &mut Frame, area: Rect, model: &Model, app: &App) {
         ));
     }
     if rows.is_empty() {
-        lines.push(Line::from("  （此 owner 下沒有任務）"));
+        lines.push(Line::from("  (no tasks in this scope)"));
     }
     f.render_widget(
         Paragraph::new(lines)
@@ -262,10 +270,25 @@ fn render_detail(
     let sel = app.selection(model);
     let mut lines: Vec<Line> = Vec::new();
     match &sel {
-        Sel::None => lines.push(Line::from("（無選中項）")),
-        Sel::Owner(o) => {
-            lines.push(Line::from(format!("owner : {o}")));
-            lines.push(liveness_line("狀態  : ", owner_liveness(live, o)));
+        Sel::None => lines.push(Line::from("(nothing selected)")),
+        // origin DETAIL（題 3）：window 三態＋計數，**不輸出任何 agent 死活
+        // 判斷**——這一欄講的是「這個 origin 標籤指向的 window 現在如何」，
+        // 不是「底下的 agent 還活著嗎」（§11 根因：兩者早就分家了）
+        Sel::Origin(o) => {
+            lines.push(Line::from(format!("origin : {o}")));
+            lines.push(Line::from(format!("window : {}", window_detail(live, o))));
+            lines.push(Line::from(format!(
+                "workers: {}",
+                model
+                    .workers
+                    .iter()
+                    .filter(|w| *o == ALL_SCOPE || origin_label(w) == *o)
+                    .count()
+            )));
+            lines.push(Line::from(format!(
+                "tasks  : {}",
+                crate::model::task_rows(model, o).len()
+            )));
         }
         Sel::Worker(w) => {
             for l in worker_detail(w, live) {
@@ -338,6 +361,10 @@ fn blocker_line(b: Blocker) -> Line<'static> {
     ])
 }
 
+/// worker DETAIL（題 3）。`origin :` 與 `state  :` **拆成兩列**：前者講的是
+/// 「這個 worker 是誰在哪裡 spawn 出來的、那個 window 現在如何」，後者講的是
+/// 「這個 worker 自己的 pane 還在不在」。P4.5 之前只有一列，兩件事被壓成一件
+/// ——那正是使用者回饋題 2／5／7 的來源。
 fn worker_detail(w: &ab_core::registry::AgentSnapshot, live: &LiveIndex) -> Vec<Line<'static>> {
     vec![
         Line::from(format!("name   : {}", w.name)),
@@ -354,7 +381,11 @@ fn worker_detail(w: &ab_core::registry::AgentSnapshot, live: &LiveIndex) -> Vec<
             }
         )),
         Line::from(format!("ready  : {}", w.ready)),
-        liveness_line("狀態   : ", pane_liveness(live, &w.pane)),
+        Line::from(format!(
+            "origin : {}",
+            window_detail(live, &origin_label(w))
+        )),
+        liveness_line("state  : ", pane_liveness(live, &w.pane)),
     ]
 }
 
@@ -378,8 +409,8 @@ pub(crate) fn blocker_mark(b: Blocker) -> &'static str {
 fn blocker_word(b: Blocker) -> &'static str {
     match b {
         Blocker::None => "none",
-        Blocker::Prompt => "permission/plan prompt（blocked）",
-        Blocker::Occluded => "occluded（copy-mode：人正在看）",
+        Blocker::Prompt => "permission/plan prompt (blocked)",
+        Blocker::Occluded => "occluded (copy-mode: a human is reading)",
         Blocker::Unknown => "unknown",
     }
 }
@@ -408,7 +439,9 @@ fn render_pager(f: &mut Frame, app: &App) {
         lines.push(Line::from(l.to_string()));
     }
     lines.push(Line::from(""));
-    lines.push(Line::from("j/k（↓↑）捲動 · Esc/q 關閉"));
+    lines.push(Line::from(
+        "j/k (\u{2193}\u{2191}) scroll \u{b7} Esc/q close",
+    ));
     let area = f.area();
     f.render_widget(Clear, area);
     f.render_widget(
@@ -416,7 +449,7 @@ fn render_pager(f: &mut Frame, app: &App) {
             .block(
                 Block::default()
                     .borders(Borders::ALL)
-                    .title("read（唯讀全文）"),
+                    .title("read (read-only, full text)"),
             )
             .scroll((p.scroll as u16, 0)),
         area,
@@ -436,7 +469,7 @@ fn render_info(f: &mut Frame, lines: &[String]) {
         f,
         w,
         h,
-        "worker 摘要（唯讀）",
+        "worker info (read-only)",
         lines.iter().map(|l| Line::from(l.clone())).collect(),
     );
 }
@@ -444,7 +477,7 @@ fn render_info(f: &mut Frame, lines: &[String]) {
 fn render_footer(f: &mut Frame, area: Rect, app: &App) {
     let mut lines = vec![
         Line::from(
-            " Tab/S-Tab/j/k（↓↑）導航 · Enter focus · r read · i 摘要 · c 複製證據 · x cancel · e evict · ? 合法鍵 · q 離開",
+            " Tab/S-Tab/j/k (\u{2193}\u{2191}) navigate \u{b7} Enter focus \u{b7} r read \u{b7} i info \u{b7} c copy evidence \u{b7} x cancel \u{b7} e evict \u{b7} ? keys \u{b7} q quit",
         ),
         Line::from(format!(" [poll 500ms · tmux 2s] {}", app.message)),
     ];
@@ -456,13 +489,13 @@ fn render_footer(f: &mut Frame, area: Rect, app: &App) {
         let hidden = n - shown;
         for (i, w) in app.warnings[n - shown..].iter().enumerate() {
             let text = if i == 0 && hidden > 0 {
-                format!(" ⚠ （另有 {hidden} 則較早的警告）{w}")
+                format!(" \u{26a0} ({hidden} older warning(s) not shown) {w}")
             } else {
                 format!(" ⚠ {w}")
             };
             lines.push(Line::from(text).style(theme::warning_style()));
         }
-        lines.push(Line::from(" （Esc 清除警告）"));
+        lines.push(Line::from(" (Esc clears warnings)"));
     }
     f.render_widget(Paragraph::new(lines), area);
 }
@@ -472,12 +505,12 @@ fn render_footer(f: &mut Frame, area: Rect, app: &App) {
 fn render_confirm(f: &mut Frame, id: &str) {
     let cmd = format!("$ {}", cancel_cmdline(id));
     let lines = vec![
-        Line::from("確認後執行下列等價 CLI："),
+        Line::from("Confirm to run the equivalent CLI:"),
         Line::from(cmd.clone()),
-        Line::from("[y/Enter] 執行 · [n/Esc] 放棄"),
+        Line::from("[y/Enter] run \u{b7} [n/Esc] abort"),
     ];
     let w = (cmd.chars().count() as u16 + 4).max(34);
-    popup(f, w, 5, "取消任務", lines);
+    popup(f, w, 5, "cancel task", lines);
 }
 
 /// `e` 的證據框（§5）。內容由 `action::evict_confirm_lines` 組好，這裡只負責
@@ -495,7 +528,7 @@ fn render_evict_confirm(f: &mut Frame, lines: &[String]) {
         f,
         w,
         h,
-        "evict（派收尾任務後回收）",
+        "evict (wrap-up task, then reclaim)",
         lines.iter().map(|l| Line::from(l.clone())).collect(),
     );
 }
@@ -503,39 +536,45 @@ fn render_evict_confirm(f: &mut Frame, lines: &[String]) {
 fn render_help(f: &mut Frame, model: &Model, app: &App) {
     // `?`＝當前選中項的合法鍵（§3）
     let mut lines = vec![Line::from(
-        "Tab 換欄（S-Tab 反向）· j/k（↓↑）移動 · Esc 清警告 · ? 本頁 · q 離開",
+        "Tab next panel (S-Tab reverse) \u{b7} j/k (\u{2193}\u{2191}) move \u{b7} Esc clear warnings \u{b7} ? this page \u{b7} q quit",
     )];
     match app.panel {
-        Panel::Owners => lines.push(Line::from("owner 列：無列上動作（Enter/x 無效）")),
+        Panel::Origins => lines.push(Line::from(
+            "origin row: no row action here (Enter / x do nothing)",
+        )),
         Panel::Workers => match app.selected_row(model) {
             Some(Row::Worker(_)) => {
                 lines.push(Line::from(
-                    "worker 列：Enter focus 其 pane；e evict（證據框）；x 無效（僅 task 列）",
+                    "worker row: Enter focuses its pane; e evict (evidence box); x is task-rows only",
                 ));
             }
             Some(Row::Task { .. }) => {
                 lines.push(Line::from(
-                    "task 列：Enter focus 所屬 worker；x cancel（單確認）",
+                    "task row: Enter focuses its worker; x cancel (single confirm)",
                 ));
             }
-            None => lines.push(Line::from("（無選中列）")),
+            None => lines.push(Line::from("(no row selected)")),
         },
         Panel::Tasks => match app.selection(model) {
             Sel::Task { task, .. } => {
-                lines.push(Line::from("task 列：r 讀全文 · i 摘要 · c 複製證據"));
+                lines.push(Line::from(
+                    "task row: r read full text \u{b7} i info \u{b7} c copy evidence",
+                ));
                 if crate::model::is_terminal_status(&task.status) {
-                    lines.push(Line::from("終態任務：x 無效（已無可取消的轉換）"));
+                    lines.push(Line::from(
+                        "terminal task: x does nothing (no transition left to cancel)",
+                    ));
                 } else {
-                    lines.push(Line::from("非終態任務：x cancel（單確認）"));
+                    lines.push(Line::from("non-terminal task: x cancel (single confirm)"));
                 }
             }
-            _ => lines.push(Line::from("（無選中列）")),
+            _ => lines.push(Line::from("(no row selected)")),
         },
     }
-    lines.push(Line::from("按任意鍵關閉"));
-    // 寬度要容得下最長那行（worker 列的合法鍵，CJK 雙寬）：popup 不換行，
-    // 截半句等於畫面上沒有那條規則
-    popup(f, 74, 7, "合法鍵（當前選中項）", lines);
+    lines.push(Line::from("press any key to close"));
+    // 寬度要容得下最長那行（worker 列的合法鍵）：popup 雖然會換行，但把一條
+    // 規則折成兩段仍然難讀
+    popup(f, 84, 7, "keys (current selection)", lines);
 }
 
 /// 一列的組裝：語意色由各 Span 自帶，選取狀態是**整列的底樣式**。
@@ -642,7 +681,12 @@ mod tests {
     /// 一個選取列、focus／非 focus 面板各一。純資料，**不碰 tmux 與磁碟**。
     fn fixture() -> (Model, LiveIndex, BlockerIndex, App) {
         let model = Model {
-            owners: vec!["-".to_string(), "s:@1".to_string(), "s:@9".to_string()],
+            origins: vec![
+                ALL_SCOPE.to_string(),
+                "-".to_string(),
+                "s:@1".to_string(),
+                "s:@9".to_string(),
+            ],
             workers: vec![
                 worker("alive-w", "%1", "claude", "s:@1", true),
                 worker("dead-w", "%2", "codex", "s:@1", true),
@@ -663,9 +707,14 @@ mod tests {
         let mut panes = HashMap::new();
         panes.insert("%1".to_string(), vec![("s".to_string(), "@1".to_string())]);
         panes.insert("%5".to_string(), vec![("s".to_string(), "@1".to_string())]);
+        // `@1` 還在（名叫 `main`）、`@9` 不在——origin 標籤的 live／gone 兩態
+        // 都在同一張畫面上驗得到
         let live = LiveIndex {
             panes: Some(panes),
-            windows: Some(vec!["@1".to_string()]),
+            windows: Some(HashMap::from([(
+                "@1".to_string(),
+                vec![("s".to_string(), "main".to_string())],
+            )])),
         };
         let mut bl = HashMap::new();
         bl.insert("%1".to_string(), Blocker::Prompt);
@@ -674,8 +723,8 @@ mod tests {
         let blockers = BlockerIndex { panes: Some(bl) };
 
         let mut app = App::new();
-        app.panel = Panel::Workers; // WORKERS focus、OWNERS 非 focus
-        app.owner_idx = 1; // 選中 owner "s:@1"
+        app.panel = Panel::Workers; // WORKERS focus、ORIGINS 非 focus
+        app.origin_idx = 2; // 選中 origin "s:@1"（0=ALL、1=`-`）
         app.row_idx = 0; // 選中第一列（alive-w，身上帶 blocker）
         // 警告文字刻意用單寬 ASCII：斷言要靠 `find` 逐格比對（見其註解）
         app.warnings.push("WARN-fixture".to_string());
@@ -746,7 +795,7 @@ mod tests {
     }
 
     /// WORKERS／DETAIL 兩欄的 x 起點（120 欄、三欄版面）。
-    const WORKERS_X0: u16 = OWNERS_W;
+    const WORKERS_X0: u16 = ORIGINS_W;
     const DETAIL_X0: u16 = 120 - DETAIL_W;
 
     fn style_in_detail(buf: &Buffer, needle: &str) -> ratatui::style::Style {
@@ -791,16 +840,108 @@ mod tests {
         assert_eq!(style_at(&buf, "delivered").fg, Some(Color::Yellow));
     }
 
-    /// 三態死活各自的色。`Unknown` MUST 與 `Dead` 不同色——它們是不同的事實
-    /// （§5 三態不得壓成兩態），畫面上就要分得出來。
+    /// pane 死活三態各自的色（WORKERS 欄的後綴）。`Unknown` MUST 與 `Dead`
+    /// 不同色——它們是不同的事實（§5 三態不得壓成兩態）。
+    ///
+    /// **ORIGINS 欄不在這條的範圍內**：P4.6 之後那一欄一個 liveness glyph 都
+    /// 沒有（見 `origin_rows_carry_no_liveness_glyph`）。
     #[test]
     fn liveness_glyphs_keep_three_states_apart() {
         let buf = draw();
-        assert_eq!(style_at(&buf, "● s:@1").fg, Some(Color::Green));
-        assert_eq!(style_at(&buf, "✗ s:@9").fg, Some(Color::Red));
-        assert_eq!(style_at(&buf, "? -").fg, Some(Color::DarkGray));
-        // WORKERS 欄的死活後綴同一組色
         assert_eq!(style_at(&buf, "✗dead").fg, Some(Color::Red));
+        // DETAIL 的 pane state 字面。**要指名 `state  :` 那一列**：
+        // `origin :` 那一列也會出現 `live`，而它 y 比較小、且刻意不上色
+        let (x, y) = find_in(&buf, "state  : live", DETAIL_X0, 120);
+        assert_eq!(
+            buf[(x + "state  : ".len() as u16, y)].style().fg,
+            Some(Color::Green)
+        );
+        let dead = draw_with(|a| a.row_idx = ROW_DEAD_W);
+        let (dx, dy) = find_in(&dead, "state  : dead", DETAIL_X0, 120);
+        assert_eq!(
+            dead[(dx + "state  : ".len() as u16, dy)].style().fg,
+            Some(Color::Red)
+        );
+    }
+
+    /// **P4.6 題 2 的核心不變量**：ORIGINS 欄的列上 MUST NOT 有任何 liveness
+    /// glyph。
+    ///
+    /// 理由不是美觀：那個 glyph 判的是 origin 標籤裡那個 window 的死活，而
+    /// window 死活 **不等於** 底下 agent 的死活（§11 根因）。把它畫在 origin
+    /// 列上就是讓一個物理位置替一群 agent 的存活背書。
+    #[test]
+    fn origin_rows_carry_no_liveness_glyph() {
+        let buf = draw();
+        let area = buf.area();
+        for y in 0..area.height {
+            for x in 0..ORIGINS_W {
+                let sym = buf[(x, y)].symbol();
+                assert!(
+                    sym != "●" && sym != "✗",
+                    "ORIGINS 欄 ({x},{y}) 上出現了 liveness glyph「{sym}」"
+                );
+            }
+        }
+    }
+
+    /// P4.6 題 1／題 2 的字面：origin 列 live 顯示 `session:window-name`、
+    /// gone 顯示原 `session:@id (gone)`（**不猜舊名**）、`ALL` 列在最上面。
+    #[test]
+    fn origin_rows_show_window_names_and_gone_marker() {
+        let buf = draw();
+        let (_, y_all) = find_in(&buf, "ALL", 0, ORIGINS_W);
+        let (_, y_live) = find_in(&buf, "s:main", 0, ORIGINS_W);
+        let (_, y_gone) = find_in(&buf, "s:@9 (gone)", 0, ORIGINS_W);
+        assert!(y_all < y_live && y_all < y_gone, "ALL MUST 在最上面一列");
+        // gone 的那一列 MUST NOT 冒出任何 window 名字（fixture 裡只有 `main`）
+        let mut row = String::new();
+        for x in 0..ORIGINS_W {
+            row.push_str(buf[(x, y_gone)].symbol());
+        }
+        assert!(!row.contains("main"), "gone 的 origin 猜了舊名：{row}");
+    }
+
+    /// 題 3：worker DETAIL 的 `origin :` 與 origin DETAIL 的 `window :`／counts。
+    #[test]
+    fn detail_splits_origin_window_from_agent_state() {
+        // worker 列（alive-w，origin s:@1 還活著）
+        let buf = draw();
+        let (x, y) = find_in(&buf, "origin : s:main (@1, live)", DETAIL_X0, 120);
+        assert!(x >= DETAIL_X0 && y > 0);
+        // 同一張 DETAIL 上，agent 自己的 pane 死活是**另一列**
+        find_in(&buf, "state  : live", DETAIL_X0, 120);
+
+        // origin 列（選 s:@9＝window 已消失）：window 三態以文字呈現，
+        // 並帶 worker／task 計數；**不輸出任何 agent 死活判斷**
+        let buf_o = draw_with(|a| {
+            a.panel = Panel::Origins;
+            a.origin_idx = 3; // 0=ALL、1=`-`、2=s:@1、3=s:@9
+        });
+        find_in(&buf_o, "origin : s:@9", DETAIL_X0, 120);
+        find_in(&buf_o, "window : s:@9 (gone)", DETAIL_X0, 120);
+        find_in(&buf_o, "workers: 1", DETAIL_X0, 120);
+        // **negative**：origin 的 DETAIL MUST NOT 出現 agent 死活那一列——
+        // 混進來就等於讓 window 的狀態替底下的 agent 背書（§11 根因）
+        let mut detail = String::new();
+        for y in 0..buf_o.area().height {
+            for x in DETAIL_X0..120 {
+                detail.push_str(buf_o[(x, y)].symbol());
+            }
+        }
+        assert!(
+            !detail.contains("state  :"),
+            "origin DETAIL 混進了 agent 死活列"
+        );
+
+        // ALL 列：沒有 window 可言 → n/a（不是 unknown），計數是全部
+        let buf_all = draw_with(|a| {
+            a.panel = Panel::Origins;
+            a.origin_idx = 0;
+        });
+        find_in(&buf_all, "window : ALL (n/a)", DETAIL_X0, 120);
+        find_in(&buf_all, "workers: 5", DETAIL_X0, 120);
+        find_in(&buf_all, "tasks  : 6", DETAIL_X0, 120);
     }
 
     /// blocker 是 Red＋BOLD；且 **`none` MUST NOT 上色**——把「沒有 blocker」
@@ -860,15 +1001,15 @@ mod tests {
         assert_eq!(s.bg, Some(Color::Blue), "選取列背景");
         assert_ne!(s.fg, s.bg, "cancelled 的 fg 與選取 bg 同色＝字隱形");
 
-        // Unknown liveness 的 owner 列（OWNERS 欄，選中 manual owner "-"）
+        // 選中的 origin 列（ORIGINS 欄）：整列被塗上選取背景，字仍讀得到
         let buf2 = draw_with(|a| {
-            a.panel = Panel::Owners;
-            a.owner_idx = 0; // "-"＝manual，死活 Unknown
+            a.panel = Panel::Origins;
+            a.origin_idx = 1; // "-"＝manual
         });
-        let (gx, gy) = find(&buf2, "? -");
+        let (gx, gy) = find_in(&buf2, "-", 0, ORIGINS_W);
         let g = buf2[(gx, gy)].style();
         assert_eq!(g.bg, Some(Color::Blue));
-        assert_ne!(g.fg, g.bg, "Unknown glyph 的 fg 與選取 bg 同色＝glyph 隱形");
+        assert_ne!(g.fg, g.bg, "origin 列的 fg 與選取 bg 同色＝字隱形");
     }
 
     /// 非 focus 面板的**標題**不得被邊框的 DarkGray 一起壓暗（審查 minor #2）：
@@ -876,8 +1017,8 @@ mod tests {
     #[test]
     fn unfocused_panel_title_is_not_dimmed_with_its_border() {
         let buf = draw();
-        // OWNERS 非 focus：邊框 DarkGray，但標題不該是
-        let (x, y) = find(&buf, "OWNERS");
+        // ORIGINS 非 focus：邊框 DarkGray，但標題不該是
+        let (x, y) = find(&buf, "ORIGINS");
         assert_ne!(
             buf[(x, y)].style().fg,
             Some(Color::DarkGray),
@@ -890,12 +1031,12 @@ mod tests {
     #[test]
     fn focused_panel_is_distinguishable_from_the_rest() {
         let buf = draw();
-        // OWNERS 非 focus：左上角是細框且邊框色 DarkGray
-        let owners_corner = &buf[(0, 0)];
-        assert_eq!(owners_corner.symbol(), "┌");
-        assert_eq!(owners_corner.style().fg, Some(Color::DarkGray));
+        // ORIGINS 非 focus：左上角是細框且邊框色 DarkGray
+        let origins_corner = &buf[(0, 0)];
+        assert_eq!(origins_corner.symbol(), "┌");
+        assert_eq!(origins_corner.style().fg, Some(Color::DarkGray));
         // WORKERS focus：左上角是粗框且帶 BOLD
-        let workers_corner = &buf[(OWNERS_W, 0)];
+        let workers_corner = &buf[(ORIGINS_W, 0)];
         assert_eq!(workers_corner.symbol(), "┏");
         assert!(workers_corner.style().add_modifier.contains(Modifier::BOLD));
     }
@@ -945,9 +1086,15 @@ mod tests {
             // 它有沒有被畫出來）
             assert!(t.contains(w), "畫面上少了權威字「{w}」");
         }
-        for g in ["●", "✗", "⛔"] {
+        // `●` 已隨 P4.6 的 origin 列一起退場（window 死活不再冒充 agent
+        // 死活）；留下的兩個都是 **worker 自己那一軸** 的標記
+        for g in ["✗", "⛔"] {
             assert!(t.contains(g), "畫面上少了 glyph「{g}」");
         }
+        assert!(
+            !t.contains("●"),
+            "origin 列的 liveness glyph MUST 已退場（P4.6 題 2）"
+        );
         // `blocked` 不是 task 狀態字（它是 BLOCKER 軸的字面）：theme MUST NOT
         // 認得它，否則等於承認了一個不存在的 task 狀態（tui-design.md §2）
         assert_eq!(
@@ -955,5 +1102,105 @@ mod tests {
             ratatui::style::Style::default(),
             "blocked 不是 task 狀態字，MUST NOT 有 status 對映色"
         );
+    }
+
+    /// CJK 判定（含全形標點與全形括號——「（）」「：」正是最容易漏掉的一批）。
+    fn is_cjk(c: char) -> bool {
+        matches!(c as u32,
+            0x3000..=0x303F      // CJK 標點（　、。〈〉…）
+            | 0x3040..=0x30FF    // 假名
+            | 0x3400..=0x4DBF    // 擴充 A
+            | 0x4E00..=0x9FFF    // 統一漢字
+            | 0xF900..=0xFAFF    // 相容漢字
+            | 0xFF00..=0xFFEF) // 全形／半形形式（（）：·…）
+    }
+
+    fn assert_no_cjk(buf: &Buffer, what: &str) {
+        for (i, c) in text(buf).chars().enumerate() {
+            assert!(
+                !is_cjk(c),
+                "{what}：chrome 上出現 CJK 字元「{c}」（第 {i} 個字元）"
+            );
+        }
+    }
+
+    /// **P4.6 題 9 的機器 gate**：所有 chrome 一次改完，不留半套。
+    ///
+    /// 逐畫面掃過每一個 overlay（dashboard／`?`／`x` 確認框／`e` 證據框／
+    /// `i` 摘要頁），斷言 buffer 上一個 CJK 字元都沒有。留半套的話——譬如
+    /// footer 譯了、`?` 頁沒譯——這條就會紅。
+    #[test]
+    fn every_chrome_surface_is_english_only() {
+        assert_no_cjk(&draw(), "dashboard");
+        assert_no_cjk(&draw_with(|a| a.help = true), "? keys page");
+        assert_no_cjk(
+            &draw_with(|a| a.confirm = Some("20260801T000000Z-aaaa".into())),
+            "cancel confirm",
+        );
+        let mut req = ab_core::evict::EvictRequest::new("alive-w");
+        req.expect_pane = Some("%1".to_string());
+        req.expect_generation = Some("t1".to_string());
+        assert_no_cjk(
+            &draw_with(|a| {
+                a.evict_prompt = Some(crate::action::EvictPrompt {
+                    shown: crate::action::EvictShown {
+                        name: "alive-w".into(),
+                        pane: "%1".into(),
+                        spawn_tag: "t1".into(),
+                    },
+                    lines: crate::action::evict_confirm_lines(&req),
+                });
+            }),
+            "evict evidence box",
+        );
+        // `i` 摘要頁：內容由 action 層組好（那一層也在題 9 的範圍內）
+        let (model, live, blockers, _) = fixture();
+        assert_no_cjk(
+            &draw_with(|a| {
+                a.info = Some(crate::action::info_page(
+                    &model, &live, &blockers, "alive-w",
+                ));
+            }),
+            "worker info page",
+        );
+        // 空清單 placeholder（沒有 worker／task 的 scope）也是 chrome
+        assert_no_cjk(
+            &draw_with(|a| {
+                a.panel = Panel::Origins;
+                a.origin_idx = 1; // `-`＝manual，fixture 底下沒有任務
+            }),
+            "empty-scope placeholders",
+        );
+    }
+
+    /// **反向那一半**：payload 原文 MUST NOT 被譯。
+    ///
+    /// pager 顯示的是 task 回覆的原始 bytes；上一條若寫成「整個畫面都不准有
+    /// CJK」，最省事的過關方式就是把 payload 也濾掉——那會是資料損毀，不是
+    /// 本地化。故這裡刻意餵一段中文 payload，要求它逐字出現在畫面上。
+    #[test]
+    fn payload_text_is_never_translated_or_stripped() {
+        let payload = "收尾筆記：這段是 payload 原文";
+        let buf = draw_with(|a| {
+            a.pager = Some(crate::app::Pager {
+                id: "20260801T000000Z-aaaa".into(),
+                from: "boss".into(),
+                to: "alive-w".into(),
+                bytes: payload.as_bytes().to_vec(),
+                scroll: 0,
+            });
+        });
+        // 雙寬字元在 buffer 裡佔兩格（第二格是 reset 出來的空白），逐格拼字串
+        // 對不上——所以逐字檢查「這個字有沒有被畫成某一格」
+        let rendered = text(&buf);
+        for c in payload.chars().filter(|c| !c.is_whitespace()) {
+            assert!(
+                rendered.contains(c),
+                "payload 原文少了「{c}」（MUST 逐字留在畫面上）"
+            );
+        }
+        // 同一張畫面上，pager 自己的 chrome（標題、捲動提示）仍是英文
+        find(&buf, "read (read-only, full text)");
+        find(&buf, "Esc/q close");
     }
 }
