@@ -4878,6 +4878,38 @@ assert "41h Tab → ORIGINS（marker 落在 origin 列，無 liveness glyph）" 
 tmx send-keys -t "$TUI41" Tab
 assert "41h Tab → WORKERS（循環回到起點）" wait_for 10 ui41_matches "▶ ▸ tuiw41"
 
+# 41j Enter matrix（P4.6 切片 B）：**WORKERS 的內嵌 task 列 Enter＝read**，
+# 不再 focus 所屬 worker。WORKERS 欄只列 in-flight，這裡唯一的內嵌任務是
+# queued 的 $T41Q——讀不動，於是同一條斷言同時證明兩件事：走的是 read 那條
+# 路，且拒絕由 core 權威回答（不造旁路）。
+#
+# 先按 x 在 footer 種一個哨兵訊息：41g 早就讓「尚未回覆」留在 footer 上了，
+# 不換掉的話 Enter 什麼都不做也會綠
+tmx send-keys -t "$TUI41" x
+assert "41j 前置：footer 上是哨兵訊息（x 對 worker 列無效）" \
+  wait_for 10 ui41_shows "x only acts on task rows"
+tmx send-keys -t "$TUI41" j
+tmx send-keys -t "$TUI41" Enter
+assert "41j WORKERS task 列 Enter＝read（core 的拒絕訊息逐字進 footer）" \
+  wait_for 10 ui41_shows "尚未回覆"
+assert "41j Enter 確實動了（哨兵訊息已被換掉）" ui41_lacks "x only acts on task rows"
+assert "41j task 列的 Enter MUST NOT focus 它的 worker" ui41_lacks "focused 'tuiw41'"
+assert "41j 被拒時不開 overlay（dashboard 仍在）" ui41_shows "DETAIL"
+
+# 41k ORIGINS 列 Enter：焦點切 WORKERS 並選該 scope 的第一個 worker
+# （此刻選取還停在上面那個 task 列，所以 `▶ ▸ tuiw41` 是真的被移回來的）
+tmx send-keys -t "$TUI41" BTab
+assert "41k 前置：BTab 回到 ORIGINS" \
+  wait_for 10 ui41_matches "▶ ▸ $SESS41:$WIN41NAME"
+tmx send-keys -t "$TUI41" Enter
+assert "41k ORIGINS Enter → 焦點切 WORKERS 且選中第一個 worker" \
+  wait_for 10 ui41_matches "▶ ▸ tuiw41"
+
+# 41l contextual footer（P4.6 切片 B）：第一段只列當前列有效的鍵、第二段全域
+assert "41l footer 第一段隨選中列（worker 列＝focus pane）" ui41_shows "Enter focus pane"
+assert "41l worker 列上 MUST NOT 列出 x（它只對 task 列有效）" ui41_lacks "x cancel"
+assert "41l footer 第二段是全域鍵" ui41_shows "? keys"
+
 # 41i 退出：termios 逐字還原、tmux 世界不變
 tmx send-keys -t "$TUI41" q
 assert "41i q 退出：離開 alternate screen（主畫面哨兵行回來）" \

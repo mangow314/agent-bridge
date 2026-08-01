@@ -142,7 +142,7 @@ fn event_loop(
                     };
                     // 取消結果下一幀就要看得到
                     model = Model::load(paths);
-                    app.clamp(&model);
+                    app.relocate(&model);
                     last_disk = Instant::now();
                 }
                 // `r`：成功開全螢幕 pager（保留原始 bytes，render 才 lossy）；
@@ -194,7 +194,7 @@ fn event_loop(
                     app.evict_inflight.remove(&name);
                     // 回收結果下一幀就要看得到（registry／task 都動過了）
                     model = Model::load(paths);
-                    app.clamp(&model);
+                    app.relocate(&model);
                     last_disk = Instant::now();
                 }
             }
@@ -260,7 +260,7 @@ fn event_loop(
 
         if last_disk.elapsed() >= DISK_POLL {
             model = Model::load(paths);
-            app.clamp(&model);
+            app.relocate(&model);
             app.apply_origin(&model);
             last_disk = Instant::now();
         }

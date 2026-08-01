@@ -15,7 +15,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
 
 use crate::action::{cancel_cmdline, evidence};
-use crate::app::{App, Panel, Sel};
+use crate::app::{App, EnterAct, Panel, Sel};
 use crate::model::{
     ALL_SCOPE, Blocker, BlockerIndex, LiveIndex, Liveness, Model, Row, origin_label,
     origin_row_label, pane_liveness, window_detail,
@@ -54,8 +54,9 @@ pub fn render(f: &mut Frame, model: &Model, live: &LiveIndex, blockers: &Blocker
     } else {
         app.warnings.len().min(WARN_ROWS) as u16 + 1
     };
+    // footer 三行：當前列的鍵、全域鍵、輪詢狀態＋message（P4.6 切片 B）
     let [main, footer] =
-        Layout::vertical([Constraint::Min(3), Constraint::Length(2 + warn_rows)]).areas(f.area());
+        Layout::vertical([Constraint::Min(3), Constraint::Length(3 + warn_rows)]).areas(f.area());
     // §2 版面：三欄＋中欄縱切。兩條硬不變量同時要守——中欄那 21 字元的
     // immutable task id MUST 永不截斷（它是 dashboard 全部「證據」語意的
     // 承重點，§2／§5），而 DETAIL 的等價 CLI 原文 MUST 完整留在畫面上
@@ -87,7 +88,7 @@ pub fn render(f: &mut Frame, model: &Model, live: &LiveIndex, blockers: &Blocker
     render_workers(f, workers_area, model, live, blockers, app);
     render_tasks(f, tasks_area, model, app);
     render_detail(f, detail_area, model, live, blockers, app);
-    render_footer(f, footer, app);
+    render_footer(f, footer, model, app);
 
     // overlay 優先序：確認框（cancel／evict）> 全文 pager > 摘要頁 > 合法鍵
     if let Some(id) = &app.confirm {
@@ -474,11 +475,58 @@ fn render_info(f: &mut Frame, lines: &[String]) {
     );
 }
 
-fn render_footer(f: &mut Frame, area: Rect, app: &App) {
+/// 全域鍵（與選中列無關的那一段）。`?` 頁與 footer 共用同一份字面。
+const GLOBAL_KEYS: &str = "Tab/S-Tab panes \u{b7} j/k (\u{2193}\u{2191}) move \u{b7} Esc clear warnings \u{b7} ? keys \u{b7} q quit";
+
+/// **當前選中列**有效的鍵（P4.6 切片 B 的 contextual footer）。
+///
+/// 為什麼要 contextual：舊 footer 把七個鍵一次列出來，其中大半在當下那一列是
+/// 無效的——人照著按，換來的是一行「x only acts on task rows」。列出來的鍵
+/// MUST 是按下去真的會動的鍵。
+///
+/// footer 第一段與 `?` 頁的「current row」區共用這一份正本：分成兩份寫，改鍵
+/// 位時一定有一邊漂掉。
+///
+/// **判定不在這裡**：能不能按由 `app::row_caps` 說了算，而 `dispatch_key` 讀
+/// 的是同一份 caps（審查 minor：提示與可用性脫鉤時，畫面會說一個按下去只會
+/// 回拒絕訊息的鍵）。這裡只負責把 caps 翻成字。
+fn row_keys(model: &Model, app: &App) -> String {
+    let caps = crate::app::row_caps(app, model);
+    let mut parts: Vec<&str> = Vec::new();
+    match caps.enter {
+        EnterAct::OpenScope => parts.push("Enter open this scope in WORKERS"),
+        EnterAct::Focus => parts.push("Enter focus pane"),
+        // `r` 是 Enter 的 alias（同一條路徑），一段字講完兩個鍵
+        EnterAct::Read => parts.push("Enter/r read full text"),
+        EnterAct::None => {}
+    }
+    if caps.info {
+        parts.push("i info");
+    }
+    if caps.copy {
+        parts.push("c copy evidence");
+    }
+    if caps.cancel {
+        parts.push("x cancel");
+    }
+    if caps.evict {
+        parts.push("e evict");
+    }
+    if !parts.is_empty() {
+        return parts.join(" \u{b7} ");
+    }
+    // 一個鍵都沒有：選著一列（如空 scope 的 origin 列）與根本沒選中列是兩件
+    // 不同的事，說法要分開——後者人得先按 j／k
+    match app.selection(model) {
+        Sel::None => "(no row selected)".to_string(),
+        _ => "(no keys act on this row)".to_string(),
+    }
+}
+
+fn render_footer(f: &mut Frame, area: Rect, model: &Model, app: &App) {
     let mut lines = vec![
-        Line::from(
-            " Tab/S-Tab/j/k (\u{2193}\u{2191}) navigate \u{b7} Enter focus \u{b7} r read \u{b7} i info \u{b7} c copy evidence \u{b7} x cancel \u{b7} e evict \u{b7} ? keys \u{b7} q quit",
-        ),
+        Line::from(format!(" {}", row_keys(model, app))),
+        Line::from(format!(" {GLOBAL_KEYS}")),
         Line::from(format!(" [poll 500ms · tmux 2s] {}", app.message)),
     ];
     // sticky 警告（最新的在最下面，人的視線落點）。畫得下幾則就畫幾則，
@@ -533,48 +581,49 @@ fn render_evict_confirm(f: &mut Frame, lines: &[String]) {
     );
 }
 
+/// `?` 頁：**兩區**——全域鍵一區、當前選中列一區（P4.6 切片 B）。
+///
+/// 分區的理由與 contextual footer 同一條：混成一張平表時，人分不出哪些鍵此刻
+/// 按得動。第二區與 footer 第一段共用 `row_keys`，其後再補一行「為什麼某個鍵
+/// 不在上面」的說明——那是 footer 一行塞不下、但人真的會問的東西。
 fn render_help(f: &mut Frame, model: &Model, app: &App) {
-    // `?`＝當前選中項的合法鍵（§3）
-    let mut lines = vec![Line::from(
-        "Tab next panel (S-Tab reverse) \u{b7} j/k (\u{2193}\u{2191}) move \u{b7} Esc clear warnings \u{b7} ? this page \u{b7} q quit",
-    )];
-    match app.panel {
-        Panel::Origins => lines.push(Line::from(
-            "origin row: no row action here (Enter / x do nothing)",
+    let mut lines = vec![
+        Line::from("global:"),
+        Line::from(format!("  {GLOBAL_KEYS}")),
+        Line::from(""),
+        Line::from("current row:"),
+        Line::from(format!("  {}", row_keys(model, app))),
+    ];
+    match app.selection(model) {
+        Sel::Origin(_) => lines.push(Line::from(
+            "  origin rows carry no evidence: r / i / c / x / e do nothing here",
         )),
-        Panel::Workers => match app.selected_row(model) {
-            Some(Row::Worker(_)) => {
+        Sel::Worker(_) => lines.push(Line::from(
+            "  x is task-rows only (cancel needs a unique task id)",
+        )),
+        Sel::Task { task, .. } => {
+            if crate::model::is_terminal_status(&task.status) {
                 lines.push(Line::from(
-                    "worker row: Enter focuses its pane; e evict (evidence box); x is task-rows only",
+                    "  terminal task: x does nothing (no transition left to cancel)",
+                ));
+            } else {
+                lines.push(Line::from(
+                    "  non-terminal task: read is refused until it is answered",
                 ));
             }
-            Some(Row::Task { .. }) => {
-                lines.push(Line::from(
-                    "task row: Enter focuses its worker; x cancel (single confirm)",
-                ));
-            }
-            None => lines.push(Line::from("(no row selected)")),
-        },
-        Panel::Tasks => match app.selection(model) {
-            Sel::Task { task, .. } => {
-                lines.push(Line::from(
-                    "task row: r read full text \u{b7} i info \u{b7} c copy evidence",
-                ));
-                if crate::model::is_terminal_status(&task.status) {
-                    lines.push(Line::from(
-                        "terminal task: x does nothing (no transition left to cancel)",
-                    ));
-                } else {
-                    lines.push(Line::from("non-terminal task: x cancel (single confirm)"));
-                }
-            }
-            _ => lines.push(Line::from("(no row selected)")),
-        },
+        }
+        Sel::None => {}
     }
+    lines.push(Line::from(""));
     lines.push(Line::from("press any key to close"));
-    // 寬度要容得下最長那行（worker 列的合法鍵）：popup 雖然會換行，但把一條
-    // 規則折成兩段仍然難讀
-    popup(f, 84, 7, "keys (current selection)", lines);
+    // 寬度要容得下最長那行：popup 雖然會換行，但把一條規則折成兩段仍然難讀
+    popup(
+        f,
+        84,
+        lines.len() as u16 + 2,
+        "keys (current selection)",
+        lines,
+    );
 }
 
 /// 一列的組裝：語意色由各 Span 自帶，選取狀態是**整列的底樣式**。
@@ -746,8 +795,14 @@ mod tests {
     /// 把選取移過去才驗得到——固定 selection 的單一 `draw()` 驗不出來
     /// （審查 minor #3：原本的測試名說驗了 none，實際一條斷言都沒有）。
     fn draw_with(tweak: impl FnOnce(&mut App)) -> Buffer {
-        let (model, live, blockers, mut app) = fixture();
-        tweak(&mut app);
+        draw_model_with(|_, app| tweak(app))
+    }
+
+    /// 連 read model 一起改的版本：空 scope、收件人已不在 registry 的 task
+    /// 這類形狀，`fixture()` 造不出來（它刻意是一份「什麼都正常」的畫面）。
+    fn draw_model_with(tweak: impl FnOnce(&mut Model, &mut App)) -> Buffer {
+        let (mut model, live, blockers, mut app) = fixture();
+        tweak(&mut model, &mut app);
         let mut t = Terminal::new(TestBackend::new(120, 40)).unwrap();
         t.draw(|f| render(f, &model, &live, &blockers, &app))
             .unwrap();
@@ -1102,6 +1157,128 @@ mod tests {
             ratatui::style::Style::default(),
             "blocked 不是 task 狀態字，MUST NOT 有 status 對映色"
         );
+    }
+
+    /// **contextual footer**（P4.6 切片 B）：第一段只列當前選中列按得動的鍵。
+    /// 三種列型各一條斷言，且每一條都要驗「別的列型的鍵不在上面」——只驗
+    /// 「有出現」的話，把三種都印出來的舊 footer 照樣全綠。
+    #[test]
+    fn footer_lists_only_the_keys_valid_for_the_selected_row() {
+        // worker 列（fixture 預設選取）：focus／evict 在，cancel 不在
+        let t = text(&draw());
+        assert!(t.contains("Enter focus pane"), "worker 列缺 focus 鍵");
+        assert!(t.contains("e evict"));
+        assert!(
+            !t.contains("x cancel"),
+            "worker 列 MUST NOT 列出 x（它只對 task 列有效）"
+        );
+
+        // WORKERS 的內嵌 task 列（第 1 列＝alive-w 的 running 任務，非終態）
+        let t = text(&draw_with(|a| a.row_idx = 1));
+        assert!(t.contains("Enter/r read full text"), "task 列缺 read 鍵");
+        assert!(t.contains("x cancel"), "非終態 task 列 MUST 列出 x");
+        assert!(
+            !t.contains("e evict"),
+            "task 列 MUST NOT 列出 e（evict 只對 worker 列有效）"
+        );
+
+        // origin 列
+        let t = text(&draw_with(|a| a.panel = Panel::Origins));
+        assert!(t.contains("Enter open this scope in WORKERS"));
+        assert!(!t.contains("c copy evidence"), "origin 列沒有證據可複製");
+
+        // 全域鍵是**第二段**，三種列型下都在
+        for buf in [
+            draw(),
+            draw_with(|a| a.row_idx = 1),
+            draw_with(|a| a.panel = Panel::Origins),
+        ] {
+            assert!(text(&buf).contains("? keys \u{b7} q quit"), "全域段不見了");
+        }
+    }
+
+    /// 終態 task 列不得列出 `x`：列出來等於承諾一個做不到的動作
+    /// （按下去只會換來一行「already terminal」）。
+    #[test]
+    fn footer_hides_cancel_on_terminal_tasks() {
+        // TASKS 欄第 1 列＝20260801T000001Z-bbbb（failed＝終態）
+        let t = text(&draw_with(|a| {
+            a.panel = Panel::Tasks;
+            a.task_idx = 1;
+        }));
+        assert!(t.contains("Enter/r read full text"));
+        assert!(!t.contains("x cancel"), "終態 task 列 MUST NOT 列出 x");
+    }
+
+    /// **審查 minor 的 regression（a）**：空 scope 的 origin 列上 Enter 其實
+    /// 不做事（dispatch 停在原地），footer MUST NOT 還提示它。
+    #[test]
+    fn footer_drops_the_enter_hint_on_an_empty_scope() {
+        // 正向對照：有 worker 的 origin 列照樣提示
+        let t = text(&draw_with(|a| a.panel = Panel::Origins));
+        assert!(t.contains("Enter open this scope in WORKERS"));
+
+        // 一個底下沒有 worker 的 origin
+        let t = text(&draw_model_with(|m, a| {
+            m.origins.push("empty:@7".to_string());
+            a.panel = Panel::Origins;
+            a.origin_idx = m.origins.len() - 1;
+        }));
+        assert!(
+            !t.contains("Enter open this scope in WORKERS"),
+            "空 scope MUST NOT 提示一個按下去不做事的 Enter"
+        );
+        assert!(
+            t.contains("(no keys act on this row)"),
+            "要說明這一列沒有鍵"
+        );
+        assert!(
+            t.contains("(no workers in this scope)"),
+            "空清單 placeholder 仍在"
+        );
+    }
+
+    /// **審查 minor 的 regression（b）**：收件人已不在 registry 的 task 列
+    /// （只有 `ALL` 看得到）按 `i` 其實沒有摘要可看，footer MUST NOT 提示它。
+    #[test]
+    fn footer_drops_the_info_hint_when_the_recipient_is_gone() {
+        let t = text(&draw_model_with(|m, a| {
+            m.recent
+                .insert(0, task("20260801T000009Z-9999", "vanished-w", "completed"));
+            a.panel = Panel::Tasks;
+            a.origin_idx = 0; // ALL：收件人不在 registry 的任務也留著
+            a.task_idx = 0;
+        }));
+        assert!(t.contains("Enter/r read full text"), "全文仍讀得到");
+        assert!(t.contains("c copy evidence"), "證據仍複製得到");
+        assert!(
+            !t.contains("i info"),
+            "收件人已不在 registry：MUST NOT 提示 i"
+        );
+
+        // 正向對照：收件人還在的 task 列照樣提示 i
+        let t = text(&draw_with(|a| {
+            a.panel = Panel::Tasks;
+            a.task_idx = 0;
+        }));
+        assert!(t.contains("i info"));
+    }
+
+    /// `?` 頁擴成兩區：全域鍵一區、當前列一區（第二區與 footer 同一份正本）。
+    #[test]
+    fn help_page_has_a_global_zone_and_a_current_row_zone() {
+        let t = text(&draw_with(|a| a.help = true));
+        assert!(t.contains("global:"), "`?` 頁缺全域區");
+        assert!(t.contains("current row:"), "`?` 頁缺當前列區");
+        assert!(t.contains("Tab/S-Tab panes"), "全域區缺換欄鍵");
+        assert!(t.contains("Enter focus pane"), "當前列區缺該列的鍵");
+        // 兩區的內容隨選中列換（origin 列上不該還印 worker 列那一套）
+        let t = text(&draw_with(|a| {
+            a.panel = Panel::Origins;
+            a.help = true;
+        }));
+        assert!(t.contains("Enter open this scope in WORKERS"));
+        assert!(!t.contains("Enter focus pane"));
     }
 
     /// CJK 判定（含全形標點與全形括號——「（）」「：」正是最容易漏掉的一批）。

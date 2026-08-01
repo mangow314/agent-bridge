@@ -442,6 +442,31 @@ pub enum Row {
     Task { worker: usize, task: usize },
 }
 
+/// WORKERS 欄一列的 **stable key**（P4.6 切片 B）：selection 存的是「選了誰」
+/// 而不是「選了第幾列」。列序每 500ms 都可能變（別人在你上面插了一列、你選的
+/// 那一列消失），純索引在那一刻會靜默指到另一個對象身上——而畫面上的
+/// DETAIL、`x`／`e` 的目標全都跟著它走。
+///
+/// worker 用 `(name, spawn_tag)` 而不是只用名字：同名 respawn 是**新的一代**
+/// （世代正是 evict CAS 的比對軸，§5），選取 MUST NOT 無聲接續到新代身上。
+/// task 用 immutable task id。
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum RowKey {
+    Worker { name: String, spawn_tag: String },
+    Task(String),
+}
+
+/// 列 → 身分（stable key）。
+pub fn row_key(model: &Model, row: Row) -> RowKey {
+    match row {
+        Row::Worker(wi) => RowKey::Worker {
+            name: model.workers[wi].name.clone(),
+            spawn_tag: model.workers[wi].spawn_tag.clone(),
+        },
+        Row::Task { task, .. } => RowKey::Task(model.tasks[task].id.clone()),
+    }
+}
+
 /// 選中的 ORIGINS 列是否為 synthetic `ALL`（＝不過濾）。
 fn in_scope(scope: &str, w: &AgentSnapshot) -> bool {
     scope == ALL_SCOPE || origin_label(w) == scope
