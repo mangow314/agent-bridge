@@ -7,10 +7,36 @@ use ab_core::paths::Paths;
 use ab_core::spawn::DespawnResult;
 use ab_core::tmux::TmuxClient;
 
-use crate::app::Sel;
+use crate::app::{Pager, Sel};
 use crate::model::{
     Blocker, BlockerIndex, FocusPlan, LiveIndex, Liveness, Model, focus_plan, pane_liveness,
 };
+
+/// `r` 的全螢幕 pager 攤平成的**完整內容列**（標頭＋內文＋鍵位提示）。
+///
+/// 為什麼組在這裡而不是 render 裡（同 `info_page`／`evict_confirm_lines` 的
+/// 位置）：捲動上界要知道總列數，render 各算一份的話，兩邊遲早漂移——而漂移
+/// 的症狀是「End 之後畫面上多／少一截空白」這種沒人會回報的小錯。
+///
+/// bytes → 字串的 lossy 轉換**只在這裡**做一次（action 層一律保留原始 bytes，
+/// gate (b) 比的就是 bytes）。
+pub fn pager_lines(p: &Pager) -> Vec<String> {
+    let text = String::from_utf8_lossy(&p.bytes).into_owned();
+    let mut lines = vec![
+        format!("task-id: {}", p.id),
+        format!("from: {}", p.from),
+        format!("to: {}", p.to),
+        "\u{2500}".repeat(8),
+    ];
+    lines.extend(text.lines().map(|l| l.to_string()));
+    lines.push(String::new());
+    // chrome 全英文（`every_chrome_surface_is_english_only` 掃得到這一行）
+    lines.push(
+        "j/k (\u{2193}\u{2191}) scroll \u{b7} PgUp/PgDn page \u{b7} Home/End ends \u{b7} Esc/q close"
+            .to_string(),
+    );
+    lines
+}
 
 /// `x` 的等價 CLI 原文（確認框 MUST 逐字顯示，§2 薄殼原則）。
 pub fn cancel_cmdline(id: &str) -> String {

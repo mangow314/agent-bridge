@@ -9,16 +9,20 @@
 //! 確認框、pager 標題、`?` 頁。**不譯的東西**：payload 原文、agent 名、
 //! 權威 status 字、CLI 命令原文——那些不是 chrome，是證據。
 
+use std::time::Duration;
+
 use ratatui::Frame;
-use ratatui::layout::{Constraint, Layout, Rect};
+use ratatui::layout::{Constraint, Layout, Margin, Rect};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
+use ratatui::widgets::{
+    Block, Borders, Clear, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState, Wrap,
+};
 
 use crate::action::{cancel_cmdline, evidence};
 use crate::app::{App, EnterAct, Panel, Sel};
 use crate::model::{
-    ALL_SCOPE, Blocker, BlockerIndex, LiveIndex, Liveness, Model, Row, origin_label,
-    origin_row_label, pane_liveness, window_detail,
+    ALL_SCOPE, Blocker, BlockerIndex, DISK_STALE, Freshness, LiveIndex, Liveness, Model, Row,
+    TMUX_STALE, age_is_worth_showing, origin_label, origin_row_label, pane_liveness, window_detail,
 };
 use crate::theme;
 
@@ -44,28 +48,44 @@ const DETAIL_STRIP_H: u16 = 11;
 /// `render_footer`）。
 const WARN_ROWS: usize = 3;
 
-pub fn render(f: &mut Frame, model: &Model, live: &LiveIndex, blockers: &BlockerIndex, app: &App) {
-    // footer 高度隨 sticky 警告伸縮（major #2：警告不得被單行 message 覆寫，
-    // 所以它們需要自己的行）。上限 `WARN_ROWS`，溢位以「另 N 則」帶出，
-    // 不是靜默丟掉
-    // ＋1 是「（Esc 清除警告）」那行——只在有警告時才佔位
-    let warn_rows = if app.warnings.is_empty() {
+/// 版面切分（§2）：三欄＋中欄縱切。**render 與 run loop 共用同一份計算**
+/// ——PgUp／PgDn 的一頁是「該面板的可視高度」，兩邊各算一份就會在窄畫面下
+/// 各說各話（切片 C）。
+struct Areas {
+    origins: Rect,
+    workers: Rect,
+    tasks: Rect,
+    detail: Rect,
+    footer: Rect,
+}
+
+/// footer 高度隨 sticky 警告伸縮（major #2：警告不得被單行 message 覆寫，
+/// 所以它們需要自己的行）。上限 `WARN_ROWS`，溢位以「另 N 則」帶出，
+/// 不是靜默丟掉。＋1 是「（Esc 清除警告）」那行——只在有警告時才佔位。
+fn footer_rows(warnings: usize) -> u16 {
+    // footer 三行：當前列的鍵、全域鍵、輪詢狀態＋message（P4.6 切片 B）
+    3 + if warnings == 0 {
         0
     } else {
-        app.warnings.len().min(WARN_ROWS) as u16 + 1
-    };
-    // footer 三行：當前列的鍵、全域鍵、輪詢狀態＋message（P4.6 切片 B）
-    let [main, footer] =
-        Layout::vertical([Constraint::Min(3), Constraint::Length(3 + warn_rows)]).areas(f.area());
-    // §2 版面：三欄＋中欄縱切。兩條硬不變量同時要守——中欄那 21 字元的
-    // immutable task id MUST 永不截斷（它是 dashboard 全部「證據」語意的
-    // 承重點，§2／§5），而 DETAIL 的等價 CLI 原文 MUST 完整留在畫面上
-    // （薄殼原則，§2：截半條命令等於畫面上沒有那條命令）。
+        warnings.min(WARN_ROWS) as u16 + 1
+    }
+}
+
+fn layout(area: Rect, warnings: usize) -> Areas {
+    let [main, footer] = Layout::vertical([
+        Constraint::Min(3),
+        Constraint::Length(footer_rows(warnings)),
+    ])
+    .areas(area);
+    // 兩條硬不變量同時要守——中欄那 21 字元的 immutable task id MUST 永不截斷
+    // （它是 dashboard 全部「證據」語意的承重點，§2／§5），而 DETAIL 的等價
+    // CLI 原文 MUST 完整留在畫面上（薄殼原則，§2：截半條命令等於畫面上沒有
+    // 那條命令）。
     //
     // 三者相加要 92 欄，80 欄的終端機放不下——**寬度不足時 DETAIL 改走整寬
     // 底條**，而不是壓縮任何一方。80 欄下底條有整整 78 欄，命令原文照樣成行；
     // 犧牲的只是垂直空間，那是列表捲動本來就處理得了的。
-    let (origins_area, mid_area, detail_area) = if main.width >= THREE_COL_MIN_W {
+    let (origins, mid, detail) = if main.width >= THREE_COL_MIN_W {
         let [o, m, d] = Layout::horizontal([
             Constraint::Length(ORIGINS_W),
             Constraint::Min(MID_MIN_W),
@@ -81,14 +101,48 @@ pub fn render(f: &mut Frame, model: &Model, live: &LiveIndex, blockers: &Blocker
                 .areas(top);
         (o, m, d)
     };
-    let [workers_area, tasks_area] =
-        Layout::vertical([Constraint::Percentage(50), Constraint::Percentage(50)]).areas(mid_area);
+    let [workers, tasks] =
+        Layout::vertical([Constraint::Percentage(50), Constraint::Percentage(50)]).areas(mid);
+    Areas {
+        origins,
+        workers,
+        tasks,
+        detail,
+        footer,
+    }
+}
+
+/// 各面板的可視列數（扣掉上下邊框）。run loop 每幀量一次回填給狀態機，
+/// PgUp／PgDn 據此翻一頁（`app::PageSizes`）。
+pub fn panel_heights(area: Rect, warnings: usize) -> crate::app::PageSizes {
+    let a = layout(area, warnings);
+    let inner = |r: Rect| r.height.saturating_sub(2);
+    crate::app::PageSizes {
+        origins: inner(a.origins),
+        workers: inner(a.workers),
+        tasks: inner(a.tasks),
+        // pager 是全螢幕 overlay，不吃三欄版面（上下框各一格）
+        pager: inner(area),
+    }
+}
+
+pub fn render(
+    f: &mut Frame,
+    model: &Model,
+    live: &LiveIndex,
+    blockers: &BlockerIndex,
+    app: &App,
+    fresh: Freshness,
+) {
+    let a = layout(f.area(), app.warnings.len());
+    let (origins_area, workers_area, tasks_area, detail_area, footer) =
+        (a.origins, a.workers, a.tasks, a.detail, a.footer);
 
     render_origins(f, origins_area, model, live, app);
     render_workers(f, workers_area, model, live, blockers, app);
     render_tasks(f, tasks_area, model, app);
     render_detail(f, detail_area, model, live, blockers, app);
-    render_footer(f, footer, model, app);
+    render_footer(f, footer, model, app, fresh);
 
     // overlay 優先序：確認框（cancel／evict）> 全文 pager > 摘要頁 > 合法鍵
     if let Some(id) = &app.confirm {
@@ -250,11 +304,53 @@ fn render_tasks(f: &mut Frame, area: Rect, model: &Model, app: &App) {
     if rows.is_empty() {
         lines.push(Line::from("  (no tasks in this scope)"));
     }
+    // 標題帶 `N/total`（P4.6 切片 C）：沒有它，人看不出自己在第幾筆、也看不出
+    // 底下還有多少。**截斷要說出來**——`RECENT_LIMIT` 之外還有更舊的任務時
+    // 標 `+`，否則畫面等於宣稱「就這些了」。
+    //
+    // **只有 ALL scope 標得出 `+`**（審查 F5）：`recent_truncated` 是**全 pool**
+    // 的旗標，而 `rows` 已依 scope 過濾過。把全域旗標貼到過濾後的數字上，等於
+    // 宣稱「這個 scope 底下還有更舊的」——沒有任何證據支持那件事（最差形狀是
+    // 某 scope 顯示 `TASKS 0/0+`）。被截掉的那些任務可能一筆都不屬於它。
+    let total = rows.len();
+    let pos = if total == 0 { 0 } else { app.task_idx + 1 };
+    let all_scope = app.selected_scope(model) == Some(ALL_SCOPE);
+    let more = if model.recent_truncated && all_scope {
+        "+"
+    } else {
+        ""
+    };
+    let title = format!("TASKS {pos}/{total}{more}");
     f.render_widget(
         Paragraph::new(lines)
-            .block(panel_block("TASKS", focused))
+            .block(panel_block(&title, focused))
             .scroll((scroll_offset(app.task_idx, area), 0)),
         area,
+    );
+    render_scrollbar(f, area, total, app.task_idx);
+}
+
+/// TASKS 欄的捲軸（P4.6 切片 C）。
+///
+/// **只在真的捲得動時才畫**：列數塞得進畫面時畫一條空軌道，等於用一欄寬度說
+/// 一句沒有資訊量的話。thumb 位置由 (選取序位, 總數) 決定——首列在頂、末列在
+/// 底、中段在中，人用它判斷「我在清單的哪裡」。
+///
+/// 樣式走 theme 語意層（P4.5：view 內零個 `Style::` 字面）。
+fn render_scrollbar(f: &mut Frame, area: Rect, total: usize, pos: usize) {
+    let viewport = area.height.saturating_sub(2) as usize;
+    if total <= viewport {
+        return;
+    }
+    let mut state = ScrollbarState::new(total).position(pos);
+    f.render_stateful_widget(
+        Scrollbar::new(ScrollbarOrientation::VerticalRight).style(theme::scrollbar_style()),
+        // 上下各留一格給邊框：軌道畫在框內，不蓋掉面板的上下框線
+        area.inner(Margin {
+            vertical: 1,
+            horizontal: 0,
+        }),
+        &mut state,
     );
 }
 
@@ -429,20 +525,10 @@ fn liveness_word(l: Liveness) -> &'static str {
 /// 保留原始 bytes）。標頭三欄與 CLI 的 stderr 同一組欄位。
 fn render_pager(f: &mut Frame, app: &App) {
     let Some(p) = &app.pager else { return };
-    let text = String::from_utf8_lossy(&p.bytes).into_owned();
-    let mut lines = vec![
-        Line::from(format!("task-id: {}", p.id)),
-        Line::from(format!("from: {}", p.from)),
-        Line::from(format!("to: {}", p.to)),
-        Line::from("────────"),
-    ];
-    for l in text.lines() {
-        lines.push(Line::from(l.to_string()));
-    }
-    lines.push(Line::from(""));
-    lines.push(Line::from(
-        "j/k (\u{2193}\u{2191}) scroll \u{b7} Esc/q close",
-    ));
+    let lines: Vec<Line> = crate::action::pager_lines(p)
+        .into_iter()
+        .map(Line::from)
+        .collect();
     let area = f.area();
     f.render_widget(Clear, area);
     f.render_widget(
@@ -476,7 +562,7 @@ fn render_info(f: &mut Frame, lines: &[String]) {
 }
 
 /// 全域鍵（與選中列無關的那一段）。`?` 頁與 footer 共用同一份字面。
-const GLOBAL_KEYS: &str = "Tab/S-Tab panes \u{b7} j/k (\u{2193}\u{2191}) move \u{b7} Esc clear warnings \u{b7} ? keys \u{b7} q quit";
+const GLOBAL_KEYS: &str = "Tab/S-Tab panes \u{b7} j/k (\u{2193}\u{2191}) move \u{b7} PgUp/PgDn page \u{b7} Home/End ends \u{b7} Esc clear warnings \u{b7} ? keys \u{b7} q quit";
 
 /// **當前選中列**有效的鍵（P4.6 切片 B 的 contextual footer）。
 ///
@@ -523,11 +609,59 @@ fn row_keys(model: &Model, app: &App) -> String {
     }
 }
 
-fn render_footer(f: &mut Frame, area: Rect, model: &Model, app: &App) {
+/// 一軸的新鮮度字樣（P4.6 切片 C）。三段式，**低噪**是刻意的：
+///
+/// - 年輕：只寫節奏（`disk 500ms`），不寫數字。正常態每一幀 age 都在跳，逐秒
+///   顯示會訓練人忽略這個位置，等真的 stale 了也不會注意到。
+/// - 過半程：`disk 2s ago`——開始往 stale 走了，這時的數字才有意義。
+/// - 逾門檻：`disk STALE 12s`，且該軸資料同時降級為 unknown（見 lib.rs）。
+///
+/// 第四種：`age` 是 `None`＝**至今沒有可信的樣本**（tmux 軸專屬，審查 F2）。
+/// 那時說不出任何年紀，寫 `tmux unknown` 並比照 stale 上色——畫面上的死活本來
+/// 就已經是 unknown，footer 不該在那時顯示一個看起來很新的數字。
+///
+/// 回傳字串與是否 stale，呼叫端據此決定要不要上色。
+fn axis_label(
+    name: &str,
+    cadence: &str,
+    age: Option<Duration>,
+    stale_at: Duration,
+) -> (String, bool) {
+    let Some(age) = age else {
+        return (format!("{name} unknown"), true);
+    };
+    let secs = age.as_secs();
+    if age >= stale_at {
+        (format!("{name} STALE {secs}s"), true)
+    } else if age_is_worth_showing(age, stale_at) {
+        (format!("{name} {secs}s ago"), false)
+    } else {
+        (format!("{name} {cadence}"), false)
+    }
+}
+
+fn render_footer(f: &mut Frame, area: Rect, model: &Model, app: &App, fresh: Freshness) {
+    // disk 軸恆有值：`Model::load` 不回錯，但「上次**完成**一輪掃描」永遠說得出
+    // 口（F3：說得出口的只有 completed scan，不是 success）
+    let (disk, disk_stale) = axis_label("disk", "500ms", Some(fresh.disk), DISK_STALE);
+    let (tmux, tmux_stale) = axis_label("tmux", "2s", fresh.tmux, TMUX_STALE);
+    let mut status = vec![Span::raw(" [")];
+    status.push(if disk_stale {
+        Span::styled(disk, theme::stale_style())
+    } else {
+        Span::raw(disk)
+    });
+    status.push(Span::raw(" \u{b7} "));
+    status.push(if tmux_stale {
+        Span::styled(tmux, theme::stale_style())
+    } else {
+        Span::raw(tmux)
+    });
+    status.push(Span::raw(format!("] {}", app.message)));
     let mut lines = vec![
         Line::from(format!(" {}", row_keys(model, app))),
         Line::from(format!(" {GLOBAL_KEYS}")),
-        Line::from(format!(" [poll 500ms · tmux 2s] {}", app.message)),
+        Line::from(status),
     ];
     // sticky 警告（最新的在最下面，人的視線落點）。畫得下幾則就畫幾則，
     // 剩下的以計數帶出——「被覆寫」與「畫面放不下但說得出還有幾則」是兩件事
@@ -614,12 +748,27 @@ fn render_help(f: &mut Frame, model: &Model, app: &App) {
         }
         Sel::None => {}
     }
+    // footer 那兩軸各自證明得了什麼，逐字說清楚（審查 F3）。**兩軸的說法刻意
+    // 不同**：tmux 查詢有明確的失敗訊號，disk 沒有——`Model::load` 讀不到就是
+    // 空快照、單檔損壞逕自跳過，它只證明得了「這一輪掃描跑完了」。把它也寫成
+    // success，UI 就是在宣稱一件它證明不了的事。
+    lines.push(Line::from(""));
+    lines.push(Line::from("freshness (footer):"));
+    lines.push(Line::from(
+        "  disk = age of the last completed scan (a scan can complete with unreadable entries skipped)",
+    ));
+    lines.push(Line::from(
+        "  tmux = age of the last successful query round; unknown = no successful round yet",
+    ));
     lines.push(Line::from(""));
     lines.push(Line::from("press any key to close"));
     // 寬度要容得下最長那行：popup 雖然會換行，但把一條規則折成兩段仍然難讀
+    // 100 而不是 84：全域鍵那一行加入翻頁鍵之後變長（切片 C），窄一點就會被
+    // popup 折成兩段——把一條規則折半仍然難讀。畫面不足 100 欄時 `popup`
+    // 自己會夾回去並改走換行
     popup(
         f,
-        84,
+        100,
         lines.len() as u16 + 2,
         "keys (current selection)",
         lines,
@@ -752,6 +901,7 @@ mod tests {
                 task("20260801T000004Z-eeee", "dead-w", "cancelled"),
                 task("20260801T000005Z-ffff", "alive-w", "delivered"),
             ],
+            recent_truncated: false,
         };
         let mut panes = HashMap::new();
         panes.insert("%1".to_string(), vec![("s".to_string(), "@1".to_string())]);
@@ -764,6 +914,7 @@ mod tests {
                 "@1".to_string(),
                 vec![("s".to_string(), "main".to_string())],
             )])),
+            ..LiveIndex::unknown()
         };
         let mut bl = HashMap::new();
         bl.insert("%1".to_string(), Blocker::Prompt);
@@ -801,10 +952,16 @@ mod tests {
     /// 連 read model 一起改的版本：空 scope、收件人已不在 registry 的 task
     /// 這類形狀，`fixture()` 造不出來（它刻意是一份「什麼都正常」的畫面）。
     fn draw_model_with(tweak: impl FnOnce(&mut Model, &mut App)) -> Buffer {
+        draw_fresh(Freshness::default(), tweak)
+    }
+
+    /// 再加一層：連 freshness 都由呼叫端指定（stale 顯示與降級要驗得到）。
+    /// 預設 `Freshness::default()`＝兩軸都是 0，也就是「剛更新」。
+    fn draw_fresh(fresh: Freshness, tweak: impl FnOnce(&mut Model, &mut App)) -> Buffer {
         let (mut model, live, blockers, mut app) = fixture();
         tweak(&mut model, &mut app);
         let mut t = Terminal::new(TestBackend::new(120, 40)).unwrap();
-        t.draw(|f| render(f, &model, &live, &blockers, &app))
+        t.draw(|f| render(f, &model, &live, &blockers, &app, fresh))
             .unwrap();
         t.backend().buffer().clone()
     }
@@ -1279,6 +1436,245 @@ mod tests {
         }));
         assert!(t.contains("Enter open this scope in WORKERS"));
         assert!(!t.contains("Enter focus pane"));
+    }
+
+    // ---- P4.6 切片 C：scrollbar／N-total／freshness ----
+
+    /// 造一份 n 筆 recent 的模型（TASKS 欄剛好 n 列）。
+    fn with_tasks(n: usize, truncated: bool) -> impl FnOnce(&mut Model, &mut App) {
+        move |m: &mut Model, a: &mut App| {
+            m.recent = (0..n)
+                .map(|i| {
+                    task(
+                        &format!("20260801T0000{i:02}Z-t{i:03}"),
+                        "alive-w",
+                        "completed",
+                    )
+                })
+                .collect();
+            m.recent_truncated = truncated;
+            a.panel = Panel::Tasks;
+            a.origin_idx = 0; // ALL：不過濾，n 列全在
+        }
+    }
+
+    /// TASKS 面板的位置（版面計算與 render 共用同一份 `layout`——fixture 的
+    /// app 帶 1 則警告，footer 高度要跟著算）。
+    fn tasks_area() -> Rect {
+        layout(Rect::new(0, 0, 120, 40), 1).tasks
+    }
+
+    /// 捲軸畫在中欄最右那一欄（TASKS 面板的右框上）。**只掃 TASKS 那幾列**：
+    /// 同一欄在上半部是 WORKERS 面板的右框，掃進去會把邊框當成軌道。
+    fn scrollbar_col(buf: &Buffer, sym: &str) -> Vec<u16> {
+        let a = tasks_area();
+        let x = a.right() - 1;
+        (a.top()..a.bottom())
+            .filter(|&y| buf[(x, y)].symbol() == sym)
+            .collect()
+    }
+
+    fn thumb_y(buf: &Buffer) -> Option<u16> {
+        scrollbar_col(buf, "█").first().copied()
+    }
+
+    /// 捲軸：**只在捲得動時才畫**，thumb 首/中/末各在頂/中/底。
+    #[test]
+    fn tasks_scrollbar_tracks_the_selection_and_only_shows_when_needed() {
+        // 40 列遠多於 TASKS 欄的可視高度
+        let top = thumb_y(&draw_model_with(with_tasks(40, false))).expect("該畫捲軸");
+        let mid = thumb_y(&draw_model_with(|m, a| {
+            with_tasks(40, false)(m, a);
+            a.task_idx = 20;
+        }))
+        .expect("該畫捲軸");
+        let bottom = thumb_y(&draw_model_with(|m, a| {
+            with_tasks(40, false)(m, a);
+            a.task_idx = 39;
+        }))
+        .expect("該畫捲軸");
+        assert!(top < mid, "首列的 thumb 要在中段之上（{top} vs {mid}）");
+        assert!(
+            mid < bottom,
+            "中段的 thumb 要在末列之上（{mid} vs {bottom}）"
+        );
+
+        // 列數塞得下時**一格捲軸都不畫**（空軌道等於用一欄寬度說廢話）
+        let buf = draw_model_with(with_tasks(3, false));
+        assert!(thumb_y(&buf).is_none(), "塞得下時不得畫 thumb");
+        // 連**軌道與端點箭頭**都不得留下（空軌道等於用一欄寬度說廢話）
+        let scrolling = draw_model_with(with_tasks(40, false));
+        for sym in ["║", "▲", "▼"] {
+            assert!(
+                !scrollbar_col(&scrolling, sym).is_empty(),
+                "前提：捲得動時這一欄真的有「{sym}」（否則下一條斷言驗不到東西）"
+            );
+            assert!(
+                scrollbar_col(&buf, sym).is_empty(),
+                "塞得下時不得留下捲軸字元「{sym}」"
+            );
+        }
+    }
+
+    /// `N/total`：隨選取移動而變；被載入上限截斷時**說出來**。
+    #[test]
+    fn tasks_title_shows_position_total_and_truncation() {
+        let t = text(&draw_model_with(with_tasks(6, false)));
+        assert!(t.contains("TASKS 1/6"), "首列＝1/6");
+        let t = text(&draw_model_with(|m, a| {
+            with_tasks(6, false)(m, a);
+            a.task_idx = 3;
+        }));
+        assert!(t.contains("TASKS 4/6"), "序位隨選取走");
+        assert!(!t.contains("TASKS 4/6+"), "沒截斷就不得標 +");
+
+        // 截斷：`+` 表示「還有更舊的沒載入」
+        let t = text(&draw_model_with(with_tasks(6, true)));
+        assert!(
+            t.contains("TASKS 1/6+"),
+            "截斷 MUST 說出來（否則畫面等於宣稱就這些了）"
+        );
+    }
+
+    /// **F5：全域截斷旗標 MUST NOT 貼到 scope 過濾後的標題上。**
+    ///
+    /// `recent_truncated` 說的是「**全 pool**還有更舊的沒載入」，被截掉的那些
+    /// 任務可能一筆都不屬於當前 scope。貼上去等於宣稱一件沒有證據的事——最差
+    /// 形狀是某個 scope 顯示 `TASKS 0/0+`。
+    #[test]
+    fn the_global_truncation_flag_only_shows_in_the_all_scope() {
+        // 同一份「有截斷」的模型，只換 scope：ALL 標 `+`、scoped 不標
+        let t = text(&draw_model_with(|m, a| {
+            with_tasks(6, true)(m, a);
+            a.origin_idx = 1; // 真實 origin（非 ALL）
+        }));
+        assert!(t.contains("TASKS "), "前提：標題畫出來了");
+        assert!(
+            !t.contains('+'),
+            "scoped view MUST NOT 帶全域截斷旗標，實際標題：{}",
+            t.lines()
+                .find(|l| l.contains("TASKS"))
+                .unwrap_or("(找不到)")
+        );
+
+        // 最差形狀：該 scope 一列都沒有——`TASKS 0/0+` 的 `+` 尤其無稽
+        let t = text(&draw_model_with(|m, a| {
+            with_tasks(6, true)(m, a);
+            m.recent = Vec::new(); // 這個 scope 底下沒有任何任務
+            a.origin_idx = 1;
+        }));
+        assert!(t.contains("TASKS 0/0"), "空 scope 的標題");
+        assert!(!t.contains("TASKS 0/0+"), "0/0+ 是最無稽的那一種宣稱");
+    }
+
+    /// 兩軸都有成功樣本的正常態。
+    fn fresh_at(disk: Duration, tmux: Duration) -> Freshness {
+        Freshness {
+            disk,
+            tmux: Some(tmux),
+        }
+    }
+
+    /// freshness：正常態低噪（只寫節奏、不寫數字）；逾門檻標 STALE。
+    #[test]
+    fn footer_shows_freshness_and_marks_stale_axes() {
+        let t = text(&draw_fresh(
+            fresh_at(Duration::ZERO, Duration::ZERO),
+            |_, _| {},
+        ));
+        assert!(t.contains("[disk 500ms · tmux 2s]"), "正常態只寫節奏");
+        assert!(!t.contains("STALE"));
+
+        // tmux 軸逾門檻
+        let t = text(&draw_fresh(
+            fresh_at(Duration::ZERO, Duration::from_secs(30)),
+            |_, _| {},
+        ));
+        assert!(t.contains("tmux STALE 30s"), "逾門檻要標 STALE＋年紀");
+        assert!(t.contains("disk 500ms"), "另一軸不受波及");
+
+        // 過半程但未逾門檻：顯示數字（開始往 stale 走了）
+        let t = text(&draw_fresh(
+            fresh_at(Duration::from_secs(2), Duration::ZERO),
+            |_, _| {},
+        ));
+        assert!(t.contains("disk 2s ago"), "半程之後才顯示數字（低噪）");
+    }
+
+    /// **F2：還沒有任何成功 round 時，footer MUST 說 unknown**——不得顯示
+    /// 一個從啟動時間算出來的年紀，那是替一份根本不存在的樣本背書。
+    #[test]
+    fn footer_says_unknown_before_the_first_successful_tmux_round() {
+        // `Freshness::default()` 就是啟動當下的狀態：tmux 尚無樣本
+        let t = text(&draw_fresh(Freshness::default(), |_, _| {}));
+        assert!(
+            t.contains("tmux unknown"),
+            "沒有成功樣本 MUST 說 unknown，實際 footer：{}",
+            t.lines().find(|l| l.contains("disk")).unwrap_or("(找不到)")
+        );
+        assert!(
+            !t.contains("tmux 2s") && !t.contains("tmux 0s"),
+            "MUST NOT 拿啟動時間冒充新鮮度"
+        );
+        assert!(t.contains("disk 500ms"), "disk 軸不受波及（它確實掃完過）");
+    }
+
+    /// **F3：footer 兩軸的契約逐字說得出口**——disk 只證明得了「上次**完成**
+    /// 一輪掃描」（`Model::load` 不回錯、單檔損壞逕自跳過），MUST NOT 宣稱
+    /// success；tmux 才有明確的失敗訊號。
+    #[test]
+    fn help_states_what_each_freshness_axis_actually_proves() {
+        let t = text(&draw_with(|a| a.help = true));
+        assert!(
+            t.contains("disk = age of the last completed scan"),
+            "disk 軸的說法 MUST 是 completed scan，不得宣稱 success"
+        );
+        assert!(
+            t.contains("tmux = age of the last successful query round"),
+            "tmux 軸有失敗訊號，說得出 successful"
+        );
+        assert!(
+            t.contains("no successful round yet"),
+            "unknown 這個字在 footer 出現時，`?` 頁要說得出它是什麼意思"
+        );
+    }
+
+    /// stale 的 tmux 軸 MUST 降級成 **unknown**——不是續留舊死活，也不是說它
+    /// 死了。降級發生在 run loop（把 unknown 快照交給 render），這裡驗的是
+    /// 「拿到 unknown 快照時畫面說 unknown」這一半。
+    #[test]
+    fn a_stale_tmux_axis_reads_as_unknown_not_as_gone() {
+        let (model, _, _, app) = fixture();
+        let mut t = Terminal::new(TestBackend::new(120, 40)).unwrap();
+        let fresh = fresh_at(Duration::ZERO, Duration::from_secs(30));
+        t.draw(|f| {
+            render(
+                f,
+                &model,
+                &LiveIndex::unknown(),
+                &BlockerIndex::unknown(),
+                &app,
+                fresh,
+            )
+        })
+        .unwrap();
+        let buf = t.backend().buffer().clone();
+        let txt = text(&buf);
+        assert!(txt.contains("tmux STALE"), "footer 要說這一軸已經舊了");
+        // worker 列：unknown 標記在，`✗dead` 不得出現（unknown ≠ gone）
+        assert!(
+            !txt.contains("✗dead"),
+            "unknown MUST NOT 被說成 dead（三態不得壓成兩態）"
+        );
+        assert!(
+            text(&draw()).contains("✗dead"),
+            "正向對照：新鮮快照下 dead 標記本來就在"
+        );
+        // DETAIL 的 agent 死活列也要是 unknown
+        assert!(
+            txt.contains("state  : unknown"),
+            "DETAIL 的死活列要說 unknown"
+        );
     }
 
     /// CJK 判定（含全形標點與全形括號——「（）」「：」正是最容易漏掉的一批）。

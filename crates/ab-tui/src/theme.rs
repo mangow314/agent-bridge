@@ -114,6 +114,21 @@ pub fn panel_title_style(focused: bool) -> Style {
     }
 }
 
+/// TASKS 欄的捲軸（P4.6 切片 C）。與非 focus 邊框同一個 DarkGray：捲軸講的是
+/// 「清單有多長、你在哪」，是**方位**不是語意——上任何語意色都會讓它跟
+/// status／liveness 搶注意力，而它一格資訊都沒有多給。
+pub fn scrollbar_style() -> Style {
+    Style::default().fg(Color::DarkGray)
+}
+
+/// 兩軸資料 stale 時的 footer 標記（P4.6 切片 C）：沿用警告色。
+///
+/// 「畫面上這份資料已經舊了」與 sticky 警告是同一類訊息——請你看一眼，不是
+/// 出錯了。用 Red 會讓它看起來像 `failed`／blocker 那種等級的事。
+pub fn stale_style() -> Style {
+    warning_style()
+}
+
 /// footer 的 sticky 警告：既有 BOLD ＋ Yellow。
 ///
 /// 不用 Red：警告是「請你看一眼」，不是「出錯了」——Red 在本 dashboard 已被

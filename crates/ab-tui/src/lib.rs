@@ -95,15 +95,43 @@ fn event_loop(
     // 故活在主迴圈而不是每輪重建的 BlockerIndex 裡
     let mut debounce = BlockerDebounce::new();
     let mut app = App::new();
+    // **嘗試**時間戳（決定何時再輪詢一次）
     let mut last_disk = Instant::now();
     let mut last_live = Instant::now();
+    // **成功**時間戳（決定畫面上那份資料有多新，P4.6 切片 C）。兩者必須分開：
+    // 用嘗試時間算 freshness 的話，worker 每 2s 發一次查詢就足以讓畫面永遠
+    // 顯示「剛更新」——即使那些查詢一次都沒回來過。
+    //
+    // disk 軸沒有失敗訊號可用（`Model::load` 讀不到就是空快照，不回錯），所以
+    // 它量的是「上次真的**完成**一輪重讀」——抓得到迴圈被拖住，抓不到部分讀
+    // 失敗。這個限制寫在這裡，畫面不假裝它抓得到。
+    let mut stamps = Stamps::new(Instant::now());
     // 同時只讓一個 liveness 請求在途：worker 卡住時不得堆積無界佇列
     let mut live_inflight = true;
 
+    // 兩軸的 stale 降級都落在同一份 unknown 上（借用，不每幀複製 HashMap）
+    let unknown_live = LiveIndex::unknown();
+    let unknown_blockers = BlockerIndex::unknown();
+
     loop {
+        let fresh = stamps.freshness(Instant::now());
+        // **stale＝降級為 unknown，不是繼續畫舊的**（§4）：背景 worker 卡死時
+        // 舊死活／舊 blocker 冒充新鮮，人會據此下判斷（例如以為某個 pane 還
+        // 活著而不去看它）。unknown 說的是「現在不知道」，那是真的
+        let (live_view, blockers_view) = if degrade_on_stale(fresh, &mut debounce) {
+            (&unknown_live, &unknown_blockers)
+        } else {
+            (&live, &blockers)
+        };
+        let mut frame = ratatui::layout::Rect::default();
         terminal
-            .draw(|f| view::render(f, &model, &live, &blockers, &app))
+            .draw(|f| {
+                frame = f.area();
+                view::render(f, &model, live_view, blockers_view, &app, fresh);
+            })
             .map_err(|e| Error::new(format!("draw failed: {e}")))?;
+        // 一頁多長只有版面知道：量到之後回填給狀態機（PgUp／PgDn 用）
+        app.pages = view::panel_heights(frame, app.warnings.len());
         if selftest_panic {
             panic!("AB_TUI_SELFTEST_PANIC: test-triggered panic exit (terminal restore check)");
         }
@@ -122,6 +150,12 @@ fn event_loop(
                     app.apply_origin(&model);
                 }
                 Msg::Live(l, b) => {
+                    // **只有查得到東西才算成功，而且算的是快照的觀測時間**：
+                    // bounded 查詢逾時／tmux 不在時 worker 回的是整層降級的
+                    // unknown（那一輪沒有新資料）；查詢卡了十幾秒才回來的那一
+                    // 輪則帶著一份早就過期的快照——兩者都不得刷新 freshness，
+                    // 否則「查詢愈慢，畫面看起來愈新」（切片 C 核心修正＋F1）
+                    stamps.note_live(&l);
                     apply_live(&mut live, &mut blockers, &mut debounce, l, b);
                     live_inflight = false;
                 }
@@ -144,6 +178,7 @@ fn event_loop(
                     model = Model::load(paths);
                     app.relocate(&model);
                     last_disk = Instant::now();
+                    stamps.note_disk(last_disk);
                 }
                 // `r`：成功開全螢幕 pager（保留原始 bytes，render 才 lossy）；
                 // 失敗（未回覆／已取消／損壞）逐字沿用 core 的訊息進 footer
@@ -196,6 +231,7 @@ fn event_loop(
                     model = Model::load(paths);
                     app.relocate(&model);
                     last_disk = Instant::now();
+                    stamps.note_disk(last_disk);
                 }
             }
         }
@@ -229,7 +265,16 @@ fn event_loop(
                     // `i` 只消費已載入的 read model／liveness 快照，不開檔也
                     // 不查 tmux，故就地組頁（同一份快照＝同一個世代）
                     Effect::Info { worker: name } => {
-                        app.info = Some(action::info_page(&model, &live, &blockers, &name));
+                        // 摘要頁與 dashboard 看的必須是同一份快照——包含
+                        // stale 降級：畫面上標了 unknown、`i` 卻還印著三十秒前
+                        // 的 live，那是同一個世代說兩種話
+                        let stale = stamps.freshness(Instant::now()).tmux_stale();
+                        let (lv, bl) = if stale {
+                            (&unknown_live, &unknown_blockers)
+                        } else {
+                            (&live, &blockers)
+                        };
+                        app.info = Some(action::info_page(&model, lv, bl, &name));
                     }
                     Effect::Copy { payload } => {
                         app.message = "copying evidence…".to_string();
@@ -263,6 +308,8 @@ fn event_loop(
             app.relocate(&model);
             app.apply_origin(&model);
             last_disk = Instant::now();
+            // 這一輪真的完成了一次重讀＝disk 軸的「上次成功」
+            stamps.note_disk(last_disk);
         }
         if !live_inflight && last_live.elapsed() >= LIVE_POLL {
             live_inflight = worker.send(Req::Live);
@@ -409,8 +456,82 @@ fn translate(code: KeyCode) -> Option<Key> {
         KeyCode::Esc => Some(Key::Esc),
         KeyCode::Down => Some(Key::Down),
         KeyCode::Up => Some(Key::Up),
+        // 翻頁／到頂到底（P4.6 切片 C）：新增鍵，既有鍵語意一個都不動
+        KeyCode::PageUp => Some(Key::PageUp),
+        KeyCode::PageDown => Some(Key::PageDown),
+        KeyCode::Home => Some(Key::Home),
+        KeyCode::End => Some(Key::End),
         _ => None,
     }
+}
+
+/// 兩軸的資料年紀時間戳（P4.6 切片 C）。
+///
+/// 與輪詢用的「上次嘗試」時間戳分開，而且抽成型別而不是內嵌在主迴圈裡：
+/// 內嵌的話，把 `note_live` 改成無條件刷新（＝退回嘗試時間戳）沒有任何測試
+/// 會紅——而那正是這次要修掉的缺陷本身。
+struct Stamps {
+    /// 上次**完成**一輪磁碟掃描。不是 `Option`：`Stamps` 是在第一次
+    /// `Model::load` 之後才建的，那一輪掃描確實完成過。
+    disk: Instant,
+    /// 上次**成功**的 tmux 查詢輪的**觀測時間**（不是收信時間，審查 F1）。
+    /// `None`＝至今沒有任何成功樣本（審查 F2）——啟動時間 MUST NOT 被拿來
+    /// 充當這一格。
+    tmux: Option<Instant>,
+}
+
+impl Stamps {
+    fn new(now: Instant) -> Self {
+        Stamps {
+            disk: now,
+            tmux: None,
+        }
+    }
+
+    fn freshness(&self, now: Instant) -> model::Freshness {
+        model::Freshness {
+            disk: now.saturating_duration_since(self.disk),
+            tmux: self.tmux.map(|t| now.saturating_duration_since(t)),
+        }
+    }
+
+    /// 完成一輪磁碟掃描。
+    fn note_disk(&mut self, now: Instant) {
+        self.disk = now;
+    }
+
+    /// 收到一則 liveness 回報。
+    ///
+    /// **只有兩個必要子查詢都成功的那一輪才算數**，而且算的是那份快照的
+    /// **觀測時間**，不是這則訊息抵達 UI 的時間（`LiveIndex::success_at`）。
+    /// 用收信時間的話，一輪查詢卡到 15 秒才回來，會把 15 秒前的 pane 快照
+    /// 重新標成「剛更新」再冒充新鮮 10 秒——查詢愈慢，畫面看起來愈新。
+    ///
+    /// 取 `max`：晚到的舊 round MUST NOT 把較新的樣本往回推。至於「晚到且
+    /// 已超門檻」的那一輪，寫進去之後 age 立刻就 ≥ `TMUX_STALE`，於是照樣
+    /// 是 stale／unknown——這裡不必再攔一次。
+    fn note_live(&mut self, l: &LiveIndex) {
+        let Some(observed) = l.success_at() else {
+            return;
+        };
+        if self.tmux.is_none_or(|t| observed > t) {
+            self.tmux = Some(observed);
+        }
+    }
+}
+
+/// stale 時的降級判定（審查 F7）：**回傳「要不要降級」，順手作廢去抖連勝**。
+///
+/// 兩件事綁在同一個函式裡是刻意的：降級與清 streak 必須同時發生，分開寫
+/// 就會有一條路徑忘記清（症狀是停擺半分鐘後的第一則回報立刻升旗，而畫面
+/// 上看起來完全合理）。抽成函式也讓這條線可被測試殺掉——內嵌在主迴圈裡的
+/// 話，把 `reset()` 刪掉全套照樣綠。
+fn degrade_on_stale(fresh: model::Freshness, debounce: &mut BlockerDebounce) -> bool {
+    let stale = fresh.tmux_stale();
+    if stale {
+        debounce.reset();
+    }
+    stale
 }
 
 /// 一則 `Msg::Live` 落進 read model 的**唯一路徑**。
@@ -622,5 +743,173 @@ mod tests {
             "  ⛔blocked",
             "連續第二輪 MUST 升旗"
         );
+    }
+
+    /// 一輪**成功**的 liveness，觀測時間由呼叫端指定。
+    fn round_at(at: Instant) -> LiveIndex {
+        LiveIndex {
+            panes: Some(HashMap::new()),
+            windows: Some(HashMap::new()),
+            panes_at: Some(at),
+        }
+    }
+
+    /// **freshness 的 wiring 測試**（P4.6 切片 C）：tmux 軸的「上次成功」
+    /// MUST 只被**查得到東西**的那一輪刷新。
+    ///
+    /// 沒有這條，把 `note_live` 改回無條件刷新（＝退回嘗試時間戳）全套照樣
+    /// 綠——而那正是這次要修掉的缺陷：查詢一路逾時，畫面卻一路顯示「剛更新」。
+    #[test]
+    fn only_a_successful_tmux_round_refreshes_the_freshness_stamp() {
+        let t0 = Instant::now();
+        let mut s = Stamps::new(t0);
+        let later = t0 + Duration::from_secs(30);
+
+        // 降級（unknown）的那一輪：時間戳不動 → 30 秒後照樣是 stale
+        s.note_live(&LiveIndex::unknown());
+        let f = s.freshness(later);
+        assert!(
+            f.tmux_stale(),
+            "unknown 回報不算成功（實際 age {:?}）",
+            f.tmux
+        );
+
+        // 真的查到東西：時間戳前進 → 不再 stale
+        s.note_live(&round_at(later));
+        assert!(!s.freshness(later).tmux_stale(), "成功回報 MUST 刷新");
+
+        // disk 軸各自獨立（tmux 成功不會順手把 disk 說成新鮮）
+        assert!(s.freshness(later).disk >= Duration::from_secs(30));
+    }
+
+    /// **F1 regression：晚到的成功 round MUST NOT 把過期快照重新標新鮮。**
+    ///
+    /// 上面那條只驗「結果型別」（unknown vs 查得到），round **延遲**它一點都
+    /// 抓不到：把 stamp 改回收信時間，上面那條照樣綠。這條驗的是時間軸——
+    /// 一輪在 t0 取到 pane 快照、卡在後續 bounded 查詢上，直到 t0+15s 才送
+    /// 抵 UI。那份快照當下已經 15 秒大，畫面 MUST 維持 unknown。
+    #[test]
+    fn a_late_arriving_round_cannot_relabel_an_expired_snapshot_as_fresh() {
+        let t0 = Instant::now();
+        let mut s = Stamps::new(t0);
+        // list-panes 在 t0 就到手，整輪卻拖到 t0+15s 才回到 UI
+        let arrived = t0 + Duration::from_secs(15);
+        s.note_live(&round_at(t0));
+
+        let f = s.freshness(arrived);
+        assert_eq!(
+            f.tmux,
+            Some(Duration::from_secs(15)),
+            "age MUST 從**觀測時間**起算，不是從收信時間"
+        );
+        assert!(
+            f.tmux_stale(),
+            "晚到且已超門檻的 round MUST 維持 unknown，不得洗新"
+        );
+
+        // 對照組：同一輪若沒有延遲（觀測時間就是現在），當然是新鮮的
+        let mut s2 = Stamps::new(t0);
+        s2.note_live(&round_at(arrived));
+        assert!(
+            !s2.freshness(arrived).tmux_stale(),
+            "正向對照：不延遲就新鮮"
+        );
+
+        // 晚到的**舊** round 也不得把較新的樣本往回推
+        let mut s3 = Stamps::new(t0);
+        s3.note_live(&round_at(arrived));
+        s3.note_live(&round_at(t0));
+        assert!(
+            !s3.freshness(arrived).tmux_stale(),
+            "亂序抵達 MUST NOT 讓時間戳倒退"
+        );
+    }
+
+    /// **F2：部分成功不得替整軸背書；第一輪回來前不得有時間戳。**
+    #[test]
+    fn a_partial_tmux_round_is_not_a_successful_sample() {
+        let t0 = Instant::now();
+        let s = Stamps::new(t0);
+        // 啟動時尚無任何成功樣本：age 是 None（不是「距啟動 0 秒」）
+        assert_eq!(s.freshness(t0).tmux, None, "第一輪回來前 MUST 沒有時間戳");
+        assert!(s.freshness(t0).tmux_stale(), "沒有樣本＝unknown＝stale");
+
+        // list-panes 成功、list-windows 失敗：不算一輪成功
+        let mut s2 = Stamps::new(t0);
+        s2.note_live(&LiveIndex {
+            panes: Some(HashMap::new()),
+            windows: None,
+            panes_at: Some(t0),
+        });
+        assert_eq!(
+            s2.freshness(t0).tmux,
+            None,
+            "只有 panes 成功 MUST NOT 替 windows 背書"
+        );
+
+        // 反向：兩者都成功但**空集合**仍是合法觀測（機器上真的沒有 pane）
+        let mut s3 = Stamps::new(t0);
+        s3.note_live(&round_at(t0));
+        assert_eq!(s3.freshness(t0).tmux, Some(Duration::ZERO));
+    }
+
+    /// **F7：停擺缺口 MUST 作廢去抖連勝。**
+    ///
+    /// 「連續兩輪」隱含相鄰兩輪的時間鄰近性（2s 一輪、最壞未滿 4s）。停擺前
+    /// 命中一次的 pane，若 streak 跨過缺口留著，30 秒停擺之後的**第一則**
+    /// 回報就會立刻升旗——那兩次命中之間隔了半分鐘。
+    #[test]
+    fn a_stale_gap_voids_the_blocker_debounce_streak() {
+        let mut live = LiveIndex::unknown();
+        let mut blockers = BlockerIndex::unknown();
+        let mut debounce = BlockerDebounce::new();
+
+        // 停擺前：命中一次（streak=1，還沒升旗）
+        apply_live(
+            &mut live,
+            &mut blockers,
+            &mut debounce,
+            LiveIndex::unknown(),
+            prompt_round(),
+        );
+        assert_eq!(view::blocker_mark(blockers.get("%1")), "");
+
+        // 停擺 30 秒：畫面降級為 unknown，連勝同時作廢
+        let stale = model::Freshness {
+            disk: Duration::ZERO,
+            tmux: Some(Duration::from_secs(30)),
+        };
+        assert!(degrade_on_stale(stale, &mut debounce), "前提：這是 stale");
+
+        // 恢復後的第一則回報：MUST NOT 立刻升旗（它是缺口後的**第一**輪）
+        apply_live(
+            &mut live,
+            &mut blockers,
+            &mut debounce,
+            LiveIndex::unknown(),
+            prompt_round(),
+        );
+        assert_eq!(
+            view::blocker_mark(blockers.get("%1")),
+            "",
+            "停擺後的第一則回報升旗＝連續兩輪的時間鄰近性假設已經破了"
+        );
+
+        // 再連上一輪才算數（去抖本身沒有被關掉）
+        apply_live(
+            &mut live,
+            &mut blockers,
+            &mut debounce,
+            LiveIndex::unknown(),
+            prompt_round(),
+        );
+        assert_eq!(view::blocker_mark(blockers.get("%1")), "  ⛔blocked");
+
+        // 沒 stale 時不得清（否則等於把去抖永久關掉）
+        let ok = model::Freshness {
+            disk: Duration::ZERO,
+            tmux: Some(Duration::ZERO),
+        };
+        assert!(!degrade_on_stale(ok, &mut debounce));
     }
 }

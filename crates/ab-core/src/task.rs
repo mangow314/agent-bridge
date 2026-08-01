@@ -688,16 +688,28 @@ pub fn in_flight(paths: &Paths) -> Vec<InFlight> {
 /// **先按目錄名反序排序再截到 `limit`，之後才讀 status／metadata**：`tasks/`
 /// 會長大，500ms 輪詢不能對整個目錄做 N 次檔案讀（截斷後至多 `limit` 筆 I/O）。
 /// 目錄名以時間戳起首，字典序＝時間序，故反序＝新的在前。
-pub fn recent_tasks(paths: &Paths, limit: usize) -> Vec<InFlight> {
+pub fn recent_tasks(paths: &Paths, limit: usize) -> Recent {
     let Ok(rd) = std::fs::read_dir(&paths.tasks_dir) else {
-        return Vec::new();
+        return Recent::default();
     };
     let mut names: Vec<String> = rd
         .filter_map(|e| e.ok())
+        // **候選必須先是目錄**（審查 F4）：只驗檔名字面的話，一個名字剛好長成
+        // `YYYYMMDDTHHMMSSZ-xxxx` 的**普通檔案**也會被算進候選數，於是
+        // `names.len() > limit` 為真、畫面標出 `+`——但截限後保留的每一筆都
+        // 有效、沒有任何更舊的 task 被省略。那個 `+` 是憑空的。
+        //
+        // 用 `file_type()`（不追 symlink）而不是 `path().is_dir()`：task 目錄
+        // 是本工具生成的真目錄，指向別處的 symlink 不是這條路徑認得的形狀。
+        .filter(|e| e.file_type().is_ok_and(|t| t.is_dir()))
         .filter_map(|e| e.file_name().to_str().map(|s| s.to_string()))
         .filter(|n| is_generated_task_dirname(n))
         .collect();
     names.sort_by(|a, b| b.cmp(a));
+    // 截斷與否在**這裡**才知道：損壞任務會在下面被跳過，所以「回傳筆數等於
+    // limit」判不出截斷（有截斷但跳過幾筆時就會漏報）。呼叫端要據此誠實顯示
+    // 「還有更舊的沒載入」
+    let truncated = names.len() > limit;
     names.truncate(limit);
 
     let mut out = Vec::new();
@@ -723,7 +735,20 @@ pub fn recent_tasks(paths: &Paths, limit: usize) -> Vec<InFlight> {
             status: st,
         });
     }
-    out
+    Recent {
+        tasks: out,
+        truncated,
+    }
+}
+
+/// `recent_tasks` 的結果：任務清單＋**是否還有更舊的沒載入**。
+///
+/// 兩者要一起回傳，否則畫面沒有辦法誠實表達「你看到的不是全部」——而「以為
+/// 看到了全部」正是 dashboard 最容易說出口的謊。
+#[derive(Debug, Default)]
+pub struct Recent {
+    pub tasks: Vec<InFlight>,
+    pub truncated: bool,
 }
 
 /// `read` 一次執行的終態：標頭欄位＋response 的**原始位元組**
@@ -1460,7 +1485,7 @@ mod tests {
         std::fs::create_dir(paths.tasks_dir.join("foreign-dir")).unwrap();
 
         let rows = recent_tasks(&paths, 100);
-        let ids: Vec<&str> = rows.iter().map(|t| t.id.as_str()).collect();
+        let ids: Vec<&str> = rows.tasks.iter().map(|t| t.id.as_str()).collect();
         assert_eq!(
             ids,
             vec![
@@ -1470,16 +1495,56 @@ mod tests {
             ],
             "反序（新的在上）＋終態亦在列＋損壞者跳過"
         );
-        assert_eq!(rows[0].status, "cancelled");
+        assert_eq!(rows.tasks[0].status, "cancelled");
+        assert!(!rows.truncated, "limit 遠大於候選數：沒有截斷");
         // limit 在**讀檔前**截斷：最新的一筆正是那個損壞目錄，limit=1 時
         // 截斷後只剩它，讀不出東西就是空清單（證明截斷不是發生在讀檔之後）
-        assert!(
-            recent_tasks(&paths, 1).is_empty(),
-            "截斷在排序之後、讀檔之前"
-        );
+        let one = recent_tasks(&paths, 1);
+        assert!(one.tasks.is_empty(), "截斷在排序之後、讀檔之前");
+        assert!(one.truncated, "截斷旗標看的是**候選數**，不是回傳筆數");
         let two = recent_tasks(&paths, 2);
-        assert_eq!(two.len(), 1);
-        assert_eq!(two[0].id, "20260731T000003Z-0003");
+        assert_eq!(two.tasks.len(), 1);
+        assert_eq!(two.tasks[0].id, "20260731T000003Z-0003");
+        assert!(
+            two.truncated,
+            "回傳 1 筆但候選有 4 筆：這正是『用回傳筆數判截斷』會漏報的情況"
+        );
+    }
+
+    /// **F4：截斷旗標的候選必須先是目錄。**
+    ///
+    /// 只驗檔名字面的話，一個名字剛好長成 `YYYYMMDDTHHMMSSZ-xxxx` 的**普通
+    /// 檔案**會被算進候選數：limit=2、兩個有效目錄＋一個字典序最舊的同形普通
+    /// 檔案 → 候選 3 > 2 → 標 `+`。但截限後保留的兩筆全有效、沒有任何更舊的
+    /// task 被省略——那個 `+` 是憑空的。
+    #[test]
+    fn recent_tasks_only_counts_directories_as_candidates() {
+        let d = Dir::new("ab-core-recent-nondir");
+        let paths = test_paths(&d);
+        seed_task(&paths, "20260731T000002Z-0002", "completed", Some(b"x"));
+        seed_task(&paths, "20260731T000003Z-0003", "completed", Some(b"x"));
+        // 名稱完全合法、但它是**檔案**（字典序最舊，截限後本來就輪不到它）
+        std::fs::write(paths.tasks_dir.join("20260731T000001Z-0001"), "not a dir").unwrap();
+
+        let rows = recent_tasks(&paths, 2);
+        let ids: Vec<&str> = rows.tasks.iter().map(|t| t.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            vec!["20260731T000003Z-0003", "20260731T000002Z-0002"],
+            "普通檔案 MUST NOT 進 read model"
+        );
+        assert!(
+            !rows.truncated,
+            "保留的 2 筆全有效、沒有更舊的 task 被省略：MUST NOT 標 +"
+        );
+
+        // 反向對照：把它換成真的目錄，就真的有第三筆被截掉了
+        std::fs::remove_file(paths.tasks_dir.join("20260731T000001Z-0001")).unwrap();
+        seed_task(&paths, "20260731T000001Z-0001", "completed", Some(b"x"));
+        assert!(
+            recent_tasks(&paths, 2).truncated,
+            "正向對照：真的有目錄被截掉時照樣要標 +"
+        );
     }
 
     /// 非權威狀態字（`tasks/` 裡任何人都能寫）MUST NOT 進 read model：
@@ -1499,7 +1564,7 @@ mod tests {
         }
 
         let rows = recent_tasks(&paths, 100);
-        let ids: Vec<&str> = rows.iter().map(|t| t.id.as_str()).collect();
+        let ids: Vec<&str> = rows.tasks.iter().map(|t| t.id.as_str()).collect();
         assert_eq!(
             ids,
             vec!["20260731T000001Z-000a"],

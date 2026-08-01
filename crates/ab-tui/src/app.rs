@@ -120,6 +120,16 @@ pub struct Pager {
     pub scroll: usize,
 }
 
+impl Pager {
+    /// 捲動上界：最後一頁的頂端。內容比一頁短時是 0（沒得捲）。
+    ///
+    /// 列數問的是 `action::pager_lines`——render 畫的就是那一份，兩邊各算一次
+    /// 就會漂移（F6）。
+    pub fn max_scroll(&self, page: usize) -> usize {
+        crate::action::pager_lines(self).len().saturating_sub(page)
+    }
+}
+
 /// 與 crossterm 解耦的鍵表示：狀態機測試不需要 terminal 事件型別。
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Key {
@@ -131,6 +141,37 @@ pub enum Key {
     Esc,
     Down,
     Up,
+    /// 翻頁／到頂到底（P4.6 切片 C）。位移一律走與 `j`／`k` 同一條 selection
+    /// 路徑（stable key），不是另一套索引運算
+    PageUp,
+    PageDown,
+    Home,
+    End,
+}
+
+/// 各面板的**可視高度**（列數）。PgUp／PgDn 的位移是「一頁」，而一頁多長只有
+/// 版面知道——render 每幀量到之後回填到這裡（見 `view::panel_heights`），
+/// 狀態機自己不碰 terminal 尺寸。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct PageSizes {
+    pub origins: u16,
+    pub workers: u16,
+    pub tasks: u16,
+    /// `r` 的全螢幕 pager 可視高度（它不吃三欄版面，另量一份）
+    pub pager: u16,
+}
+
+impl Default for PageSizes {
+    /// 還沒畫過第一幀時的保守值（單元測試也用它）：小一點只是翻得慢，
+    /// 大過真實高度才會翻過頭。
+    fn default() -> Self {
+        PageSizes {
+            origins: 10,
+            workers: 10,
+            tasks: 10,
+            pager: 10,
+        }
+    }
 }
 
 /// 待 run loop 執行的副作用。
@@ -215,6 +256,8 @@ pub struct App {
     /// 使用者是否已自行動過 ORIGINS 欄：動過之後 origin 不得再搶 selection
     /// （晚到的定位把人拉走比選錯還糟）。
     pub origin_touched: bool,
+    /// 各面板可視高度（PgUp／PgDn 的一頁），每幀由 run loop 回填
+    pub pages: PageSizes,
 }
 
 impl App {
@@ -238,6 +281,7 @@ impl App {
             caller_origin: None,
             caller_pane: None,
             origin_touched: false,
+            pages: PageSizes::default(),
         }
     }
 
@@ -530,11 +574,23 @@ fn dispatch_key(app: &mut App, model: &Model, key: Key) -> Effect {
         };
     }
     // `r` 的 pager 開著：只認捲動與關閉。導航鍵在這裡被吞掉——overlay 期間
-    // 底層 selection MUST 不動（關掉之後人才回得到原本那一列）
+    // 底層 selection MUST 不動（關掉之後人才回得到原本那一列）。
+    //
+    // **翻頁鍵在這裡是捲動，不是吞掉**（審查 F6）：PgUp／PgDn／Home／End 與
+    // j／k 是同一族（捲動語意），而 footer 與 `?` 頁都列著它們——畫面上列出
+    // 的鍵按下去 MUST 真的有那個效果。cancel／evict 確認框吞鍵是另一回事：
+    // 破壞性確認框本來就該吞掉一切非確認鍵。
     if let Some(p) = app.pager.as_mut() {
+        // 下界一律夾在最後一頁：捲過尾端只會得到整片空白，那不是「到底」
+        let page = app.pages.pager.max(1) as usize;
+        let max = p.max_scroll(page);
         match key {
-            Key::Char('j') | Key::Down => p.scroll = p.scroll.saturating_add(1),
+            Key::Char('j') | Key::Down => p.scroll = (p.scroll + 1).min(max),
             Key::Char('k') | Key::Up => p.scroll = p.scroll.saturating_sub(1),
+            Key::PageDown => p.scroll = p.scroll.saturating_add(page).min(max),
+            Key::PageUp => p.scroll = p.scroll.saturating_sub(page),
+            Key::Home => p.scroll = 0,
+            Key::End => p.scroll = max,
             Key::Esc | Key::Char('q') => app.pager = None,
             _ => {}
         }
@@ -589,11 +645,31 @@ fn dispatch_key(app: &mut App, model: &Model, key: Key) -> Effect {
             Effect::None
         }
         Key::Char('j') | Key::Down => {
-            move_sel(app, model, 1);
+            move_sel(app, model, Move::By(1));
             Effect::None
         }
         Key::Char('k') | Key::Up => {
-            move_sel(app, model, -1);
+            move_sel(app, model, Move::By(-1));
+            Effect::None
+        }
+        // 翻頁／到頂到底（P4.6 切片 C）。作用在**當前焦點面板**，與 j／k 同一
+        // 條路徑：一律經 `move_sel`（夾在範圍內、換 origin 時重置、之後由
+        // `handle_key` 收尾的 `sync_keys` 寫回 stable key），不另開索引運算。
+        // 空面板時 `move_sel` 直接返回——不動、不 panic、不報錯
+        Key::PageDown => {
+            move_sel(app, model, Move::By(page_len(app)));
+            Effect::None
+        }
+        Key::PageUp => {
+            move_sel(app, model, Move::By(-page_len(app)));
+            Effect::None
+        }
+        Key::Home => {
+            move_sel(app, model, Move::First);
+            Effect::None
+        }
+        Key::End => {
+            move_sel(app, model, Move::Last);
             Effect::None
         }
         // Enter matrix（P4.6 切片 B）：Enter＝「打開我選的這一項」，各欄的
@@ -739,7 +815,28 @@ fn read_effect(app: &mut App, model: &Model) -> Effect {
     }
 }
 
-fn move_sel(app: &mut App, model: &Model, delta: i64) {
+/// selection 的位移方式（`j`／`k`／PgUp／PgDn／Home／End 共用一條路徑）。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Move {
+    By(i64),
+    First,
+    Last,
+}
+
+/// 當前焦點面板的一頁是幾列（PgUp／PgDn 的位移量）。
+///
+/// 至少 1：畫面被壓到連一列都放不下時，翻頁仍要能動一列，不然那兩個鍵在窄
+/// 畫面上會變成啞鍵。
+fn page_len(app: &App) -> i64 {
+    let h = match app.panel {
+        Panel::Origins => app.pages.origins,
+        Panel::Workers => app.pages.workers,
+        Panel::Tasks => app.pages.tasks,
+    };
+    i64::from(h).max(1)
+}
+
+fn move_sel(app: &mut App, model: &Model, mv: Move) {
     let (idx, len) = match app.panel {
         Panel::Origins => (&mut app.origin_idx, model.origins.len()),
         Panel::Workers => {
@@ -754,7 +851,13 @@ fn move_sel(app: &mut App, model: &Model, delta: i64) {
     if len == 0 {
         return;
     }
-    let cur = *idx as i64 + delta;
+    // 一律夾在範圍內＝翻頁到邊界飽和，不 wrap（wrap 會讓「一直按 PgDn」在
+    // 末尾突然跳回頂端，那是誤導而不是效率）
+    let cur = match mv {
+        Move::By(d) => *idx as i64 + d,
+        Move::First => 0,
+        Move::Last => len as i64 - 1,
+    };
     *idx = cur.clamp(0, len as i64 - 1) as usize;
     if matches!(app.panel, Panel::Origins) {
         // 換 scope 後 WORKERS／TASKS 欄都從頭選起
@@ -802,6 +905,7 @@ mod tests {
                 task("20260731T000009Z-dddd", "w1", "completed"),
                 task("20260731T000001Z-aaaa", "w1", "queued"),
             ],
+            recent_truncated: false,
         }
     }
 
@@ -931,6 +1035,7 @@ mod tests {
             ],
             tasks: Vec::new(),
             recent: Vec::new(),
+            recent_truncated: false,
         };
         // (1) origin 標籤直接對上：字典序在前的 aaa:@1 不是 current
         assert_eq!(caller_origin_idx(&m, Some("zzz:@9"), None), Some(2));
@@ -1058,6 +1163,18 @@ mod tests {
         assert_eq!(handle_key(&mut app, &m, Key::Char('r')), Effect::None);
     }
 
+    /// 一份 `n` 行內文的 pager（總列數＝標頭 4 ＋ n ＋ 尾端 2）。
+    fn open_pager(app: &mut App, n: usize) {
+        let body: String = (0..n).map(|i| format!("line{i}\n")).collect();
+        app.pager = Some(Pager {
+            id: "20260731T000009Z-dddd".into(),
+            from: "alice".into(),
+            to: "w1".into(),
+            bytes: body.into_bytes(),
+            scroll: 0,
+        });
+    }
+
     /// overlay（`r` 的 pager）開著時導航鍵只捲動，**MUST NOT** 改動底層
     /// selection——關掉之後人要回得到原本那一列。
     #[test]
@@ -1065,13 +1182,7 @@ mod tests {
         let m = model();
         let mut app = App::new();
         handle_key(&mut app, &m, Key::Char('j')); // row_idx=1（task 列）
-        app.pager = Some(Pager {
-            id: "20260731T000009Z-dddd".into(),
-            from: "alice".into(),
-            to: "w1".into(),
-            bytes: b"line1\nline2\n".to_vec(),
-            scroll: 0,
-        });
+        open_pager(&mut app, 20);
         assert_eq!(handle_key(&mut app, &m, Key::Char('j')), Effect::None);
         assert_eq!(app.row_idx, 1, "overlay 期間底層 selection 不得移動");
         assert_eq!(app.pager.as_ref().unwrap().scroll, 1);
@@ -1083,6 +1194,47 @@ mod tests {
         assert_eq!(handle_key(&mut app, &m, Key::Char('q')), Effect::None);
         assert!(app.pager.is_none());
         assert_eq!(app.row_idx, 1);
+    }
+
+    /// **F6：pager MUST 吃翻頁鍵。** footer 與 `?` 頁都列著 PgUp／PgDn／
+    /// Home／End，畫面上列出的鍵按下去就得有那個效果；它們與 j／k 同族
+    /// （捲動語意），且**一樣不得動到底層 selection**。
+    #[test]
+    fn pager_pages_with_pgup_pgdn_home_end_without_touching_selection() {
+        let m = model();
+        let mut app = App::new();
+        handle_key(&mut app, &m, Key::Char('j')); // row_idx=1
+        open_pager(&mut app, 40);
+        let page = app.pages.pager as usize; // 預設 10
+        let scroll = |a: &App| a.pager.as_ref().unwrap().scroll;
+        let max = app.pager.as_ref().unwrap().max_scroll(page);
+        assert!(max > page, "前提：這份內容捲得動不只一頁（max={max}）");
+
+        handle_key(&mut app, &m, Key::PageDown);
+        assert_eq!(scroll(&app), page, "PgDn 位移一頁");
+        handle_key(&mut app, &m, Key::PageUp);
+        assert_eq!(scroll(&app), 0, "PgUp 收回同一頁");
+        handle_key(&mut app, &m, Key::PageUp);
+        assert_eq!(scroll(&app), 0, "上緣不得下溢");
+
+        handle_key(&mut app, &m, Key::End);
+        assert_eq!(scroll(&app), max, "End＝最後一頁的頂端");
+        // 到底之後再按 PgDn／j 都不得捲進空白（那不是「到底」）
+        handle_key(&mut app, &m, Key::PageDown);
+        assert_eq!(scroll(&app), max, "下緣夾在最後一頁");
+        handle_key(&mut app, &m, Key::Char('j'));
+        assert_eq!(scroll(&app), max, "j 同樣夾住");
+        handle_key(&mut app, &m, Key::Home);
+        assert_eq!(scroll(&app), 0, "Home 回頂");
+
+        assert_eq!(app.row_idx, 1, "翻頁鍵 MUST NOT 動到底層 selection");
+
+        // 內容比一頁短：四個鍵都是 no-op（沒得捲）
+        open_pager(&mut app, 2);
+        for k in [Key::PageDown, Key::End, Key::Char('j')] {
+            handle_key(&mut app, &m, k);
+            assert_eq!(scroll(&app), 0, "塞得下就沒得捲（{k:?}）");
+        }
     }
 
     /// `c`：payload 交給 Effect（組裝正本在 action 層），ORIGINS 欄則提示無效。
@@ -1234,6 +1386,7 @@ mod tests {
             workers: Vec::new(),
             tasks: Vec::new(),
             recent: Vec::new(),
+            recent_truncated: false,
         };
         app.relocate(&empty);
         assert_eq!(app.row_idx, 0, "一列都沒有時索引不得越界");
@@ -1304,6 +1457,7 @@ mod tests {
             workers: Vec::new(),
             tasks: Vec::new(),
             recent: Vec::new(),
+            recent_truncated: false,
         };
         let mut app = App::new();
         app.panel = Panel::Origins;
@@ -1404,6 +1558,7 @@ mod tests {
             workers: Vec::new(),
             tasks: Vec::new(),
             recent: Vec::new(),
+            recent_truncated: false,
         };
         app.relocate(&bare);
         assert_eq!(app.origin_idx, 0);
@@ -1484,6 +1639,7 @@ mod tests {
             }],
             tasks: Vec::new(),
             recent: Vec::new(),
+            recent_truncated: false,
         };
         let m = one("t-gen1");
         let mut app = App::new();
@@ -1517,6 +1673,164 @@ mod tests {
             app.row_key,
             Some(crate::model::row_key(&m2, Row::Worker(0)))
         );
+    }
+
+    // ---- P4.6 切片 C：翻頁鍵 ----
+
+    /// n 個 worker、沒有 task 的模型（WORKERS 欄剛好 n 列，翻頁算術驗得乾淨）。
+    fn many(n: usize) -> Model {
+        Model {
+            origins: vec![crate::model::ALL_SCOPE.into(), "it:@1".into()],
+            workers: (0..n)
+                .map(|i| AgentSnapshot {
+                    name: format!("w{i:02}"),
+                    pane: format!("%{i}"),
+                    runtime: "codex".into(),
+                    owner: "it:@1".into(),
+                    ready: "ready".into(),
+                    spawn_tag: "t-gen1".into(),
+                    registered_at: "2026-07-31T00:00:00Z".into(),
+                    spawned: true,
+                    corrupt: false,
+                })
+                .collect(),
+            tasks: Vec::new(),
+            recent: Vec::new(),
+            recent_truncated: false,
+        }
+    }
+
+    fn pages(origins: u16, workers: u16, tasks: u16) -> PageSizes {
+        PageSizes {
+            origins,
+            workers,
+            tasks,
+            ..PageSizes::default()
+        }
+    }
+
+    /// PgUp／PgDn 位移一頁（＝該面板可視高度）、Home／End 到頭到尾，
+    /// 兩端一律飽和不 wrap。
+    #[test]
+    fn page_keys_move_by_one_viewport_and_saturate_at_both_ends() {
+        let m = many(30);
+        let mut app = App::new();
+        app.pages = pages(5, 8, 4);
+
+        handle_key(&mut app, &m, Key::PageDown);
+        assert_eq!(app.row_idx, 8, "一頁＝WORKERS 的可視高度");
+        handle_key(&mut app, &m, Key::PageDown);
+        assert_eq!(app.row_idx, 16);
+        for _ in 0..10 {
+            handle_key(&mut app, &m, Key::PageDown);
+        }
+        assert_eq!(app.row_idx, 29, "下緣飽和，MUST NOT wrap 回頂端");
+        handle_key(&mut app, &m, Key::PageUp);
+        assert_eq!(app.row_idx, 21);
+        handle_key(&mut app, &m, Key::Home);
+        assert_eq!(app.row_idx, 0);
+        handle_key(&mut app, &m, Key::PageUp);
+        assert_eq!(app.row_idx, 0, "上緣飽和");
+        handle_key(&mut app, &m, Key::End);
+        assert_eq!(app.row_idx, 29);
+
+        // 每個面板用**自己**的高度（ORIGINS 只有 2 列，翻一頁就到底）
+        app.panel = Panel::Origins;
+        handle_key(&mut app, &m, Key::PageDown);
+        assert_eq!(app.origin_idx, 1);
+        assert!(
+            app.origin_touched,
+            "人自己動過 ORIGINS：定位不得再搶 selection"
+        );
+        handle_key(&mut app, &m, Key::Home);
+        assert_eq!(app.origin_idx, 0);
+    }
+
+    /// 列數**不足一頁**時，翻頁等於到底／到頂（不越界）。
+    #[test]
+    fn page_keys_on_a_short_list_land_on_the_edges() {
+        let m = many(3);
+        let mut app = App::new();
+        app.pages = pages(8, 8, 8);
+        handle_key(&mut app, &m, Key::PageDown);
+        assert_eq!(app.row_idx, 2);
+        handle_key(&mut app, &m, Key::PageUp);
+        assert_eq!(app.row_idx, 0);
+    }
+
+    /// **空面板**按這四鍵：不動、不 panic、不報錯（一則訊息都不留）。
+    #[test]
+    fn page_keys_on_an_empty_panel_do_nothing() {
+        let m = many(0);
+        let mut app = App::new();
+        for k in [Key::PageDown, Key::PageUp, Key::Home, Key::End] {
+            assert_eq!(handle_key(&mut app, &m, k), Effect::None);
+            assert_eq!(app.row_idx, 0);
+            assert!(app.message.is_empty(), "實際：{}", app.message);
+        }
+        // TASKS 欄同樣（fixture 沒有任何 recent）
+        app.panel = Panel::Tasks;
+        for k in [Key::PageDown, Key::End] {
+            assert_eq!(handle_key(&mut app, &m, k), Effect::None);
+            assert_eq!(app.task_idx, 0);
+        }
+    }
+
+    /// 翻頁走的是與 j／k 同一條路徑：位移後 selection 仍是 **stable key**，
+    /// 下一輪 reload 重排也不跳列（切片 B 的不變量不得被切片 C 旁路）。
+    #[test]
+    fn paging_keeps_selection_on_a_stable_key() {
+        let m = many(30);
+        let mut app = App::new();
+        app.pages = pages(5, 8, 4);
+        handle_key(&mut app, &m, Key::PageDown);
+        let Some(Row::Worker(wi)) = app.selected_row(&m) else {
+            panic!("應選在 worker 列");
+        };
+        let name = m.workers[wi].name.clone();
+        assert_eq!(
+            app.row_key,
+            Some(RowKey::Worker {
+                name: name.clone(),
+                spawn_tag: "t-gen1".into()
+            })
+        );
+
+        // 在選取之前插入一列 → 位置變、選的還是同一個 worker
+        let mut m2 = many(30);
+        m2.workers.insert(
+            0,
+            AgentSnapshot {
+                name: "w--".into(),
+                pane: "%99".into(),
+                runtime: "codex".into(),
+                owner: "it:@1".into(),
+                ready: "ready".into(),
+                spawn_tag: "t-gen1".into(),
+                registered_at: "2026-07-31T00:00:00Z".into(),
+                spawned: true,
+                corrupt: false,
+            },
+        );
+        app.relocate(&m2);
+        assert_eq!(app.row_idx, 9, "列序後移一格");
+        let Some(Row::Worker(wi2)) = app.selected_row(&m2) else {
+            panic!("仍應在 worker 列");
+        };
+        assert_eq!(m2.workers[wi2].name, name);
+    }
+
+    /// 破壞性動作的模態下，翻頁鍵與導航鍵同紀律：一律吞掉、selection 不動。
+    #[test]
+    fn page_keys_are_swallowed_by_the_confirm_modal() {
+        let m = model();
+        let mut app = App::new();
+        handle_key(&mut app, &m, Key::Char('j'));
+        handle_key(&mut app, &m, Key::Char('x'));
+        assert!(app.confirm.is_some());
+        assert_eq!(handle_key(&mut app, &m, Key::PageDown), Effect::None);
+        assert_eq!(app.row_idx, 1, "模態下 selection 不得移動");
+        assert!(app.confirm.is_some(), "翻頁鍵不得關掉確認框");
     }
 
     /// 人沒動選取時，連跑幾輪 relocate（模型未變）MUST 完全不動。

@@ -7,6 +7,7 @@
 //! 純資料轉換全部放這裡（不碰 terminal），單元測試不經 render。
 
 use std::collections::HashMap;
+use std::time::{Duration, Instant};
 
 use ab_core::paths::Paths;
 use ab_core::registry::{self, AgentSnapshot};
@@ -36,6 +37,9 @@ pub struct Model {
     /// TASKS 面板用：近期任務（**含終態**），id 反序。與 `tasks` 分開存放
     /// ——WORKERS 欄要的是 in-flight，TASKS 欄要的是「有東西可讀」的全集。
     pub recent: Vec<InFlight>,
+    /// `recent` 是否因為 `RECENT_LIMIT` 而**還有更舊的沒載入**。畫面上的
+    /// `N/total` 要據此標示，否則人會以為看到的就是全部（P4.6 切片 C）。
+    pub recent_truncated: bool,
 }
 
 impl Model {
@@ -52,7 +56,8 @@ impl Model {
             origins,
             workers,
             tasks,
-            recent,
+            recent: recent.tasks,
+            recent_truncated: recent.truncated,
         }
     }
 
@@ -79,6 +84,56 @@ pub fn origin_label(w: &AgentSnapshot) -> String {
     }
 }
 
+/// 兩軸資料的**年紀**（P4.6 切片 C）：距離上一次可信的更新過了多久。
+///
+/// 為什麼要有這個型別：畫面上的死活與 blocker 是快照，快照會老。背景 worker
+/// 卡住時，舊資料若一直原樣掛在畫面上，人看到的是「一切正常」——而正常的其實
+/// 只有那份三十秒前的記憶。逾門檻就**降級為 unknown**：unknown 是誠實的，
+/// 舊資料冒充新鮮不是。
+///
+/// 存的是 age 而不是 `Instant`：render 才好被測試餵任意年紀（§4 的 stale
+/// 顯示要驗得到），狀態機與 view 也不必各自算時間。
+///
+/// **兩軸的契約強度不同，型別與文案都據實分開**（審查 F3）：
+/// - disk 只說得出「上次**完成**一輪掃描」。`Model::load` 不回 `Result`，
+///   `read_dir` 失敗與單檔損壞都靜默跳過——它抓得到迴圈被拖住，抓不到部分讀
+///   失敗，所以**不得**宣稱 success。
+/// - tmux 說得出「上次**成功**」：查詢有明確的失敗訊號（整層降級 `None`）。
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub struct Freshness {
+    /// 距上次**完成**一輪磁碟掃描（完成 ≠ 每一筆都讀成功）
+    pub disk: Duration,
+    /// 距上次**成功**的 tmux 查詢輪；`None`＝**至今沒有任何成功樣本**
+    /// （啟動後第一輪還沒回來，或回來的每一輪都是降級的 unknown）。
+    /// 用 `Option` 而不是「拿啟動時間充當 stamp」：後者會在前 10 秒顯示
+    /// 「距啟動多久」並冒充新鮮，那是無中生有的背書（審查 F2）。
+    pub tmux: Option<Duration>,
+}
+
+/// disk 軸的 stale 門檻。磁碟輪詢是 500ms，取 3s＝六個週期：一兩輪被慢磁碟或
+/// 一次長按鍵處理拖過去不該報警，連續六輪沒完成就不是抖動而是迴圈真的卡住了。
+pub const DISK_STALE: Duration = Duration::from_secs(3);
+/// tmux 軸的 stale 門檻。liveness 節流是 2s，取 10s＝五個週期，且高於單次
+/// bounded 查詢的逾時上限——低於它會把「這一輪剛好慢」誤報成 stale。
+pub const TMUX_STALE: Duration = Duration::from_secs(10);
+/// age 低於這個數就不顯示數字（低噪）：正常態每一幀的 age 都在跳動，逐秒
+/// 顯示只會讓人習慣性忽略它，等真的 stale 了也不會注意到。門檻取各軸的
+/// stale 門檻之半——會顯示數字時，代表它已經在往 stale 走了。
+pub fn age_is_worth_showing(age: Duration, stale_at: Duration) -> bool {
+    age * 2 >= stale_at
+}
+
+impl Freshness {
+    /// tmux 軸是否已舊到該降級為 unknown（run loop 用；disk 軸沒有對應的降級
+    /// 動作——它沒有「別的值可以退回去」，只有 footer 上的 stale 標記）。
+    ///
+    /// **沒有成功樣本（`None`）一律算 stale**：那時畫面上根本沒有可信的死活
+    /// 可畫，unknown 才是誠實的說法。
+    pub fn tmux_stale(&self) -> bool {
+        self.tmux.is_none_or(|age| age >= TMUX_STALE)
+    }
+}
+
 /// tmux liveness 快照（§4：節流每 2s，且每條查詢 bounded——逾時整層降級
 /// `None`＝unknown，MUST NOT 凍結 UI）。
 pub struct LiveIndex {
@@ -97,6 +152,18 @@ pub struct LiveIndex {
     /// CLI-LIST-2「cardinality 不可丟」擋下的事（`spawn.rs::live_label` 同一
     /// 條紀律）。
     pub windows: Option<HashMap<String, Vec<(String, String)>>>,
+    /// `list-panes` 的結果**實際到手的那一刻**（審查 F1）。
+    ///
+    /// 為什麼觀測時間要跟著快照走、而不是由 UI 在收信時取 `Instant::now()`：
+    /// 一輪 `Msg::Live` 要跑完 list-panes → list-windows → 逐 pane 兩次 bounded
+    /// blocker 查詢，單次逾時預設 5 秒，整輪可以遠超過 `TMUX_STALE`。用收信
+    /// 時間算 age，等於把十幾秒前的 pane 快照重新標成「剛更新」——正是這一項
+    /// 要修掉的缺陷。放在結構裡而不是另傳一個參數，是為了讓它**不可能被忘記
+    /// 帶上**。
+    ///
+    /// 取 panes 這一筆是刻意的保守值：它是整輪最先發出的查詢，因此是本輪所有
+    /// 子快照裡**最舊**的觀測時間。`None`＝這一輪沒有成功的 pane 快照。
+    pub panes_at: Option<Instant>,
 }
 
 impl LiveIndex {
@@ -121,6 +188,9 @@ impl LiveIndex {
                 }
                 map
             });
+        // pane 快照到手的那一刻就記下來——後面的 list-windows 與逐 pane blocker
+        // 查詢每一條都可能各等一次 bounded 逾時
+        let panes_at = panes.as_ref().map(|_| Instant::now());
         let windows = tmux
             .exec(&[
                 "list-windows",
@@ -149,7 +219,11 @@ impl LiveIndex {
                 }
                 map
             });
-        LiveIndex { panes, windows }
+        LiveIndex {
+            panes,
+            windows,
+            panes_at,
+        }
     }
 
     /// 全 unknown 的空快照。UI 的起始值就是它——第一輪 liveness 由背景
@@ -158,6 +232,28 @@ impl LiveIndex {
         LiveIndex {
             panes: None,
             windows: None,
+            panes_at: None,
+        }
+    }
+
+    /// 這一輪算不算「成功拿到 tmux 快照」，算的話回傳**觀測時間**
+    /// （審查 F1／F2）。
+    ///
+    /// 兩個必要子項都要成功：`panes` 撐死活軸、`windows` 撐 ORIGINS 欄的
+    /// window 狀態。只有 panes 成功就刷新整個 tmux age，等於讓 list-panes
+    /// 替 list-windows 背書——畫面上 origin 列全是 unknown，footer 卻寫著
+    /// 「2s」。
+    ///
+    /// **空集合仍算成功**：`list-panes` 回了一份沒有任何 pane 的結果，那是
+    /// 一個成立的觀測（機器上真的沒有 pane），與查詢失敗是兩回事。
+    ///
+    /// blocker 軸**刻意不列入成功判定**：單一 pane 已經死掉時 `blocker_of`
+    /// 合法地回 `Unknown`，把它算成失敗會讓 registry 裡留著一個死 pane 就
+    /// 永遠標不出新鮮——那是比誤報更糟的誤報。
+    pub fn success_at(&self) -> Option<Instant> {
+        match (&self.panes, &self.windows) {
+            (Some(_), Some(_)) => self.panes_at,
+            _ => None,
         }
     }
 }
@@ -241,6 +337,17 @@ pub struct BlockerDebounce {
 impl BlockerDebounce {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// 丟掉所有連勝（審查 F7）。
+    ///
+    /// 「連續兩輪」這個條件隱含**時間鄰近性**：以 2s 一輪計，升旗代表框在
+    /// 最壞未滿 4s 的窗口裡連著出現兩次。tmux 軸停擺（stale 降級）期間畫面
+    /// 走 unknown，但 streak 若原樣留著，停擺前 streak=1 的 pane 會在停擺
+    /// 30 秒後的**第一則**回報就立刻升旗——那兩次命中之間隔了半分鐘，與去抖
+    /// 想證明的事完全無關。缺口一出現就把連勝作廢，重新起算。
+    pub fn reset(&mut self) {
+        self.streak.clear();
     }
 
     /// 把一輪原始判定過一次去抖，回傳要拿去顯示的索引。
@@ -599,6 +706,7 @@ mod tests {
                 inflight("20260731T000003Z-cccc", "w1"),
             ],
             recent: Vec::new(),
+            recent_truncated: false,
         };
         let rows = worker_rows(&model, "it:@1");
         assert_eq!(
@@ -636,6 +744,7 @@ mod tests {
                 // 它的任務不該從畫面上人間蒸發）
                 inflight("20260731T000000Z-zzzz", "gone-w"),
             ],
+            recent_truncated: false,
         };
         assert_eq!(
             worker_rows(&model, ALL_SCOPE),
@@ -669,6 +778,7 @@ mod tests {
                 inflight("20260731T000005Z-eeee", "wx"),
                 inflight("20260731T000001Z-aaaa", "w1"),
             ],
+            recent_truncated: false,
         };
         assert_eq!(task_rows(&model, "it:@1"), vec![0, 2], "含終態、新的在上");
         assert_eq!(task_rows(&model, "other:@2"), vec![1]);
@@ -808,6 +918,7 @@ mod tests {
         let live = LiveIndex {
             panes: Some(panes),
             windows: Some(win_index(&[("it", "@1", "main")])),
+            ..LiveIndex::unknown()
         };
         assert!(matches!(pane_liveness(&live, "%1"), Liveness::Live));
         assert!(matches!(pane_liveness(&live, "%9"), Liveness::Dead));
@@ -829,6 +940,7 @@ mod tests {
         let live = LiveIndex {
             panes: None,
             windows: Some(win_index(&[("scratch", "@108", "main")])),
+            ..LiveIndex::unknown()
         };
         // live：人看得懂的 session:window-name；DETAIL 仍留完整 @id
         assert_eq!(origin_row_label(&live, "scratch:@108"), "scratch:main");
@@ -866,6 +978,7 @@ mod tests {
                 ("beta", "@7", "work-linked"),
                 ("solo", "@8", "only"),
             ])),
+            ..LiveIndex::unknown()
         };
 
         // (a) 標籤的 session 與其中恰一筆相符 → 取那一筆（不是列序最後一筆）
@@ -911,6 +1024,7 @@ mod tests {
         let dup = LiveIndex {
             panes: None,
             windows: Some(win_index(&[("alpha", "@9", "a"), ("alpha", "@9", "b")])),
+            ..LiveIndex::unknown()
         };
         assert!(matches!(
             window_state(&dup, "alpha:@9"),
@@ -931,6 +1045,7 @@ mod tests {
                 ("alpha", "@7", "work"),
                 ("alpha", "@7", "work"),
             ])),
+            ..LiveIndex::unknown()
         };
         assert_eq!(
             window_state(&same, "alpha:@7"),
@@ -946,6 +1061,7 @@ mod tests {
         let live = LiveIndex {
             panes: None,
             windows: Some(win_index(&[("s", "@1", "main")])),
+            ..LiveIndex::unknown()
         };
         for bad in [
             "s:@",
