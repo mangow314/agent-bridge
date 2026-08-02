@@ -68,11 +68,243 @@ pub trait TmuxClient {
     /// 這是 Rust 獨有的關卡（bash 正本自 M4 凍結時沒有）。
     fn pane_in_mode(&self, pane: &str) -> Option<bool>;
 
+    /// **尾行預覽的專用取得路徑**（tui-design §9 P4.7 切片 D）。
+    ///
+    /// 與 `capture_pane` 分開是刻意的：那一條是 blocker 軸在用的（每 2s 一輪、
+    /// 抓當前畫面），語意與界都不同，改它會波及 BLOCKER 軸。這一條的三個界
+    /// （history 行數／byte／時間）都成立於**取得路徑本身**：
+    /// - 行：`-S -<history_lines>`＝向後要求這麼多行 **history**。實際取得約
+    ///   `history_lines + pane 高度`（可見區一律在內），**不是**「總共只取 n
+    ///   行」——這一項的作用是「不撈整份 scrollback」，不是總量上限
+    /// - byte：讀取迴圈分塊累積，超過就停讀並殺掉子行程（**不得** `read_to_end`）
+    ///   ——**總量的硬上限是這一項**
+    /// - 時間：呼叫端給的 deadline，不吃 `AGENT_BRIDGE_TMUX_TIMEOUT=0` 的
+    ///   無限逃生口
+    ///
+    /// 逾時／起不來／非零退出一律 `None`（fail-closed，同本 trait 其餘查詢）。
+    ///
+    /// **有預設實作（回 `None`）**：這是本 trait 唯一有預設的方法。理由是它只
+    /// 服務 TUI 的一條 one-shot 路徑，而 repo 裡另有五份為 spawn／notify 寫的
+    /// 假件——讓它們一律回「查不出來」比逼每一份都編一個尾行出來誠實，也不會
+    /// 因為新增一個方法就動到那幾條路徑的測試。真正的實作在 `SubprocessTmux`，
+    /// 要驗參數的假件自己覆寫它。
+    fn capture_pane_tail(&self, _pane: &str, _bounds: TailBounds) -> Option<TailCapture> {
+        None
+    }
+
     /// 對齊 `tmux send-keys -t <pane> <keys>`；成功回 `true`。
     ///
     /// **實作 MUST 有逾時**：copy-mode 中的 pane 會讓 send-keys 永不返回
     /// （AB-COPYMODE-1 實測），沒有逾時就等於整個 `send` 指令被鎖死。
     fn send_keys(&self, pane: &str, keys: &str) -> bool;
+}
+
+/// 尾行預覽的三重界。值的來源只有 `config`（`TAIL_HISTORY_LINES`／
+/// `TAIL_MAX_BYTES`／`TAIL_TIMEOUT`），這個型別只是把它們一起搬運，**不提供
+/// 預設**——預設散在兩處就會有兩份界。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct TailBounds {
+    /// 向後要求的 **history 行數**（`-S -<n>`）。實際取得約 `n + pane 高度`
+    /// ——可見區一律在內。這不是總量上限，總量看 `max_bytes`
+    pub history_lines: usize,
+    pub max_bytes: usize,
+    pub timeout: Duration,
+}
+
+/// 一次尾行預覽的結果。
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct TailCapture {
+    /// 已經在 byte 界內的畫面文字
+    pub text: String,
+    /// 是否因為 byte 界而截斷（畫面要據此標記，否則人會以為那就是全部）
+    pub truncated: bool,
+}
+
+/// `capture-pane` 的 argv（純函式，測試直接驗**送出去的參數形狀**）。
+///
+/// `-p` 印到 stdout、`-J` 併接被 tmux 折過的行、`-S -<n>` **向後要求 n 行
+/// history**。
+///
+/// ⚠️ `-S -<n>` 的語意不是「總共只回 n 行」：tmux 回的是「n 行 history ＋整個
+/// 可見區」，實測 80x24 的 pane 印 500 行後 `-S -200` 回 224 行。這裡的 `-S`
+/// 只保證**不撈整份 scrollback**；總量的硬上限是讀取迴圈的 byte 界。
+pub fn tail_args(pane: &str, history_lines: usize) -> Vec<String> {
+    vec![
+        "capture-pane".to_string(),
+        "-p".to_string(),
+        "-J".to_string(),
+        "-t".to_string(),
+        pane.to_string(),
+        "-S".to_string(),
+        format!("-{history_lines}"),
+    ]
+}
+
+/// 有界讀取的收場。**逾時不在這裡**：那條路徑回的是 `None`（reader 還卡著，
+/// 連 outcome 都生不出來）。
+///
+/// 三種收場的收屍與判定各不相同（跨廠複核 M3）：只有 `Eof` 那條可以、也必須
+/// 去看子行程的真實退出碼；`Capped` 是**本方**主動停讀，非零退出多半正是我們
+/// 殺出來的，拿它判失敗會把一次合法的截斷變成 unavailable。
+#[derive(Debug)]
+enum ReadOutcome {
+    /// 來源自己結束（EOF）
+    Eof(Vec<u8>),
+    /// 撞到 byte 界，本方主動停讀
+    Capped(Vec<u8>),
+    /// 讀取途中出錯
+    ReadError,
+}
+
+/// **有界讀取**：分塊讀到 `max_bytes` 為止，或到 `deadline` 為止。
+///
+/// 回 `None`＝逾時或 reader thread 起不來（呼叫端負責殺子行程）。
+///
+/// 為什麼要一條 reader thread：`Read` 沒有 deadline 的概念，唯一能在「讀取
+/// 卡住」時仍然收手的辦法就是把讀取放到另一條 thread、主緒等一個有逾時的
+/// channel。**不 join**：卡住的那條 thread 會在子行程被殺、pipe EOF 之後自己
+/// 收斂；join 它等於把逾時又還回去。
+///
+/// 每一輪只遞 `min(剩餘額度 + 1, chunk)` 的 slice（跨廠複核 m1）：
+/// - 來源實際被 consume 的量最多超出上限 **1 byte**（用整個 chunk 去讀，剩餘
+///   額度小於 chunk 時會白白吞掉後面的資料）
+/// - `truncated` 只有在**真的看到多出來那一 byte** 時才設。恰好等於上限的來源
+///   是「完整讀完」，標成截斷會讓畫面說一件不存在的事
+fn read_capped<R: std::io::Read + Send + 'static>(
+    reader: R,
+    max_bytes: usize,
+    deadline: Instant,
+) -> Option<ReadOutcome> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let spawned = std::thread::Builder::new()
+        .name("ab-tail-read".to_string())
+        .spawn(move || {
+            let mut reader = reader;
+            let mut buf: Vec<u8> = Vec::new();
+            let mut chunk = [0u8; 8192];
+            let outcome = loop {
+                // 多要 1 byte：那一 byte 的存在**就是**「來源還有東西」的證據
+                let want = (max_bytes - buf.len() + 1).min(chunk.len());
+                match std::io::Read::read(&mut reader, &mut chunk[..want]) {
+                    Ok(0) => break ReadOutcome::Eof(buf),
+                    Ok(n) => {
+                        buf.extend_from_slice(&chunk[..n]);
+                        if buf.len() > max_bytes {
+                            // 停讀＝不再把後面的東西搬進記憶體。子行程可能因此
+                            // 卡在寫入，呼叫端接著會殺它
+                            buf.truncate(max_bytes);
+                            break ReadOutcome::Capped(buf);
+                        }
+                    }
+                    Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                    Err(_) => break ReadOutcome::ReadError,
+                }
+            };
+            let _ = tx.send(outcome);
+        })
+        .is_ok();
+    if !spawned {
+        return None;
+    }
+    let left = deadline.saturating_duration_since(Instant::now());
+    rx.recv_timeout(left).ok()
+}
+
+/// 一次尾行取得的完整結果（含收屍證據）。**測試看得到 `status`／`killed`**
+/// ——「逾時之後子行程真的被殺並收屍」這件事，只驗 `capture` 是驗不到的
+/// （跨廠複核 m2）。
+#[derive(Debug)]
+struct TailRun {
+    capture: Option<TailCapture>,
+    /// 收屍拿到的退出狀態（`None`＝連 `wait` 都失敗）。**只有測試讀它**——
+    /// production 只要 `capture`，但把收屍證據丟掉就等於那條保證沒人驗得到
+    #[cfg_attr(not(test), allow(dead_code))]
+    status: Option<std::process::ExitStatus>,
+    /// 本方是否主動送過 kill（同上：測試用的收屍證據）
+    #[cfg_attr(not(test), allow(dead_code))]
+    killed: bool,
+}
+
+/// 以**已經起好的子行程**執行有界讀取＋收屍（與「怎麼起 tmux」分開，測試才
+/// 注得進可控的 fixture process——真 tmux 做不出決定性的 hang）。
+///
+/// 退出碼的分流是這一段的重點（跨廠複核 M3）：
+/// - `Eof`：在剩餘期限內取得**真實**退出狀態，非零一律 `None`（fail-closed，
+///   對齊 trait 註解）。pane 已消失時 `capture-pane` 正是「非零退出＋空 stdout」
+///   ——不看退出碼就會把它報成「這個 pane 沒有輸出」
+/// - `Capped`：本方刻意提前停讀，kill＋收屍後回**合法的**截斷結果。這條路徑
+///   MUST NOT 檢查退出碼：那多半是自己殺出來的
+/// - 逾時／`ReadError`：kill＋收屍後 `None`
+fn tail_from_child(mut child: std::process::Child, max_bytes: usize, deadline: Instant) -> TailRun {
+    let Some(stdout) = child.stdout.take() else {
+        // `Stdio::piped()` 下不可達；真的走到就與逾時同一條收尾路徑
+        return reap(child, None);
+    };
+    let text = |buf: Vec<u8>| TailCapture {
+        // 畫面文字只用來給人看，非 payload 路徑（同 `capture_pane`）
+        text: String::from_utf8_lossy(&buf).into_owned(),
+        truncated: false,
+    };
+    match read_capped(stdout, max_bytes, deadline) {
+        // 完整讀完：**不先殺**——先殺再看退出碼會把正常完成也變成失敗
+        Some(ReadOutcome::Eof(buf)) => match wait_deadline(&mut child, deadline) {
+            Some(status) if status.success() => TailRun {
+                capture: Some(text(buf)),
+                status: Some(status),
+                killed: false,
+            },
+            // 非零退出（pane 不在、target 打錯…）＝查不出來，不是「沒有輸出」
+            Some(status) => TailRun {
+                capture: None,
+                status: Some(status),
+                killed: false,
+            },
+            // 讀完了卻等不到退出狀態：期限已到，殺掉收屍當查不出來
+            None => reap(child, None),
+        },
+        Some(ReadOutcome::Capped(buf)) => {
+            let mut run = reap(child, None);
+            run.capture = Some(TailCapture {
+                truncated: true,
+                ..text(buf)
+            });
+            run
+        }
+        Some(ReadOutcome::ReadError) | None => reap(child, None),
+    }
+}
+
+/// kill＋收屍（不留殭屍）。`capture` 由呼叫端決定要不要放回去。
+fn reap(mut child: std::process::Child, capture: Option<TailCapture>) -> TailRun {
+    let killed = child.kill().is_ok();
+    TailRun {
+        capture,
+        status: child.wait().ok(),
+        killed,
+    }
+}
+
+/// 在期限內等子行程結束。逾時回 `None`（**不殺**——殺與否由呼叫端依收場決定）。
+///
+/// 輪詢間隔沿用 `wait_with_timeout` 的 20ms：EOF 之後子行程通常已經在結束途中，
+/// 這裡只是不讓「stdout 關了卻不退出」的病態情況把 UI 的一次預覽拖成無限等待。
+fn wait_deadline(
+    child: &mut std::process::Child,
+    deadline: Instant,
+) -> Option<std::process::ExitStatus> {
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return Some(status),
+            Ok(None) => {}
+            // EINTR：輪詢被訊號打斷，子行程沒事（同 `wait_with_timeout`）
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(_) => return None,
+        }
+        if Instant::now() >= deadline {
+            return None;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
 }
 
 pub struct SubprocessTmux;
@@ -123,6 +355,23 @@ impl TmuxClient for SubprocessTmux {
         } else {
             None
         }
+    }
+
+    fn capture_pane_tail(&self, pane: &str, bounds: TailBounds) -> Option<TailCapture> {
+        // **不走 `run_bounded`**：那條的 stdout 是 `read_to_end`（byte 無界），
+        // 逾時又吃 `AGENT_BRIDGE_TMUX_TIMEOUT=0` 的無限逃生口。它是 spawn／
+        // notify 全線在用的路徑，語意不動；這裡自己起子行程
+        let deadline = Instant::now().checked_add(bounds.timeout)?;
+        let args = tail_args(pane, bounds.history_lines);
+        let child = Command::new("tmux")
+            .args(args.iter().map(String::as_str))
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            // stderr 丟掉：這條路徑的失敗訊號是**退出碼**，錯誤原文沒有消費者
+            .stderr(Stdio::null())
+            .spawn()
+            .ok()?;
+        tail_from_child(child, bounds.max_bytes, deadline).capture
     }
 
     fn pane_in_mode(&self, pane: &str) -> Option<bool> {
@@ -318,6 +567,253 @@ mod tests {
             wait_with_timeout(&mut child, None)
                 .expect("應收到狀態")
                 .success()
+        );
+    }
+
+    // ---- P4.7 切片 D：尾行預覽的三重界 ----
+
+    /// 驗的是**送出去的參數形狀**，不是 tmux 的回傳語意。
+    ///
+    /// ⚠️ 這條測試在切片 D 的第一版曾經把一個**錯誤的語意**驗成綠燈：當時的
+    /// 名字與註解都寫著「總共只取 n 行」，而 `-S -<n>` 實際上是「n 行 history
+    /// ＋整個可見區」（真 tmux 實測 200 → 224 行）。argv 測試證明不了外部工具
+    /// 的回傳語意——那一半由分組 45 的真 tmux 測試負責（G2）。
+    #[test]
+    fn the_tail_asks_tmux_for_a_bounded_span_of_history() {
+        let args = tail_args("%7", 200);
+        assert_eq!(
+            args,
+            vec!["capture-pane", "-p", "-J", "-t", "%7", "-S", "-200"],
+            "參數形狀：-p 印 stdout、-J 併軟折行、-S -<n> 向後要 n 行 history"
+        );
+        // history 行數是參數，不是寫死的
+        assert_eq!(tail_args("%7", 5).last().unwrap(), "-5");
+    }
+
+    /// 記下**實際被 consume 的 byte 數**的包裝（跨廠複核 m1：只驗 buffer 長度
+    /// 的話，「每次都遞完整 chunk、白白吞掉後面的資料」是驗不出來的）。
+    struct Counting<R> {
+        inner: R,
+        n: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    }
+    impl<R: std::io::Read> std::io::Read for Counting<R> {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            let got = self.inner.read(buf)?;
+            self.n.fetch_add(got, std::sync::atomic::Ordering::SeqCst);
+            Ok(got)
+        }
+    }
+
+    /// **byte 界成立於讀取迴圈**（gate (d)）：來源是「無限長的單行」，讀進來的
+    /// bytes MUST 不超過上限——證明不是先全讀再截。
+    ///
+    /// 而且**最多只多 consume 1 byte**：那一 byte 正是「來源還有東西」的證據，
+    /// 也是 `truncated` 唯一的依據。
+    #[test]
+    fn the_tail_stops_reading_at_the_byte_bound() {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let n = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        // `io::repeat` 是永遠讀得到東西的來源：`read_to_end` 對它是不會結束的
+        let src = Counting {
+            inner: std::io::repeat(b'x'),
+            n: n.clone(),
+        };
+        let Some(ReadOutcome::Capped(buf)) = read_capped(src, 4096, deadline) else {
+            panic!("無限來源 MUST 收在 Capped");
+        };
+        assert_eq!(buf.len(), 4096, "交出去的 MUST 剛好是上限");
+        assert_eq!(
+            n.load(std::sync::atomic::Ordering::SeqCst),
+            4097,
+            "來源實際被 consume 的量 MUST 只多那一 byte（不是整個 8192 chunk）"
+        );
+    }
+
+    /// **恰好等於上限不是截斷**（跨廠複核 m1）：`truncated` 說的是「後面還有
+    /// 東西沒給你」，剛好讀完卻標成截斷，等於畫面說了一件不存在的事。
+    #[test]
+    fn a_source_that_exactly_fills_the_bound_is_not_truncated() {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        for (len, label) in [(4095usize, "少一 byte"), (4096, "恰好等於上限")] {
+            let src = std::io::Cursor::new(vec![b'x'; len]);
+            let Some(ReadOutcome::Eof(buf)) = read_capped(src, 4096, deadline) else {
+                panic!("{label} MUST 收在 Eof");
+            };
+            assert_eq!(buf.len(), len, "{label}：MUST 完整讀完");
+        }
+        // 對照組：多一 byte 才算截斷
+        let src = std::io::Cursor::new(vec![b'x'; 4097]);
+        assert!(
+            matches!(
+                read_capped(src, 4096, deadline),
+                Some(ReadOutcome::Capped(_))
+            ),
+            "多一 byte MUST 收在 Capped"
+        );
+    }
+
+    /// **時間界自持**（gate (d)：hanging tmux）：讀不到東西也不會卡住——
+    /// 期限到就回 `None`，呼叫端據此殺子行程並顯示逾時。
+    ///
+    /// 卡住的來源是**可關閉**的（跨廠複核 m2）：睡一小時的 detached thread 每
+    /// 跑一次就留一條到 process 結束，測試自己不該產生那種殘留。這裡逾時之後
+    /// 主動放行，並等 reader 真的收斂。
+    #[test]
+    fn the_tail_gives_up_on_a_hanging_source() {
+        /// 阻塞到測試放行為止的來源（放行＝EOF）。`Drop` 時回報，證明 reader
+        /// thread 真的收斂了、不是留在那裡睡
+        struct Hanging {
+            gate: std::sync::mpsc::Receiver<()>,
+            done: std::sync::mpsc::Sender<()>,
+        }
+        impl std::io::Read for Hanging {
+            fn read(&mut self, _buf: &mut [u8]) -> std::io::Result<usize> {
+                let _ = self.gate.recv(); // 發送端 drop → 立刻返回 → EOF
+                Ok(0)
+            }
+        }
+        impl Drop for Hanging {
+            fn drop(&mut self) {
+                let _ = self.done.send(());
+            }
+        }
+        let (release, gate) = std::sync::mpsc::channel();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let src = Hanging {
+            gate,
+            done: done_tx,
+        };
+
+        let started = Instant::now();
+        let deadline = Instant::now() + Duration::from_millis(150);
+        assert!(
+            read_capped(src, 4096, deadline).is_none(),
+            "卡住的來源 MUST 逾時，不得無限等"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "而且要在期限的量級內回來（實測 {:?}）",
+            started.elapsed()
+        );
+
+        // 放行：真實情境裡這一步是「子行程被殺、pipe EOF」
+        drop(release);
+        done_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("reader thread MUST 在來源關閉後收斂（不留 detached thread）");
+    }
+
+    /// 收屍是**這條路徑自己的責任**（跨廠複核 m2）：卡住的子行程逾時之後 MUST
+    /// 被殺並 `wait` 到底，否則每按一次 `L` 就留一個殭屍。
+    ///
+    /// 用可控的 fixture process 而不是真 tmux：真 tmux 做不出決定性的 hang。
+    #[test]
+    fn a_hanging_child_is_killed_and_reaped_on_timeout() {
+        // 開著 stdout 卻永不寫入也永不結束：正是「卡住的 tmux」的形狀
+        let child = Command::new("sleep")
+            .arg("60")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("sleep 應可 spawn");
+        let started = Instant::now();
+        let run = tail_from_child(child, 4096, Instant::now() + Duration::from_millis(200));
+        assert!(run.capture.is_none(), "逾時 MUST 回 None，不是空 capture");
+        assert!(run.killed, "MUST 主動送 kill");
+        let status = run.status.expect("MUST 收屍（wait 到底），不留殭屍");
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::ExitStatusExt;
+            assert_eq!(status.signal(), Some(9), "終結方式 MUST 是本方的 SIGKILL");
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "MUST 在期限的量級內回來（實測 {:?}）",
+            started.elapsed()
+        );
+    }
+
+    /// **非零退出 ≠ 沒有輸出**（跨廠複核 M3）：pane 已消失時 `capture-pane` 是
+    /// 「非零退出＋空 stdout」——不看退出碼就會把它畫成「這個 pane 沒有輸出」，
+    /// 與 trait 註解承諾的 fail-closed 直接矛盾。
+    #[test]
+    fn a_child_that_exits_non_zero_is_unavailable_not_empty() {
+        let child = Command::new("sh")
+            .args(["-c", "exit 3"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("sh 應可 spawn");
+        let run = tail_from_child(child, 4096, Instant::now() + Duration::from_secs(5));
+        assert!(run.capture.is_none(), "非零退出 MUST 回 None");
+        assert!(
+            !run.killed,
+            "正常結束的子行程 MUST NOT 被殺（先殺再看退出碼會把成功也變成失敗）"
+        );
+        assert_eq!(
+            run.status.and_then(|s| s.code()),
+            Some(3),
+            "MUST 是真實退出碼"
+        );
+    }
+
+    /// 正常路徑：完整讀完＋退出碼 0 → 有內容、未截斷、**沒有被殺**。
+    #[test]
+    fn a_child_that_succeeds_yields_its_output_untruncated() {
+        let child = Command::new("sh")
+            .args(["-c", "printf 'a\\nb\\n'"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("sh 應可 spawn");
+        let run = tail_from_child(child, 4096, Instant::now() + Duration::from_secs(5));
+        let cap = run.capture.expect("成功路徑 MUST 有內容");
+        assert_eq!(cap.text, "a\nb\n");
+        assert!(!cap.truncated);
+        assert!(!run.killed, "成功路徑 MUST NOT 送 kill");
+        assert!(run.status.is_some_and(|s| s.success()));
+    }
+
+    /// 截斷路徑：本方主動停讀 → kill＋收屍，但結果**仍然合法**。
+    ///
+    /// 這條釘的是 M3 修法裡最容易做錯的一格：`Capped` 之後去檢查退出碼，等於
+    /// 拿自己殺出來的非零狀態否定一次合法的截斷。
+    #[test]
+    fn a_capped_child_still_yields_a_truncated_capture() {
+        let child = Command::new("sh")
+            // 一直吐字元、不會自己結束：撞 byte 界的形狀
+            .args(["-c", "while :; do printf 'xxxxxxxxxxxxxxxx'; done"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("sh 應可 spawn");
+        let run = tail_from_child(child, 4096, Instant::now() + Duration::from_secs(5));
+        let cap = run.capture.expect("截斷 MUST 仍有內容（不是 unavailable）");
+        assert_eq!(cap.text.len(), 4096);
+        assert!(cap.truncated, "截斷 MUST 說出來");
+        assert!(run.killed, "停讀之後 MUST 殺掉還在寫的子行程");
+        assert!(run.status.is_some(), "MUST 收屍");
+    }
+
+    /// 三個界的值只有一份定義（`config`），這裡釘住它們是**有限**的正數
+    /// ——常數被改成 0／`usize::MAX` 時，上面三條測試都還會綠。
+    #[test]
+    fn the_tail_bounds_are_finite() {
+        // 常數 → `const` 區塊裡斷言（clippy 的建議，順帶把它變成編譯期關卡：
+        // 把界設成 0／無限大的那一版根本編不過）
+        const {
+            assert!(config::TAIL_HISTORY_LINES > 0 && config::TAIL_HISTORY_LINES <= 10_000);
+        }
+        const {
+            assert!(config::TAIL_MAX_BYTES >= 1024 && config::TAIL_MAX_BYTES <= 1 << 20);
+        }
+        assert!(
+            config::TAIL_TIMEOUT >= Duration::from_millis(200)
+                && config::TAIL_TIMEOUT <= Duration::from_secs(30)
         );
     }
 }

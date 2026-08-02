@@ -101,6 +101,7 @@ CLI 才是介面；任何 TUI 能做的事，人離開 TUI 都做得到。
 | `e` | evict 選中 worker | `agent-bridge evict <name> --expect-pane <pane> --expect-generation <tag>` | ✔ 證據框＋CAS |
 | `/` | filter（**literal**：regex metachar 一律當字面字元；Enter 保留、Esc 清空） | — | —（純顯示面） |
 | `S` | 切 TASKS 欄的 scope（`all` ⇄ `unattached`） | — | —（純顯示面。**大寫**是因為小寫 `s` 已被本表保留給 send；同一鍵兩種語意正是 contextual footer 要消滅的漂移） |
+| `L` | 選中 worker 的 pane **尾行預覽**（one-shot） | 近似 `tmux capture-pane -p -J -t <pane> -S -<n>` | —（唯讀。行／byte／時間三重有界，見下） |
 | `?` | 顯示**當前選中項**的合法鍵 | — | — |
 | `q` | 離開 | — | — |
 
@@ -113,6 +114,18 @@ CLI 才是介面；任何 TUI 能做的事，人離開 TUI 都做得到。
 （「同名 respawn 不自動附掛歷史 task」），故一律 fail-closed。代價是
 `register` 後同一秒派出的任務會暫時落在 `unattached`——那是**可見且可恢復**的
 （切 scope 就看得到），而錯誤歸屬是靜默的。不為此重開磁碟 schema（已裁定）。
+
+**`L` 的三重界（P4.7 切片 D）**：界**成立於資料取得路徑**——先全讀進記憶體
+再截不算。行界推給 tmux 自身（`-S -<n>`），byte 界在讀取迴圈邊讀邊停（看到
+超出額度的那一 byte 才算截斷，看到即停讀並 kill＋收屍），時間界自持
+**且刻意不吃 `AGENT_BRIDGE_TMUX_TIMEOUT=0` 的無限逃生口**——可以被環境變數
+關掉的界不是界。三者只有一份定義（config → bounds → 取得函式），UI 端不再截。
+**`-S -<n>` 不是「總共 n 行」**：tmux 的行號以可見區第一行為 0、負數進
+history，結束點仍是 pane 底部，所以實際取得約 `n + pane 高度`（分組 45 在真
+tmux 上釘住這條語意；假件只證明得了送出去的參數形狀）。總量的硬上限是 byte
+界，行界的作用是不撈整份 scrollback。
+退出碼分流：正常 EOF 要求 `success()` 才算數（非零＝unavailable，不是「沒有
+輸出」）；本方主動截斷則不看退出碼——那多半是自己殺出來的。
 
 **`c` 的複製後端（v1 定案）**：寫入 **tmux buffer**（`set-buffer`），不引入
 clipboard crate、不依賴 OSC52／Wayland；人要出 tmux 世界自己 `paste-buffer`。

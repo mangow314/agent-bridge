@@ -21,7 +21,7 @@ use std::time::{Duration, Instant};
 
 use ab_core::error::{Error, Result};
 use ab_core::paths::Paths;
-use ab_core::tmux::SubprocessTmux;
+use ab_core::tmux::{SubprocessTmux, TmuxClient};
 use crossterm::event::{self, Event, KeyCode, KeyEventKind};
 
 use app::{App, Effect, Key};
@@ -235,6 +235,14 @@ fn event_loop(
                     last_disk = Instant::now();
                     stamps.note_disk(last_disk);
                 }
+                // `L` 的回信。判斷（放閘、比對目標、丟棄晚到結果）全在
+                // `app::peek_apply` 這個純函式裡；run loop 的責任只有一件：
+                // **先做一次權威重讀再比對**（跨廠複核 M2）
+                Msg::Peek { target, res } => {
+                    peek_arrival(&mut app, &mut model, || Model::load(paths), &target, res);
+                    last_disk = Instant::now();
+                    stamps.note_disk(last_disk);
+                }
             }
         }
 
@@ -299,6 +307,12 @@ fn event_loop(
                     // worker 那條 thread 等於五分鐘不再有 liveness
                     Effect::Evict { shown } => {
                         start_evict(&mut app, worker, paths, shown);
+                    }
+                    // `L`：一次性 thread 上跑一次三重有界的 capture。**不搭常駐
+                    // worker**——它同時負責 liveness 輪詢，一次卡住的 capture
+                    // 會讓兩軸一起停擺（同 evict 的理由）
+                    Effect::Peek { target } => {
+                        start_peek(&mut app, worker, target);
                     }
                     Effect::None => {}
                 }
@@ -412,6 +426,69 @@ fn start_evict(app: &mut App, worker: &worker::Handle, paths: &Paths, shown: act
         app.push_warning(format!(
             "evict '{name}' could not start (background worker failed to spawn); run it from the CLI instead: {cmdline}"
         ));
+    }
+}
+
+/// 晚到的預覽結果落地：**先做一次權威重讀，再比對目標**（跨廠複核 M2）。
+///
+/// 為什麼不能直接拿記憶體裡那份 model 比：磁碟軸每 500ms 才重讀一次，回信落在
+/// 兩次 poll 之間時，`model` 最舊可以是 500ms 前的。具體會出事的次序是——
+/// disk poll 剛結束 → w1 respawn（registry 的 pane／`spawn_tag` 都換了）→ 舊
+/// capture 的回信到了 → 對**舊** model 比對「還是同一列」→ 舊世代的畫面內容
+/// 就這樣貼上新一代的列。而那正是 gate (d) 指名要擋掉的情境。
+///
+/// loader 由呼叫端注入，這一條才驗得到（真 run loop 傳 `Model::load`）。
+fn peek_arrival(
+    app: &mut App,
+    model: &mut Model,
+    load: impl FnOnce() -> Model,
+    target: &app::PeekTarget,
+    res: Option<ab_core::tmux::TailCapture>,
+) {
+    *model = load();
+    app.relocate(model);
+    app::peek_apply(app, model, target, res);
+}
+
+/// 尾行預覽的三個界。**只從 `ab_core::config` 讀**——那是唯一一份定義，UI 端
+/// 不再截第二次（切片 D 契約）。
+fn peek_bounds() -> ab_core::tmux::TailBounds {
+    ab_core::tmux::TailBounds {
+        history_lines: ab_core::config::TAIL_HISTORY_LINES,
+        max_bytes: ab_core::config::TAIL_MAX_BYTES,
+        timeout: ab_core::config::TAIL_TIMEOUT,
+    }
+}
+
+/// 一次性 thread 上真正做的那一件事（與 thread 的起法分開，才注得進假件）。
+///
+/// panic 也回一則終局：閘由回信放開，沒有回信就永遠按不動下一次 `L`。
+fn peek_once(tmux: &dyn TmuxClient, target: app::PeekTarget) -> Msg {
+    let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        tmux.capture_pane_tail(&target.pane, peek_bounds())
+    }))
+    .unwrap_or(None);
+    Msg::Peek { target, res }
+}
+
+/// `L` 的執行段：in-flight 閘 → 一次性 thread → 回信（P4.7 切片 D）。
+///
+/// UI thread 在這裡只起一條 thread，capture 本身連同它的三個界都在那一條上；
+/// 界的值只從 `ab_core::config` 讀一次，UI 端不再截第二次。
+fn start_peek(app: &mut App, worker: &worker::Handle, target: app::PeekTarget) {
+    let name = target.name.clone();
+    let req_target = target.clone();
+    let started = worker.spawn_oneshot(move |tx| {
+        let _ = tx.send(peek_once(&SubprocessTmux, req_target));
+    });
+    if started {
+        app.peek_inflight = Some(target);
+        app.message = format!("preview of '{name}' in progress…");
+    } else {
+        // thread 起不來：當場給終態，別讓閘卡在一個不會回來的請求上
+        app.peek_inflight = None;
+        app.message =
+            format!("preview of '{name}' could not start (background worker failed to spawn)");
     }
 }
 
@@ -915,5 +992,202 @@ mod tests {
             tmux: Some(Duration::ZERO),
         };
         assert!(!degrade_on_stale(ok, &mut debounce));
+    }
+
+    // ── P4.7 切片 D：`L` 尾行預覽的 wiring ────────────────────────────
+
+    fn peek_target(pane: &str, name: &str) -> app::PeekTarget {
+        app::PeekTarget {
+            pane: pane.to_string(),
+            name: name.to_string(),
+            key: model::RowKey::Worker {
+                name: name.to_string(),
+                spawn_tag: "t-gen1".to_string(),
+            },
+        }
+    }
+
+    /// 假 tmux：記下 `capture_pane_tail` 收到的 `(pane, bounds)`，其餘方法都是
+    /// fail-closed 的空殼（這一條路徑用不到）。
+    struct TailTmux {
+        seen: std::sync::Mutex<Vec<(String, ab_core::tmux::TailBounds)>>,
+        /// 每次呼叫先睡這麼久（模擬卡住的 tmux）
+        delay: Duration,
+    }
+    impl TmuxClient for TailTmux {
+        fn exec(&self, _a: &[&str]) -> Option<ab_core::tmux::TmuxOutput> {
+            None
+        }
+        fn available(&self) -> bool {
+            true
+        }
+        fn resolve_pane(&self, _t: &str) -> Option<String> {
+            None
+        }
+        fn pane_exists(&self, _p: &str) -> bool {
+            true
+        }
+        fn capture_pane(&self, _p: &str) -> Option<String> {
+            None
+        }
+        fn pane_in_mode(&self, _p: &str) -> Option<bool> {
+            None
+        }
+        fn send_keys(&self, _p: &str, _k: &str) -> bool {
+            false
+        }
+        fn capture_pane_tail(
+            &self,
+            pane: &str,
+            bounds: ab_core::tmux::TailBounds,
+        ) -> Option<ab_core::tmux::TailCapture> {
+            self.seen.lock().unwrap().push((pane.to_string(), bounds));
+            std::thread::sleep(self.delay);
+            Some(ab_core::tmux::TailCapture {
+                text: "tail\n".to_string(),
+                truncated: false,
+            })
+        }
+    }
+
+    fn tail_tmux(delay: Duration) -> TailTmux {
+        TailTmux {
+            seen: std::sync::Mutex::new(Vec::new()),
+            delay,
+        }
+    }
+
+    /// 只有一個 worker 的 read model（世代由呼叫端指定）。
+    fn one_worker(tag: &str) -> Model {
+        let mut m = Model {
+            groups: Vec::new(),
+            workers: vec![ab_core::registry::AgentSnapshot {
+                name: "w1".into(),
+                pane: "%5".into(),
+                runtime: "codex".into(),
+                owner: "it:@1".into(),
+                ready: "ready".into(),
+                spawn_tag: tag.into(),
+                registered_at: "2026-07-31T00:00:00Z".into(),
+                spawned: true,
+                corrupt: false,
+                lineage_root: None,
+                parent_agent: None,
+            }],
+            tasks: Vec::new(),
+            recent: Vec::new(),
+            recent_truncated: false,
+        };
+        m.groups = model::group_by_lineage(&m.workers);
+        m
+    }
+
+    /// **晚到的結果 MUST 對權威資料比對**（跨廠複核 M2）。
+    ///
+    /// 重現真 run loop 的次序：disk poll 之後 w1 respawn → 舊 capture 的回信先
+    ///到 → 下一次 periodic poll 還沒發生。此時記憶體裡的 model 仍是舊世代，
+    /// 直接拿它比對會判成「還是同一列」而把舊內容貼上去。
+    #[test]
+    fn a_peek_result_is_matched_against_a_freshly_loaded_model() {
+        let mut model = one_worker("t-gen1");
+        let mut app = App::new();
+        let target = app::peek_target(&app, &model).expect("有 pane 的 worker 列");
+        app.peek_inflight = Some(target.clone());
+
+        // 磁碟上已經換代，記憶體裡的 `model` 還是舊的那一份
+        let cap = ab_core::tmux::TailCapture {
+            text: "stale\n".to_string(),
+            truncated: false,
+        };
+        peek_arrival(
+            &mut app,
+            &mut model,
+            || one_worker("t-gen2"),
+            &target,
+            Some(cap.clone()),
+        );
+        assert!(
+            app.peek.is_none(),
+            "換代之後 MUST NOT 把舊世代的畫面貼上新一代的列"
+        );
+        assert!(app.message.contains("discarded"), "{}", app.message);
+        assert_eq!(
+            model.workers[0].spawn_tag, "t-gen2",
+            "重讀進來的 MUST 是權威那一份"
+        );
+
+        // 對照組：世代沒變 → 照常貼上（重讀不是把功能關掉）
+        let mut app = App::new();
+        let target = app::peek_target(&app, &model).expect("仍有選中列");
+        app.peek_inflight = Some(target.clone());
+        peek_arrival(
+            &mut app,
+            &mut model,
+            || one_worker("t-gen2"),
+            &target,
+            Some(cap),
+        );
+        assert!(app.peek.is_some(), "同一代 MUST 正常開出預覽");
+    }
+
+    /// 取得路徑收到的界**就是 `config` 那一份**（UI 端不另立一套），而且回信
+    /// 原樣帶回目標——晚到比對靠的就是它。
+    #[test]
+    fn a_peek_request_carries_the_config_bounds_and_its_target() {
+        let tmux = tail_tmux(Duration::ZERO);
+        let t = peek_target("%5", "w1");
+        let Msg::Peek { target, res } = peek_once(&tmux, t.clone()) else {
+            panic!("MUST 回 Msg::Peek");
+        };
+        assert_eq!(target, t, "回信 MUST 原樣帶回目標");
+        assert_eq!(res.expect("有結果").text, "tail\n");
+
+        let seen = tmux.seen.lock().unwrap();
+        assert_eq!(seen.len(), 1, "一次按鍵只查一次");
+        assert_eq!(seen[0].0, "%5");
+        assert_eq!(
+            seen[0].1,
+            ab_core::tmux::TailBounds {
+                history_lines: ab_core::config::TAIL_HISTORY_LINES,
+                max_bytes: ab_core::config::TAIL_MAX_BYTES,
+                timeout: ab_core::config::TAIL_TIMEOUT,
+            },
+            "三個界 MUST 全部來自 config 那一份定義"
+        );
+    }
+
+    /// **UI thread 不因 tmux 卡住而凍結**（§4 硬條款）：capture 跑在一次性
+    /// thread 上，UI 端的 drain 是 non-blocking——查詢還沒回來時它立刻回空手，
+    /// 不是等在那裡。
+    #[test]
+    fn a_hanging_peek_does_not_block_the_ui_drain() {
+        let (h, _req_rx) = worker::Handle::detached();
+        let t = peek_target("%5", "w1");
+        assert!(h.spawn_oneshot(move |tx| {
+            let tmux = tail_tmux(Duration::from_millis(400));
+            let _ = tx.send(peek_once(&tmux, t));
+        }));
+        // 這一輪 drain 發生在查詢還卡著的時候：MUST 立刻回來
+        let started = Instant::now();
+        let first = h.try_recv();
+        let drain = started.elapsed();
+        assert!(first.is_none(), "還沒回來的請求 MUST NOT 有訊息");
+        assert!(
+            drain < Duration::from_millis(100),
+            "drain MUST 不等查詢（實測 {drain:?}）"
+        );
+
+        // 查詢完成後訊息才進來（證明卡住的是工人，不是 UI）
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let got = loop {
+            if let Some(m) = h.try_recv() {
+                break Some(m);
+            }
+            if Instant::now() >= deadline {
+                break None;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        assert!(matches!(got, Some(Msg::Peek { .. })), "終局 MUST 送達");
     }
 }

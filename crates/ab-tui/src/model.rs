@@ -518,7 +518,9 @@ pub fn breadcrumb_line_fit(crumbs: &[Crumb], width: usize) -> String {
     }
 }
 
-fn truncate_with_ellipsis(s: &str, width: usize) -> String {
+/// 截到指定寬度，截掉的部分以 `…` 表示（尾行預覽的 overlay 也用它——
+/// 兩處各寫一份截字邏輯就會有兩種「截到一半」的字）。
+pub fn truncate_with_ellipsis(s: &str, width: usize) -> String {
     if width == 0 {
         return String::new();
     }

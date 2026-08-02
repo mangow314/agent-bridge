@@ -5950,6 +5950,106 @@ else
   printf 'SKIP: 44 P4 效率驗收（SRC_KIND=bash：bash 正本凍結在 M4，不含 TUI）\n'
 fi
 
+# ---- 45. 尾行預覽的 capture-pane 語意（真 tmux；P4.7 切片 D） ----
+# spec: CLI-UI-1
+# 設計正本 docs/tui-design.md §9 P4.7 切片 D（`L` 尾行預覽）。
+#
+# 為什麼非要真 tmux 不可：切片 D 的第一版把 `-S -<n>` 當成「總共只取 n 行」，
+# 而 argv 單元測試照樣全綠——**假件證明不了外部工具的回傳語意**，這一片踩到的
+# 正是這個坑（跨廠複核 M1，真 tmux 實測 80x24 的 pane 印 500 行後回 224 行）。
+# 本組鎖的就是「tmux 那一側到底回什麼」。
+#
+# **不進本組**：hang、非零退出、kill／收屍。真 tmux 做不出決定性的 hang，寫進來
+# 只會換到 flaky；那三項在 Rust 單元測試裡以可控的 fixture process 驗
+# （crates/ab-core/src/tmux.rs 的 `tail_from_child`）。
+#
+# 與 40–44 同理只對 Rust 執行（bash 正本不含 TUI）。
+if [[ "$SRC_KIND" == rust ]]; then
+
+TAIL45_N=20
+# **自己一個 window**：同一個 window 的 pane 數有上限（第 6 個 split 必炸，
+# 16a7 的教訓），而且本組要固定 geometry，與別人共用會被對方的 layout 改掉
+W45="$(tmx new-window -dP -F '#{window_id}' -t it "$pane_cmd")"
+P45="$(tmx list-panes -t "$W45" -F '#{pane_id}' | head -1)"
+# 固定 geometry：行數的上界是「n 行 history ＋ pane 高度」，高度浮動的話這一組
+# 的上界斷言就沒有意義。`window-size manual` 讓 window 不再跟著 client 縮放
+tmx set-option -t "$W45" window-size manual 2>/dev/null || true
+tmx resize-window -t "$W45" -x 80 -y 24 2>/dev/null || true
+PH45="$(tmx display -p -t "$P45" '#{pane_height}' 2>/dev/null)"
+PW45="$(tmx display -p -t "$P45" '#{pane_width}' 2>/dev/null)"
+# 讀回來的值才是分母（resize 沒生效時上界斷言仍然有意義，只是換一個數字）
+assert "45 前置：pane geometry 讀得出來（$PW45 x $PH45；上界斷言的分母）" \
+  bash -c 'test -n "$1" && test -n "$2" && test "$1" -gt 0 && test "$2" -gt 0' \
+  _ "$PH45" "$PW45"
+
+# fixture 內容：把它寫成腳本再叫 pane 跑，比把整串塞進 send-keys 可控
+cat > "$TESTROOT/feed45.sh" <<'EOF'
+# 300 行編號行：尾端在、開頭不在，才證明取到的是**尾端**
+for i in $(seq 1 300); do printf 'L%03d\n' "$i"; done
+# 超長軟折行：一行遠寬於 80 欄，tmux 顯示時折成數列；`-J` MUST 把它接回一行
+printf 'SOFTSTART%sSOFTEND\n' "$(printf 'x%.0s' $(seq 1 222))"
+# 硬換行：兩行各自獨立，MUST NOT 被 `-J` 併起來（-J 併的是「軟折」不是「換行」）
+printf 'HARDA\n'
+printf 'HARDB\n'
+# CJK／寬字元：一個字佔兩欄，行寬計算與折行判定靠它才驗得到
+printf 'CJK寬字元測試中文尾行 CJKEND\n'
+printf 'TAILMARK\n'
+EOF
+tmx send-keys -t "$P45" \
+  "$(printf 'bash %q; touch %q' "$TESTROOT/feed45.sh" "$TESTROOT/fed45")" Enter
+assert "45 前置：fixture 內容已印進 pane" wait_for 20 test -f "$TESTROOT/fed45"
+
+# 送出去的 argv MUST 與 Rust 那一側是同一組（`tail_args`）。兩邊各寫一份就會漂，
+# 而漂掉的症狀正是本組要擋的那種：這裡驗真 tmux 的語意、程式卻送別的參數
+sed -n '/pub fn tail_args/,/^}/p' "$ROOT/crates/ab-core/src/tmux.rs" > "$TESTROOT/tailargs45.txt"
+assert "45：Rust 的 tail_args 仍是 capture-pane -p -J -t <pane> -S -<n>" \
+  bash -c '
+    f="$1"
+    grep -qF "\"capture-pane\"" "$f" \
+      && grep -qF "\"-p\"" "$f" \
+      && grep -qF "\"-J\"" "$f" \
+      && grep -qF "\"-t\"" "$f" \
+      && grep -qF "\"-S\"" "$f" \
+      && grep -qF -- "-{history_lines}" "$f"' _ "$TESTROOT/tailargs45.txt"
+
+# 與 Rust 送的同一組參數（history 行數縮小成 20，只是為了讓 fixture 跑得快）
+tmx capture-pane -p -J -t "$P45" -S -"$TAIL45_N" > "$TESTROOT/tail45.cap" 2>/dev/null
+RC45=$?
+assert "45：capture-pane 正常退出（exit 0）" test "$RC45" -eq 0
+LINES45="$(wc -l < "$TESTROOT/tail45.cap")"
+
+# (1) 取到的是**尾端**：最後印的在、最先印的不在
+assert "45：取到的是尾端（TAILMARK 在）" grep -qF 'TAILMARK' "$TESTROOT/tail45.cap"
+assert "45：取到的是尾端（第 1 行 L001 不在）" \
+  bash -c '! grep -qF "L001" "$1"' _ "$TESTROOT/tail45.cap"
+
+# (2) 行數有界，但**不是**「恰好 n 行」——這一條把 M1 揭露的真實語意釘在測試裡：
+#     `-S -<n>` ＝ n 行 history ＋整個可見區，所以行數落在 (n, n + 高度 + 小量]
+assert "45：行數有界（$LINES45 ≤ $TAIL45_N + $PH45 + 2）" \
+  bash -c 'test "$1" -le "$(( $2 + $3 + 2 ))"' _ "$LINES45" "$TAIL45_N" "$PH45"
+assert "45：-S -n 不是「總共 n 行」（實得 $LINES45 > $TAIL45_N；含整個可見區）" \
+  test "$LINES45" -gt "$TAIL45_N"
+
+# (3) `-J`：軟折行被接回**一行**（首尾兩個標記出現在同一行，且只有一行）
+assert "45：-J 把超長軟折行併成一條（首尾標記同一行、恰一行）" \
+  bash -c 'test "$(grep -c "SOFTSTART.*SOFTEND" "$1")" -eq 1' _ "$TESTROOT/tail45.cap"
+
+# (4) 硬換行 MUST NOT 被併：兩個標記各自成行
+assert "45：硬換行不被 -J 併掉（HARDA／HARDB 不同行）" \
+  bash -c '! grep -q "HARDA.*HARDB" "$1"' _ "$TESTROOT/tail45.cap"
+assert "45：硬換行兩行都在" \
+  bash -c 'grep -q "^HARDA" "$1" && grep -q "^HARDB" "$1"' _ "$TESTROOT/tail45.cap"
+
+# (5) CJK／寬字元原樣保留在同一行（寬字元的欄寬換算沒有把它切斷）
+assert "45：CJK／寬字元行原樣保留（同一行）" \
+  grep -qF 'CJK寬字元測試中文尾行 CJKEND' "$TESTROOT/tail45.cap"
+
+tmx kill-window -t "$W45" 2>/dev/null || true
+
+else
+  printf 'SKIP: 45 尾行預覽 capture-pane 語意（SRC_KIND=bash：bash 正本凍結在 M4，不含 TUI）\n'
+fi
+
 # ---- 總結 ----
 printf '\n共 %d PASS、%d FAIL\n' "$PASS" "$FAIL"
 if (( FAIL > 0 )); then

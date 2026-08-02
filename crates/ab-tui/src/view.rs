@@ -157,7 +157,8 @@ pub fn render(
     render_detail(f, detail_area, model, live, blockers, app, a.detail_strip);
     render_footer(f, footer, model, app, blockers, fresh);
 
-    // overlay 優先序：確認框（cancel／evict）> 全文 pager > 摘要頁 > 合法鍵
+    // overlay 優先序：確認框（cancel／evict）> 全文 pager > 摘要頁 >
+    // 尾行預覽 > 合法鍵
     if let Some(id) = &app.confirm {
         render_confirm(f, id);
     } else if let Some(p) = &app.evict_prompt {
@@ -166,6 +167,8 @@ pub fn render(
         render_pager(f, app);
     } else if let Some(lines) = &app.info {
         render_info(f, lines);
+    } else if let Some(p) = &app.peek {
+        render_peek(f, p);
     } else if app.help {
         render_help(f, model, app);
     }
@@ -804,6 +807,49 @@ fn render_info(f: &mut Frame, lines: &[String]) {
     );
 }
 
+/// `L` 的尾行預覽（內容由 `action::peek_page` 組好，這裡只負責畫）。
+///
+/// **底部對齊**是這一頁與 `i` 唯一的差別，也是它必須另寫一份的理由：畫不下時
+/// `Paragraph` 截的是尾端，而尾行預覽要看的正是最後那幾行——沿用 `render_info`
+/// 等於把唯一有用的部分切掉。截斷過就在頂端補一行標記，人才知道上面還有東西。
+fn render_peek(f: &mut Frame, p: &crate::app::PeekView) {
+    let area = f.area();
+    // **寬高一律先在 `usize` 裡算完再夾回 `u16`**（跨廠複核 M4／verifier 同時
+    // 抓到）：byte 界 64 KiB ＋ `-J` 併行之後單行寬度可以逼近 65535，`as u16`
+    // 在 debug build（overflow-checks 開著）會 panic，恰好 65536 則靜靜變成 0。
+    // 這條路徑的輸入來自別人的畫面，不能假設它的寬度落在 u16 裡
+    let longest = p.lines.iter().map(|l| l.chars().count()).max().unwrap_or(0);
+    let w = fit_u16(longest + 4).max(40).min(area.width.max(1));
+    let inner = w.saturating_sub(2).max(1) as usize;
+    // **每行截到一列寬**（不換行）：這一頁是「最後幾行」，一條 64 KiB 的長行
+    // 若讓它折行，光它自己就吃掉整個 overlay，尾端反而看不見——那正是這一頁
+    // 存在的理由。截掉的部分以 `…` 標出來，不假裝那是全部
+    let fit = |s: &String| crate::model::truncate_with_ellipsis(s, inner);
+    // 邊框 2 列＋提示 1 列＋（截斷時）標記 1 列
+    let chrome = 3 + usize::from(p.truncated);
+    let room = (area.height as usize).saturating_sub(chrome).max(1);
+    let start = p.lines.len().saturating_sub(room);
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    if p.truncated {
+        lines.push(Line::from(fit(&format!(
+            "\u{2026} truncated at {} KiB (byte bound)",
+            ab_core::config::TAIL_MAX_BYTES / 1024
+        ))));
+    }
+    lines.extend(p.lines[start..].iter().map(|l| Line::from(fit(l))));
+    lines.push(Line::from(fit(&"press any key to close".to_string())));
+    let h = fit_u16(lines.len() + 2);
+    popup(f, w, h, &p.title, lines);
+}
+
+/// `usize` 的版面尺寸 → `u16`（超出就夾在 `u16::MAX`）。
+///
+/// 存在的理由只有一個：`as u16` 是靜默窄化，而這裡的輸入來自別人的 pane 畫面。
+/// 夾在最大值是安全的——`popup` 接著還會夾回實際畫面尺寸。
+fn fit_u16(v: usize) -> u16 {
+    u16::try_from(v).unwrap_or(u16::MAX)
+}
+
 /// 全域鍵（與選中列無關的那一段）。`?` 頁與 footer 共用同一份字面。
 const GLOBAL_KEYS: &str = "Tab/S-Tab panes \u{b7} j/k (\u{2193}\u{2191}) move \u{b7} PgUp/PgDn page \u{b7} Home/End \u{b7} / filter \u{b7} S scope \u{b7} Esc clear warn \u{b7} ? keys \u{b7} q quit";
 
@@ -830,6 +876,9 @@ fn row_keys(model: &Model, app: &App) -> String {
     }
     if caps.info {
         parts.push("i info");
+    }
+    if caps.peek {
+        parts.push("L tail preview");
     }
     if caps.copy {
         parts.push("c copy evidence");
@@ -1125,8 +1174,10 @@ fn popup(f: &mut Frame, w: u16, h: u16, title: &str, lines: Vec<Line<'static>>) 
     // 等價 CLI（約 112 字元）截掉尾端的 generation——那條命令原文是薄殼原則
     // 的憑證，截半條等於畫面上沒有它（codex 複核 minor #5）
     let inner = w.saturating_sub(2).max(1) as usize;
+    // `rows` 由**別人畫面的行寬**推出來（尾行預覽），可能遠超過 u16：先在
+    // `usize` 裡算完再夾（跨廠複核 M4）。`h.min(area.height)` 隨後還會夾一次
     let rows: usize = lines.iter().map(|l| l.width().div_ceil(inner).max(1)).sum();
-    let h = h.max(rows as u16 + 2);
+    let h = h.max(fit_u16(rows + 2));
     let h = h.min(area.height);
     let rect = Rect {
         x: area.x + (area.width.saturating_sub(w)) / 2,
@@ -1601,6 +1652,86 @@ mod tests {
             ratatui::style::Style::default(),
             "blocked 不是 task 狀態字，MUST NOT 有 status 對映色"
         );
+    }
+
+    /// P4.7 切片 D：`L` 的提示與 dispatch 是同一份事實源（`RowCaps`）——
+    /// 有 pane 的 worker 列才列得出來，task 列與無 pane 的列上不得出現。
+    #[test]
+    fn the_footer_offers_the_tail_preview_only_where_it_works() {
+        assert!(text(&draw()).contains("L tail preview"), "worker 列缺 L");
+        assert!(
+            !text(&draw_with(|a| a.row_idx = 1)).contains("L tail preview"),
+            "task 列 MUST NOT 列出 L（沒有唯一的 pane 可 capture）"
+        );
+        let t = text(&draw_model_with(|m, _| m.workers[0].pane = String::new()));
+        assert!(
+            !t.contains("L tail preview"),
+            "pane 欄空的列 MUST NOT 列出 L：\n{t}"
+        );
+    }
+
+    /// 尾行預覽畫的是**最後**那幾行：畫不下時截頭不截尾，且截斷過要說出來。
+    ///
+    /// 這一條是它不能沿用 `render_info` 的理由——那個 popup 溢出時砍的是尾端，
+    /// 也就是尾行預覽唯一有用的部分。
+    #[test]
+    fn the_tail_preview_shows_the_end_not_the_beginning() {
+        let lines: Vec<String> = (0..300).map(|i| format!("line-{i}")).collect();
+        let t = text(&draw_with(|a| {
+            a.peek = Some(crate::app::PeekView {
+                title: "tail preview — w1 (%5)".to_string(),
+                lines: lines.clone(),
+                truncated: true,
+            })
+        }));
+        assert!(t.contains("tail preview \u{2014} w1 (%5)"), "缺標題：\n{t}");
+        assert!(t.contains("line-299"), "最後一行 MUST 看得到：\n{t}");
+        assert!(!t.contains("line-0 "), "畫不下時 MUST 砍開頭：\n{t}");
+        assert!(t.contains("truncated at"), "截斷 MUST 標記：\n{t}");
+        assert!(t.contains("press any key to close"));
+
+        // 沒截斷就不要無中生有一行標記
+        let t = text(&draw_with(|a| {
+            a.peek = Some(crate::app::PeekView {
+                title: "tail preview \u{2014} w1 (%5)".to_string(),
+                lines: vec!["only".to_string()],
+                truncated: false,
+            })
+        }));
+        assert!(t.contains("only"));
+        assert!(!t.contains("truncated at"), "未截斷時 MUST NOT 標記：\n{t}");
+    }
+
+    /// 一整個 byte 界寬的**單行**畫得出來，不 panic、不靜默歸零。
+    ///
+    /// 這一條釘的是型別窄化（跨廠複核 M4／verifier 獨立抓到同一條）：`-J` 會把
+    /// 軟折行併成一條，所以「64 KiB 的單行」不是假想——`l.width() as u16` 在
+    /// debug build（overflow-checks 開著）會 panic，恰好 65536 則 cast 成 0。
+    /// 兩個尺寸都要驗：`TAIL_MAX_BYTES - 1`（65535，`as u16` 的邊界）與整界。
+    #[test]
+    fn a_pane_line_as_wide_as_the_byte_bound_still_renders() {
+        for len in [
+            ab_core::config::TAIL_MAX_BYTES - 1,
+            ab_core::config::TAIL_MAX_BYTES,
+        ] {
+            let wide = "w".repeat(len);
+            let t = text(&draw_with(|a| {
+                a.peek = Some(crate::app::PeekView {
+                    title: "tail preview \u{2014} w1 (%5)".to_string(),
+                    lines: vec![wide.clone(), "tail-marker".to_string()],
+                    truncated: true,
+                })
+            }));
+            // 畫得出來就是第一個斷言（panic 會讓測試直接紅）
+            assert!(
+                t.contains("tail-marker"),
+                "{len} 寬的單行之後，尾端仍 MUST 看得到：\n{t}"
+            );
+            assert!(
+                t.contains("press any key to close"),
+                "{len}：一條長行 MUST NOT 把整個 overlay 吃掉：\n{t}"
+            );
+        }
     }
 
     /// **contextual footer**（P4.6 切片 B）：第一段只列當前選中列按得動的鍵。

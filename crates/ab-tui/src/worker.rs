@@ -76,6 +76,15 @@ pub enum Msg {
         name: String,
         res: Result<EvictOutcome>,
     },
+    /// `L` 尾行預覽的結果（P4.7 切片 D）。`None`＝逾時／tmux 起不來／pane 不在
+    /// （取得路徑 fail-closed，不猜）。
+    ///
+    /// **一定帶回 `target`**：晚到的結果要能被辨認出「這是給哪一列的」，UI 才
+    /// 能在 selection 已經換過時把它丟掉，而不是貼到別人身上
+    Peek {
+        target: crate::app::PeekTarget,
+        res: Option<ab_core::tmux::TailCapture>,
+    },
 }
 
 /// UI 端持有的把手。`Drop` 時關掉請求端，worker 做完手上那件事就自行結束

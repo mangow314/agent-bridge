@@ -61,6 +61,12 @@ pub struct RowCaps {
     /// 沒有這個鍵」，而且按下去會得到「already in progress」這個有用的回覆
     /// ——把鍵從畫面上抽掉反而讓人以為自己按錯列。
     pub evict: bool,
+    /// `L`：尾行預覽（P4.7 切片 D）。只對**有 pane 的 worker 列**有效——
+    /// 沒有 pane 就沒有東西可 capture，task 列則沒有唯一的 pane 可言。
+    ///
+    /// 同 `evict`：**刻意不看 `peek_inflight`**，那是暫時狀態不是「這一列有沒有
+    /// 這個鍵」，按下去會得到「already in progress」這個有用的回覆
+    pub peek: bool,
 }
 
 impl RowCaps {
@@ -71,6 +77,7 @@ impl RowCaps {
         copy: false,
         cancel: false,
         evict: false,
+        peek: false,
     };
 }
 
@@ -78,11 +85,13 @@ impl RowCaps {
 pub fn row_caps(app: &App, model: &Model) -> RowCaps {
     match app.selection(model) {
         Sel::None => RowCaps::NONE,
-        Sel::Worker(_) => RowCaps {
+        Sel::Worker(w) => RowCaps {
             enter: EnterAct::Focus,
             info: true,
             copy: true,
             evict: true,
+            // 沒有 pane 的列（registry 有紀錄、pane 欄空）capture 不到任何東西
+            peek: !w.pane.is_empty(),
             ..RowCaps::NONE
         },
         Sel::Task { task, worker } => RowCaps {
@@ -92,6 +101,7 @@ pub fn row_caps(app: &App, model: &Model) -> RowCaps {
             copy: true,
             cancel: !is_terminal_status(&task.status),
             evict: false,
+            peek: false,
         },
     }
 }
@@ -197,6 +207,38 @@ pub enum Effect {
     Evict {
         shown: crate::action::EvictShown,
     },
+    /// `L`：尾行預覽（P4.7 切片 D）。one-shot，帶著**目標識別**出門——晚到的
+    /// 結果要靠它比對，MUST NOT 貼到已經換過的 selection 上
+    Peek {
+        target: PeekTarget,
+    },
+}
+
+/// 一次尾行預覽的目標（P4.7 切片 D）。
+///
+/// 為什麼不只帶 pane：pane id 會被 tmux 回收再發給別人，而 `RowKey` 帶著世代
+/// （`(name, spawn_tag)`）。兩者一起比，晚到的結果才不會貼到「同一個 pane、
+/// 不同一代」的列上——與 evict 的 compare-and-act 是同一條紀律：目標是**那一
+/// 代**，不是那個名字。
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct PeekTarget {
+    pub pane: String,
+    pub name: String,
+    pub key: RowKey,
+}
+
+/// 尾行預覽的 overlay 內容（純資料，render 只負責畫）。
+///
+/// 為什麼不塞進 `app.info`：`i` 那個 popup 溢出時**截尾**，而這裡要看的正是
+/// 最後那幾行——用同一個容器等於把唯一有用的部分切掉。這裡改由 render 端
+/// 底部對齊（見 `view::render_peek`）。
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct PeekView {
+    /// 框上的標題（worker 名＋pane，人要能確認自己看的是哪一列）
+    pub title: String,
+    pub lines: Vec<String>,
+    /// byte 界截斷過：畫面 MUST 標記，否則人會以為那就是全部
+    pub truncated: bool,
 }
 
 pub struct App {
@@ -240,8 +282,13 @@ pub struct App {
     /// 正在輸入 filter：這個模式下**所有** `Key::Char` 都進緩衝區，不再當
     /// 命令鍵——否則打一個 `q` 就把 dashboard 關掉了
     pub filter_input: bool,
-    /// TASKS 欄的 scope（`s` 切換）。預設 `All`＝現行語意
+    /// TASKS 欄的 scope（`S` 切換）。預設 `All`＝現行語意
     pub scope: crate::model::Scope,
+    /// `L` 的尾行預覽 overlay（任意鍵關閉，同 `i`）
+    pub peek: Option<PeekView>,
+    /// 正在跑的尾行預覽（P4.7 切片 D）。`Some`＝一次按鍵送出的那個 request
+    /// 還沒回來，此時再按 `L` 不再送（同 `evict_inflight` 的閘）
+    pub peek_inflight: Option<PeekTarget>,
 }
 
 impl App {
@@ -264,6 +311,8 @@ impl App {
             filter: crate::model::Filter::default(),
             filter_input: false,
             scope: crate::model::Scope::default(),
+            peek: None,
+            peek_inflight: None,
         }
     }
 
@@ -523,6 +572,12 @@ fn dispatch_key(app: &mut App, model: &Model, key: Key) -> Effect {
         app.info = None; // 任意鍵關閉（沿用 help overlay 的慣例）
         return Effect::None;
     }
+    // `L` 的尾行預覽：同樣任意鍵關閉。**不因此取消 in-flight 的請求**——閘是
+    // 由回信放開的，關掉畫面不代表子行程回來了
+    if app.peek.is_some() {
+        app.peek = None;
+        return Effect::None;
+    }
     // `/` 的輸入模式（P4.7 切片 C）。**攔截順序刻意排在 overlay 之後**：
     // 確認框／pager／摘要頁是模態的，它們在的時候連 `/` 都不該進來。
     //
@@ -732,6 +787,29 @@ fn dispatch_key(app: &mut App, model: &Model, key: Key) -> Effect {
                 Effect::None
             }
         },
+        // `L`：尾行預覽（P4.7 切片 D）。**大寫**是契約：§3 的鍵位表上大小寫
+        // 各有指派（`s` send／`S` scope），順手改成小寫會讓下一次擴充撞上。
+        //
+        // 這裡只發動：三重有界的取得路徑在 core（`tmux::capture_pane_tail`），
+        // 一次性 thread 在 run loop——UI thread 不碰 tmux（§4 硬條款）
+        Key::Char('L') => {
+            if !row_caps(app, model).peek {
+                app.message =
+                    "L only acts on worker rows that have a pane (nothing to capture)".to_string();
+                return Effect::None;
+            }
+            // **一次按鍵一個 request**：沒回來之前再按不再送。這一則訊息是有用
+            // 的回覆（人知道自己按到了），不是拒絕
+            if let Some(t) = app.peek_inflight.as_ref() {
+                app.message = format!("preview of '{}' is already in progress", t.name);
+                return Effect::None;
+            }
+            match peek_target(app, model) {
+                Some(target) => Effect::Peek { target },
+                // caps 已經放行，這裡拿不到目標只可能是列在這一瞬消失
+                None => Effect::None,
+            }
+        }
         // `c`：複製**證據**（唯讀命令原文＋immutable id），MUST NOT 複製任何
         // mutation 命令（§5 顯示紀律）
         Key::Char('c') => {
@@ -748,6 +826,63 @@ fn dispatch_key(app: &mut App, model: &Model, key: Key) -> Effect {
             }
         }
         _ => Effect::None,
+    }
+}
+
+/// 當前選中列的預覽目標（`None`＝這一列預覽不了）。
+///
+/// **與 `row_caps().peek` 同一個條件**：worker 列且 pane 非空。兩處各寫一份
+/// 判斷就會出現「footer 說按得動、按下去沒反應」——那正是 contextual footer
+/// 要消滅的東西。
+pub fn peek_target(app: &App, model: &Model) -> Option<PeekTarget> {
+    let row = app.selected_row(model)?;
+    let Row::Worker(wi) = row else {
+        return None;
+    };
+    let w = &model.workers[wi];
+    if w.pane.is_empty() {
+        return None;
+    }
+    Some(PeekTarget {
+        pane: w.pane.clone(),
+        name: w.name.clone(),
+        key: crate::model::row_key(model, row),
+    })
+}
+
+/// 預覽結果回到 UI（P4.7 切片 D）。**純函式、不碰 terminal**：run loop 只把
+/// 一次性 thread 的回信轉進來，判斷全在這裡，gate (d) 的「晚到結果不貼新
+/// selection」才驗得到。
+///
+/// 兩件事一定會發生：**閘一律放開**（否則失敗一次就再也按不動），以及**目標
+/// 比對**——回來時當前選中列若已不是當初那一個（換列、換代、被 filter 篩掉），
+/// 結果丟棄。丟棄要說出來，不然人會以為 `L` 沒作用。
+pub fn peek_apply(
+    app: &mut App,
+    model: &Model,
+    target: &PeekTarget,
+    res: Option<ab_core::tmux::TailCapture>,
+) {
+    app.peek_inflight = None;
+    if peek_target(app, model).as_ref() != Some(target) {
+        app.message = format!(
+            "preview of '{}' discarded (the selection moved on while it was running)",
+            target.name
+        );
+        return;
+    }
+    match res {
+        Some(cap) => {
+            app.peek = Some(crate::action::peek_page(target, &cap));
+            app.message.clear();
+        }
+        // 逾時／tmux 起不來／pane 已不在：**只影響這一次預覽**，畫面照跑
+        None => {
+            app.message = format!(
+                "preview of '{}' ({}) timed out or is unavailable",
+                target.name, target.pane
+            );
+        }
     }
 }
 
@@ -2074,6 +2209,134 @@ mod tests {
         assert_eq!(handle_key(&mut app, &m, Key::PageDown), Effect::None);
         assert_eq!(app.row_idx, 1, "模態下 selection 不得移動");
         assert!(app.confirm.is_some(), "翻頁鍵不得關掉確認框");
+    }
+
+    // ── P4.7 切片 D：`L` 尾行預覽 ─────────────────────────────────────
+
+    fn capture(text: &str, truncated: bool) -> ab_core::tmux::TailCapture {
+        ab_core::tmux::TailCapture {
+            text: text.to_string(),
+            truncated,
+        }
+    }
+
+    /// `L` 的合法目標只有**有 pane 的 worker 列**，而且提示與 dispatch 讀的是
+    /// 同一份 `RowCaps`——footer 說按得動、按下去卻回一行拒絕訊息，正是
+    /// contextual footer 要消滅的東西。
+    #[test]
+    fn peek_only_acts_on_worker_rows_that_have_a_pane() {
+        let m = model();
+        let mut app = App::new();
+        // 第 0 列＝w1（pane %5）
+        assert!(row_caps(&app, &m).peek, "有 pane 的 worker 列 MUST 可按");
+        let Effect::Peek { target } = handle_key(&mut app, &m, Key::Char('L')) else {
+            panic!("worker 列上的 `L` MUST 產出 Peek");
+        };
+        assert_eq!(target.pane, "%5");
+        assert_eq!(target.name, "w1");
+
+        // task 列：沒有唯一的 pane 可言
+        let mut app = App::new();
+        handle_key(&mut app, &m, Key::Char('j'));
+        assert!(matches!(app.selection(&m), Sel::Task { .. }));
+        assert!(!row_caps(&app, &m).peek);
+        assert_eq!(handle_key(&mut app, &m, Key::Char('L')), Effect::None);
+        assert!(app.message.contains("worker rows that have a pane"));
+
+        // pane 欄空的 worker 列：capture 不到任何東西
+        let mut m2 = model();
+        m2.workers[0].pane = String::new();
+        let m2 = with_groups(m2);
+        let mut app = App::new();
+        assert!(!row_caps(&app, &m2).peek);
+        assert_eq!(handle_key(&mut app, &m2, Key::Char('L')), Effect::None);
+        assert!(peek_target(&app, &m2).is_none(), "caps 與目標同一個條件");
+    }
+
+    /// **一次按鍵一個 request**：閘沒放開之前再按 `L` 不再送。
+    #[test]
+    fn peek_sends_one_request_per_keypress() {
+        let m = model();
+        let mut app = App::new();
+        let Effect::Peek { target } = handle_key(&mut app, &m, Key::Char('L')) else {
+            panic!("第一次 MUST 送出");
+        };
+        // run loop 起 thread 成功＝掛上閘（見 `crate::start_peek`）
+        app.peek_inflight = Some(target.clone());
+        assert_eq!(
+            handle_key(&mut app, &m, Key::Char('L')),
+            Effect::None,
+            "在途期間 MUST NOT 再送第二個 request"
+        );
+        assert!(
+            app.message.contains("already in progress"),
+            "{}",
+            app.message
+        );
+
+        // 回信一到，閘就放開——**失敗也放開**，否則失敗一次就再也按不動
+        peek_apply(&mut app, &m, &target, None);
+        assert!(app.peek_inflight.is_none());
+        assert!(
+            matches!(
+                handle_key(&mut app, &m, Key::Char('L')),
+                Effect::Peek { .. }
+            ),
+            "放閘之後 MUST 能再送"
+        );
+    }
+
+    /// 結果回來時 selection 還在原處：貼上去、標記截斷。
+    #[test]
+    fn a_peek_result_lands_on_the_row_that_asked_for_it() {
+        let m = model();
+        let mut app = App::new();
+        let Effect::Peek { target } = handle_key(&mut app, &m, Key::Char('L')) else {
+            panic!("MUST 送出");
+        };
+        app.peek_inflight = Some(target.clone());
+        peek_apply(&mut app, &m, &target, Some(capture("a\nb\n\n\n", true)));
+        let p = app.peek.as_ref().expect("MUST 開出預覽");
+        assert!(p.title.contains("w1") && p.title.contains("%5"));
+        assert_eq!(p.lines, vec!["a", "b"], "尾端補出來的空行不是內容");
+        assert!(p.truncated, "截斷 MUST 傳到呈現層（畫面要標記）");
+        // 任意鍵關閉，且**不取消在途請求**（閘由回信放開，不是由關窗放開）
+        app.peek_inflight = Some(target);
+        assert_eq!(handle_key(&mut app, &m, Key::Char('j')), Effect::None);
+        assert!(app.peek.is_none());
+        assert!(app.peek_inflight.is_some());
+    }
+
+    /// **晚到的結果不貼新 selection**：request 帶著目標識別出門，回來時比對，
+    /// 不符就丟棄——而且要說出來，否則人會以為 `L` 沒作用。
+    #[test]
+    fn a_late_peek_result_is_discarded_not_pasted_on_the_new_row() {
+        let m = model();
+        let mut app = App::new();
+        let Effect::Peek { target } = handle_key(&mut app, &m, Key::Char('L')) else {
+            panic!("MUST 送出");
+        };
+        app.peek_inflight = Some(target.clone());
+
+        // (1) 人換到了別的列
+        handle_key(&mut app, &m, Key::Char('j'));
+        peek_apply(&mut app, &m, &target, Some(capture("late", false)));
+        assert!(app.peek.is_none(), "MUST NOT 貼到新 selection 上");
+        assert!(app.message.contains("discarded"), "{}", app.message);
+        assert!(app.peek_inflight.is_none(), "閘照樣放開");
+
+        // (2) 列還在原處，但那一列已經**換代**（同名 respawn）：pane 相同也算
+        // 不同目標——世代是 evict CAS 的比對軸，預覽不得比它寬鬆
+        let mut app = App::new();
+        let Effect::Peek { target } = handle_key(&mut app, &m, Key::Char('L')) else {
+            panic!("MUST 送出");
+        };
+        let mut m2 = model();
+        m2.workers[0].spawn_tag = "t-gen2".into();
+        let m2 = with_groups(m2);
+        app.relocate(&m2);
+        peek_apply(&mut app, &m2, &target, Some(capture("late", false)));
+        assert!(app.peek.is_none(), "換代之後 MUST NOT 貼上");
     }
 
     /// 人沒動選取時，連跑幾輪 relocate（模型未變）MUST 完全不動。

@@ -181,6 +181,33 @@ fn parse_tmux_timeout(raw: Option<&str>) -> Option<std::time::Duration> {
     }
 }
 
+/// `L` 尾行預覽的**三重界**（tui-design §9 P4.7：one-shot、行／byte／時間
+/// 三重有界，且 bounded MUST 成立於**資料取得路徑**——先全讀進記憶體再截
+/// 不算）。三個值只有這一份定義，取得路徑（`tmux::capture_pane_tail`）與
+/// UI 都讀它，不在別處各截一次。
+///
+/// 為什麼是這三個數字：
+/// - `TAIL_HISTORY_LINES = 200`：這是**預覽**不是 scrollback dump。200 行約等於
+///   兩三個畫面高，足以看出「這個 worker 最後在做什麼」。
+///
+///   ⚠️ 名字說的就是它的實情：這是傳給 `capture-pane -S -<n>` 的**向後要求的
+///   history 行數**，不是「總共只取 n 行」。tmux 回的是「n 行 history ＋整個
+///   可見區」——實測 80x24 的 pane 印 500 行後 `-S -200` 回 224 行（＝200＋24）。
+///   它的作用是讓 tmux 那一側一開始就不撈整份歷史；**總量的硬上限是下面的
+///   byte 界**，那一條才是資源保證。
+/// - `TAIL_MAX_BYTES = 64 KiB`：約 200 行 × 320 欄的寬鬆估計，並涵蓋上面那個
+///   「多回一個畫面高」的落差。單行 10MB 的 pane（例如 `cat` 了一個 minified
+///   bundle）會在讀取迴圈裡當場被截斷，不會整份進記憶體。
+/// - `TAIL_TIMEOUT = 2s`：與 liveness 輪詢同一個量級（`LIVE_POLL`）。這條路徑
+///   是一次性 thread，逾時只影響那一次預覽；**刻意不吃**
+///   `AGENT_BRIDGE_TMUX_TIMEOUT=0` 的無限逃生口——契約要求時間界成立於取得
+///   路徑本身，一個可以被環境變數關掉的界不是界。
+pub const TAIL_HISTORY_LINES: usize = 200;
+/// 見 `TAIL_HISTORY_LINES`。
+pub const TAIL_MAX_BYTES: usize = 64 * 1024;
+/// 見 `TAIL_HISTORY_LINES`。
+pub const TAIL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
 /// bash `REPO_ROOT="$(dirname "$(dirname "$SCRIPT_PATH")")"`（bin/agent-bridge:45-46），
 /// 其中 `SCRIPT_PATH` 是 `readlink -f` 後的實體路徑。Rust 這邊
 /// `current_exe()` 在 Linux 讀 `/proc/self/exe`，同樣是解析完符號連結的實體

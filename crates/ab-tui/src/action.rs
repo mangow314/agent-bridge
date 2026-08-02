@@ -7,7 +7,7 @@ use ab_core::paths::Paths;
 use ab_core::spawn::DespawnResult;
 use ab_core::tmux::TmuxClient;
 
-use crate::app::{Pager, Sel};
+use crate::app::{Pager, PeekTarget, PeekView, Sel};
 use crate::model::{
     Blocker, BlockerIndex, FocusPlan, LiveIndex, Liveness, Model, focus_plan, pane_liveness,
 };
@@ -199,6 +199,27 @@ pub fn info_page(
     lines.push(String::new());
     lines.push("press any key to close".to_string());
     lines
+}
+
+/// `L` 的尾行預覽頁（P4.7 切片 D；純函式，不經 render 可測）。
+///
+/// **這裡不再截一次**：行／byte／時間三個界只有 `ab_core::config` 那一份定義，
+/// 且都成立於取得路徑上（`tmux::capture_pane_tail`）。這裡只做呈現層的事——
+/// 去掉 capture-pane 在畫面下緣補出來的空行（那是 pane 高度的產物，不是內容），
+/// 並在截斷過時加一行標記。
+pub fn peek_page(target: &PeekTarget, cap: &ab_core::tmux::TailCapture) -> PeekView {
+    let mut lines: Vec<String> = cap.text.lines().map(|l| l.trim_end().to_string()).collect();
+    while lines.last().is_some_and(|l| l.is_empty()) {
+        lines.pop();
+    }
+    if lines.is_empty() {
+        lines.push("(the pane has produced no output)".to_string());
+    }
+    PeekView {
+        title: format!("tail preview — {} ({})", target.name, target.pane),
+        lines,
+        truncated: cap.truncated,
+    }
 }
 
 /// `e` 證據框上顯示過的世代識別（tui-design §5 compare-and-act 的「compare」
