@@ -15,6 +15,33 @@
 **目標**：一個給人看、給人介入的 dashboard——回答「誰在替誰做什麼、
 哪裡卡住了、我現在要不要出手」。
 
+**定位陳述（2026-08-03 使用者拍板，取代「可推播中斷收件匣」舊句）**：
+跨 runtime 的 agent triage dashboard——需要處理的 session 排最上面
+（失敗、死亡、待收件），其中真的出事的兩類主動推通知；lineage 鑑識放
+二級鍵，查因果再開。ab 本體的原始目的是解決 CC 內建 codex plugin／MCP
+呼叫常卡住無回應（使用者原話），dashboard 是附屬加分項，不是本體。
+
+**兩層架構（三廠競品研究 R2 對抗輪裁決，對齊 SRE pager／dashboard 原則）**：
+
+- **Page 層**：只放可行動的、推到人面前、不需打開任何東西——事件恰兩類：
+  「task 進 fail 終態」（純磁碟）與「pane 死但掛著非終態 task」（tmux＋磁碟），
+  皆由寫盤的那個 CLI 行程同步發，**不上 daemon**（與非目標一致；實作相位
+  未開批）。
+- **Dashboard 層**：subcritical＋因果訊號（lineage、provenance、unattached、
+  歷史），有疑問時才打開。lineage 是這一層的正字標記能力；它不進第一眼
+  不是因為沒價值，是因為它不是第一眼要回答的問題。
+
+**Known gap（明文認列，v1 不做偵測）**：手動起的 session（未帶 skip flag——
+使用者自開的 claude、relay 鏈第一棒）可能彈權限框卡住而無人看見。spawn
+出來的 worker 依 `spawn.rs` 權限設定（codex `approval_policy=never`／claude
+`--permission-mode auto`／agy `--dangerously-skip-permissions`）**不會彈框**，
+此類事件對 spawn worker 不存在；`notify.rs` 的 `screen_has_prompt` 本職是
+send-keys 通知路徑的安全護欄，不是「誰在等我」偵測器。偵測手動 session 的
+彈框唯一的路是常駐輪詢（R4 tmux 3.7b 實測：detached 下 `status-interval`
+的 `#()` 不執行；`alert-silence` 測的是「pane 沒輸出」不是「在等人」），
+成本＝整支 daemon，不值。緩解（使用者裁定）：`relay` 由手動（非 spawn-born）
+session 呼叫時印一行提醒，零偵測成本。
+
 **非目標**（越線即設計錯誤）：
 
 - 不是新的協定層：send／receive／reply／relay／evict **既有 invocation 的語意零改變**；
@@ -318,7 +345,9 @@ focus 跨 window 語意、CAS（cancel 綁 id）。
 | P4.5 視覺樣式層 | `theme` 模組＋ANSI 16 語意色（additive 純樣式：狀態字上色但權威字原文不變、liveness／blocker 語意色、focus Thick 邊框、選取列背景色、footer 警告 Yellow——顏色編碼軸固定五種：status／liveness／blocker／focus／warning；不動 selection 起點／鍵位／面板順序）**［P4.6 起為六種：增 content-syntax，見 P4.6 列］** | (a) render 單元測試（ratatui `TestBackend`）：指定 cell 的 fg/bg/modifier 符合 theme 對映（每個語意色至少一條）＋buffer 字元內容仍含六個權威字原文與 ●/✗/⛔ glyph；(b) P4 replay 重跑步數不變仍達標（樣式不進 capture 計數，重跑確認非假設） |
 | P4.6 UX truthfulness | 使用者實跑回饋（2026-08-01，9 題）第一段：ORIGINS 平坦視圖取代假 owner 樹（origin 誠實標籤 `session:window-name`＋live/gone/unknown，不做推測分組）；DETAIL 拆 agent state／origin window 兩列；Enter 分面板（OWNERS→WORKERS、worker→focus、task→read，`r` 保留）＋contextual footer；chrome 全英文；TASKS scrollbar＋`N/total`＋PgUp/PgDn/Home/End；pager markdown-lite 高亮（標題/fence/清單/中繼標頭；diff 僅限明確 diff 區段；bytes 不變，色彩契約加第六軸 content-syntax）；selection 改存 stable key（task id／(name,spawn_tag)）；freshness 顯示（disk/tmux age，逾時 stale 降級）。零協定改動 | (a) P1 gate 重跑（Enter matrix 動 focus 語意）；(b) P2 read bytes gate 重跑；(c) P4 replay 依新鍵位/文字重寫後 TUI ≤ baseline 50% 且正確率 100%；(d) render 測試新增斷言：英文 chrome（buffer 無中文 chrome 字元）、origin 標籤三態、scrollbar 首/中/末 thumb、reload 重排後 selection 依 stable key 不跳列、stale 降級顯示；(e) pager 高亮測試：同一 bytes 前後字元層完全相同＋fence/標題命中＋散文 +/- 不染 |
 | P4.7 lineage provenance | 第二段（**2026-08-02 開批**；契約經 codex plan-stage 審查＋使用者兩裁定細化，見 §11）：registry additive optional 欄位 `lineage_root`＋`parent_agent`——**值為 generation key（canonical `spawn_tag` 全串，非名稱）**；spawn 於既有 agents-registry 鎖內，將呼叫者環境 tag 前綴化後與各 registry `spawn_tag` byte-for-byte 比對，**恰一匹配**才認 parent（0 筆＝自成根；≥2 筆＝ambiguous→自成根＋可見警告，不得依目錄序任選）；parent 缺 `lineage_root` 退 parent 自身 `spawn_tag`；無 parent 時 `parent_agent` **缺席**（非空字串）、`lineage_root`＝自身 `spawn_tag`；`register` 不寫兩欄、legacy 不 backfill；兩欄僅 provenance/display，不升格 auth/CAS；`AGENT_BRIDGE_PASS_ENV` 排除 reserved 變數（`SPAWN_TAG`／`RELAY_DEPTH`，雙 runtime＋spec 同步）；TUI 依 lineage 分組（**唯一邏輯軸**：WORKERS 分組與 TASKS scope 皆以 lineage generation key 為準，ORIGINS 面板退場、物理位置留 DETAIL）＋DETAIL breadcrumb `root → … → parent† → self`（僅由兩欄重建：缺席節點 tombstone、中間斷層省略號；traversal 具 cycle／最大 hop／invalid 防護，invalid 列 standalone）；`/` literal filter；copy-mode info banner（消費既有 bounded `pane_in_mode` 三態）；`L` 尾行預覽（one-shot、行/byte/時間三重有界，bounded 必須成立於資料取得路徑）；TASKS All/Unattached scope（僅由當前同世代證據可唯一連結者入組；同名 respawn 不自動附掛歷史 task） | (a) lineage fixture root→A→B→C：移除 A/B registry 後 C 及其 tasks 仍歸同一 lineage（generation key 比對）、breadcrumb 為 `root → … → B† → C`（A 無資料＝省略號、B 留 tombstone；使用者 2026-08-02 裁定不擴充 lineage_path）、不得由 task `from` 推導（負向 case 含同名誘惑）；(b) 新舊 registry 混合：legacy 列不誤併（僅自身 `spawn_tag` 等於某 lineage root key 者歸該組）、既有 owner／spawn／evict／CAS 行為逐字不變、雙 runtime 以同組 golden case 驗語意對等；(c) P4 fixture 異常定義重寫（scope 軸改 lineage）後重量 ≤50%；(d) filter（regex metachar 當 literal）／`L`（hanging tmux、超長行、selection 換代晚到）／banner（三態）各自 bounded 斷言 |
-| P5 理解驗收 | 歸屬樹測驗（**順延至 P4.7 之後**，rubric 改驗 lineage→worker→task 歸屬；2026-08-01 使用者裁定） | **human judgment**：受測者 10 秒內畫出 lineage→worker→in-flight task 正確歸屬樹（理由：關聯可見性是原始痛點，步數量不到它）；rubric 見下（**已於 P4.7 切片 B2 依 lineage 軸改寫**） |
+| P5 理解驗收 | 歸屬樹測驗 v1（**2026-08-02 實測未通過，判定作廢**；v2 改兩層驗收，見下方 rubric v2） | v1 gate 作廢；v2 gate 見 rubric v2（page 層機器判定＋human judgment、dashboard 層機器判定＋human judgment 各一組） |
+| P5.1 可見性補洞 | WORKERS 補 scrollbar＋`N/total`（P5 v1 敗因的直接機制修復；照 P4.6c TASKS 既成範式） | render 測試（比照 TASKS 既有測試）：WORKERS 首／中／末 thumb＋`N/total` 標題；分組 44／45 與 P4 replay 重跑不退步 |
+| P5.2 relay 提醒 | `relay` 由手動（非 spawn-born）session 呼叫時印一行盯守提醒（known gap 的零成本緩解） | 輸出斷言兩則：呼叫者環境無 `AGENT_BRIDGE_SPAWN_TAG` → stderr 恰一行提醒；有 → 不印。協定行為零改變 |
 
 P4 附註：replay script 是 fixture 的一部分（固定初始 selection 與異常排序位置），
 量的是「固定操作序列下的步數差」，不宣稱量到任意操作者的自由行為。
@@ -342,21 +371,54 @@ p4w12 的 pane 改成活的（舊 fixture 讓它同時是第二個 orphan，四�
 證據行。**步數變少不是因為換了異常，是因為前兩個異常不再被 scope 藏住。**
 baseline 仍是 7 步（CLI 沒有 blocker 軸這件事沒有改變）。
 
-### P5 rubric（每條可由證據答是／否）
+### P5 rubric v1：判定未通過（2026-08-02 實測，作廢留檔）
 
-驗的是 **lineage → worker → in-flight task** 這條歸屬鏈（P4.7 B2 改寫；
-版面已無 ORIGINS，WORKERS 依 lineage 分組，DETAIL 有 breadcrumb）。
+12 worker／23 task fixture（`tests/p5-fixture.sh`，入庫 `99e47b1`）下使用者
+實測：條 1 ✗（只答出 lineage 條數，未答成員、未察覺 standalone 段）、
+條 2 ✗（unattached 3 筆答成 0 筆）、條 3 ✗ 2/3（第三個異常誤答）。事後鑑識
+兩層根因：
 
-1. 受測者畫出的樹中，每一條 lineage 的 worker 成員全部正確——含**中間世代已
-   不在場、DETAIL breadcrumb 只剩墓碑**的那一條（墓碑節點答成「這一代已不在，
-   但它在過」即算對，指成某個在場的同名者算錯）——且說不出世代的列
-   （legacy／manual／invalid）落在 standalone、未被併進任何一條 lineage？
-2. 每個 in-flight task 都掛在正確的 worker 下——且**只有**當前同世代證據可唯一
-   連結的那些被掛上去？（連結不到的 task 受測者應指到 Unattached，而不是硬掛
-   給某個 worker；同名 respawn **不承接**前一代的歷史 task，掛上去算錯）
-3. 3 個異常標的（origin window 已消失的 worker／blocked prompt／orphaned
-   worker）全部被指認？
-4. 作答時間 ≤10 秒（碼表計時）？
+- **直接機制＝可見性缺陷，不是理解力**：`render_scrollbar` 只掛在 TASKS
+  （view.rs:345），WORKERS 用 `panel_block` 無 scrollbar 亦無 `N/total`
+  （P4.6c 只給了 TASKS）；受測終端高度下 WORKERS 只畫得下 7 列，lineage 與
+  standalone 段全在摺線下且畫面零提示。修復＝P5.1。
+- **更深根因＝rubric 測錯層級（自我批評）**：拿「10 秒第一眼」的標準考
+  鑑識層能力。兩層架構（§1）下 lineage 屬 dashboard 層——「有疑問才打開、
+  給時間查證」，不是「第一眼背出整棵樹」。v1 條 1–4 整組作廢。
+- 附帶修正：v1 條 3 把「origin window 已消失」列為三異常之一，與 2026-08-03
+  裁決衝突——relay 鏈前一棒 despawn 後 window 必然消失，**gone 是常態不是
+  異常**（健康 worker 的 DETAIL 也在亮 gone）。顯示層現狀已是 DETAIL-only
+  （列表列有測試禁止 `(gone)` 字樣），此裁決是語意層的：rubric 與未來
+  triage 訊號不再把 origin gone 當異常；「pane 死」與「origin 沒了」是兩個
+  獨立的軸，前者仍是異常。
+
+### P5 rubric v2（兩層驗收；2026-08-03 定案）
+
+依 §1 兩層架構分層驗，取代 v1。原稿（codex 交件）中所有 permission-prompt
+條目已依 `spawn.rs` 權限查證移除——spawn worker 不彈框，該事件不存在。
+
+**Page 層（機器判定）**：固定正負 fixture 逐一答是／否——
+
+1. 帶非終態 task 的 pane-exit **恰推一次**通知？
+2. 重複事件／行程重啟／已 seen 的事件**不重推**？
+3. task completed／idle pane／單幀假框／copy-mode／stale generation／
+   無 task 的 pane-exit **一律零推播**？
+4. notifier 故障時仍有 durable event 落盤？
+
+**Page 層（human judgment）**：10 個混合事件，受測者**只看通知**（不開面板），
+10/10 能說出「哪個 agent、為何現在需要我」？
+
+**Dashboard 層（機器判定）**：啟動首屏 buffer 無 lineage tree；按鍵進鑑識
+視圖後，root→A→B→C／B†／同名 respawn／Unattached fixture 的分組與
+breadcrumb 全部符合 generation 證據；返回時停在同一個 attention event？
+
+**Dashboard 層（human judgment）**：給「誰派生此 blocker／缺席哪一代／
+此 task 為何 unattached」三題，受測者可開面板查證，60 秒內 3/3 並指出
+畫面證據？
+
+注意：v2 的 page 層與「首屏 triage 排序」隱含的版面演進（attention 排最上、
+lineage 視圖移二級鍵，對齊 k9s／btop「樹放二級鍵」準則）尚未開批；P5.1／
+P5.2 是其前置，不依賴它。
 
 ## 10. 開放問題（已全數定案；2026-08-01 使用者拍板回填）
 
@@ -440,3 +502,50 @@ ISO parser 而 repo 早有 `parse_iso_to_epoch`、UI 端與取得路徑各截一
 防灌水閘**，`[a-z]` 不涵蓋 `/`／`S`／`L`——**刻意不放寬**：`p4-tui.keys` 沒用到
 這三鍵，為了未用到的鍵放寬閘門會削弱步數量測的可信度；哪天量測情境真要按
 它們，再連同理由一起放寬。
+
+## 12. P5 判定與定位重寫（2026-08-03）
+
+P5 v1 實測未過（§9）。隨後跑 4 輪 × 3 廠競品研究（claude 協調、codex、agy，
+主張一律附 URL、未查證須標明），收斂出 §1 的定位陳述與兩層架構，使用者
+2026-08-03 拍板。
+
+**第一方競品（決定性）**：Agent Teams（2026-02，派工層——team lead spawn
+teammates、共享 task board）；Agent View（2026-05 research preview，儀表板層，
+https://code.claude.com/docs/en/agent-view.md ）——needs-input session 排最上、
+Haiku 一行摘要、`Space` peek、tab 標題計數、系統通知。同份文件明文不做：
+subagent 不 parent 到 supervisor／不決定 spawn 與依賴鏈／session 綁本機關機
+即失／僅 Claude Code。成熟 TUI 準則：k9s／btop 均把樹放二級鍵（`:tree`／`t`）；
+SRE monitoring 章同時主張 page 只推可行動＋dashboard 承載 subcritical 因果
+訊號（https://sre.google/sre-book/monitoring-distributed-systems/ ）——
+兩層是分工不是競爭。
+
+**Capability matrix**（差異化＝第一方明文不做的三件事）：
+
+| 能力 | Agent Teams | Agent View | ab |
+|---|---|---|---|
+| 跨 runtime（codex／claude／agy） | ✗ Claude only | ✗ Claude only | ✓ |
+| 狀態跨 session／跨重開機 | ✗ context 內 | ✗ 綁本機，關機即失 | ✓ 磁碟 task-plane |
+| worker 父子鏈／出身鑑識 | 部分（task board） | ✗ 明文不 parent | ✓ lineage key＋墓碑 |
+| spawn／依賴鏈編排 | ✓ | ✗ 明文不做 | ✓ spawn/relay/evict |
+| needs-input 排序＋通知 | — | ✓ | 規劃中（triage＋兩類磁碟事件） |
+
+**權限查證翻盤（研究後段才做，教訓：先查前提再開研究）**：
+`spawn.rs:340-351`——codex `approval_policy=never`／claude `--permission-mode
+auto`／agy `--dangerously-skip-permissions`，三 runtime 的 spawn worker 皆
+不彈權限框（agy 實測佐證）。「中斷收件匣」的第一類事件因此不存在，舊定位句
+作廢；page 層剩兩類磁碟事件，皆可由寫盤 CLI 同步發，**daemon 需求歸零**。
+R4 tmux 3.7b detached 實測（backlog 備查）：`status-interval` 的 `#()` 不執行
+／`alert-silence` 會觸發但每秒重繪的 pane 永不觸發——只在處理手動 session 時
+有意義。
+
+**使用者裁決（2026-08-03）**：定位句照 §1／known gap 走 relay 一行提醒
+（P5.2）／origin gone 自異常名單除名（§9 rubric v1 附帶修正）／WAITING
+（queued ≥5m）heuristic 不做／`stalled` 標籤不可做（schema 無 progress
+heartbeat：`updated_at` 只在狀態轉換時寫，task.rs:157；要標只能叫
+`long-running`）。UI/UX 方向：dashboard 是附屬加分項（ab 本體原始目的＝
+解決 CC 內建 codex plugin／MCP 呼叫卡住無回應），有餘裕時往吸睛亮點調，
+不設硬性相位。
+
+量測載具 `tests/p5-fixture.sh` 入庫 `99e47b1`：40 條不變式（資料層＋畫面層），
+codex 獨立審查 5 major 全修（ownership marker、shim 自指重入、down 失敗傳播、
+status 分布鎖死、墓碑逐字匹配）。
