@@ -38,12 +38,11 @@ pub enum Req {
 }
 
 /// worker → UI 的訊息。
+///
+/// P4.7 切片 B1：原本的第一則 `Origin`（開場回報呼叫者的 owner／pane）在
+/// ORIGINS 面板退場後沒有消費者了——初始 selection 不再看 origin——故整則
+/// 移除，連帶 `App::caller_origin`／`caller_pane` 與 `current_pane` 查詢。
 pub enum Msg {
-    /// 啟動定位：呼叫者所在的 owner 標籤與 pane id（初始 owner 用，審查 F2）
-    Origin {
-        owner: Option<String>,
-        pane: Option<String>,
-    },
     /// 一輪 tmux 查詢：死活（§4 liveness）＋ blocker 軸（§4 v1 matcher 契約）。
     /// 兩者同一輪回報：分兩則會讓畫面出現「死活已更新、blocker 還是上一輪」
     /// 的混搭狀態
@@ -157,21 +156,13 @@ pub fn spawn<T: TmuxClient + Send + 'static>(tmux: T, paths: Paths) -> Handle {
     let oneshot_tx = msg_tx.clone();
 
     thread::spawn(move || {
-        let owner = current_owner(&tmux);
-        let pane = current_pane(&tmux);
-        // current session 只在 worker 內部用（focus 的 switch-client 目標）
-        let session = owner
-            .as_ref()
+        // `current_owner` 的**唯一消費者**：從中取出 session 名，給 focus 的
+        // switch-client 當目標（跨 session 的 focus 要指定 client 落在哪個
+        // session）。它不再回報給 UI——P4.7 切片 B1 之後 UI 對 origin 沒有
+        // 任何導航用途
+        let session = current_owner(&tmux)
+            .as_deref()
             .and_then(|o| o.rsplit_once(':').map(|(s, _)| s.to_string()));
-        if msg_tx
-            .send(Msg::Origin {
-                owner,
-                pane: pane.clone(),
-            })
-            .is_err()
-        {
-            return;
-        }
         if msg_tx.send(live_round(&tmux, &paths)).is_err() {
             return;
         }
@@ -223,7 +214,9 @@ fn live_round(tmux: &dyn TmuxClient, paths: &Paths) -> Msg {
     Msg::Live(live, BlockerIndex::query(tmux, &panes))
 }
 
-/// 呼叫者所在的 owner 標籤 `session:@window`。先走 `caller_owner`
+/// 呼叫者所在的 owner 標籤 `session:@window`。**唯一消費者是 `spawn` 裡的
+/// session 推導**（focus 的 switch-client 目標），不再進 UI state。
+/// 先走 `caller_owner`
 /// （`TMUX_PANE` env ＋ display-message 覆核，與 spawn 的歸屬邏輯同一條）；
 /// 該路徑要求 `TMUX`／`TMUX_PANE` 同時存在，缺一就退而直接問 tmux 當前
 /// client 的定位（審查 F2 指定的兩段式）。
@@ -235,18 +228,6 @@ fn current_owner(tmux: &dyn TmuxClient) -> Option<String> {
         .exec(&["display-message", "-p", "#{session_name}:#{window_id}"])?
         .ok_stdout()?;
     if out.contains(":@") { Some(out) } else { None }
-}
-
-/// 呼叫者所在的 pane id。`TMUX_PANE` 優先（不必開子行程），缺失才問 tmux。
-/// 用途是「TUI 就開在某個 worker 的 pane 裡」時仍能反查其 owner。
-fn current_pane(tmux: &dyn TmuxClient) -> Option<String> {
-    if let Ok(p) = std::env::var("TMUX_PANE")
-        && !p.is_empty()
-    {
-        return Some(p);
-    }
-    tmux.exec(&["display-message", "-p", "#{pane_id}"])?
-        .ok_stdout()
 }
 
 #[cfg(test)]

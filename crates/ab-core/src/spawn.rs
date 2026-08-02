@@ -550,7 +550,7 @@ pub const GEN_KEY_RE: &str =
 /// 代價是「兩 runtime 同一條文法」少了一個機器錨，故把 regex 原文留成
 /// `GEN_KEY_RE` 常數，並由 `gen_key_grammar_matches_the_bash_runtime`
 /// 對 `bin/agent-bridge.bash` 逐字比對。
-fn is_generation_key(s: &str) -> bool {
+pub fn is_generation_key(s: &str) -> bool {
     let Some(rest) = s.strip_prefix(&format!("{}=ab-spawn-", config::ENV_SPAWN_TAG)) else {
         return false;
     };

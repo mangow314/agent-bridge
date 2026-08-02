@@ -19,19 +19,15 @@ use ab_core::tmux::TmuxClient;
 /// 人要看更舊的請走 `list`／`gc` 那條 CLI 路徑。
 pub const RECENT_LIMIT: usize = 200;
 
-/// ORIGINS 欄頂端的 synthetic scope：選中它＝WORKERS／TASKS 不做 origin 過濾
-/// （P4.6 §9：origin 是**物理位置**不是邏輯 principal，relay 鏈會讓它斷裂，
-/// 所以「不分組地看全部」必須是一個隨手可達的視圖，而不是走訪每一列）。
-///
-/// 與真實 origin 標籤不會相撞：後者恆為 `session:@winid`／`-`／`?`。
-pub const ALL_SCOPE: &str = "ALL";
-
 /// 磁碟 read model 的一輪快照。
 pub struct Model {
-    /// ORIGINS 欄的列：第 0 筆恆為 `ALL_SCOPE`，其後是去重後的 origin 標籤
-    /// （字典序）。manual worker 統一掛在 `-` 之下（沿用 `list --long` 的
-    /// owner 欄慣例：人工註冊者沒有 origin 概念）。
-    pub origins: Vec<String>,
+    /// WORKERS 欄的 **lineage 分組**（P4.7 切片 B：唯一邏輯軸）。
+    ///
+    /// ORIGINS 面板在此退場：origin＝spawn 當下的 window id，是**物理位置**
+    /// 不是邏輯 principal，relay 鏈一接棒就斷裂（§11 根因判定）。物理位置沒有
+    /// 消失，它降到 DETAIL 當證據列——那裡它是「這個 worker 現在坐在哪」，
+    /// 是事實；當成歸屬軸才是謊。
+    pub groups: Vec<Group>,
     pub workers: Vec<AgentSnapshot>,
     pub tasks: Vec<InFlight>,
     /// TASKS 面板用：近期任務（**含終態**），id 反序。與 `tasks` 分開存放
@@ -47,13 +43,9 @@ impl Model {
         let workers = registry::snapshot(paths);
         let tasks = task::in_flight(paths);
         let recent = task::recent_tasks(paths, RECENT_LIMIT);
-        let mut labels: Vec<String> = workers.iter().map(origin_label).collect();
-        labels.sort();
-        labels.dedup();
-        let mut origins = vec![ALL_SCOPE.to_string()];
-        origins.extend(labels);
+        let groups = group_by_lineage(&workers);
         Model {
-            origins,
+            groups,
             workers,
             tasks,
             recent: recent.tasks,
@@ -82,6 +74,231 @@ pub fn origin_label(w: &AgentSnapshot) -> String {
     } else {
         w.owner.clone()
     }
+}
+
+/// 一列 worker 的 lineage 歸屬（P4.7 切片 B：**唯一邏輯軸**）。
+///
+/// 契約逐條（§9 P4.7）：新式列依 `lineage_root` 歸組；legacy 列（兩欄缺席）
+/// 只有在**自身 `spawn_tag` 等於某組的 root key** 時才歸組（證據在子代側，
+/// legacy 永不 backfill）；人工註冊沒有世代可言；兩欄不可信者一律 invalid。
+/// **MUST NOT 由 task 的 `from`／`to` 推導**——那是訊息往來，不是出身。
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum Affiliation {
+    /// 屬於某條 lineage，值是該組的 generation key
+    Lineage(String),
+    /// 有 spawn_tag，但兩欄缺席且自身不是任何一組的根
+    Legacy,
+    /// 人工註冊（`register`）：沒有 spawn_tag，也沒有世代
+    Manual,
+    /// 兩欄不可信：非 generation key（含 `Some("")` 的 invalid 標記）、
+    /// 自己是自己的 parent、與 parent 分屬不同 lineage、registry 損壞
+    Invalid,
+}
+
+/// WORKERS 欄的一組。lineage 組以 generation key 為身分；四型 standalone
+/// 共用一個尾段（每一列自帶 `Affiliation` 標記，見 `worker_affiliation`）。
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum GroupKey {
+    Lineage(String),
+    /// legacy／manual／invalid 的收容段——**它們是 standalone，不是一個組**：
+    /// 這一段只是版面上的落點，成員之間沒有任何歸屬關係
+    Standalone,
+}
+
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct Group {
+    pub key: GroupKey,
+    /// 成員在 `Model::workers` 的索引，維持 snapshot 序（檔名字典序）
+    pub members: Vec<usize>,
+}
+
+/// 這一列的 `lineage_root` 說得出口嗎——說得出口才拿它當組別。
+fn valid_root(w: &AgentSnapshot) -> Option<&str> {
+    w.lineage_root
+        .as_deref()
+        .filter(|v| ab_core::spawn::is_generation_key(v))
+}
+
+/// **一列的形狀**（不依賴其他列的部分）。
+///
+/// 拆出來是因為歸屬判定有兩個層次：形狀是這一列自己說得通不通，歸組才需要
+/// 看別人（legacy 要不要被吸附進某條 lineage，取決於有沒有子代以它為根）。
+/// 混在一起寫的後果是 **invalid 列的 root 會汙染 `roots`**——一列自相矛盾的
+/// registry 就能無中生有一個組別（切片 B1 修正輪 G1 的反例）。
+enum Shape {
+    /// 通過形狀驗證的新式 lineage 列，值＝該列的組別 key
+    Lineage(String),
+    /// 有 spawn_tag、兩欄皆缺席
+    Legacy,
+    Manual,
+    Invalid,
+}
+
+/// 逐列判形狀。**registry 兩欄是 worker 可寫面**，所以每一種缺漏／矛盾都要
+/// 有明確歸屬，不能靠「大概是舊版寫的」放行。
+fn row_shape(w: &AgentSnapshot, by_tag: &HashMap<&str, &AgentSnapshot>) -> Shape {
+    if w.corrupt {
+        return Shape::Invalid;
+    }
+    if w.spawn_tag.is_empty() {
+        // 人工註冊（`register`）：沒有世代，也**不該**有 spawned 或 lineage 欄。
+        // 三者有任何一項對不上，這一列在說一件不可能的事——不是 manual，是
+        // invalid（`spawned:true` 卻沒有 spawn_tag 尤其可疑）
+        return if !w.spawned && w.lineage_root.is_none() && w.parent_agent.is_none() {
+            Shape::Manual
+        } else {
+            Shape::Invalid
+        };
+    }
+    match (&w.lineage_root, w.parent_agent.as_deref()) {
+        // legacy：**兩欄皆缺席**（欄位永不 backfill）
+        (None, None) => Shape::Legacy,
+        // parent-only：有 parent 卻說不出自己屬於哪一條 lineage。半殘的形狀
+        // 不得被當成 legacy 放行——它宣稱了一段血緣，卻拒絕說是哪一段
+        (None, Some(_)) => Shape::Invalid,
+        (Some(_), parent) => {
+            let Some(root) = valid_root(w) else {
+                // `Some("")`（型別錯誤的 invalid 標記）與任何不合文法的值
+                return Shape::Invalid;
+            };
+            match parent {
+                Some(p) => {
+                    if !ab_core::spawn::is_generation_key(p) {
+                        return Shape::Invalid;
+                    }
+                    // 自己是自己的 parent：這一列在說一件不可能的事
+                    if p == w.spawn_tag {
+                        return Shape::Invalid;
+                    }
+                    // parent 在場但分屬不同 lineage：兩欄互相矛盾，不猜哪一邊對
+                    if let Some(pw) = by_tag.get(p)
+                        && let Some(proot) = valid_root(pw)
+                        && proot != root
+                    {
+                        return Shape::Invalid;
+                    }
+                }
+                // 沒有 parent 的新式列只有一種說得通的形狀：**它自己就是根**。
+                // root 指向別人卻不說自己是誰的子代，等於憑空認領一個組別
+                None => {
+                    if root != w.spawn_tag {
+                        return Shape::Invalid;
+                    }
+                }
+            }
+            Shape::Lineage(root.to_string())
+        }
+    }
+}
+
+/// 單列的歸屬判定（B6 防護中**歸組會用到的那部分**：非 generation key／
+/// 自指／跨 lineage 不一致／半殘形狀 → invalid → standalone，不參與任何組）。
+///
+/// `by_tag` 是「spawn_tag → 該列」的索引，`roots` 是本輪**已通過形狀驗證的**
+/// lineage 列所宣告的組別 key。兩者都由呼叫端在同一份快照上建好——registry
+/// 兩欄是 worker 可寫面，**不得假設它們構成一棵樹**。
+pub fn worker_affiliation(
+    w: &AgentSnapshot,
+    roots: &std::collections::HashSet<String>,
+    by_tag: &HashMap<&str, &AgentSnapshot>,
+) -> Affiliation {
+    match row_shape(w, by_tag) {
+        Shape::Lineage(root) => Affiliation::Lineage(root),
+        // legacy 的唯一歸組理由：**別人**以它的 spawn_tag 為根（子代側的證據）
+        Shape::Legacy => {
+            if roots.contains(&w.spawn_tag) {
+                Affiliation::Lineage(w.spawn_tag.clone())
+            } else {
+                Affiliation::Legacy
+            }
+        }
+        Shape::Manual => Affiliation::Manual,
+        Shape::Invalid => Affiliation::Invalid,
+    }
+}
+
+/// 把一份 registry 快照攤成 WORKERS 欄的分組（P4.7 切片 B）。
+///
+/// 三趟：`by_tag`（不依賴任何判定）→ 逐列形狀＋收 `roots`（**只收形狀合法的
+/// lineage 列**）→ legacy 吸附。第二、三趟不能合併：legacy 要不要歸組取決於
+/// 全部子代看完之後的 `roots`。
+pub fn group_by_lineage(workers: &[AgentSnapshot]) -> Vec<Group> {
+    let by_tag: HashMap<&str, &AgentSnapshot> = workers
+        .iter()
+        .filter(|w| !w.corrupt && !w.spawn_tag.is_empty())
+        .map(|w| (w.spawn_tag.as_str(), w))
+        .collect();
+    // 第一趟：所有**說得出口的**組別 key。invalid 列的 root 不進來——否則
+    // 一列自相矛盾的 registry 就能讓一個 legacy 列被吸進不存在的組
+    let roots: std::collections::HashSet<String> = workers
+        .iter()
+        .filter_map(|w| match row_shape(w, &by_tag) {
+            Shape::Lineage(r) => Some(r),
+            _ => None,
+        })
+        .collect();
+
+    // 第二趟：逐列判歸屬。lineage 組依 key 字典序（畫面每輪都要穩定），
+    // standalone 段恆在最後
+    let mut lineage: std::collections::BTreeMap<String, Vec<usize>> = Default::default();
+    let mut standalone: Vec<usize> = Vec::new();
+    for (i, w) in workers.iter().enumerate() {
+        match worker_affiliation(w, &roots, &by_tag) {
+            Affiliation::Lineage(k) => lineage.entry(k).or_default().push(i),
+            Affiliation::Legacy | Affiliation::Manual | Affiliation::Invalid => standalone.push(i),
+        }
+    }
+    let mut out: Vec<Group> = lineage
+        .into_iter()
+        .map(|(k, members)| Group {
+            key: GroupKey::Lineage(k),
+            members,
+        })
+        .collect();
+    if !standalone.is_empty() {
+        out.push(Group {
+            key: GroupKey::Standalone,
+            members: standalone,
+        });
+    }
+    out
+}
+
+/// 一組的畫面標籤。
+///
+/// **display-only 的 tag 剖析**（契約允許的那條界線）：禁止的是拿 name 做
+/// **歸組／lookup**——歸組全程只比對 generation key 全串，這裡剖析出來的
+/// 字串一個字都不會回到判定路徑上，只用來讓人讀得懂畫面。
+///
+/// 根在場（有一列的 `spawn_tag` 等於組 key）→ 用它的 agent 名；不在場 →
+/// tag 的 name 段＋世代短碼＋`†`（墓碑）。
+pub fn group_label(model: &Model, g: &Group) -> String {
+    let GroupKey::Lineage(key) = &g.key else {
+        return "(standalone)".to_string();
+    };
+    if let Some(w) = model
+        .workers
+        .iter()
+        .find(|w| !w.corrupt && w.spawn_tag == *key)
+    {
+        return format!("lineage {}", w.name);
+    }
+    match tag_display_parts(key) {
+        Some((name, code)) => format!("lineage {name}\u{2020} ({code})"),
+        // 連剖析都失敗：只說得出「這個 key 存在」，不編故事
+        None => "lineage ?\u{2020}".to_string(),
+    }
+}
+
+/// canonical generation key → `(name 段, 世代短碼)`，**display only**。
+///
+/// 短碼取 12 位 hex 的前 4 位：同名 respawn 在畫面上要分得出是哪一代，而
+/// 完整 tag 塞不進一欄寬。呼叫端只在已通過文法驗證的 key 上用它。
+pub fn tag_display_parts(key: &str) -> Option<(String, String)> {
+    let rest = key.strip_prefix("AGENT_BRIDGE_SPAWN_TAG=ab-spawn-")?;
+    let (head, hex) = rest.rsplit_once('-')?;
+    let (name, _pid) = head.rsplit_once('-')?;
+    Some((name.to_string(), hex.get(..4)?.to_string()))
 }
 
 /// 兩軸資料的**年紀**（P4.6 切片 C）：距離上一次可信的更新過了多久。
@@ -495,25 +712,6 @@ pub fn window_state(live: &LiveIndex, label: &str) -> WindowState {
     }
 }
 
-/// ORIGINS 欄那一列的字面（短版，欄寬有限）。
-///
-/// - live → `session:window-name`（人看得懂的那個）
-/// - gone → `session:@id (gone)`——**沿用標籤原本的 session 與 id，不猜舊名**
-/// - unknown → `session:@id`（查不到就照原樣，不加任何暗示）
-/// - ambiguous（linked window 消歧義不出唯一位置）→ 同樣照原樣：這一欄太窄，
-///   放不下位置清單，而**冒用其中一個 session 的名字比不說更糟**（完整位置
-///   由 `window_detail` 在 DETAIL 攤開）
-/// - 非 window 形（`-`／`?`／`ALL`）→ 原樣
-pub fn origin_row_label(live: &LiveIndex, label: &str) -> String {
-    match window_state(live, label) {
-        WindowState::Live(sess, name) => format!("{sess}:{name}"),
-        WindowState::Gone => format!("{label} (gone)"),
-        WindowState::Ambiguous(_) | WindowState::Unknown | WindowState::NotAWindow => {
-            label.to_string()
-        }
-    }
-}
-
 /// DETAIL 欄的 window 行（長版：**完整 `@id` MUST 留著**，它才是介入時能拿去
 /// 對 tmux 下命令的那個識別）。
 ///
@@ -574,57 +772,125 @@ pub fn row_key(model: &Model, row: Row) -> RowKey {
     }
 }
 
-/// 選中的 ORIGINS 列是否為 synthetic `ALL`（＝不過濾）。
-fn in_scope(scope: &str, w: &AgentSnapshot) -> bool {
-    scope == ALL_SCOPE || origin_label(w) == scope
-}
-
-/// 攤平選中 scope 之下的 worker／task 列。worker 依 snapshot 序（檔名字典
-/// 序），task 依 id 序（in_flight 已排序）。`scope == ALL_SCOPE` 時不過濾。
-pub fn worker_rows(model: &Model, scope: &str) -> Vec<Row> {
+/// 攤平 WORKERS 欄：依 lineage 分組的順序列出 worker 與其 in-flight task。
+///
+/// **組標頭不是一列 `Row`**（P4.7 切片 B 的設計取捨）：它是 render 端插進去
+/// 的裝飾行。理由有兩條——(1) 組是分類不是對象，它身上沒有任何鍵可按，讓
+/// 游標停在上面只是多一次 `j`（P4 的步數是 gate）；(2) selection 的語意因此
+/// **逐字不變**：`rows` 仍然只有 worker 與 task 兩種，P4.6 的 stable key／
+/// `fallback_row`／Enter matrix 一行都不必動。代價是 render 要把「第幾列」
+/// 換算成「第幾行」（見 `group_line_offsets`／`worker_row_lines`），那是純函式。
+///
+/// worker 依組序、組內依 snapshot 序（檔名字典序），task 依 id 序。
+pub fn worker_rows(model: &Model) -> Vec<Row> {
     let mut rows = Vec::new();
-    for (wi, w) in model.workers.iter().enumerate() {
-        if !in_scope(scope, w) {
-            continue;
-        }
-        rows.push(Row::Worker(wi));
-        for (ti, t) in model.tasks.iter().enumerate() {
-            if t.to == w.name {
-                rows.push(Row::Task {
-                    worker: wi,
-                    task: ti,
-                });
+    for g in model.groups.iter() {
+        for &wi in &g.members {
+            rows.push(Row::Worker(wi));
+            for (ti, t) in model.tasks.iter().enumerate() {
+                if t.to == model.workers[wi].name {
+                    rows.push(Row::Task {
+                        worker: wi,
+                        task: ti,
+                    });
+                }
             }
         }
     }
     rows
 }
 
-/// TASKS 欄的列：`model.recent` 的索引。只留派給「當前 scope 底下某個
-/// worker」的任務，順序沿用 `recent`（id 反序＝新的在上）；`ALL_SCOPE` 不過濾。
+/// 每一個 `worker_rows` 列在畫面上的**行號**（組標頭佔行不佔列）。
 ///
-/// 為什麼要含終態：`r` 讀的是回覆，而 `read` 只對 `completed`／`failed`
-/// 合法；WORKERS 欄只有 in-flight 列，沒有終態任務就沒有東西可讀。
-pub fn task_rows(model: &Model, scope: &str) -> Vec<usize> {
-    // ALL＝「全部」的字面意思：連收件人已不在 registry 的任務也留著。過濾掉
-    // 它們等於讓 worker 被回收之後、它的任務從畫面上人間蒸發——而那正是人在
-    // ALL 這個視圖裡最想找回來的東西
-    if scope == ALL_SCOPE {
-        return (0..model.recent.len()).collect();
+/// 與 `worker_rows` 逐字同一個走訪順序——兩者一旦漂開，捲動就會把選取列推出
+/// 畫面外，而那是靜默的（畫面照畫，只是看不到游標）。
+pub fn worker_row_lines(model: &Model) -> Vec<usize> {
+    let mut out = Vec::new();
+    let mut line = 0usize;
+    for g in model.groups.iter() {
+        line += 1; // 組標頭：佔一行，不佔列
+        for &wi in &g.members {
+            out.push(line);
+            line += 1;
+            for t in model.tasks.iter() {
+                if t.to == model.workers[wi].name {
+                    out.push(line);
+                    line += 1;
+                }
+            }
+        }
     }
-    let names: Vec<&str> = model
-        .workers
-        .iter()
-        .filter(|w| in_scope(scope, w))
-        .map(|w| w.name.as_str())
-        .collect();
-    model
-        .recent
-        .iter()
-        .enumerate()
-        .filter(|(_, t)| names.contains(&t.to.as_str()))
-        .map(|(i, _)| i)
-        .collect()
+    out
+}
+
+/// `rows` 索引 → 「在它之前要插入哪一組的標頭」（render 端畫標頭用）。
+pub fn group_line_offsets(model: &Model) -> HashMap<usize, usize> {
+    let mut out = HashMap::new();
+    let mut row = 0usize;
+    for (gi, g) in model.groups.iter().enumerate() {
+        // 空組不可達：`group_by_lineage` 只在有成員時才建組（lineage 組來自
+        // `entry().or_default().push()`，standalone 段有 `is_empty()` 閘）。
+        // 真的來了一個空組，這裡會讓兩組共用同一個 row key，標頭少畫一行
+        debug_assert!(
+            !g.members.is_empty(),
+            "空組不可達（group_by_lineage 不產生）"
+        );
+        out.insert(row, gi);
+        for &wi in &g.members {
+            row += 1; // worker 列
+            row += model
+                .tasks
+                .iter()
+                .filter(|t| t.to == model.workers[wi].name)
+                .count();
+        }
+    }
+    out
+}
+
+/// 選取列在畫面上的行號（列號＋它前面所有組標頭）。
+pub fn worker_line_of(model: &Model, row_idx: usize) -> usize {
+    worker_row_lines(model)
+        .get(row_idx)
+        .copied()
+        .unwrap_or(row_idx)
+}
+
+/// PgUp／PgDn 的目標列：以**一個 viewport 的 rendered lines** 為位移量。
+///
+/// 直接把可視行高當成「幾列」是錯的（切片 B1 修正輪 G2）：組標頭佔行不佔列，
+/// 兩者一差，翻頁的落點就會**跳過**中間某些列——而且是永久跳過，那些列在
+/// 任何一頁上都不出現。這裡改成先換算成行號、位移一個 viewport，再挑
+/// 「行號跨過該位置的第一個／最後一個列」，翻頁於是與畫面逐行銜接。
+pub fn worker_page_row(model: &Model, row_idx: usize, page_lines: usize, down: bool) -> usize {
+    let lines = worker_row_lines(model);
+    if lines.is_empty() {
+        return 0;
+    }
+    let last = lines.len() - 1;
+    let cur = lines.get(row_idx).copied().unwrap_or(0);
+    let page = page_lines.max(1);
+    if down {
+        let target = cur + page;
+        // 下一頁的頁首＝上一頁末列的下一列（行號 >= target 的第一個列）
+        lines.iter().position(|&l| l >= target).unwrap_or(last)
+    } else {
+        let target = cur.saturating_sub(page);
+        lines.iter().rposition(|&l| l <= target).unwrap_or(0)
+    }
+}
+
+/// TASKS 欄的列：`model.recent` 的索引，順序沿用 `recent`（id 反序＝新的在上）。
+///
+/// **P4.7 切片 B 起不再過濾**：過濾軸原本是 ORIGINS 的 scope，而那個面板已
+/// 退場。lineage-scoped 的 All／Unattached 是切片 C 的題目——在它落地之前，
+/// 這一欄的語意就是舊的 `ALL`：全部，連收件人已不在 registry 的任務也留著
+/// （worker 被回收之後，它的任務正是人最想找回來的東西）。
+///
+/// 附帶效果：`recent_truncated` 的 `+` 恆為誠實的——那是**全 pool** 的旗標，
+/// 而這一欄現在也正是全 pool（P4.6 切片 C 的 F5 因此自然成立）。
+pub fn task_rows(model: &Model) -> Vec<usize> {
+    (0..model.recent.len()).collect()
 }
 
 /// 終態判定（`x` 的合法目標判斷用）。權威字沿用 `spec/state.md`。
@@ -683,6 +949,44 @@ mod tests {
         }
     }
 
+    /// 帶 lineage 兩欄的快照（P4.7 切片 B）。`tag` 是**裸的世代碼**，這裡
+    /// 補上 canonical 前綴——測試要驗的是「歸組只比對全串」，用真的形狀才驗得到
+    fn lin(name: &str, tag: &str, root: Option<&str>, parent: Option<&str>) -> AgentSnapshot {
+        let key = |t: &str| format!("AGENT_BRIDGE_SPAWN_TAG=ab-spawn-{t}");
+        AgentSnapshot {
+            spawn_tag: key(tag),
+            lineage_root: root.map(key),
+            parent_agent: parent.map(key),
+            ..snap(name, true, "it:@1")
+        }
+    }
+
+    /// 三種 registry 形狀的捷徑：人工註冊（無 spawn_tag）／損壞。
+    fn manual(name: &str) -> AgentSnapshot {
+        AgentSnapshot {
+            spawn_tag: String::new(),
+            spawned: false,
+            ..snap(name, false, "")
+        }
+    }
+
+    /// 測試用 model：`groups` 一律由 `group_by_lineage` 推導，與 `load`
+    /// 同一條路徑（fixture 自己寫一份分組＝驗自己抄的答案）。
+    fn model_of(workers: Vec<AgentSnapshot>, tasks: Vec<InFlight>) -> Model {
+        Model {
+            groups: group_by_lineage(&workers),
+            workers,
+            tasks,
+            recent: Vec::new(),
+            recent_truncated: false,
+        }
+    }
+
+    /// 裸世代碼 → canonical generation key（測試裡到處要用）
+    fn canon(tag: &str) -> String {
+        format!("AGENT_BRIDGE_SPAWN_TAG=ab-spawn-{tag}")
+    }
+
     fn inflight(id: &str, to: &str) -> InFlight {
         InFlight {
             id: id.to_string(),
@@ -693,98 +997,367 @@ mod tests {
     }
 
     /// selection model（§2）：worker 列與其 in-flight task 列皆為可選取列，
-    /// task 緊接在所屬 worker 之後；別的 origin 的 worker 不得混入。
+    /// task 緊接在所屬 worker 之後。組標頭**不是列**（render 端裝飾），
+    /// 但列序必須依 `model.groups` 分組排（P4.7 切片 B：ORIGINS 退場，
+    /// lineage 成為唯一軸）。
     #[test]
-    fn worker_rows_interleave_tasks_under_their_worker() {
-        let model = Model {
-            origins: vec![ALL_SCOPE.into(), "-".into(), "it:@1".into()],
-            workers: vec![
-                snap("w1", true, "it:@1"),
-                snap("w2", true, "it:@1"),
-                snap("manual", false, ""),
+    fn worker_rows_group_by_lineage_and_interleave_tasks() {
+        let model = model_of(
+            vec![
+                lin(
+                    "root",
+                    "root-1-aaaaaaaaaaaa",
+                    Some("root-1-aaaaaaaaaaaa"),
+                    None,
+                ),
+                lin(
+                    "w1",
+                    "w1-2-bbbbbbbbbbbb",
+                    Some("root-1-aaaaaaaaaaaa"),
+                    Some("root-1-aaaaaaaaaaaa"),
+                ),
+                manual("manual"),
             ],
-            tasks: vec![
+            vec![
                 inflight("20260731T000001Z-aaaa", "w1"),
-                inflight("20260731T000002Z-bbbb", "w2"),
+                inflight("20260731T000002Z-bbbb", "root"),
                 inflight("20260731T000003Z-cccc", "w1"),
             ],
-            recent: Vec::new(),
-            recent_truncated: false,
-        };
-        let rows = worker_rows(&model, "it:@1");
-        assert_eq!(
-            rows,
-            vec![
-                Row::Worker(0),
-                Row::Task { worker: 0, task: 0 },
-                Row::Task { worker: 0, task: 2 },
-                Row::Worker(1),
-                Row::Task { worker: 1, task: 1 },
-            ]
         );
-        assert_eq!(worker_rows(&model, "-"), vec![Row::Worker(2)]);
-    }
-
-    /// synthetic `ALL`（P4.6 題 2）：跨 origin 聚合，且**每個 worker 的 task
-    /// 仍緊接在自己那一列之下**（ALL 不是把列表重排成兩段）。
-    #[test]
-    fn all_scope_aggregates_every_origin_without_reordering() {
-        let model = Model {
-            origins: vec![ALL_SCOPE.into(), "-".into(), "it:@1".into()],
-            workers: vec![
-                snap("w1", true, "it:@1"),
-                snap("manual", false, ""),
-                snap("wx", true, "other:@2"),
-            ],
-            tasks: vec![
-                inflight("20260731T000001Z-aaaa", "w1"),
-                inflight("20260731T000002Z-bbbb", "wx"),
-            ],
-            recent: vec![
-                inflight("20260731T000002Z-bbbb", "wx"),
-                inflight("20260731T000001Z-aaaa", "w1"),
-                // 收件人已不在 registry：ALL MUST 仍留著它（worker 被回收之後
-                // 它的任務不該從畫面上人間蒸發）
-                inflight("20260731T000000Z-zzzz", "gone-w"),
-            ],
-            recent_truncated: false,
-        };
+        // 一個 lineage 組（root＋w1）＋一個 standalone 段（manual）
+        assert_eq!(model.groups.len(), 2);
         assert_eq!(
-            worker_rows(&model, ALL_SCOPE),
+            model.groups[0].key,
+            GroupKey::Lineage(canon("root-1-aaaaaaaaaaaa"))
+        );
+        assert_eq!(model.groups[1].key, GroupKey::Standalone);
+        assert_eq!(
+            worker_rows(&model),
             vec![
                 Row::Worker(0),
-                Row::Task { worker: 0, task: 0 },
+                Row::Task { worker: 0, task: 1 },
                 Row::Worker(1),
+                Row::Task { worker: 1, task: 0 },
+                Row::Task { worker: 1, task: 2 },
                 Row::Worker(2),
-                Row::Task { worker: 2, task: 1 },
             ]
         );
-        assert_eq!(task_rows(&model, ALL_SCOPE), vec![0, 1, 2]);
-        // 單一 origin 仍然只看自己那一份（ALL 不得汙染既有過濾）
-        assert_eq!(worker_rows(&model, "it:@1").len(), 2);
-        assert_eq!(task_rows(&model, "it:@1"), vec![1]);
     }
 
-    /// TASKS 欄（§2 版面新增）：含終態、id 反序、只留本 origin 底下 worker 的
-    /// 任務；別的 origin 的任務不得混入。
+    /// **gate (a) 資料面**：lineage root→A→B→C，移除 A／B 的 registry 之後
+    /// C 仍歸同一組——歸屬的證據是 C 自己身上的 generation key，不是「鏈上
+    /// 每一節都還在」。
     #[test]
-    fn task_rows_keep_terminal_tasks_of_this_owner_newest_first() {
-        let mut done = inflight("20260731T000009Z-dddd", "w1");
-        done.status = "completed".to_string();
-        let model = Model {
-            origins: vec![ALL_SCOPE.into(), "it:@1".into(), "other:@2".into()],
-            workers: vec![snap("w1", true, "it:@1"), snap("wx", true, "other:@2")],
-            tasks: Vec::new(),
-            // recent_tasks 的輸出已是反序
-            recent: vec![
-                done,
-                inflight("20260731T000005Z-eeee", "wx"),
-                inflight("20260731T000001Z-aaaa", "w1"),
+    fn a_lineage_survives_the_removal_of_its_middle_generations() {
+        let root = "root-1-aaaaaaaaaaaa";
+        let full = model_of(
+            vec![
+                lin("root", root, Some(root), None),
+                lin("A", "a-2-bbbbbbbbbbbb", Some(root), Some(root)),
+                lin(
+                    "B",
+                    "b-3-cccccccccccc",
+                    Some(root),
+                    Some("a-2-bbbbbbbbbbbb"),
+                ),
+                lin(
+                    "C",
+                    "c-4-dddddddddddd",
+                    Some(root),
+                    Some("b-3-cccccccccccc"),
+                ),
             ],
-            recent_truncated: false,
+            Vec::new(),
+        );
+        assert_eq!(full.groups.len(), 1, "四代同組");
+        assert_eq!(full.groups[0].members, vec![0, 1, 2, 3]);
+
+        // A／B 的 registry 被移除（例如 despawn）：C 照樣在同一組
+        let pruned = model_of(
+            vec![
+                lin("root", root, Some(root), None),
+                lin(
+                    "C",
+                    "c-4-dddddddddddd",
+                    Some(root),
+                    Some("b-3-cccccccccccc"),
+                ),
+            ],
+            Vec::new(),
+        );
+        assert_eq!(pruned.groups.len(), 1, "中間兩代不在了，組還在");
+        assert_eq!(
+            pruned.groups[0].key,
+            GroupKey::Lineage(canon(root)),
+            "組別 key 不變（它是 generation key，不是誰還在場）"
+        );
+        assert_eq!(pruned.groups[0].members, vec![0, 1]);
+
+        // **負向：不得由 task 推導歸組**。C 的 parent（B）不在場，而 task 的
+        // `from` 恰好叫 "A"——若歸組偷看 task，這裡就會多出一組或改變成員
+        let with_tasks = model_of(
+            vec![
+                lin("root", root, Some(root), None),
+                lin(
+                    "C",
+                    "c-4-dddddddddddd",
+                    Some(root),
+                    Some("b-3-cccccccccccc"),
+                ),
+            ],
+            vec![InFlight {
+                id: "20260731T000009Z-zzzz".into(),
+                from: "A".into(),
+                to: "C".into(),
+                status: "queued".into(),
+            }],
+        );
+        assert_eq!(
+            with_tasks.groups, pruned.groups,
+            "task 的 from/to 不參與歸組"
+        );
+    }
+
+    /// **gate (b) 資料面**：新舊混合的四型歸屬。
+    #[test]
+    fn legacy_manual_and_invalid_rows_follow_the_contract() {
+        let root = "root-1-aaaaaaaaaaaa";
+        // legacy＝兩欄缺席。第一個 legacy 的 spawn_tag **就是**某組的 root key
+        // → 它是那一組的根；第二個誰也不是 → standalone
+        let legacy_root = AgentSnapshot {
+            lineage_root: None,
+            parent_agent: None,
+            ..lin("legacy-root", root, None, None)
         };
-        assert_eq!(task_rows(&model, "it:@1"), vec![0, 2], "含終態、新的在上");
-        assert_eq!(task_rows(&model, "other:@2"), vec![1]);
+        let legacy_orphan = AgentSnapshot {
+            lineage_root: None,
+            parent_agent: None,
+            ..lin("legacy-orphan", "orphan-9-999999999999", None, None)
+        };
+        // invalid：lineage_root 存在但不是 generation key（`Some("")` 是型別
+        // 錯誤的 invalid 標記，型別面見 registry 的三態測試）
+        let mut bad_root = lin("bad-root", "bad-5-eeeeeeeeeeee", Some(root), None);
+        bad_root.lineage_root = Some(String::new());
+        // invalid：自己是自己的 parent
+        let self_parent = lin(
+            "self-parent",
+            "sp-6-ffffffffffff",
+            Some(root),
+            Some("sp-6-ffffffffffff"),
+        );
+        let model = model_of(
+            vec![
+                lin("child", "c-2-bbbbbbbbbbbb", Some(root), Some(root)),
+                legacy_root,
+                legacy_orphan,
+                manual("manual"),
+                bad_root,
+                self_parent,
+            ],
+            Vec::new(),
+        );
+        let roots: std::collections::HashSet<String> =
+            std::collections::HashSet::from([canon(root)]);
+        let by_tag: HashMap<&str, &AgentSnapshot> = model
+            .workers
+            .iter()
+            .map(|w| (w.spawn_tag.as_str(), w))
+            .collect();
+        let aff = |i: usize| worker_affiliation(&model.workers[i], &roots, &by_tag);
+        assert_eq!(
+            aff(0),
+            Affiliation::Lineage(canon(root)),
+            "新式列依 root 歸組"
+        );
+        assert_eq!(
+            aff(1),
+            Affiliation::Lineage(canon(root)),
+            "legacy 且自身 tag ＝某組 root key → 它就是該組的根"
+        );
+        assert_eq!(
+            aff(2),
+            Affiliation::Legacy,
+            "legacy 且誰也不是 → standalone"
+        );
+        assert_eq!(aff(3), Affiliation::Manual, "人工註冊沒有世代");
+        assert_eq!(
+            aff(4),
+            Affiliation::Invalid,
+            "lineage_root 不是 generation key"
+        );
+        assert_eq!(aff(5), Affiliation::Invalid, "自己是自己的 parent");
+
+        // 版面：lineage 組一個（child＋legacy-root），其餘四列全進 standalone 段
+        assert_eq!(model.groups.len(), 2);
+        assert_eq!(model.groups[0].members, vec![0, 1]);
+        assert_eq!(model.groups[1].key, GroupKey::Standalone);
+        assert_eq!(model.groups[1].members, vec![2, 3, 4, 5]);
+    }
+
+    /// **形狀驗證（切片 B1 修正輪 G1）**：半殘的 registry 列 MUST NOT 被當成
+    /// legacy／manual 放行，而且 **invalid 列宣告的 root 不得進 `roots`**。
+    ///
+    /// 四條各自對應一個反例。少了它們，一列自相矛盾的 registry 就能無中生有
+    /// 一個組別，或把一個 legacy 列吸進不存在的 lineage。
+    #[test]
+    fn half_shaped_rows_are_invalid_and_never_contaminate_the_roots() {
+        let root = "root-1-aaaaaaaaaaaa";
+
+        // (1) spawned/tag 不一致：沒有 spawn_tag 卻宣稱自己是 spawn 出來的
+        let mut ghost = manual("ghost");
+        ghost.spawned = true;
+        // (1b) 沒有 spawn_tag 卻帶 lineage 欄
+        let mut rootless = manual("rootless");
+        rootless.lineage_root = Some(canon(root));
+
+        // (2) parent-only：說得出上一代，卻說不出自己屬於哪一條 lineage
+        let parent_only = AgentSnapshot {
+            lineage_root: None,
+            ..lin("parent-only", "po-2-bbbbbbbbbbbb", None, Some(root))
+        };
+
+        // (3) foreign-root-without-parent：root 指向別人，卻不說自己是誰的子代
+        //     ——等於憑空認領一個組別
+        let foreign = lin("foreign", "fr-3-cccccccccccc", Some(root), None);
+
+        let model = model_of(
+            vec![ghost, rootless, parent_only, foreign, manual("real-manual")],
+            Vec::new(),
+        );
+        let by_tag: HashMap<&str, &AgentSnapshot> = model
+            .workers
+            .iter()
+            .filter(|w| !w.spawn_tag.is_empty())
+            .map(|w| (w.spawn_tag.as_str(), w))
+            .collect();
+        let roots: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let aff = |i: usize| worker_affiliation(&model.workers[i], &roots, &by_tag);
+        assert_eq!(
+            aff(0),
+            Affiliation::Invalid,
+            "spawned:true 卻沒有 spawn_tag"
+        );
+        assert_eq!(
+            aff(1),
+            Affiliation::Invalid,
+            "沒有 spawn_tag 卻帶 lineage 欄"
+        );
+        assert_eq!(aff(2), Affiliation::Invalid, "parent-only：半殘形狀");
+        assert_eq!(
+            aff(3),
+            Affiliation::Invalid,
+            "foreign-root-without-parent：憑空認領組別"
+        );
+        assert_eq!(aff(4), Affiliation::Manual, "三項都對得上才是 manual");
+        // 五列全 standalone，一個 lineage 組都不得生出來
+        assert_eq!(model.groups.len(), 1);
+        assert_eq!(model.groups[0].key, GroupKey::Standalone);
+        assert_eq!(model.groups[0].members, vec![0, 1, 2, 3, 4]);
+    }
+
+    /// (4) **invalid-root-contaminates-legacy**：唯一提到 `R` 的那一列自己是
+    /// invalid（foreign-root-without-parent），`R` 於是 MUST NOT 進 `roots`
+    /// ——否則 spawn_tag 剛好等於 `R` 的那個 legacy 列會被吸進一個沒有任何
+    /// 合法成員的組。
+    #[test]
+    fn an_invalid_rows_root_never_creates_a_group_for_a_legacy_row() {
+        let r = "r-1-aaaaaaaaaaaa";
+        // legacy：兩欄缺席，spawn_tag 恰好就是 R
+        let legacy = AgentSnapshot {
+            lineage_root: None,
+            parent_agent: None,
+            ..lin("legacy", r, None, None)
+        };
+        // invalid：root 指向 R，卻沒有 parent（憑空認領）
+        let bad = lin("bad", "bad-2-bbbbbbbbbbbb", Some(r), None);
+        let model = model_of(vec![legacy, bad], Vec::new());
+
+        assert_eq!(
+            model.groups.len(),
+            1,
+            "MUST NOT 生出 Lineage(R) 組（實際：{:?}）",
+            model.groups
+        );
+        assert_eq!(model.groups[0].key, GroupKey::Standalone);
+        assert_eq!(model.groups[0].members, vec![0, 1], "兩列都落 standalone");
+
+        // 對照組：換成一個**形狀合法**的子代（有 parent、root 一致），R 才
+        // 成為組別 key，legacy 列也才被吸附進來
+        let good = lin("good", "good-2-cccccccccccc", Some(r), Some(r));
+        let ok = model_of(
+            vec![
+                AgentSnapshot {
+                    lineage_root: None,
+                    parent_agent: None,
+                    ..lin("legacy", r, None, None)
+                },
+                good,
+            ],
+            Vec::new(),
+        );
+        assert_eq!(ok.groups.len(), 1);
+        assert_eq!(ok.groups[0].key, GroupKey::Lineage(canon(r)));
+        assert_eq!(ok.groups[0].members, vec![0, 1]);
+    }
+
+    /// B6（歸組會用到的那部分）：兩欄是 **worker 可寫面**，不得假設它們構成
+    /// 一棵樹。cycle 與跨 lineage 不一致都不得把兩列併進同一組。
+    #[test]
+    fn a_cycle_or_cross_lineage_parent_never_forms_a_group() {
+        let ra = "ra-1-aaaaaaaaaaaa";
+        let rb = "rb-1-bbbbbbbbbbbb";
+        // A→B→A 的 cycle：兩列互為 parent，且各自宣稱自己是根
+        let model = model_of(
+            vec![
+                lin("A", "a-2-cccccccccccc", Some(ra), Some("b-3-dddddddddddd")),
+                lin("B", "b-3-dddddddddddd", Some(ra), Some("a-2-cccccccccccc")),
+            ],
+            Vec::new(),
+        );
+        // 同一個 lineage_root，所以**歸組是合法的**——cycle 的傷害在 traversal
+        // （breadcrumb 會繞不完），那是切片 B2 的防護矩陣。這裡釘住的是
+        // 「歸組不因為 cycle 就崩潰或分裂」
+        assert_eq!(model.groups.len(), 1);
+        assert_eq!(model.groups[0].members, vec![0, 1]);
+
+        // 跨 lineage 不一致：C 說自己屬於 ra，但它的 parent 屬於 rb。
+        // P 是 rb 這一組的根（無 parent 的新式列 MUST root ＝自身 tag，
+        // 見形狀驗證），所以它自己是合法的——不合法的只有 C
+        let model = model_of(
+            vec![
+                lin("P", rb, Some(rb), None),
+                lin("C", "c-3-ffffffffffff", Some(ra), Some(rb)),
+            ],
+            Vec::new(),
+        );
+        let roots: std::collections::HashSet<String> =
+            std::collections::HashSet::from([canon(ra), canon(rb)]);
+        let by_tag: HashMap<&str, &AgentSnapshot> = model
+            .workers
+            .iter()
+            .map(|w| (w.spawn_tag.as_str(), w))
+            .collect();
+        assert_eq!(
+            worker_affiliation(&model.workers[1], &roots, &by_tag),
+            Affiliation::Invalid,
+            "兩欄互相矛盾時不猜哪一邊對"
+        );
+        assert_eq!(model.groups[1].key, GroupKey::Standalone);
+        assert_eq!(model.groups[1].members, vec![1], "invalid 列 standalone");
+    }
+
+    /// TASKS 欄（P4.7 切片 B）：**不再過濾**——scope 軸隨 ORIGINS 一起退場，
+    /// lineage-scoped 的 All／Unattached 是切片 C 的題目。
+    #[test]
+    fn task_rows_keep_every_recent_task_including_orphans() {
+        let mut model = model_of(vec![lin("w1", "w1-2-bbbbbbbbbbbb", None, None)], Vec::new());
+        model.recent = vec![
+            inflight("20260731T000003Z-cccc", "w1"),
+            // 收件人已不在 registry：**MUST 留著**（worker 被回收之後，
+            // 它的任務正是人最想找回來的東西）
+            inflight("20260731T000002Z-bbbb", "gone"),
+        ];
+        assert_eq!(task_rows(&model), vec![0, 1]);
         assert!(is_terminal_status("completed") && is_terminal_status("cancelled"));
         assert!(!is_terminal_status("running"));
     }
@@ -946,21 +1519,17 @@ mod tests {
             ..LiveIndex::unknown()
         };
         // live：人看得懂的 session:window-name；DETAIL 仍留完整 @id
-        assert_eq!(origin_row_label(&live, "scratch:@108"), "scratch:main");
         assert_eq!(
             window_detail(&live, "scratch:@108"),
             "scratch:main (@108, live)"
         );
         // gone：沿用原標籤（session＋@id），一個字的舊名都不猜
-        assert_eq!(origin_row_label(&live, "old:@9"), "old:@9 (gone)");
         assert_eq!(window_detail(&live, "old:@9"), "old:@9 (gone)");
         // unknown（tmux 查不到）MUST NOT 被寫成 gone
         let unknown = LiveIndex::unknown();
-        assert_eq!(origin_row_label(&unknown, "old:@9"), "old:@9");
         assert_eq!(window_detail(&unknown, "old:@9"), "old:@9 (unknown)");
         // 非 window 形：列上原樣，DETAIL 標 n/a（不是「查不到」）
-        for label in ["-", "?", ALL_SCOPE] {
-            assert_eq!(origin_row_label(&live, label), label);
+        for label in ["-", "?"] {
             assert_eq!(window_detail(&live, label), format!("{label} (n/a)"));
         }
     }
@@ -989,7 +1558,6 @@ mod tests {
             window_state(&live, "alpha:@7"),
             WindowState::Live("alpha".into(), "work".into())
         );
-        assert_eq!(origin_row_label(&live, "alpha:@7"), "alpha:work");
         assert_eq!(
             window_state(&live, "beta:@7"),
             WindowState::Live("beta".into(), "work-linked".into())
@@ -1004,11 +1572,6 @@ mod tests {
                 ("alpha".into(), "work".into()),
                 ("beta".into(), "work-linked".into()),
             ])
-        );
-        assert_eq!(
-            origin_row_label(&live, "gamma:@7"),
-            "gamma:@7",
-            "消歧義不出來時 MUST 照原樣，MUST NOT 冒用任一 session 的名字"
         );
         let detail = window_detail(&live, "gamma:@7");
         assert!(
@@ -1066,22 +1629,12 @@ mod tests {
             windows: Some(win_index(&[("s", "@1", "main")])),
             ..LiveIndex::unknown()
         };
-        for bad in [
-            "s:@",
-            "s:@garbage",
-            ":@1",
-            "s:@1x",
-            "@1",
-            "-",
-            "?",
-            ALL_SCOPE,
-        ] {
+        for bad in ["s:@", "s:@garbage", ":@1", "s:@1x", "@1", "-", "?"] {
             assert_eq!(
                 window_state(&live, bad),
                 WindowState::NotAWindow,
                 "畸形／非 window 形標籤「{bad}」"
             );
-            assert_eq!(origin_row_label(&live, bad), bad);
             assert_eq!(window_detail(&live, bad), format!("{bad} (n/a)"));
         }
         // 對照組：形狀合法但不存在 → 這才是 Gone
@@ -1139,8 +1692,11 @@ mod tests {
                 .any(|a| a == "#{session_name}\t#{window_id}\t#{window_name}")),
             "list-windows 的 format MUST 一次帶回三欄：{calls:?}"
         );
-        assert_eq!(origin_row_label(&live, "scratch:@108"), "scratch:main");
-        assert_eq!(origin_row_label(&live, "it:@2"), "it:side");
+        assert_eq!(
+            window_detail(&live, "scratch:@108"),
+            "scratch:main (@108, live)"
+        );
+        assert_eq!(window_detail(&live, "it:@2"), "it:side (@2, live)");
         assert_eq!(pane_liveness(&live, "%1"), Liveness::Live);
     }
 

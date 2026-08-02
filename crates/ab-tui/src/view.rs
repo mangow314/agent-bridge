@@ -21,8 +21,9 @@ use ratatui::widgets::{
 use crate::action::{cancel_cmdline, evidence};
 use crate::app::{App, EnterAct, Panel, Sel};
 use crate::model::{
-    ALL_SCOPE, Blocker, BlockerIndex, DISK_STALE, Freshness, LiveIndex, Liveness, Model, Row,
-    TMUX_STALE, age_is_worth_showing, origin_label, origin_row_label, pane_liveness, window_detail,
+    Blocker, BlockerIndex, DISK_STALE, Freshness, LiveIndex, Liveness, Model, Row, TMUX_STALE,
+    age_is_worth_showing, group_label, group_line_offsets, origin_label, pane_liveness,
+    window_detail, worker_line_of,
 };
 use crate::theme;
 
@@ -30,17 +31,15 @@ use crate::theme;
 const TASK_ID_W: u16 = 21;
 /// 中欄最小寬：選中 marker（2）＋列 glyph（2）＋完整 task id ＋左右邊框（2）。
 const MID_MIN_W: u16 = 4 + TASK_ID_W + 2;
-/// ORIGINS 欄：marker（2）＋游標（2）＋標籤＋邊框。
-///
-/// 24 而不是 P4.5 的 20：P4.6 之後這一欄要放得下 `session:@108 (gone)`
-/// （最長的那一種標籤）——截掉 `(gone)` 等於把「這個 window 已經不在了」
-/// 這件事從畫面上抹掉，而那正是本欄改版要說的話。
-const ORIGINS_W: u16 = 24;
+// ORIGINS 欄在 P4.7 切片 B 退場（lineage 成為唯一邏輯軸）。物理位置沒有被
+// 刪掉，它降到 DETAIL 當證據列——那裡它是「這個 worker 現在坐在哪」，是事實。
 /// DETAIL 欄：容得下最長的等價 CLI 原文 `  $ agent-bridge read <id>`
 /// （2＋2＋18＋21＝43）＋左右邊框。
 const DETAIL_W: u16 = 43 + 2;
 /// 三欄同時成立所需的最小寬。不足時 DETAIL 改走整寬底條（見 `render`）。
-const THREE_COL_MIN_W: u16 = ORIGINS_W + MID_MIN_W + DETAIL_W;
+/// 兩欄並排（中欄＋DETAIL）的最小寬。ORIGINS 退場後少了 24 欄，同一台 80 欄
+/// 終端機因此更容易走得進並排版面
+const TWO_COL_MIN_W: u16 = MID_MIN_W + DETAIL_W;
 /// 底條模式下 DETAIL 的高度：task 細節 5 行＋空行＋`evidence:`＋2 條命令＋
 /// 上下邊框。
 const DETAIL_STRIP_H: u16 = 11;
@@ -52,7 +51,6 @@ const WARN_ROWS: usize = 3;
 /// ——PgUp／PgDn 的一頁是「該面板的可視高度」，兩邊各算一份就會在窄畫面下
 /// 各說各話（切片 C）。
 struct Areas {
-    origins: Rect,
     workers: Rect,
     tasks: Rect,
     detail: Rect,
@@ -85,26 +83,18 @@ fn layout(area: Rect, warnings: usize) -> Areas {
     // 三者相加要 92 欄，80 欄的終端機放不下——**寬度不足時 DETAIL 改走整寬
     // 底條**，而不是壓縮任何一方。80 欄下底條有整整 78 欄，命令原文照樣成行；
     // 犧牲的只是垂直空間，那是列表捲動本來就處理得了的。
-    let (origins, mid, detail) = if main.width >= THREE_COL_MIN_W {
-        let [o, m, d] = Layout::horizontal([
-            Constraint::Length(ORIGINS_W),
-            Constraint::Min(MID_MIN_W),
-            Constraint::Length(DETAIL_W),
-        ])
-        .areas(main);
-        (o, m, d)
+    let (mid, detail) = if main.width >= TWO_COL_MIN_W {
+        let [m, d] = Layout::horizontal([Constraint::Min(MID_MIN_W), Constraint::Length(DETAIL_W)])
+            .areas(main);
+        (m, d)
     } else {
-        let [top, d] =
+        let [m, d] =
             Layout::vertical([Constraint::Min(6), Constraint::Length(DETAIL_STRIP_H)]).areas(main);
-        let [o, m] =
-            Layout::horizontal([Constraint::Length(ORIGINS_W), Constraint::Min(MID_MIN_W)])
-                .areas(top);
-        (o, m, d)
+        (m, d)
     };
     let [workers, tasks] =
         Layout::vertical([Constraint::Percentage(50), Constraint::Percentage(50)]).areas(mid);
     Areas {
-        origins,
         workers,
         tasks,
         detail,
@@ -118,7 +108,6 @@ pub fn panel_heights(area: Rect, warnings: usize) -> crate::app::PageSizes {
     let a = layout(area, warnings);
     let inner = |r: Rect| r.height.saturating_sub(2);
     crate::app::PageSizes {
-        origins: inner(a.origins),
         workers: inner(a.workers),
         tasks: inner(a.tasks),
         // pager 是全螢幕 overlay，不吃三欄版面（上下框各一格）
@@ -135,10 +124,8 @@ pub fn render(
     fresh: Freshness,
 ) {
     let a = layout(f.area(), app.warnings.len());
-    let (origins_area, workers_area, tasks_area, detail_area, footer) =
-        (a.origins, a.workers, a.tasks, a.detail, a.footer);
+    let (workers_area, tasks_area, detail_area, footer) = (a.workers, a.tasks, a.detail, a.footer);
 
-    render_origins(f, origins_area, model, live, app);
     render_workers(f, workers_area, model, live, blockers, app);
     render_tasks(f, tasks_area, model, app);
     render_detail(f, detail_area, model, live, blockers, app);
@@ -162,40 +149,6 @@ fn sel_prefix(selected: bool) -> &'static str {
     if selected { "▶ " } else { "  " }
 }
 
-/// ORIGINS 欄（P4.6 題 2）。
-///
-/// 兩件事與 P4.5 不同，兩件都是「別替人下判斷」的直接後果：
-/// - **列上不再有 ●／✗ liveness glyph**：那個 glyph 判的是 origin 標籤裡那個
-///   window 的死活，而 window 死活 **不等於** 底下 agent 的死活（§11 根因）。
-///   window 三態改以文字進 DETAIL，一個字都不上色。
-/// - 標籤誠實化：window 還在就顯示 `session:window-name`，不在就顯示原
-///   `session:@id (gone)`（**不猜舊名**），查不到就原樣。
-///
-/// 第 0 列是 synthetic `ALL`（不過濾），與真實 origin 同一套列語意。
-fn render_origins(f: &mut Frame, area: Rect, model: &Model, live: &LiveIndex, app: &App) {
-    let focused = app.panel == Panel::Origins;
-    let mut lines = Vec::new();
-    for (i, o) in model.origins.iter().enumerate() {
-        let selected = focused && i == app.origin_idx;
-        let marker = if i == app.origin_idx { "▸" } else { " " };
-        lines.push(styled(
-            vec![Span::raw(format!(
-                "{}{marker} {}",
-                sel_prefix(selected),
-                origin_row_label(live, o)
-            ))],
-            selected,
-        ));
-    }
-    let block = panel_block("ORIGINS", focused);
-    f.render_widget(
-        Paragraph::new(lines)
-            .block(block)
-            .scroll((scroll_offset(app.origin_idx, area), 0)),
-        area,
-    );
-}
-
 fn render_workers(
     f: &mut Frame,
     area: Rect,
@@ -206,8 +159,21 @@ fn render_workers(
 ) {
     let focused = app.panel == Panel::Workers;
     let rows = app.rows(model);
+    // 每一列前面要先插幾行組標頭（純函式，捲動位移與畫線共用同一份答案）
+    let heads = group_line_offsets(model);
     let mut lines = Vec::new();
     for (i, row) in rows.iter().enumerate() {
+        // 這一列是某組的第一個成員 → 先畫該組的標頭
+        if let Some(gi) = heads.get(&i) {
+            let g = &model.groups[*gi];
+            // **標頭不上任何語意色**：組是分類不是狀態，染色會與 status／
+            // liveness 搶同一份注意力，而它一格狀態資訊都沒有多給
+            lines.push(Line::from(Span::raw(format!(
+                "{} ({})",
+                group_label(model, g),
+                g.members.len()
+            ))));
+        }
         let selected = focused && i == app.row_idx;
         let spans = match *row {
             Row::Worker(wi) => {
@@ -259,20 +225,16 @@ fn render_workers(
         lines.push(styled(spans, selected));
     }
     if rows.is_empty() {
-        lines.push(Line::from("  (no workers in this scope)"));
+        lines.push(Line::from("  (no workers registered)"));
     }
     let block = panel_block("WORKERS", focused);
-    f.render_widget(
-        Paragraph::new(lines)
-            .block(block)
-            .scroll((scroll_offset(app.row_idx, area), 0)),
-        area,
-    );
+    let scroll = scroll_offset(worker_line_of(model, app.row_idx), area);
+    f.render_widget(Paragraph::new(lines).block(block).scroll((scroll, 0)), area);
 }
 
-/// TASKS 欄（§2）：當前 owner 底下所有 worker 的任務平坦列表，**含終態**，
-/// id 反序。沒有這一欄，畫面上就沒有 `r` 讀得動的任務（read 只對
-/// completed／failed 合法）。
+/// TASKS 欄（§2）：**全 pool** 的任務平坦列表（P4.7 切片 B1 起不再依 owner
+/// 過濾——過濾軸隨 ORIGINS 面板一起退場），**含終態**，id 反序。沒有這一欄，
+/// 畫面上就沒有 `r` 讀得動的任務（read 只對 completed／failed 合法）。
 fn render_tasks(f: &mut Frame, area: Rect, model: &Model, app: &App) {
     let focused = app.panel == Panel::Tasks;
     let rows = app.task_rows(model);
@@ -302,20 +264,20 @@ fn render_tasks(f: &mut Frame, area: Rect, model: &Model, app: &App) {
         ));
     }
     if rows.is_empty() {
-        lines.push(Line::from("  (no tasks in this scope)"));
+        lines.push(Line::from("  (no recent tasks)"));
     }
     // 標題帶 `N/total`（P4.6 切片 C）：沒有它，人看不出自己在第幾筆、也看不出
     // 底下還有多少。**截斷要說出來**——`RECENT_LIMIT` 之外還有更舊的任務時
     // 標 `+`，否則畫面等於宣稱「就這些了」。
     //
-    // **只有 ALL scope 標得出 `+`**（審查 F5）：`recent_truncated` 是**全 pool**
-    // 的旗標，而 `rows` 已依 scope 過濾過。把全域旗標貼到過濾後的數字上，等於
-    // 宣稱「這個 scope 底下還有更舊的」——沒有任何證據支持那件事（最差形狀是
-    // 某 scope 顯示 `TASKS 0/0+`）。被截掉的那些任務可能一筆都不屬於它。
+    // P4.6 切片 C 的 F5 要求「只有 ALL scope 才標 `+`」（`recent_truncated`
+    // 是**全 pool** 的旗標，貼到過濾後的數字上等於宣稱沒有證據的事）。
+    // ORIGINS 退場後這一欄**本來就是全 pool**（見 `model::task_rows`），
+    // 前提與旗標於是同一個範圍。只留下 F5 的另外半條：一列都沒有時 MUST NOT
+    // 標 `+`——`TASKS 0/0+` 是在說「還有更舊的」卻連一筆都沒載到。
     let total = rows.len();
     let pos = if total == 0 { 0 } else { app.task_idx + 1 };
-    let all_scope = app.selected_scope(model) == Some(ALL_SCOPE);
-    let more = if model.recent_truncated && all_scope {
+    let more = if model.recent_truncated && total > 0 {
         "+"
     } else {
         ""
@@ -368,25 +330,6 @@ fn render_detail(
     let mut lines: Vec<Line> = Vec::new();
     match &sel {
         Sel::None => lines.push(Line::from("(nothing selected)")),
-        // origin DETAIL（題 3）：window 三態＋計數，**不輸出任何 agent 死活
-        // 判斷**——這一欄講的是「這個 origin 標籤指向的 window 現在如何」，
-        // 不是「底下的 agent 還活著嗎」（§11 根因：兩者早就分家了）
-        Sel::Origin(o) => {
-            lines.push(Line::from(format!("origin : {o}")));
-            lines.push(Line::from(format!("window : {}", window_detail(live, o))));
-            lines.push(Line::from(format!(
-                "workers: {}",
-                model
-                    .workers
-                    .iter()
-                    .filter(|w| *o == ALL_SCOPE || origin_label(w) == *o)
-                    .count()
-            )));
-            lines.push(Line::from(format!(
-                "tasks  : {}",
-                crate::model::task_rows(model, o).len()
-            )));
-        }
         Sel::Worker(w) => {
             for l in worker_detail(w, live) {
                 lines.push(l);
@@ -805,7 +748,6 @@ fn row_keys(model: &Model, app: &App) -> String {
     let caps = crate::app::row_caps(app, model);
     let mut parts: Vec<&str> = Vec::new();
     match caps.enter {
-        EnterAct::OpenScope => parts.push("Enter open this scope in WORKERS"),
         EnterAct::Focus => parts.push("Enter focus pane"),
         // `r` 是 Enter 的 alias（同一條路徑），一段字講完兩個鍵
         EnterAct::Read => parts.push("Enter/r read full text"),
@@ -826,8 +768,9 @@ fn row_keys(model: &Model, app: &App) -> String {
     if !parts.is_empty() {
         return parts.join(" \u{b7} ");
     }
-    // 一個鍵都沒有：選著一列（如空 scope 的 origin 列）與根本沒選中列是兩件
-    // 不同的事，說法要分開——後者人得先按 j／k
+    // 一個鍵都沒有：選著一列與根本沒選中列是兩件不同的事，說法要分開——
+    // 後者人得先按 j／k。P4.7 切片 B 之後 worker／task 列都至少有一個鍵，
+    // 第二個分支形同保險絲：真的走到了，代表 `row_caps` 漏了一列型。
     match app.selection(model) {
         Sel::None => "(no row selected)".to_string(),
         _ => "(no keys act on this row)".to_string(),
@@ -954,9 +897,6 @@ fn render_help(f: &mut Frame, model: &Model, app: &App) {
         Line::from(format!("  {}", row_keys(model, app))),
     ];
     match app.selection(model) {
-        Sel::Origin(_) => lines.push(Line::from(
-            "  origin rows carry no evidence: r / i / c / x / e do nothing here",
-        )),
         Sel::Worker(_) => lines.push(Line::from(
             "  x is task-rows only (cancel needs a unique task id)",
         )),
@@ -1103,16 +1043,18 @@ mod tests {
         }
     }
 
+    /// fixture 的 `groups` 一律由 `group_by_lineage` 推導（與 `Model::load`
+    /// 同一條路徑）。
+    fn with_groups(mut m: Model) -> Model {
+        m.groups = crate::model::group_by_lineage(&m.workers);
+        m
+    }
+
     /// 一個涵蓋全部語意的最小 fixture：五種 status、三種死活、一個 blocker、
     /// 一個選取列、focus／非 focus 面板各一。純資料，**不碰 tmux 與磁碟**。
     fn fixture() -> (Model, LiveIndex, BlockerIndex, App) {
-        let model = Model {
-            origins: vec![
-                ALL_SCOPE.to_string(),
-                "-".to_string(),
-                "s:@1".to_string(),
-                "s:@9".to_string(),
-            ],
+        let model = with_groups(Model {
+            groups: Vec::new(),
             workers: vec![
                 worker("alive-w", "%1", "claude", "s:@1", true),
                 worker("dead-w", "%2", "codex", "s:@1", true),
@@ -1130,7 +1072,7 @@ mod tests {
                 task("20260801T000005Z-ffff", "alive-w", "delivered"),
             ],
             recent_truncated: false,
-        };
+        });
         let mut panes = HashMap::new();
         panes.insert("%1".to_string(), vec![("s".to_string(), "@1".to_string())]);
         panes.insert("%5".to_string(), vec![("s".to_string(), "@1".to_string())]);
@@ -1151,8 +1093,7 @@ mod tests {
         let blockers = BlockerIndex { panes: Some(bl) };
 
         let mut app = App::new();
-        app.panel = Panel::Workers; // WORKERS focus、ORIGINS 非 focus
-        app.origin_idx = 2; // 選中 origin "s:@1"（0=ALL、1=`-`）
+        app.panel = Panel::Workers; // WORKERS focus、TASKS 非 focus
         app.row_idx = 0; // 選中第一列（alive-w，身上帶 blocker）
         // 警告文字刻意用單寬 ASCII：斷言要靠 `find` 逐格比對（見其註解）
         app.warnings.push("WARN-fixture".to_string());
@@ -1234,8 +1175,9 @@ mod tests {
         buf[(x, y)].style()
     }
 
-    /// WORKERS／DETAIL 兩欄的 x 起點（120 欄、三欄版面）。
-    const WORKERS_X0: u16 = ORIGINS_W;
+    /// WORKERS／DETAIL 兩欄的 x 起點（120 欄、**兩欄**版面——ORIGINS 退場
+    /// 之後中欄從 0 起）。
+    const WORKERS_X0: u16 = 0;
     const DETAIL_X0: u16 = 120 - DETAIL_W;
 
     fn style_in_detail(buf: &Buffer, needle: &str) -> ratatui::style::Style {
@@ -1304,87 +1246,19 @@ mod tests {
         );
     }
 
-    /// **P4.6 題 2 的核心不變量**：ORIGINS 欄的列上 MUST NOT 有任何 liveness
-    /// glyph。
-    ///
-    /// 理由不是美觀：那個 glyph 判的是 origin 標籤裡那個 window 的死活，而
-    /// window 死活 **不等於** 底下 agent 的死活（§11 根因）。把它畫在 origin
-    /// 列上就是讓一個物理位置替一群 agent 的存活背書。
+    /// worker DETAIL 仍留著 origin（物理位置）那一列——ORIGINS **面板**退場
+    /// 不等於證據消失：origin 是「這個 worker 現在坐在哪」，那是事實；當成
+    /// 歸屬軸才是謊（§11 根因）。
     #[test]
-    fn origin_rows_carry_no_liveness_glyph() {
-        let buf = draw();
-        let area = buf.area();
-        for y in 0..area.height {
-            for x in 0..ORIGINS_W {
-                let sym = buf[(x, y)].symbol();
-                assert!(
-                    sym != "●" && sym != "✗",
-                    "ORIGINS 欄 ({x},{y}) 上出現了 liveness glyph「{sym}」"
-                );
-            }
-        }
-    }
-
-    /// P4.6 題 1／題 2 的字面：origin 列 live 顯示 `session:window-name`、
-    /// gone 顯示原 `session:@id (gone)`（**不猜舊名**）、`ALL` 列在最上面。
-    #[test]
-    fn origin_rows_show_window_names_and_gone_marker() {
-        let buf = draw();
-        let (_, y_all) = find_in(&buf, "ALL", 0, ORIGINS_W);
-        let (_, y_live) = find_in(&buf, "s:main", 0, ORIGINS_W);
-        let (_, y_gone) = find_in(&buf, "s:@9 (gone)", 0, ORIGINS_W);
-        assert!(y_all < y_live && y_all < y_gone, "ALL MUST 在最上面一列");
-        // gone 的那一列 MUST NOT 冒出任何 window 名字（fixture 裡只有 `main`）
-        let mut row = String::new();
-        for x in 0..ORIGINS_W {
-            row.push_str(buf[(x, y_gone)].symbol());
-        }
-        assert!(!row.contains("main"), "gone 的 origin 猜了舊名：{row}");
-    }
-
-    /// 題 3：worker DETAIL 的 `origin :` 與 origin DETAIL 的 `window :`／counts。
-    #[test]
-    fn detail_splits_origin_window_from_agent_state() {
+    fn detail_keeps_origin_as_evidence_next_to_agent_state() {
         // worker 列（alive-w，origin s:@1 還活著）
         let buf = draw();
         let (x, y) = find_in(&buf, "origin : s:main (@1, live)", DETAIL_X0, 120);
         assert!(x >= DETAIL_X0 && y > 0);
-        // 同一張 DETAIL 上，agent 自己的 pane 死活是**另一列**
+        // 同一張 DETAIL 上，agent 自己的 pane 死活是**另一列**——兩者不得混寫
         find_in(&buf, "state  : live", DETAIL_X0, 120);
-
-        // origin 列（選 s:@9＝window 已消失）：window 三態以文字呈現，
-        // 並帶 worker／task 計數；**不輸出任何 agent 死活判斷**
-        let buf_o = draw_with(|a| {
-            a.panel = Panel::Origins;
-            a.origin_idx = 3; // 0=ALL、1=`-`、2=s:@1、3=s:@9
-        });
-        find_in(&buf_o, "origin : s:@9", DETAIL_X0, 120);
-        find_in(&buf_o, "window : s:@9 (gone)", DETAIL_X0, 120);
-        find_in(&buf_o, "workers: 1", DETAIL_X0, 120);
-        // **negative**：origin 的 DETAIL MUST NOT 出現 agent 死活那一列——
-        // 混進來就等於讓 window 的狀態替底下的 agent 背書（§11 根因）
-        let mut detail = String::new();
-        for y in 0..buf_o.area().height {
-            for x in DETAIL_X0..120 {
-                detail.push_str(buf_o[(x, y)].symbol());
-            }
-        }
-        assert!(
-            !detail.contains("state  :"),
-            "origin DETAIL 混進了 agent 死活列"
-        );
-
-        // ALL 列：沒有 window 可言 → n/a（不是 unknown），計數是全部
-        let buf_all = draw_with(|a| {
-            a.panel = Panel::Origins;
-            a.origin_idx = 0;
-        });
-        find_in(&buf_all, "window : ALL (n/a)", DETAIL_X0, 120);
-        find_in(&buf_all, "workers: 5", DETAIL_X0, 120);
-        find_in(&buf_all, "tasks  : 6", DETAIL_X0, 120);
     }
 
-    /// blocker 是 Red＋BOLD；且 **`none` MUST NOT 上色**——把「沒有 blocker」
     /// 畫成紅色是謊報。
     #[test]
     fn blocker_is_red_bold_and_none_is_not_coloured() {
@@ -1440,16 +1314,6 @@ mod tests {
         let s = buf[(x, y)].style();
         assert_eq!(s.bg, Some(Color::Blue), "選取列背景");
         assert_ne!(s.fg, s.bg, "cancelled 的 fg 與選取 bg 同色＝字隱形");
-
-        // 選中的 origin 列（ORIGINS 欄）：整列被塗上選取背景，字仍讀得到
-        let buf2 = draw_with(|a| {
-            a.panel = Panel::Origins;
-            a.origin_idx = 1; // "-"＝manual
-        });
-        let (gx, gy) = find_in(&buf2, "-", 0, ORIGINS_W);
-        let g = buf2[(gx, gy)].style();
-        assert_eq!(g.bg, Some(Color::Blue));
-        assert_ne!(g.fg, g.bg, "origin 列的 fg 與選取 bg 同色＝字隱形");
     }
 
     /// 非 focus 面板的**標題**不得被邊框的 DarkGray 一起壓暗（審查 minor #2）：
@@ -1457,26 +1321,33 @@ mod tests {
     #[test]
     fn unfocused_panel_title_is_not_dimmed_with_its_border() {
         let buf = draw();
-        // ORIGINS 非 focus：邊框 DarkGray，但標題不該是
-        let (x, y) = find(&buf, "ORIGINS");
+        // TASKS 非 focus（fixture 的焦點在 WORKERS）：邊框 DarkGray，標題不該是
+        let (x, y) = find(&buf, "TASKS");
         assert_ne!(
             buf[(x, y)].style().fg,
             Some(Color::DarkGray),
             "非 focus 面板的標題被邊框色壓暗了"
         );
-        assert_eq!(buf[(0, 0)].style().fg, Some(Color::DarkGray), "邊框仍應暗");
+        // 非 focus 面板的邊框仍應暗（TASKS 的左上角）
+        let tasks_top = layout(Rect::new(0, 0, 120, 40), 1).tasks.top();
+        assert_eq!(
+            buf[(0, tasks_top)].style().fg,
+            Some(Color::DarkGray),
+            "邊框仍應暗"
+        );
     }
 
     /// focus／非 focus 面板：粗框＋BOLD vs DarkGray 邊框。
     #[test]
     fn focused_panel_is_distinguishable_from_the_rest() {
         let buf = draw();
-        // ORIGINS 非 focus：左上角是細框且邊框色 DarkGray
-        let origins_corner = &buf[(0, 0)];
-        assert_eq!(origins_corner.symbol(), "┌");
-        assert_eq!(origins_corner.style().fg, Some(Color::DarkGray));
-        // WORKERS focus：左上角是粗框且帶 BOLD
-        let workers_corner = &buf[(ORIGINS_W, 0)];
+        // TASKS 非 focus：左上角是細框且邊框色 DarkGray
+        let tasks_top = layout(Rect::new(0, 0, 120, 40), 1).tasks.top();
+        let tasks_corner = &buf[(0, tasks_top)];
+        assert_eq!(tasks_corner.symbol(), "┌");
+        assert_eq!(tasks_corner.style().fg, Some(Color::DarkGray));
+        // WORKERS focus：左上角是粗框且帶 BOLD（ORIGINS 退場後中欄從 x=0 起）
+        let workers_corner = &buf[(WORKERS_X0, 0)];
         assert_eq!(workers_corner.symbol(), "┏");
         assert!(workers_corner.style().add_modifier.contains(Modifier::BOLD));
     }
@@ -1567,16 +1438,19 @@ mod tests {
             "task 列 MUST NOT 列出 e（evict 只對 worker 列有效）"
         );
 
-        // origin 列
-        let t = text(&draw_with(|a| a.panel = Panel::Origins));
-        assert!(t.contains("Enter open this scope in WORKERS"));
-        assert!(!t.contains("c copy evidence"), "origin 列沒有證據可複製");
+        // TASKS 欄的列（P4.7 切片 B：原本這格驗的是 origin 列）
+        let t = text(&draw_with(|a| a.panel = Panel::Tasks));
+        assert!(t.contains("Enter/r read full text"));
+        assert!(
+            !t.contains("e evict"),
+            "TASKS 欄選的是 task，MUST NOT 列出 e"
+        );
 
         // 全域鍵是**第二段**，三種列型下都在
         for buf in [
             draw(),
             draw_with(|a| a.row_idx = 1),
-            draw_with(|a| a.panel = Panel::Origins),
+            draw_with(|a| a.panel = Panel::Tasks),
         ] {
             assert!(text(&buf).contains("? keys \u{b7} q quit"), "全域段不見了");
         }
@@ -1595,30 +1469,31 @@ mod tests {
         assert!(!t.contains("x cancel"), "終態 task 列 MUST NOT 列出 x");
     }
 
-    /// **審查 minor 的 regression（a）**：空 scope 的 origin 列上 Enter 其實
-    /// 不做事（dispatch 停在原地），footer MUST NOT 還提示它。
+    /// **審查 minor 的 regression（a）**：按下去不做事的鍵 MUST NOT 出現在
+    /// footer。P4.7 切片 B：ORIGINS 退場後，這個情境由「一列都沒有」承接
+    /// （原測試名 `footer_drops_the_enter_hint_on_an_empty_scope`）。
     #[test]
-    fn footer_drops_the_enter_hint_on_an_empty_scope() {
-        // 正向對照：有 worker 的 origin 列照樣提示
-        let t = text(&draw_with(|a| a.panel = Panel::Origins));
-        assert!(t.contains("Enter open this scope in WORKERS"));
+    fn footer_drops_every_key_hint_when_nothing_is_selected() {
+        // 正向對照：有 worker 時照樣提示
+        let t = text(&draw());
+        assert!(t.contains("Enter focus pane"));
 
-        // 一個底下沒有 worker 的 origin
-        let t = text(&draw_model_with(|m, a| {
-            m.origins.push("empty:@7".to_string());
-            a.panel = Panel::Origins;
-            a.origin_idx = m.origins.len() - 1;
+        // registry 全空：沒有任何列，也就沒有任何鍵
+        let t = text(&draw_model_with(|m, _| {
+            m.workers.clear();
+            m.tasks.clear();
+            m.groups.clear();
         }));
         assert!(
-            !t.contains("Enter open this scope in WORKERS"),
-            "空 scope MUST NOT 提示一個按下去不做事的 Enter"
+            !t.contains("Enter focus pane"),
+            "沒有選中列 MUST NOT 提示一個按下去不做事的 Enter"
         );
         assert!(
-            t.contains("(no keys act on this row)"),
-            "要說明這一列沒有鍵"
+            t.contains("(no row selected)"),
+            "要說明「沒有選中列」（而不是「這一列沒有鍵」）"
         );
         assert!(
-            t.contains("(no workers in this scope)"),
+            t.contains("(no workers registered)"),
             "空清單 placeholder 仍在"
         );
     }
@@ -1631,7 +1506,6 @@ mod tests {
             m.recent
                 .insert(0, task("20260801T000009Z-9999", "vanished-w", "completed"));
             a.panel = Panel::Tasks;
-            a.origin_idx = 0; // ALL：收件人不在 registry 的任務也留著
             a.task_idx = 0;
         }));
         assert!(t.contains("Enter/r read full text"), "全文仍讀得到");
@@ -1657,13 +1531,147 @@ mod tests {
         assert!(t.contains("current row:"), "`?` 頁缺當前列區");
         assert!(t.contains("Tab/S-Tab panes"), "全域區缺換欄鍵");
         assert!(t.contains("Enter focus pane"), "當前列區缺該列的鍵");
-        // 兩區的內容隨選中列換（origin 列上不該還印 worker 列那一套）
+        // 兩區的內容隨選中列換（TASKS 欄不該還印 worker 列那一套）
         let t = text(&draw_with(|a| {
-            a.panel = Panel::Origins;
+            a.panel = Panel::Tasks;
             a.help = true;
         }));
-        assert!(t.contains("Enter open this scope in WORKERS"));
+        assert!(t.contains("Enter/r read full text"));
         assert!(!t.contains("Enter focus pane"));
+    }
+
+    // ---- P4.7 切片 B1：lineage 分組（render 面）----
+
+    /// 測試用 canonical generation key（與 `ab_core::spawn::GEN_KEY_RE` 同文法）。
+    fn canon(tag: &str) -> String {
+        format!("AGENT_BRIDGE_SPAWN_TAG=ab-spawn-{tag}")
+    }
+
+    /// 一列 lineage worker。
+    fn lin(name: &str, pane: &str, tag: &str, root: &str, parent: Option<&str>) -> AgentSnapshot {
+        AgentSnapshot {
+            spawn_tag: canon(tag),
+            lineage_root: Some(canon(root)),
+            parent_agent: parent.map(canon),
+            ..worker(name, pane, "codex", "s:@1", true)
+        }
+    }
+
+    /// 把 fixture 的 worker 清單整批換掉（groups 一併重推）。
+    fn draw_workers(ws: Vec<AgentSnapshot>) -> Buffer {
+        draw_model_with(move |m, _| {
+            m.workers = ws;
+            m.tasks.clear();
+            m.groups = crate::model::group_by_lineage(&m.workers);
+        })
+    }
+
+    /// 組標頭是**畫面上的裝飾行**：帶標籤與成員數，且排在該組第一列之前。
+    /// 它不是 `Row`——這一點由 `model::worker_rows` 那條測試守住。
+    #[test]
+    fn workers_column_prints_a_header_line_before_each_group() {
+        let root = "root-1-aaaaaaaaaaaa";
+        let buf = draw_workers(vec![
+            lin("root", "%1", root, root, None),
+            lin("kid", "%2", "kid-2-bbbbbbbbbbbb", root, Some(root)),
+            worker("solo", "%3", "agy", "", false),
+        ]);
+        let (_, y_head) = find_in(&buf, "lineage root (2)", WORKERS_X0, DETAIL_X0);
+        let (_, y_root) = find_in(&buf, "\u{25b8} root ", WORKERS_X0, DETAIL_X0);
+        let (_, y_kid) = find_in(&buf, "\u{25b8} kid ", WORKERS_X0, DETAIL_X0);
+        let (_, y_stand) = find_in(&buf, "(standalone) (1)", WORKERS_X0, DETAIL_X0);
+        let (_, y_solo) = find_in(&buf, "\u{25b8} solo ", WORKERS_X0, DETAIL_X0);
+        assert!(y_head < y_root && y_root < y_kid, "組標頭 MUST 在成員之前");
+        assert!(y_kid < y_stand, "standalone 段恆在最後");
+        assert!(y_stand < y_solo);
+    }
+
+    /// **gate (a) render 面**：root→A→B→C，A／B 的 registry 不在了，C 仍畫在
+    /// 同一個 lineage 標頭底下——歸屬的證據是 C 自己身上的 generation key。
+    #[test]
+    fn a_lineage_header_still_covers_the_survivor_after_its_middle_is_gone() {
+        let root = "root-1-aaaaaaaaaaaa";
+        let buf = draw_workers(vec![
+            lin("root", "%1", root, root, None),
+            lin(
+                "C",
+                "%4",
+                "c-4-dddddddddddd",
+                root,
+                Some("b-3-cccccccccccc"),
+            ),
+        ]);
+        let (_, y_head) = find_in(&buf, "lineage root (2)", WORKERS_X0, DETAIL_X0);
+        let (_, y_c) = find_in(&buf, "\u{25b8} C ", WORKERS_X0, DETAIL_X0);
+        assert!(y_head < y_c);
+        assert!(
+            !text(&buf).contains("(standalone)"),
+            "C MUST NOT 被踢去 standalone"
+        );
+
+        // root 也不在了：標籤降級成 `†＋世代短碼`（不冒用任何在場者的名字），
+        // 但 C 還是自成同一組
+        let buf = draw_workers(vec![lin(
+            "C",
+            "%4",
+            "c-4-dddddddddddd",
+            root,
+            Some("b-3-cccccccccccc"),
+        )]);
+        let t = text(&buf);
+        assert!(
+            t.contains("lineage root\u{2020} (aaaa)"),
+            "根不在場 MUST 標 †＋世代短碼，實際畫面：{t}"
+        );
+        assert!(!t.contains("(standalone)"));
+    }
+
+    /// **gate (b) render 面**：Legacy／Manual／Invalid 三型都畫在 `(standalone)`
+    /// 底下，且 MUST NOT 生出自己的 lineage 標頭——「說不出組別」與「屬於某一
+    /// 組」是兩件事，畫面不得把前者演成後者。
+    #[test]
+    fn legacy_manual_and_invalid_all_land_under_standalone() {
+        let mut legacy = worker("legacy-w", "%1", "codex", "s:@1", true);
+        legacy.spawn_tag = "ab-spawn-old-1-aaaaaaaaaaaa".to_string(); // 舊式：非 canonical
+        let manual = AgentSnapshot {
+            spawn_tag: String::new(), // 人工註冊：沒有世代
+            ..worker("manual-w", "%2", "agy", "", false)
+        };
+        let mut invalid = worker("invalid-w", "%3", "claude", "s:@1", true);
+        invalid.spawn_tag = canon("inv-9-eeeeeeeeeeee");
+        invalid.lineage_root = Some(String::new()); // 非字串欄位＝無效標記
+
+        let buf = draw_workers(vec![legacy, manual, invalid]);
+        let t = text(&buf);
+        assert!(t.contains("(standalone) (3)"), "三型 MUST 都在 standalone");
+        assert!(
+            !t.contains("lineage "),
+            "說不出組別的列 MUST NOT 生出 lineage 標頭：{t}"
+        );
+    }
+
+    /// 組標頭是**行**不是列：選取第 n 列時捲動要換算過標頭，否則列數一多就
+    /// 會把選中列捲出畫面（P4.6 切片 C 的捲動語意不得因分組而失效）。
+    #[test]
+    fn group_headers_shift_the_rendered_line_of_a_row() {
+        let root = "root-1-aaaaaaaaaaaa";
+        let ws = vec![
+            lin("root", "%1", root, root, None),
+            lin("kid", "%2", "kid-2-bbbbbbbbbbbb", root, Some(root)),
+            worker("solo", "%3", "agy", "", false),
+        ];
+        let mut m = with_groups(Model {
+            groups: Vec::new(),
+            workers: ws,
+            tasks: Vec::new(),
+            recent: Vec::new(),
+            recent_truncated: false,
+        });
+        m.groups = crate::model::group_by_lineage(&m.workers);
+        // 列 0/1＝lineage 兩員（前面 1 個標頭）、列 2＝solo（前面 2 個標頭）
+        assert_eq!(worker_line_of(&m, 0), 1);
+        assert_eq!(worker_line_of(&m, 1), 2);
+        assert_eq!(worker_line_of(&m, 2), 4);
     }
 
     // ---- P4.6 切片 C：scrollbar／N-total／freshness ----
@@ -1682,7 +1690,6 @@ mod tests {
                 .collect();
             m.recent_truncated = truncated;
             a.panel = Panel::Tasks;
-            a.origin_idx = 0; // ALL：不過濾，n 列全在
         }
     }
 
@@ -1764,34 +1771,24 @@ mod tests {
         );
     }
 
-    /// **F5：全域截斷旗標 MUST NOT 貼到 scope 過濾後的標題上。**
+    /// **F5（P4.7 切片 B 改寫）：`+` 的前提與旗標必須同一個範圍。**
     ///
-    /// `recent_truncated` 說的是「**全 pool**還有更舊的沒載入」，被截掉的那些
-    /// 任務可能一筆都不屬於當前 scope。貼上去等於宣稱一件沒有證據的事——最差
-    /// 形狀是某個 scope 顯示 `TASKS 0/0+`。
+    /// 原本這條驗的是「scoped view MUST NOT 帶全域截斷旗標」。ORIGINS 退場後
+    /// TASKS 欄**本來就是全 pool**，過濾這件事不存在了，於是改驗保留下來的那半
+    /// 條：`recent` 一筆都沒有時 MUST NOT 標 `+`——`TASKS 0/0+` 是最無稽的那
+    /// 一種宣稱（說「還有更舊的」卻連一筆都沒載到）。
     #[test]
-    fn the_global_truncation_flag_only_shows_in_the_all_scope() {
-        // 同一份「有截斷」的模型，只換 scope：ALL 標 `+`、scoped 不標
-        let t = text(&draw_model_with(|m, a| {
-            with_tasks(6, true)(m, a);
-            a.origin_idx = 1; // 真實 origin（非 ALL）
-        }));
-        assert!(t.contains("TASKS "), "前提：標題畫出來了");
-        assert!(
-            !t.contains('+'),
-            "scoped view MUST NOT 帶全域截斷旗標，實際標題：{}",
-            t.lines()
-                .find(|l| l.contains("TASKS"))
-                .unwrap_or("(找不到)")
-        );
+    fn the_truncation_flag_never_rides_on_an_empty_task_list() {
+        // 正向對照：有列且截斷 → 標 `+`
+        let t = text(&draw_model_with(with_tasks(6, true)));
+        assert!(t.contains("TASKS 1/6+"), "有列時截斷要標出來");
 
-        // 最差形狀：該 scope 一列都沒有——`TASKS 0/0+` 的 `+` 尤其無稽
+        // 一列都沒有：旗標還在，但畫面上 MUST NOT 出現 `0/0+`
         let t = text(&draw_model_with(|m, a| {
             with_tasks(6, true)(m, a);
-            m.recent = Vec::new(); // 這個 scope 底下沒有任何任務
-            a.origin_idx = 1;
+            m.recent = Vec::new();
         }));
-        assert!(t.contains("TASKS 0/0"), "空 scope 的標題");
+        assert!(t.contains("TASKS 0/0"), "空清單的標題");
         assert!(!t.contains("TASKS 0/0+"), "0/0+ 是最無稽的那一種宣稱");
     }
 
@@ -1964,13 +1961,15 @@ mod tests {
             }),
             "worker info page",
         );
-        // 空清單 placeholder（沒有 worker／task 的 scope）也是 chrome
+        // 空清單 placeholder（一列都沒有的 WORKERS／TASKS）也是 chrome
         assert_no_cjk(
-            &draw_with(|a| {
-                a.panel = Panel::Origins;
-                a.origin_idx = 1; // `-`＝manual，fixture 底下沒有任務
+            &draw_model_with(|m, _| {
+                m.workers.clear();
+                m.tasks.clear();
+                m.groups.clear();
+                m.recent.clear();
             }),
-            "empty-scope placeholders",
+            "empty-list placeholders",
         );
     }
 

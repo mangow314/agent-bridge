@@ -71,7 +71,7 @@ pub fn evidence(sel: &Sel) -> Vec<String> {
             ));
             out.push("agent-bridge list --long".to_string());
         }
-        Sel::Origin(_) | Sel::None => {}
+        Sel::None => {}
     }
     out
 }
@@ -549,8 +549,7 @@ mod tests {
             // set-buffer 的位置參數若以 `-` 起首會被當旗標
             assert!(!payload.starts_with('-'), "payload 首字元不得是 -");
         }
-        // owner 列／無選中項：沒有證據可複製（呼叫端據此提示無效）
-        assert!(copy_payload(&Sel::Origin("it:@1")).is_empty());
+        // 無選中項：沒有證據可複製（呼叫端據此提示無效）
         assert!(copy_payload(&Sel::None).is_empty());
     }
 

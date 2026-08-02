@@ -1,6 +1,7 @@
 //! ab-tui：`agent-bridge ui` 的 alternate-screen dashboard（設計正本
-//! `docs/tui-design.md`；本 crate 為第一縱切 §8：OWNERS｜WORKERS 兩欄＋
-//! `Enter` focus＋`x` cancel）。
+//! `docs/tui-design.md`）。版面到 P4.7 切片 B1 為止是
+//! WORKERS｜TASKS｜DETAIL 三欄（可聚焦的只有前兩個），WORKERS 的唯一軸是
+//! lineage 分組；ORIGINS 面板已退場。
 //!
 //! 形狀（§2）：lib crate，由 `ab` 的 `ui` 子指令呼叫 `run()`——部署邊界是
 //! `cp target/release/ab bin/ab` 單一 binary。依賴上限（§6）：ratatui＋
@@ -144,11 +145,6 @@ fn event_loop(
         // worker 回信：non-blocking drain，一則都不等
         while let Some(msg) = worker.try_recv() {
             match msg {
-                Msg::Origin { owner, pane } => {
-                    app.caller_origin = owner;
-                    app.caller_pane = pane;
-                    app.apply_origin(&model);
-                }
                 Msg::Live(l, b) => {
                     // **只有查得到東西才算成功，而且算的是快照的觀測時間**：
                     // bounded 查詢逾時／tmux 不在時 worker 回的是整層降級的
@@ -306,7 +302,6 @@ fn event_loop(
         if last_disk.elapsed() >= DISK_POLL {
             model = Model::load(paths);
             app.relocate(&model);
-            app.apply_origin(&model);
             last_disk = Instant::now();
             // 這一輪真的完成了一次重讀＝disk 軸的「上次成功」
             stamps.note_disk(last_disk);

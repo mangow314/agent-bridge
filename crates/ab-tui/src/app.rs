@@ -4,7 +4,7 @@
 use ab_core::registry::AgentSnapshot;
 use ab_core::task::InFlight;
 
-use crate::model::{ALL_SCOPE, Model, Row, RowKey, is_terminal_status, task_rows, worker_rows};
+use crate::model::{Model, Row, RowKey, is_terminal_status, task_rows, worker_rows};
 
 /// footer 保留的警告則數上限（畫面是有限的，但**丟掉**與**覆寫**是兩件事：
 /// 這裡至少保證最近幾則留得住，且掉的那幾則有計數可見）。
@@ -12,7 +12,6 @@ pub const MAX_WARNINGS: usize = 5;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Panel {
-    Origins,
     Workers,
     Tasks,
 }
@@ -21,7 +20,6 @@ pub enum Panel {
 /// DETAIL 本身不可聚焦——它永遠顯示「當前聚焦面板的選中項」。
 pub enum Sel<'m> {
     None,
-    Origin(&'m str),
     Worker(&'m AgentSnapshot),
     Task {
         task: &'m InFlight,
@@ -33,10 +31,8 @@ pub enum Sel<'m> {
 /// `Enter` 在當前選中列上的意義（Enter matrix 的四格，§9 P4.6）。
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum EnterAct {
-    /// 這一列上 Enter 不做事（沒有選中列，或 scope 底下沒有 worker 可進去）
+    /// 這一列上 Enter 不做事（沒有選中列）
     None,
-    /// origin 列：進去看這個 scope
-    OpenScope,
     /// worker 列：focus 它的 pane
     Focus,
     /// task 列：讀全文
@@ -82,16 +78,6 @@ impl RowCaps {
 pub fn row_caps(app: &App, model: &Model) -> RowCaps {
     match app.selection(model) {
         Sel::None => RowCaps::NONE,
-        // 空 scope 的 origin 列上 Enter 不做事（切進空清單是死路，dispatch 那
-        // 邊也是停在原地）——提示 MUST 跟著消失
-        Sel::Origin(_) => RowCaps {
-            enter: if app.rows(model).is_empty() {
-                EnterAct::None
-            } else {
-                EnterAct::OpenScope
-            },
-            ..RowCaps::NONE
-        },
         Sel::Worker(_) => RowCaps {
             enter: EnterAct::Focus,
             info: true,
@@ -154,7 +140,6 @@ pub enum Key {
 /// 狀態機自己不碰 terminal 尺寸。
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct PageSizes {
-    pub origins: u16,
     pub workers: u16,
     pub tasks: u16,
     /// `r` 的全螢幕 pager 可視高度（它不吃三欄版面，另量一份）
@@ -166,7 +151,6 @@ impl Default for PageSizes {
     /// 大過真實高度才會翻過頭。
     fn default() -> Self {
         PageSizes {
-            origins: 10,
             workers: 10,
             tasks: 10,
             pager: 10,
@@ -220,12 +204,9 @@ pub struct App {
     /// 位置→身分是 `sync_keys`（每個按鍵之後跑一次），身分→位置是 `relocate`
     /// （每輪磁碟重讀跑一次）。任何直接寫 `*_idx` 的路徑都會在同一次
     /// `handle_key` 內被 `sync_keys` 收斂回來。
-    pub origin_idx: usize,
     pub row_idx: usize,
     /// TASKS 欄的選中列（`task_rows` 的索引）
     pub task_idx: usize,
-    /// ORIGINS 的 stable key＝origin 標籤本身（`ALL` 也是合法標籤）
-    pub origin_key: String,
     /// WORKERS 的 stable key；欄空時為 `None`
     pub row_key: Option<RowKey>,
     /// TASKS 的 stable key＝immutable task id
@@ -249,13 +230,6 @@ pub struct App {
     /// 終局訊息 MUST NOT 清掉它，由人按 `Esc` 確認後才清。
     pub warnings: Vec<String>,
     pub message: String,
-    /// 呼叫者定位（worker 開場回報）：初始 selection 以此為根（§2「以 current
-    /// origin 為根」）。晚到才落地，故每次磁碟重讀都重試一次。
-    pub caller_origin: Option<String>,
-    pub caller_pane: Option<String>,
-    /// 使用者是否已自行動過 ORIGINS 欄：動過之後 origin 不得再搶 selection
-    /// （晚到的定位把人拉走比選錯還糟）。
-    pub origin_touched: bool,
     /// 各面板可視高度（PgUp／PgDn 的一頁），每幀由 run loop 回填
     pub pages: PageSizes,
 }
@@ -264,10 +238,8 @@ impl App {
     pub fn new() -> Self {
         App {
             panel: Panel::Workers,
-            origin_idx: 0,
             row_idx: 0,
             task_idx: 0,
-            origin_key: ALL_SCOPE.to_string(),
             row_key: None,
             task_key: None,
             confirm: None,
@@ -278,9 +250,6 @@ impl App {
             evict_inflight: std::collections::HashSet::new(),
             warnings: Vec::new(),
             message: String::new(),
-            caller_origin: None,
-            caller_pane: None,
-            origin_touched: false,
             pages: PageSizes::default(),
         }
     }
@@ -300,27 +269,7 @@ impl App {
         }
     }
 
-    /// 把 selection 落到 current origin（§2）。人動過 ORIGINS 欄之後就不再
-    /// 套用；找不到對應 origin 時**維持第 0 筆（synthetic `ALL`）**——不猜、
-    /// 不新增假列。
-    pub fn apply_origin(&mut self, model: &Model) {
-        if self.origin_touched {
-            return;
-        }
-        if let Some(i) = caller_origin_idx(
-            model,
-            self.caller_origin.as_deref(),
-            self.caller_pane.as_deref(),
-        ) && i != self.origin_idx
-        {
-            self.origin_idx = i;
-            self.row_idx = 0;
-            self.task_idx = 0;
-            self.sync_keys(model);
-        }
-    }
-
-    /// 位置 → 身分。以索引改動 selection 的路徑（鍵盤、`apply_origin`）之後
+    /// 位置 → 身分。以索引改動 selection 的路徑（鍵盤）之後
     /// 都要走這一步，否則下一輪 reload 會拿舊身分把游標拉回去。
     ///
     /// **沒有選中列時保留舊 key**（不寫成 `None`）：`relocate` 會把「原本那一
@@ -328,9 +277,6 @@ impl App {
     /// 個無關的按鍵（`?`、`Tab`…）就會讓下一輪 reload 重新自動選列——正好選回
     /// 那個新一代。舊 key 留著，這個狀態才停得住。
     pub fn sync_keys(&mut self, model: &Model) {
-        if let Some(o) = model.origins.get(self.origin_idx) {
-            self.origin_key = o.clone();
-        }
         if let Some(r) = self.selected_row(model) {
             self.row_key = Some(crate::model::row_key(model, r));
         }
@@ -343,13 +289,6 @@ impl App {
     /// 項**，不管它現在排第幾——人沒動選取時畫面就不會跳列。找不到（該項真的
     /// 沒了）才落鄰列。
     pub fn relocate(&mut self, model: &Model) {
-        let oi = model
-            .origins
-            .iter()
-            .position(|o| *o == self.origin_key)
-            .unwrap_or_else(|| neighbor(self.origin_idx, model.origins.len()));
-        self.origin_idx = oi;
-
         let rows = self.rows(model);
         let old_row = self.row_idx;
         match self
@@ -395,15 +334,8 @@ impl App {
         self.sync_keys(model);
     }
 
-    pub fn selected_scope<'m>(&self, model: &'m Model) -> Option<&'m str> {
-        model.origins.get(self.origin_idx).map(|s| s.as_str())
-    }
-
     pub fn rows(&self, model: &Model) -> Vec<Row> {
-        match self.selected_scope(model) {
-            Some(scope) => worker_rows(model, scope),
-            None => Vec::new(),
-        }
+        worker_rows(model)
     }
 
     pub fn selected_row(&self, model: &Model) -> Option<Row> {
@@ -412,20 +344,13 @@ impl App {
 
     /// TASKS 欄的列（`model.recent` 的索引，含終態）。
     pub fn task_rows(&self, model: &Model) -> Vec<usize> {
-        match self.selected_scope(model) {
-            Some(scope) => task_rows(model, scope),
-            None => Vec::new(),
-        }
+        task_rows(model)
     }
 
     /// 當前聚焦面板的選中項（DETAIL 與 `r`／`i`／`c` 共用的單一入口，
     /// 免得每個鍵各寫一份索引運算）。
     pub fn selection<'m>(&self, model: &'m Model) -> Sel<'m> {
         match self.panel {
-            Panel::Origins => match self.selected_scope(model) {
-                Some(o) => Sel::Origin(o),
-                None => Sel::None,
-            },
             Panel::Workers => match self.selected_row(model) {
                 Some(Row::Worker(wi)) => Sel::Worker(&model.workers[wi]),
                 Some(Row::Task { worker, task }) => Sel::Task {
@@ -452,28 +377,6 @@ impl Default for App {
     fn default() -> Self {
         Self::new()
     }
-}
-
-/// current origin 在 ORIGINS 欄的索引（純函式，可單測）。兩段式反查：
-/// 1. 呼叫者所在 window 的 origin 標籤 `session:@window` 直接對上一列
-/// 2. 對不上時（例如 TUI 開在某個 worker 自己的 pane 裡）以 current pane
-///    在 registry 快照中反查該 worker 的 origin
-///
-/// 都對不上→`None`，呼叫端維持既有 selection（第 0 筆＝synthetic `ALL`，
-/// 那是「不分組地看全部」而不是某個猜出來的 origin）。
-pub fn caller_origin_idx(model: &Model, origin: Option<&str>, pane: Option<&str>) -> Option<usize> {
-    if let Some(o) = origin
-        && let Some(i) = model.origins.iter().position(|x| x == o)
-    {
-        return Some(i);
-    }
-    let p = pane?;
-    if p.is_empty() {
-        return None;
-    }
-    let w = model.workers.iter().find(|w| w.pane == p)?;
-    let label = crate::model::origin_label(w);
-    model.origins.iter().position(|x| *x == label)
 }
 
 /// 這一列是不是「**同名、不同世代**」——也就是原本選中的那個 worker 被
@@ -622,12 +525,14 @@ fn dispatch_key(app: &mut App, model: &Model, key: Key) -> Effect {
             app.help = true;
             Effect::None
         }
-        // 三欄循環（DETAIL 不可聚焦：它只是選中項的投影）
+        // 兩欄循環（DETAIL 不可聚焦：它只是選中項的投影）。
+        // **ORIGINS 退場後只剩兩欄**（P4.7 切片 B）：Tab 與 Shift+Tab 於是
+        // 是同一個來回。兩個鍵都留著——手指記得的是「Tab 換欄」，把反向鍵
+        // 抽掉只會讓人按了沒反應
         Key::Tab => {
             app.panel = match app.panel {
-                Panel::Origins => Panel::Workers,
                 Panel::Workers => Panel::Tasks,
-                Panel::Tasks => Panel::Origins,
+                Panel::Tasks => Panel::Workers,
             };
             Effect::None
         }
@@ -638,8 +543,7 @@ fn dispatch_key(app: &mut App, model: &Model, key: Key) -> Effect {
         // 不動 selection 起點、不動任何協定語意。
         Key::BackTab => {
             app.panel = match app.panel {
-                Panel::Origins => Panel::Tasks,
-                Panel::Workers => Panel::Origins,
+                Panel::Workers => Panel::Tasks,
                 Panel::Tasks => Panel::Workers,
             };
             Effect::None
@@ -657,11 +561,11 @@ fn dispatch_key(app: &mut App, model: &Model, key: Key) -> Effect {
         // `handle_key` 收尾的 `sync_keys` 寫回 stable key），不另開索引運算。
         // 空面板時 `move_sel` 直接返回——不動、不 panic、不報錯
         Key::PageDown => {
-            move_sel(app, model, Move::By(page_len(app)));
+            move_sel(app, model, page_move(app, true));
             Effect::None
         }
         Key::PageUp => {
-            move_sel(app, model, Move::By(-page_len(app)));
+            move_sel(app, model, page_move(app, false));
             Effect::None
         }
         Key::Home => {
@@ -676,13 +580,6 @@ fn dispatch_key(app: &mut App, model: &Model, key: Key) -> Effect {
         // 「打開」是什麼由 `row_caps` 這個**單一事實源**決定——footer 的提示
         // 讀的是同一份 caps，於是提示與實際行為不可能各說各話
         Key::Enter => match row_caps(app, model).enter {
-            // origin 列：打開＝進去看這個 scope
-            EnterAct::OpenScope => {
-                app.panel = Panel::Workers;
-                app.row_idx = 0;
-                app.message.clear();
-                Effect::None
-            }
             // worker 列：打開＝focus 它的 pane（語意逐字不變，含 popup 協定）
             EnterAct::Focus => match app.selected_row(model) {
                 Some(Row::Worker(wi)) => {
@@ -698,15 +595,7 @@ fn dispatch_key(app: &mut App, model: &Model, key: Key) -> Effect {
             // 路徑）——**不再代人跳去它的 worker**：人在 task 列上選的是任務，
             // 想看的是內容；worker 就在上一列，要 focus 按 k 再 Enter 即可
             EnterAct::Read => read_effect(app, model),
-            // scope 底下沒有 worker 時**留在 ORIGINS**——切進一個空清單是死路
-            // （j/k 無事可做，還得 Tab 回來）；而「empty」這件事 WORKERS 欄
-            // 本來就畫著 `(no workers in this scope)`。不是錯誤，只給一則訊息
-            EnterAct::None => {
-                if let Sel::Origin(o) = app.selection(model) {
-                    app.message = format!("scope '{o}' has no workers");
-                }
-                Effect::None
-            }
+            EnterAct::None => Effect::None,
         },
         // `x` 的合法目標只有 task 列（§2 selection model：否則沒有唯一的
         // immutable id 可綁），且 TASKS 欄還多一道終態閘——終態任務 cancel
@@ -789,8 +678,7 @@ fn dispatch_key(app: &mut App, model: &Model, key: Key) -> Effect {
                 String::new()
             };
             if payload.is_empty() {
-                app.message =
-                    "c only acts on worker / task rows (origin rows carry no evidence)".to_string();
+                app.message = "c only acts on worker / task rows (nothing is selected)".to_string();
                 Effect::None
             } else {
                 Effect::Copy { payload }
@@ -819,6 +707,13 @@ fn read_effect(app: &mut App, model: &Model) -> Effect {
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Move {
     By(i64),
+    /// WORKERS 欄的翻頁：位移量是**一個 viewport 的 rendered lines**，不是
+    /// 「幾列」——組標頭佔行不佔列，把行高直接當列數會永久跳過某些列
+    /// （切片 B1 修正輪 G2）。TASKS 欄沒有標頭，行＝列，仍走 `By`
+    Page {
+        lines: usize,
+        down: bool,
+    },
     First,
     Last,
 }
@@ -829,16 +724,25 @@ enum Move {
 /// 畫面上會變成啞鍵。
 fn page_len(app: &App) -> i64 {
     let h = match app.panel {
-        Panel::Origins => app.pages.origins,
         Panel::Workers => app.pages.workers,
         Panel::Tasks => app.pages.tasks,
     };
     i64::from(h).max(1)
 }
 
+/// 翻頁的位移方式：WORKERS 走行號換算（組標頭），TASKS 行＝列直接位移。
+fn page_move(app: &App, down: bool) -> Move {
+    match app.panel {
+        Panel::Workers => Move::Page {
+            lines: page_len(app) as usize,
+            down,
+        },
+        Panel::Tasks => Move::By(if down { page_len(app) } else { -page_len(app) }),
+    }
+}
+
 fn move_sel(app: &mut App, model: &Model, mv: Move) {
     let (idx, len) = match app.panel {
-        Panel::Origins => (&mut app.origin_idx, model.origins.len()),
         Panel::Workers => {
             let n = app.rows(model).len();
             (&mut app.row_idx, n)
@@ -855,26 +759,29 @@ fn move_sel(app: &mut App, model: &Model, mv: Move) {
     // 末尾突然跳回頂端，那是誤導而不是效率）
     let cur = match mv {
         Move::By(d) => *idx as i64 + d,
+        Move::Page { lines, down } => {
+            crate::model::worker_page_row(model, *idx, lines, down) as i64
+        }
         Move::First => 0,
         Move::Last => len as i64 - 1,
     };
     *idx = cur.clamp(0, len as i64 - 1) as usize;
-    if matches!(app.panel, Panel::Origins) {
-        // 換 scope 後 WORKERS／TASKS 欄都從頭選起
-        app.row_idx = 0;
-        app.task_idx = 0;
-        // 人自己選過 origin 之後，晚到的定位不得再改 selection
-        app.origin_touched = true;
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    /// fixture 的 `groups` 一律由 `group_by_lineage` 推導（與 `Model::load`
+    /// 同一條路徑）——fixture 自己寫一份分組等於驗自己抄的答案。
+    fn with_groups(mut m: Model) -> Model {
+        m.groups = crate::model::group_by_lineage(&m.workers);
+        m
+    }
+
     fn model() -> Model {
-        Model {
-            origins: vec![crate::model::ALL_SCOPE.into(), "it:@1".into()],
+        with_groups(Model {
+            groups: Vec::new(),
             workers: vec![
                 AgentSnapshot {
                     name: "w1".into(),
@@ -912,7 +819,7 @@ mod tests {
                 task("20260731T000001Z-aaaa", "w1", "queued"),
             ],
             recent_truncated: false,
-        }
+        })
     }
 
     fn task(id: &str, to: &str, status: &str) -> InFlight {
@@ -1005,108 +912,34 @@ mod tests {
         assert_eq!(handle_key(&mut app, &m, Key::Char('q')), Effect::Quit);
     }
 
-    /// §2「以 current origin 為根」：首頁 selection 落在呼叫者所在的 origin，
-    /// 而不是第 0 筆（審查 F2）。三條路徑各驗一次。
-    #[test]
-    fn initial_origin_is_current_origin_not_the_all_row() {
-        let m = Model {
-            origins: vec![
-                crate::model::ALL_SCOPE.into(),
-                "aaa:@1".into(),
-                "zzz:@9".into(),
-            ],
-            workers: vec![
-                AgentSnapshot {
-                    name: "wa".into(),
-                    pane: "%1".into(),
-                    runtime: "codex".into(),
-                    owner: "aaa:@1".into(),
-                    ready: "ready".into(),
-                    spawn_tag: "t-gen1".into(),
-                    registered_at: "2026-07-31T00:00:00Z".into(),
-                    spawned: true,
-                    corrupt: false,
-                    // P4.7 切片 A：lineage 兩欄對這些 fixture 無關（None＝欄位缺席）
-                    lineage_root: None,
-                    parent_agent: None,
-                },
-                AgentSnapshot {
-                    name: "wz".into(),
-                    pane: "%2".into(),
-                    runtime: "codex".into(),
-                    owner: "zzz:@9".into(),
-                    ready: "ready".into(),
-                    spawn_tag: "t-gen1".into(),
-                    registered_at: "2026-07-31T00:00:00Z".into(),
-                    spawned: true,
-                    corrupt: false,
-                    // P4.7 切片 A：lineage 兩欄對這些 fixture 無關（None＝欄位缺席）
-                    lineage_root: None,
-                    parent_agent: None,
-                },
-            ],
-            tasks: Vec::new(),
-            recent: Vec::new(),
-            recent_truncated: false,
-        };
-        // (1) origin 標籤直接對上：字典序在前的 aaa:@1 不是 current
-        assert_eq!(caller_origin_idx(&m, Some("zzz:@9"), None), Some(2));
-        // (2) 標籤對不上（例如 TUI 開在 worker 自己的 pane 裡）→ 以 pane 反查
-        assert_eq!(caller_origin_idx(&m, Some("nope:@0"), Some("%2")), Some(2));
-        // (3) 都對不上 → None（呼叫端維持第 0 筆，不猜）
-        assert_eq!(caller_origin_idx(&m, Some("nope:@0"), Some("%404")), None);
-        assert_eq!(caller_origin_idx(&m, None, None), None);
-
-        // apply_origin 落地；人動過 OWNERS 欄之後不得再被 origin 拉走
-        let mut app = App::new();
-        app.caller_origin = Some("zzz:@9".into());
-        app.apply_origin(&m);
-        assert_eq!(app.origin_idx, 2, "首頁根 MUST 是 current origin");
-
-        let mut app2 = App::new();
-        app2.panel = Panel::Origins;
-        handle_key(&mut app2, &m, Key::Char('j'));
-        handle_key(&mut app2, &m, Key::Char('k')); // 人自己選回第 0 筆（ALL）
-        app2.caller_origin = Some("zzz:@9".into());
-        app2.apply_origin(&m);
-        assert_eq!(app2.origin_idx, 0, "人動過之後定位不得搶 selection");
-    }
-
-    /// Tab 三欄循環：ORIGINS → WORKERS → TASKS → ORIGINS。DETAIL 不在循環裡
+    /// Tab 兩欄循環：WORKERS → TASKS → WORKERS。DETAIL 不在循環裡
     /// （它只是選中項的投影，§2）。
     #[test]
-    fn tab_cycles_three_panels_only() {
+    fn tab_cycles_two_panels_only() {
         let m = model();
         let mut app = App::new();
         assert_eq!(app.panel, Panel::Workers);
         handle_key(&mut app, &m, Key::Tab);
         assert_eq!(app.panel, Panel::Tasks);
-        handle_key(&mut app, &m, Key::Tab);
-        assert_eq!(app.panel, Panel::Origins);
+        // ORIGINS 退場後只剩兩欄（P4.7 切片 B）：再按一次就回來
         handle_key(&mut app, &m, Key::Tab);
         assert_eq!(app.panel, Panel::Workers);
     }
 
-    /// `Shift+Tab` 反向循環：ORIGINS → TASKS → WORKERS → ORIGINS，且與 `Tab`
-    /// 互為逆運算（P4 效率量測驅動的 additive 補入；DETAIL 仍不在循環裡）。
+    /// `Shift+Tab` 反向循環。兩欄之下它與 `Tab` 走同一個來回——**兩個鍵都
+    /// 留著**：手指記得的是「Tab 換欄」，把反向鍵抽掉只會讓人按了沒反應。
     #[test]
-    fn backtab_cycles_three_panels_in_reverse() {
+    fn backtab_cycles_two_panels_in_reverse() {
         let m = model();
         let mut app = App::new();
         assert_eq!(app.panel, Panel::Workers);
-        handle_key(&mut app, &m, Key::BackTab);
-        assert_eq!(
-            app.panel,
-            Panel::Origins,
-            "初始 WORKERS 反向一步就到 ORIGINS"
-        );
         handle_key(&mut app, &m, Key::BackTab);
         assert_eq!(app.panel, Panel::Tasks);
         handle_key(&mut app, &m, Key::BackTab);
         assert_eq!(app.panel, Panel::Workers);
 
-        // 與 Tab 互為逆運算（三個起點各驗一次）
-        for start in [Panel::Origins, Panel::Workers, Panel::Tasks] {
+        // 與 Tab 互為逆運算（兩個起點各驗一次）
+        for start in [Panel::Workers, Panel::Tasks] {
             app.panel = start;
             handle_key(&mut app, &m, Key::Tab);
             handle_key(&mut app, &m, Key::BackTab);
@@ -1168,11 +1001,6 @@ mod tests {
                 id: "20260731T000009Z-dddd".into()
             }
         );
-        // ORIGINS 欄：r／i 都無效
-        app.panel = Panel::Origins;
-        assert_eq!(handle_key(&mut app, &m, Key::Char('i')), Effect::None);
-        assert!(app.message.contains("worker"), "實際：{}", app.message);
-        assert_eq!(handle_key(&mut app, &m, Key::Char('r')), Effect::None);
     }
 
     /// 一份 `n` 行內文的 pager（總列數＝標頭 4 ＋ n ＋ 尾端 2）。
@@ -1249,7 +1077,8 @@ mod tests {
         }
     }
 
-    /// `c`：payload 交給 Effect（組裝正本在 action 層），ORIGINS 欄則提示無效。
+    /// `c`：payload 交給 Effect（組裝正本在 action 層），沒有選中列則提示無效。
+    /// （P4.7 切片 B：ORIGINS 退場後，「不可 copy」只剩空選取這一格。）
     #[test]
     fn copy_key_emits_payload_for_task_rows() {
         let m = model();
@@ -1259,12 +1088,15 @@ mod tests {
             panic!("task 列按 c 應產生 Copy");
         };
         assert!(payload.contains("agent-bridge read 20260731T000001Z-aaaa"));
-        app.panel = Panel::Origins;
-        assert_eq!(handle_key(&mut app, &m, Key::Char('c')), Effect::None);
+        // TASKS 欄空清單＝無選中列
+        let mut none = model();
+        none.recent.clear();
+        app.panel = Panel::Tasks;
+        assert_eq!(handle_key(&mut app, &none, Key::Char('c')), Effect::None);
     }
 
     /// `e` 的合法目標只有 worker 列（§3／§5：破壞性動作要有唯一明確目標）；
-    /// task 列與 origin 列一律提示無效、不開證據框。
+    /// WORKERS 欄的 task 列與 TASKS 欄一律提示無效、不開證據框。
     #[test]
     fn evict_key_targets_worker_rows_only() {
         let m = model();
@@ -1281,7 +1113,7 @@ mod tests {
         assert_eq!(handle_key(&mut app, &m, Key::Char('e')), Effect::None);
         assert!(app.message.contains("worker rows"), "實際：{}", app.message);
 
-        app.panel = Panel::Origins;
+        app.panel = Panel::Tasks;
         assert_eq!(handle_key(&mut app, &m, Key::Char('e')), Effect::None);
     }
 
@@ -1394,7 +1226,7 @@ mod tests {
         app.row_idx = 2;
         app.sync_keys(&m);
         let empty = Model {
-            origins: vec![crate::model::ALL_SCOPE.into(), "it:@1".into()],
+            groups: Vec::new(),
             workers: Vec::new(),
             tasks: Vec::new(),
             recent: Vec::new(),
@@ -1415,7 +1247,7 @@ mod tests {
 
     // ---- P4.6 切片 B ----
 
-    /// Enter matrix 的四個分支（§9 P4.6）。
+    /// Enter matrix 的三個分支（§9 P4.6；P4.7 切片 B 拿掉 ORIGINS 那一格）。
     #[test]
     fn enter_matrix_dispatches_by_row_kind() {
         let m = model();
@@ -1448,36 +1280,28 @@ mod tests {
                 id: "20260731T000009Z-dddd".into()
             }
         );
-
-        // (4) ORIGINS 列 → 焦點切 WORKERS 並選該 scope 第一個 worker
-        app.panel = Panel::Origins;
-        app.origin_idx = 1; // it:@1（w1／w2 都在其下）
-        app.row_idx = 2;
-        app.sync_keys(&m);
-        assert_eq!(handle_key(&mut app, &m, Key::Enter), Effect::None);
-        assert_eq!(app.panel, Panel::Workers);
-        assert_eq!(app.row_idx, 0);
-        assert!(matches!(app.selected_row(&m), Some(Row::Worker(0))));
     }
 
-    /// ORIGINS 的 Enter 落在**空 scope** 上：停在 ORIGINS、給訊息、不報錯
-    /// ——切進一個空清單是死路。
+    /// 空清單上的 Enter：不動、不報錯（P4.7 切片 B 取代原本的
+    /// `enter_on_empty_scope_stays_put_without_error`——沒有 scope 可切了，
+    /// 但「Enter 落在無選中列上是 no-op」這條語意要留著）。
     #[test]
-    fn enter_on_empty_scope_stays_put_without_error() {
+    fn enter_on_an_empty_list_is_a_no_op() {
         let m = Model {
-            origins: vec![crate::model::ALL_SCOPE.into(), "-".into()],
+            groups: Vec::new(),
             workers: Vec::new(),
             tasks: Vec::new(),
             recent: Vec::new(),
             recent_truncated: false,
         };
         let mut app = App::new();
-        app.panel = Panel::Origins;
-        app.origin_idx = 1;
-        app.sync_keys(&m);
-        assert_eq!(handle_key(&mut app, &m, Key::Enter), Effect::None);
-        assert_eq!(app.panel, Panel::Origins, "空 scope MUST 停在 ORIGINS");
-        assert!(app.message.contains("no workers"), "實際：{}", app.message);
+        for panel in [Panel::Workers, Panel::Tasks] {
+            app.panel = panel;
+            app.sync_keys(&m);
+            assert_eq!(handle_key(&mut app, &m, Key::Enter), Effect::None);
+            assert_eq!(app.panel, panel, "無選中列時焦點不得跳走");
+            assert_eq!(row_caps(&app, &m).enter, EnterAct::None);
+        }
     }
 
     /// `r` ≡ task 列的 `Enter`：同一個 id、同一個 Effect（alias 而非兩份實作）。
@@ -1531,12 +1355,63 @@ mod tests {
                 parent_agent: None,
             },
         );
+        let m2 = with_groups(m2);
         app.relocate(&m2);
         assert_eq!(app.row_idx, 3, "列序後移一格，游標要跟著走");
         let Some(Row::Worker(wi)) = app.selected_row(&m2) else {
             panic!("仍應停在 worker 列");
         };
         assert_eq!(m2.workers[wi].name, "w2", "選取的仍是同一個 worker");
+    }
+
+    /// **P4.7 切片 B1：分組把列序整個重排，stable key 仍認人不認位置。**
+    ///
+    /// 分組是 P4.6 之後第一個會**大幅**動到列序的東西（新 spawn 出來的一整條
+    /// lineage 會整組插在 standalone 段之前）。沒有這條，`row_idx` 的位置快取
+    /// 一旦被當成權威，畫面就會在別人 spawn 的那一輪把人的游標甩到別的 worker
+    /// 身上——而那正是 stable key 存在的理由。
+    #[test]
+    fn selection_survives_a_wholesale_regroup() {
+        let m = model(); // w1／w2 都是 standalone（沒有 lineage 欄）
+        let mut app = App::new();
+        handle_key(&mut app, &m, Key::Char('j'));
+        handle_key(&mut app, &m, Key::Char('j')); // 第 2 列＝w2
+        assert!(matches!(app.selected_row(&m), Some(Row::Worker(1))));
+
+        // 另一條 lineage 冒出來：它排在 standalone 段**之前**，w1／w2 整段後移
+        let root = "AGENT_BRIDGE_SPAWN_TAG=ab-spawn-root-1-aaaaaaaaaaaa";
+        let mut m2 = model();
+        let kid = "AGENT_BRIDGE_SPAWN_TAG=ab-spawn-b-2-bbbbbbbbbbbb";
+        for (i, (name, pane, tag)) in [("a", "%81", root), ("b", "%82", kid)].iter().enumerate() {
+            m2.workers.insert(
+                i,
+                AgentSnapshot {
+                    name: (*name).into(),
+                    pane: (*pane).into(),
+                    runtime: "codex".into(),
+                    owner: "it:@1".into(),
+                    ready: "ready".into(),
+                    spawn_tag: (*tag).into(),
+                    registered_at: "2026-07-31T00:00:00Z".into(),
+                    spawned: true,
+                    corrupt: false,
+                    lineage_root: Some(root.to_string()),
+                    parent_agent: (i == 1).then(|| root.to_string()),
+                },
+            );
+        }
+        let m2 = with_groups(m2);
+        assert_eq!(m2.groups.len(), 2, "前提：真的分成兩組了");
+
+        app.relocate(&m2);
+        let Some(Row::Worker(wi)) = app.selected_row(&m2) else {
+            panic!("仍應停在 worker 列");
+        };
+        assert_eq!(
+            m2.workers[wi].name, "w2",
+            "重排 MUST NOT 把游標甩到別的 worker（實際 row_idx={}）",
+            app.row_idx
+        );
     }
 
     /// stable selection（2）：選取項消失 → 落**前一列**（無則後一列、再無則
@@ -1550,6 +1425,7 @@ mod tests {
         handle_key(&mut app, &m, Key::Char('j'));
         let mut m2 = model();
         m2.workers.remove(1); // 拿掉 w2
+        let m2 = with_groups(m2);
         app.relocate(&m2);
         assert_eq!(app.row_idx, 1, "落前一列（w1 的 task 列）");
 
@@ -1562,22 +1438,6 @@ mod tests {
         m3.recent.remove(1);
         app.relocate(&m3);
         assert_eq!(app.task_idx, 0, "落前一列");
-
-        // origin：選 it:@1，該 origin 消失（底下 worker 都收回了）
-        let mut app = App::new();
-        app.panel = Panel::Origins;
-        handle_key(&mut app, &m, Key::Char('j'));
-        assert_eq!(app.origin_key, "it:@1");
-        let bare = Model {
-            origins: vec![crate::model::ALL_SCOPE.into()],
-            workers: Vec::new(),
-            tasks: Vec::new(),
-            recent: Vec::new(),
-            recent_truncated: false,
-        };
-        app.relocate(&bare);
-        assert_eq!(app.origin_idx, 0);
-        assert_eq!(app.origin_key, crate::model::ALL_SCOPE);
     }
 
     /// stable selection（3）：同名 respawn 換了 `spawn_tag` ＝**新的一代**，
@@ -1592,6 +1452,7 @@ mod tests {
 
         let mut m2 = model();
         m2.workers[1].spawn_tag = "t-gen2".into(); // w2 換代
+        let m2 = with_groups(m2);
         app.relocate(&m2);
         assert_eq!(app.row_idx, 1, "換代＝找不到原項，落前一列");
         assert!(
@@ -1618,6 +1479,7 @@ mod tests {
         // w1 換代（名字與位置都不變，只有 spawn_tag 變了）
         let mut m2 = model();
         m2.workers[0].spawn_tag = "t-gen2".into();
+        let m2 = with_groups(m2);
         app.relocate(&m2);
         assert!(
             !matches!(app.selected_row(&m2), Some(Row::Worker(0))),
@@ -1639,25 +1501,27 @@ mod tests {
     /// MUST NOT 自己選回新一代。
     #[test]
     fn a_lone_respawn_clears_the_selection_and_stays_cleared() {
-        let one = |tag: &str| Model {
-            origins: vec![crate::model::ALL_SCOPE.into(), "it:@1".into()],
-            workers: vec![AgentSnapshot {
-                name: "w1".into(),
-                pane: "%5".into(),
-                runtime: "codex".into(),
-                owner: "it:@1".into(),
-                ready: "ready".into(),
-                spawn_tag: tag.into(),
-                registered_at: "2026-07-31T00:00:00Z".into(),
-                spawned: true,
-                corrupt: false,
-                // P4.7 切片 A：lineage 兩欄對這些 fixture 無關（None＝欄位缺席）
-                lineage_root: None,
-                parent_agent: None,
-            }],
-            tasks: Vec::new(),
-            recent: Vec::new(),
-            recent_truncated: false,
+        let one = |tag: &str| {
+            with_groups(Model {
+                groups: Vec::new(),
+                workers: vec![AgentSnapshot {
+                    name: "w1".into(),
+                    pane: "%5".into(),
+                    runtime: "codex".into(),
+                    owner: "it:@1".into(),
+                    ready: "ready".into(),
+                    spawn_tag: tag.into(),
+                    registered_at: "2026-07-31T00:00:00Z".into(),
+                    spawned: true,
+                    corrupt: false,
+                    // P4.7 切片 A：lineage 兩欄對這些 fixture 無關（None＝欄位缺席）
+                    lineage_root: None,
+                    parent_agent: None,
+                }],
+                tasks: Vec::new(),
+                recent: Vec::new(),
+                recent_truncated: false,
+            })
         };
         let m = one("t-gen1");
         let mut app = App::new();
@@ -1697,8 +1561,8 @@ mod tests {
 
     /// n 個 worker、沒有 task 的模型（WORKERS 欄剛好 n 列，翻頁算術驗得乾淨）。
     fn many(n: usize) -> Model {
-        Model {
-            origins: vec![crate::model::ALL_SCOPE.into(), "it:@1".into()],
+        with_groups(Model {
+            groups: Vec::new(),
             workers: (0..n)
                 .map(|i| AgentSnapshot {
                     name: format!("w{i:02}"),
@@ -1718,12 +1582,42 @@ mod tests {
             tasks: Vec::new(),
             recent: Vec::new(),
             recent_truncated: false,
-        }
+        })
     }
 
-    fn pages(origins: u16, workers: u16, tasks: u16) -> PageSizes {
+    /// n 個**單成員 lineage**（每組一行標頭＋一列 worker，無 in-flight task）
+    /// ——G2 的失敗情境靠的就是「標頭與列一比一交錯」。
+    fn lineages(n: usize) -> Model {
+        let key = |t: &str| format!("AGENT_BRIDGE_SPAWN_TAG=ab-spawn-{t}");
+        with_groups(Model {
+            groups: Vec::new(),
+            workers: (0..n)
+                .map(|i| {
+                    let tag = key(&format!("g{i:02}-{i}-{:012x}", i + 1));
+                    AgentSnapshot {
+                        name: format!("g{i:02}"),
+                        pane: format!("%{i}"),
+                        runtime: "codex".into(),
+                        owner: "it:@1".into(),
+                        ready: "ready".into(),
+                        spawn_tag: tag.clone(),
+                        registered_at: "2026-07-31T00:00:00Z".into(),
+                        spawned: true,
+                        corrupt: false,
+                        // 自己就是自己那一組的根（無 parent 的新式列的合法形狀）
+                        lineage_root: Some(tag),
+                        parent_agent: None,
+                    }
+                })
+                .collect(),
+            tasks: Vec::new(),
+            recent: Vec::new(),
+            recent_truncated: false,
+        })
+    }
+
+    fn pages(workers: u16, tasks: u16) -> PageSizes {
         PageSizes {
-            origins,
             workers,
             tasks,
             ..PageSizes::default()
@@ -1736,7 +1630,7 @@ mod tests {
     fn page_keys_move_by_one_viewport_and_saturate_at_both_ends() {
         let m = many(30);
         let mut app = App::new();
-        app.pages = pages(5, 8, 4);
+        app.pages = pages(8, 4);
 
         handle_key(&mut app, &m, Key::PageDown);
         assert_eq!(app.row_idx, 8, "一頁＝WORKERS 的可視高度");
@@ -1755,16 +1649,88 @@ mod tests {
         handle_key(&mut app, &m, Key::End);
         assert_eq!(app.row_idx, 29);
 
-        // 每個面板用**自己**的高度（ORIGINS 只有 2 列，翻一頁就到底）
-        app.panel = Panel::Origins;
+        // 每個面板用**自己**的高度：TASKS 一頁 4 列，與 WORKERS 的 8 不同
+        app.panel = Panel::Tasks;
         handle_key(&mut app, &m, Key::PageDown);
-        assert_eq!(app.origin_idx, 1);
-        assert!(
-            app.origin_touched,
-            "人自己動過 ORIGINS：定位不得再搶 selection"
+        assert_eq!(app.task_idx, 0, "這份 fixture 沒有 recent task");
+        assert_eq!(app.row_idx, 29, "換面板不得動到 WORKERS 的位置");
+    }
+
+    /// **G2 回歸（切片 B1 修正輪）：翻頁 MUST NOT 跳列。**
+    ///
+    /// codex 的失敗情境：可視行高 8、九個單成員 lineage（每組一行標頭＋一列
+    /// worker）。把行高直接當列數用的話，一次 PgDown 從 row 0 跳到 row 8，
+    /// 而 row 4 在**任何一頁上都不會出現**——它既不在第一頁（行 0–7 只到
+    /// row 3），也不在新的一頁（行 16 起）。
+    ///
+    /// 正確語意：位移量是一個 viewport 的 **rendered lines**，落點是行號跨過
+    /// 該位置的第一個列——於是下一頁的頁首恰好接上一頁的末列。
+    #[test]
+    fn paging_across_group_headers_never_skips_a_row() {
+        let m = lineages(9);
+        // 行號：標頭 0、row0=1、標頭 2、row1=3、…、row_i = 2i+1
+        assert_eq!(crate::model::worker_line_of(&m, 0), 1);
+        assert_eq!(crate::model::worker_line_of(&m, 4), 9);
+        let mut app = App::new();
+        app.pages = pages(8, 8);
+
+        handle_key(&mut app, &m, Key::PageDown);
+        assert_eq!(
+            app.row_idx, 4,
+            "第一頁畫得下 row 0–3（行 0–7），下一頁 MUST 從 row 4 起"
         );
-        handle_key(&mut app, &m, Key::Home);
-        assert_eq!(app.origin_idx, 0);
+        handle_key(&mut app, &m, Key::PageDown);
+        assert_eq!(app.row_idx, 8);
+        // 反向對稱：翻回去落在同一批頁首上
+        handle_key(&mut app, &m, Key::PageUp);
+        assert_eq!(app.row_idx, 4);
+        handle_key(&mut app, &m, Key::PageUp);
+        assert_eq!(app.row_idx, 0);
+    }
+
+    /// 同一件事的 sweep 版：一路 PgDown 到底、再一路 PgUp 回頂，把每一頁畫得
+    /// 出來的列聯集起來——**每一列都必須出現過至少一次**。
+    ///
+    /// 上一條釘的是特定落點，這條釘的是「沒有任何一列被漏掉」這個性質本身
+    /// （改成別的位移公式只要漏一列就紅）。
+    #[test]
+    fn a_full_page_sweep_covers_every_row_in_both_directions() {
+        for n in [3usize, 9, 17] {
+            for h in [1u16, 2, 3, 8] {
+                let m = lineages(n);
+                let mut app = App::new();
+                app.pages = pages(h, h);
+                let lines = crate::model::worker_row_lines(&m);
+                assert_eq!(lines.len(), n, "每個單成員組恰一列");
+                let mut seen = vec![false; n];
+                // 每一頁看得到的列＝行號落在 [scroll, scroll+h) 的那些列
+                let mut mark = |app: &App| {
+                    let sel = lines[app.row_idx];
+                    let top = sel.saturating_sub(usize::from(h).saturating_sub(1));
+                    for (r, &l) in lines.iter().enumerate() {
+                        if l >= top && l < top + usize::from(h).max(1) {
+                            seen[r] = true;
+                        }
+                    }
+                };
+                mark(&app);
+                for _ in 0..(2 * n + 4) {
+                    handle_key(&mut app, &m, Key::PageDown);
+                    mark(&app);
+                }
+                assert_eq!(app.row_idx, n - 1, "一路翻到底（n={n} h={h}）");
+                for _ in 0..(2 * n + 4) {
+                    handle_key(&mut app, &m, Key::PageUp);
+                    mark(&app);
+                }
+                assert_eq!(app.row_idx, 0, "一路翻回頂（n={n} h={h}）");
+                let missed: Vec<usize> = (0..n).filter(|&r| !seen[r]).collect();
+                assert!(
+                    missed.is_empty(),
+                    "n={n} h={h}：這些列在任何一頁上都沒出現過 {missed:?}"
+                );
+            }
+        }
     }
 
     /// 列數**不足一頁**時，翻頁等於到底／到頂（不越界）。
@@ -1772,7 +1738,7 @@ mod tests {
     fn page_keys_on_a_short_list_land_on_the_edges() {
         let m = many(3);
         let mut app = App::new();
-        app.pages = pages(8, 8, 8);
+        app.pages = pages(8, 8);
         handle_key(&mut app, &m, Key::PageDown);
         assert_eq!(app.row_idx, 2);
         handle_key(&mut app, &m, Key::PageUp);
@@ -1803,7 +1769,7 @@ mod tests {
     fn paging_keeps_selection_on_a_stable_key() {
         let m = many(30);
         let mut app = App::new();
-        app.pages = pages(5, 8, 4);
+        app.pages = pages(8, 4);
         handle_key(&mut app, &m, Key::PageDown);
         let Some(Row::Worker(wi)) = app.selected_row(&m) else {
             panic!("應選在 worker 列");
@@ -1836,6 +1802,7 @@ mod tests {
                 parent_agent: None,
             },
         );
+        let m2 = with_groups(m2);
         app.relocate(&m2);
         assert_eq!(app.row_idx, 9, "列序後移一格");
         let Some(Row::Worker(wi2)) = app.selected_row(&m2) else {
@@ -1863,10 +1830,10 @@ mod tests {
         let m = model();
         let mut app = App::new();
         handle_key(&mut app, &m, Key::Char('j'));
-        let (o, r, t) = (app.origin_idx, app.row_idx, app.task_idx);
+        let (r, t) = (app.row_idx, app.task_idx);
         for _ in 0..3 {
             app.relocate(&m);
         }
-        assert_eq!((app.origin_idx, app.row_idx, app.task_idx), (o, r, t));
+        assert_eq!((app.row_idx, app.task_idx), (r, t));
     }
 }
