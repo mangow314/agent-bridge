@@ -264,9 +264,49 @@ fn render_workers(
             "  (no workers registered)"
         }));
     }
-    let block = panel_block("WORKERS", focused);
-    let scroll = scroll_offset(worker_line_of(model, &app.filter, app.row_idx), area);
-    f.render_widget(Paragraph::new(lines).block(block).scroll((scroll, 0)), area);
+    // 標題帶 `N/total`＋捲軸（P5.1，照 P4.6 切片 C 給 TASKS 的既成範式）。
+    // 沒有它們，摺線以下的東西在畫面上零提示——P5 理解驗收就是這樣失敗的：
+    // 受測高度下 WORKERS 只畫得下 7 列，lineage 分組與 standalone 段全在摺線
+    // 下，而畫面既沒有捲軸也沒有數字說「底下還有」。
+    //
+    // **標題與捲軸刻意用不同單位**（P5.1 修正輪），因為它們回答的是不同的問題：
+    //
+    // - 標題 `N/total` 是**給人讀的文字**，語意逐字照 TASKS：「第幾個項目／共幾
+    //   項」。項目＝可選取的列，組標頭不是項目（它沒有任何鍵可按，見
+    //   `worker_rows` 的說明），計進去就會讓 `WORKERS 2/41` 被讀成「41 個
+    //   worker」——那是畫面在說一件不成立的事，正是 P5 敗因要修的那類毛病。
+    // - 捲軸吃的是**行**：WORKERS 的捲動位移一直以行計（下面那個 `scroll_offset`
+    //   吃的就是 `worker_line_of`）。thumb 若改用列數，就會指到畫面實際沒有捲到
+    //   的位置。
+    //
+    // 兩者都吃同一份 `filter`（`rows`／`heads` 皆由過濾後的走訪產生），所以篩選
+    // 中的標題數的是**畫得出來的**那些，不是全體。
+    let total = rows.len();
+    // **`row_idx` 可以合法地落在列數之外**：`App::relocate` 有一條刻意分支把它
+    // 設成 `rows.len()`＝「明確不選任何列」（同名新一代原地取代時，靜默接續到
+    // 新世代會讓 `e`／`x` 接錯世代——見 app.rs `relocate` 的 `None` 分支）。
+    // 那一輪若照算 `row_idx + 1`，標題會印出 `WORKERS 2/1`：序位超過總數，而且
+    // 謊稱有選取。**0 ＝ 沒有選中的東西**，與空清單的 `0/0` 同族。
+    let pos = if app.row_idx < total {
+        app.row_idx + 1
+    } else {
+        0
+    };
+    let title = format!("WORKERS {pos}/{total}");
+    // 捲軸的總量／位置：行（含組標頭）。**`line` 與底下 `scroll_offset` 吃的是
+    // 同一個值**，包含無選取那一輪的落點（`worker_line_of` 查不到就退回
+    // `row_idx`）——這裡另發明一個 fallback 的話，thumb 會指到畫面沒有捲到的
+    // 位置，而那正是捲軸唯一的用途。
+    let lines_total = rows.len() + heads.len();
+    let line = worker_line_of(model, &app.filter, app.row_idx);
+    let block = panel_block(&title, focused);
+    f.render_widget(
+        Paragraph::new(lines)
+            .block(block)
+            .scroll((scroll_offset(line, area), 0)),
+        area,
+    );
+    render_scrollbar(f, area, lines_total, line);
 }
 
 /// TASKS 欄（§2）：**全 pool** 的任務平坦列表（P4.7 切片 B1 起不再依 owner
@@ -345,11 +385,15 @@ fn render_tasks(f: &mut Frame, area: Rect, model: &Model, app: &App) {
     render_scrollbar(f, area, total, app.task_idx);
 }
 
-/// TASKS 欄的捲軸（P4.6 切片 C）。
+/// 列表面板的捲軸（P4.6 切片 C 起用於 TASKS，P5.1 起 WORKERS 共用同一份）。
 ///
 /// **只在真的捲得動時才畫**：列數塞得進畫面時畫一條空軌道，等於用一欄寬度說
 /// 一句沒有資訊量的話。thumb 位置由 (選取序位, 總數) 決定——首列在頂、末列在
 /// 底、中段在中，人用它判斷「我在清單的哪裡」。
+///
+/// `total`／`pos` 的單位由呼叫端決定，但**必須與該面板的捲動單位同一種**：
+/// TASKS 一列一行、兩者等價；WORKERS 的組標頭佔行不佔列，所以它傳的是行號
+/// （見 `render_workers`）。混用會讓 thumb 指到畫面沒捲到的地方。
 ///
 /// 樣式走 theme 語意層（P4.5：view 內零個 `Style::` 字面）。
 fn render_scrollbar(f: &mut Frame, area: Rect, total: usize, pos: usize) {
@@ -2331,6 +2375,275 @@ mod tests {
         assert_eq!(worker_line_of(&m, &nof, 0), 1);
         assert_eq!(worker_line_of(&m, &nof, 1), 2);
         assert_eq!(worker_line_of(&m, &nof, 2), 4);
+    }
+
+    // ---- P5.1：WORKERS 的 scrollbar／N-total ----
+
+    /// 造一份 n 個 standalone worker 的模型（WORKERS 欄剛好 n 列＋1 行組標頭）。
+    /// 交錯 task 一併清掉：這裡要驗的是行／列換算，不是掛載。
+    fn with_workers(n: usize) -> impl FnOnce(&mut Model, &mut App) {
+        move |m: &mut Model, a: &mut App| {
+            m.workers = (0..n)
+                .map(|i| {
+                    worker(
+                        &format!("w{i:03}"),
+                        &format!("%{}", 100 + i),
+                        "claude",
+                        "",
+                        false,
+                    )
+                })
+                .collect();
+            m.tasks = Vec::new();
+            m.groups = crate::model::group_by_lineage(&m.workers);
+            a.panel = Panel::Workers;
+            a.row_idx = 0;
+        }
+    }
+
+    fn workers_area() -> Rect {
+        layout(Rect::new(0, 0, 120, 40), 1, 0).workers
+    }
+
+    /// 捲軸畫在 WORKERS 面板的右框上。**只掃 WORKERS 那幾列**（同 `scrollbar_col`
+    /// 的理由：同一欄在下半部是 TASKS 的右框）。
+    fn workers_scrollbar_col(buf: &Buffer, sym: &str) -> Vec<u16> {
+        let a = workers_area();
+        let x = a.right() - 1;
+        (a.top()..a.bottom())
+            .filter(|&y| buf[(x, y)].symbol() == sym)
+            .collect()
+    }
+
+    fn workers_thumb_y(buf: &Buffer) -> Option<u16> {
+        workers_scrollbar_col(buf, "█").first().copied()
+    }
+
+    /// **行列比例刻意失衡**的 fixture（P5.1 終修輪 finding 2）：一個 20 人的
+    /// lineage 組（1 行標頭）＋ 20 個單人組（20 行標頭）。
+    ///
+    /// 為什麼要失衡：全 standalone 的 fixture 裡 40 列 vs 41 行只差一行，
+    /// 「行」與「列」兩種單位餵給捲軸幾乎畫在同一格，thumb 的單調性斷言因此
+    /// 殺不掉「捲軸誤用列數」這個 mutant。這裡列 20 的上面有 21 行標頭＋成員，
+    /// 兩種單位的 thumb 差得開。
+    ///
+    /// 列序：0–19＝大組成員（`aroot` 字典序在前），20–39＝二十個單人組。
+    /// 行數＝40 列＋21 標頭＝61。
+    fn with_lopsided_groups() -> impl FnOnce(&mut Model, &mut App) {
+        |m: &mut Model, a: &mut App| {
+            let root = "aroot-1-aaaaaaaaaaaa";
+            let mut ws: Vec<AgentSnapshot> = (0..20)
+                .map(|i| {
+                    lin(
+                        &format!("big{i:03}"),
+                        &format!("%{}", 100 + i),
+                        &format!("big{i:03}-1-{i:012x}"),
+                        root,
+                        Some(root),
+                    )
+                })
+                .collect();
+            for i in 0..20 {
+                // 每個單人組自成一條 lineage（root＝自己）
+                let solo = format!("solo{i:03}-1-{:012x}", 0xb00 + i);
+                ws.push(lin(
+                    &format!("solo{i:03}"),
+                    &format!("%{}", 200 + i),
+                    &solo,
+                    &solo,
+                    None,
+                ));
+            }
+            m.workers = ws;
+            m.tasks = Vec::new();
+            m.groups = crate::model::group_by_lineage(&m.workers);
+            a.panel = Panel::Workers;
+            a.row_idx = 0;
+        }
+    }
+
+    /// 軌道的頭尾（端點箭頭的下一格／上一格）。thumb 的絕對位置要對照它們，
+    /// 而不是對照寫死的 y——版面一改，寫死的數字會靜默失準。
+    fn workers_track_ends() -> (u16, u16) {
+        let scrolling = draw_model_with(with_lopsided_groups());
+        let up = workers_scrollbar_col(&scrolling, "▲")[0];
+        let down = workers_scrollbar_col(&scrolling, "▼")[0];
+        (up + 1, down - 1)
+    }
+
+    /// **捲軸吃的是「行」不是「列」**（P5.1 終修輪 finding 2）。
+    ///
+    /// 端點（首列在軌道頂、末列在軌道底）兩種單位都會通過——首末在哪一種
+    /// 座標系裡都是首末。真正分得開的是**中間那一格與 thumb 的長度**：
+    ///
+    /// - 列 20 在**列**空間是正中（20/40），在**行**空間只到 22/61——它上面
+    ///   有 21 行標頭＋大組成員。
+    /// - thumb 長度由 content length 決定：61 行擠進 14 格是 3 格，40 列是 4 格。
+    ///
+    /// 所以這裡釘死整段 thumb 的絕對格位。數字是 120x40 ＋ `with_lopsided_groups`
+    /// 下量出來的；版面一改它會**大聲**失敗（不是靜默失準），訊息裡帶著軌道
+    /// 範圍好判讀。
+    #[test]
+    fn the_workers_scrollbar_measures_rendered_lines_not_selectable_rows() {
+        let (track_top, track_bottom) = workers_track_ends();
+        let cells = |idx: usize| {
+            workers_scrollbar_col(
+                &draw_model_with(move |m, a| {
+                    with_lopsided_groups()(m, a);
+                    a.row_idx = idx;
+                }),
+                "█",
+            )
+        };
+        let top = cells(0);
+        assert_eq!(
+            top.first().copied(),
+            Some(track_top),
+            "首列的 thumb MUST 貼著軌道最上格（軌道 {track_top}..={track_bottom}）"
+        );
+        let bottom = cells(39);
+        assert_eq!(
+            bottom.last().copied(),
+            Some(track_bottom),
+            "末列（行 60／共 61）的 thumb MUST 貼著軌道最下格"
+        );
+
+        // 關鍵那一格：22/61 而不是 20/40。用列數畫會落在 [7,8,9,10]
+        assert_eq!(
+            cells(20),
+            vec![6, 7, 8],
+            "列 20 的 thumb MUST 反映行位置 22/61 與行總數 61\
+             （用列數畫會是 [7,8,9,10]；軌道 {track_top}..={track_bottom}）"
+        );
+    }
+
+    /// WORKERS 捲軸：thumb 首/中/末各在頂/中/底，且塞得下時一格都不畫。
+    ///
+    /// 這條是 P5 理解驗收失敗的直接補丁：摺線以下的 lineage 分組與 standalone
+    /// 段，先前在畫面上零提示。
+    #[test]
+    fn workers_scrollbar_tracks_the_selection_and_only_shows_when_needed() {
+        let top = workers_thumb_y(&draw_model_with(with_workers(40))).expect("該畫捲軸");
+        let mid = workers_thumb_y(&draw_model_with(|m, a| {
+            with_workers(40)(m, a);
+            a.row_idx = 20;
+        }))
+        .expect("該畫捲軸");
+        let bottom = workers_thumb_y(&draw_model_with(|m, a| {
+            with_workers(40)(m, a);
+            a.row_idx = 39;
+        }))
+        .expect("該畫捲軸");
+        assert!(top < mid, "首列的 thumb 要在中段之上（{top} vs {mid}）");
+        assert!(
+            mid < bottom,
+            "中段的 thumb 要在末列之上（{mid} vs {bottom}）"
+        );
+
+        // 塞得下時**一格捲軸都不畫**（空軌道等於用一欄寬度說廢話）
+        let buf = draw_model_with(with_workers(3));
+        assert!(workers_thumb_y(&buf).is_none(), "塞得下時不得畫 thumb");
+        let scrolling = draw_model_with(with_workers(40));
+        for sym in ["║", "▲", "▼"] {
+            assert!(
+                !workers_scrollbar_col(&scrolling, sym).is_empty(),
+                "前提：捲得動時這一欄真的有「{sym}」（否則下一條斷言驗不到東西）"
+            );
+            assert!(
+                workers_scrollbar_col(&buf, sym).is_empty(),
+                "塞得下時不得留下捲軸字元「{sym}」"
+            );
+        }
+    }
+
+    /// WORKERS 標題的 `N/total`：**單位是可選取的列**，語意逐字照 TASKS
+    /// 「第幾個項目／共幾項」。組標頭**不計入**——它不是項目，計進去就會讓
+    /// 40 個 worker 的畫面寫成 `2/41`，被人讀成「41 個 worker」。
+    ///
+    /// （捲軸另有其單位＝行，由 `workers_scrollbar_...` 那條各自把關。）
+    #[test]
+    fn workers_title_counts_selectable_rows_not_rendered_lines() {
+        let t = text(&draw_model_with(with_workers(40)));
+        assert!(t.contains("WORKERS 1/40"), "首列＝1/40：\n{t}");
+        assert!(
+            !t.contains("WORKERS 2/41"),
+            "組標頭 MUST NOT 混進項目計數：\n{t}"
+        );
+        let t = text(&draw_model_with(|m, a| {
+            with_workers(40)(m, a);
+            a.row_idx = 39;
+        }));
+        assert!(t.contains("WORKERS 40/40"), "末列＝40/40：\n{t}");
+        // 一列都沒有時 `0/0`（比照 TASKS：不得憑空生出序位）
+        let t = text(&draw_model_with(with_workers(0)));
+        assert!(t.contains("WORKERS 0/0"), "空清單的標題：\n{t}");
+    }
+
+    /// **無選取那一輪的標題**（P5.1 終修輪 finding 1）：`App::relocate` 有一條
+    /// 刻意分支把 `row_idx` 設成 `rows.len()`＝明確不選任何列（同名新一代原地
+    /// 取代，見 app.rs `relocate` 與 `a_lone_respawn_clears_the_selection_and_stays_cleared`）。
+    /// 標題在那一輪必須寫 `0/1`——照算會變成 `2/1`，一句話同時說錯兩件事：
+    /// 序位超過總數，而且謊稱有選取。
+    ///
+    /// 這條刻意走**真實 relocate 路徑**而不是直接把 `row_idx` 設成 1：後者只驗
+    /// 到算式，驗不到「這個狀態真的到得了」。
+    #[test]
+    fn the_workers_title_says_zero_while_a_respawn_leaves_nothing_selected() {
+        // 同一個 worker 的兩個世代（差別只在 spawn_tag）
+        let one = |tag: &str| {
+            let mut w = worker("w1", "%5", "codex", "it:@1", true);
+            w.spawn_tag = tag.to_string();
+            with_groups(Model {
+                groups: Vec::new(),
+                workers: vec![w],
+                tasks: Vec::new(),
+                recent: Vec::new(),
+                recent_truncated: false,
+            })
+        };
+        let buf = draw_model_with(|m, a| {
+            *m = one("t-gen1");
+            a.panel = Panel::Workers;
+            a.sync_keys(m);
+            assert!(a.selected_row(m).is_some(), "前提：先真的選著那一列");
+            // 同名新一代原地取代 → relocate 走到「不選任何列」
+            *m = one("t-gen2");
+            a.relocate(m);
+            assert!(
+                a.selected_row(m).is_none(),
+                "前提：relocate MUST 真的清掉選取（否則這條驗不到東西）"
+            );
+        });
+        let t = text(&buf);
+        assert!(t.contains("WORKERS 0/1"), "無選取＝序位 0：\n{t}");
+        assert!(
+            !t.contains("WORKERS 2/1"),
+            "序位 MUST NOT 超過總數（也不得謊稱有選取）：\n{t}"
+        );
+    }
+
+    /// 篩選中的標題數的是**畫得出來的**那些，不是全體：`w01*` 命中 10 個，
+    /// 標題就得寫 `1/10`。寫 `1/40` 等於畫面宣稱底下還有 30 列可以捲——而
+    /// 那 30 列按什麼鍵都到不了。
+    #[test]
+    fn the_workers_title_counts_only_what_the_filter_left() {
+        let t = text(&draw_model_with(|m, a| {
+            with_workers(40)(m, a);
+            a.filter.query = "w01".into();
+        }));
+        assert!(t.contains("WORKERS 1/10"), "篩選後的計數：\n{t}");
+        assert!(
+            !t.contains("WORKERS 1/40"),
+            "MUST NOT 拿全體的總數貼到子集合上：\n{t}"
+        );
+        // 一個都沒命中：`0/0`，且畫面要說得出是 filter 篩掉的（既有語意，
+        // 這裡順帶當作「標題與空清單訊息不打架」的對照）
+        let t = text(&draw_model_with(|m, a| {
+            with_workers(40)(m, a);
+            a.filter.query = "no-such-worker".into();
+        }));
+        assert!(t.contains("WORKERS 0/0"), "全被篩掉時的計數：\n{t}");
+        assert!(t.contains("(no rows match the filter)"), "空的原因：\n{t}");
     }
 
     // ---- P4.6 切片 C：scrollbar／N-total／freshness ----
