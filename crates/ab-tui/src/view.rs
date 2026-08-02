@@ -21,9 +21,10 @@ use ratatui::widgets::{
 use crate::action::{cancel_cmdline, evidence};
 use crate::app::{App, EnterAct, Panel, Sel};
 use crate::model::{
-    Blocker, BlockerIndex, DISK_STALE, Freshness, LiveIndex, Liveness, Model, Row, TMUX_STALE,
-    age_is_worth_showing, breadcrumb, breadcrumb_line, breadcrumb_line_fit, group_label,
-    group_line_offsets, origin_label, pane_liveness, window_detail, worker_line_of,
+    Blocker, BlockerIndex, DISK_STALE, Freshness, LiveIndex, Liveness, Model, Row,
+    STANDALONE_LABEL, TMUX_STALE, age_is_worth_showing, breadcrumb, breadcrumb_line,
+    breadcrumb_line_fit, group_label, group_line_offsets, group_visible_members, origin_label,
+    pane_liveness, window_detail, worker_line_of,
 };
 use crate::theme;
 
@@ -75,19 +76,23 @@ struct Areas {
 /// footer 高度隨 sticky 警告伸縮（major #2：警告不得被單行 message 覆寫，
 /// 所以它們需要自己的行）。上限 `WARN_ROWS`，溢位以「另 N 則」帶出，
 /// 不是靜默丟掉。＋1 是「（Esc 清除警告）」那行——只在有警告時才佔位。
-fn footer_rows(warnings: usize) -> u16 {
+/// `extra`＝footer 的額外行（P4.7 切片 C 的 filter 提示列與 copy-mode
+/// banner，各 0／1 行）。它們**佔版面**，所以必須進這個算式——只在 render
+/// 裡多畫一行的話，那一行會蓋掉面板的最後一列。
+fn footer_rows(warnings: usize, extra: usize) -> u16 {
     // footer 三行：當前列的鍵、全域鍵、輪詢狀態＋message（P4.6 切片 B）
-    3 + if warnings == 0 {
-        0
-    } else {
-        warnings.min(WARN_ROWS) as u16 + 1
-    }
+    3 + extra as u16
+        + if warnings == 0 {
+            0
+        } else {
+            warnings.min(WARN_ROWS) as u16 + 1
+        }
 }
 
-fn layout(area: Rect, warnings: usize) -> Areas {
+fn layout(area: Rect, warnings: usize, extra: usize) -> Areas {
     let [main, footer] = Layout::vertical([
         Constraint::Min(3),
-        Constraint::Length(footer_rows(warnings)),
+        Constraint::Length(footer_rows(warnings, extra)),
     ])
     .areas(area);
     // 兩條硬不變量同時要守——中欄那 21 字元的 immutable task id MUST 永不截斷
@@ -121,8 +126,8 @@ fn layout(area: Rect, warnings: usize) -> Areas {
 
 /// 各面板的可視列數（扣掉上下邊框）。run loop 每幀量一次回填給狀態機，
 /// PgUp／PgDn 據此翻一頁（`app::PageSizes`）。
-pub fn panel_heights(area: Rect, warnings: usize) -> crate::app::PageSizes {
-    let a = layout(area, warnings);
+pub fn panel_heights(area: Rect, warnings: usize, extra: usize) -> crate::app::PageSizes {
+    let a = layout(area, warnings, extra);
     let inner = |r: Rect| r.height.saturating_sub(2);
     crate::app::PageSizes {
         workers: inner(a.workers),
@@ -140,13 +145,17 @@ pub fn render(
     app: &App,
     fresh: Freshness,
 ) {
-    let a = layout(f.area(), app.warnings.len());
+    let a = layout(
+        f.area(),
+        app.warnings.len(),
+        footer_extra_rows(model, app, blockers),
+    );
     let (workers_area, tasks_area, detail_area, footer) = (a.workers, a.tasks, a.detail, a.footer);
 
     render_workers(f, workers_area, model, live, blockers, app);
     render_tasks(f, tasks_area, model, app);
     render_detail(f, detail_area, model, live, blockers, app, a.detail_strip);
-    render_footer(f, footer, model, app, fresh);
+    render_footer(f, footer, model, app, blockers, fresh);
 
     // overlay 優先序：確認框（cancel／evict）> 全文 pager > 摘要頁 > 合法鍵
     if let Some(id) = &app.confirm {
@@ -177,7 +186,9 @@ fn render_workers(
     let focused = app.panel == Panel::Workers;
     let rows = app.rows(model);
     // 每一列前面要先插幾行組標頭（純函式，捲動位移與畫線共用同一份答案）
-    let heads = group_line_offsets(model);
+    let heads = group_line_offsets(model, &app.filter);
+    // 標頭的括號數字算**畫得出來的**那些（過濾中 `members.len()` 會說謊）
+    let visible = group_visible_members(model, &app.filter);
     let mut lines = Vec::new();
     for (i, row) in rows.iter().enumerate() {
         // 這一列是某組的第一個成員 → 先畫該組的標頭
@@ -188,7 +199,7 @@ fn render_workers(
             lines.push(Line::from(Span::raw(format!(
                 "{} ({})",
                 group_label(model, g),
-                g.members.len()
+                visible.get(gi).copied().unwrap_or(g.members.len())
             ))));
         }
         let selected = focused && i == app.row_idx;
@@ -242,10 +253,16 @@ fn render_workers(
         lines.push(styled(spans, selected));
     }
     if rows.is_empty() {
-        lines.push(Line::from("  (no workers registered)"));
+        // 空的原因有兩種，畫面要說得出是哪一種：一個都沒註冊，還是被 filter
+        // 篩掉了（後者按 Esc 就回得來，前者按什麼都沒用）
+        lines.push(Line::from(if app.filter.is_active() {
+            "  (no rows match the filter)"
+        } else {
+            "  (no workers registered)"
+        }));
     }
     let block = panel_block("WORKERS", focused);
-    let scroll = scroll_offset(worker_line_of(model, app.row_idx), area);
+    let scroll = scroll_offset(worker_line_of(model, &app.filter, app.row_idx), area);
     f.render_widget(Paragraph::new(lines).block(block).scroll((scroll, 0)), area);
 }
 
@@ -281,25 +298,41 @@ fn render_tasks(f: &mut Frame, area: Rect, model: &Model, app: &App) {
         ));
     }
     if rows.is_empty() {
-        lines.push(Line::from("  (no recent tasks)"));
+        // 空的原因有三種，畫面 MUST 說得出是哪一種。**`recent` 本身是空的要
+        // 排在最前面**（修正輪 R2／F5）：一筆任務都不存在時說「全部都掛上了」
+        // 是在宣稱一件沒有證據的事（全新 pool 切到 Unattached 就會踩到），
+        // 與同檔 `+` 旗標防的是同一類毛病
+        lines.push(Line::from(if model.recent.is_empty() {
+            "  (no recent tasks)"
+        } else if app.filter.is_active() {
+            "  (no rows match the filter)"
+        } else if app.scope == crate::model::Scope::Unattached {
+            "  (every task is attached to a worker)"
+        } else {
+            "  (no recent tasks)"
+        }));
     }
     // 標題帶 `N/total`（P4.6 切片 C）：沒有它，人看不出自己在第幾筆、也看不出
     // 底下還有多少。**截斷要說出來**——`RECENT_LIMIT` 之外還有更舊的任務時
     // 標 `+`，否則畫面等於宣稱「就這些了」。
     //
-    // P4.6 切片 C 的 F5 要求「只有 ALL scope 才標 `+`」（`recent_truncated`
-    // 是**全 pool** 的旗標，貼到過濾後的數字上等於宣稱沒有證據的事）。
-    // ORIGINS 退場後這一欄**本來就是全 pool**（見 `model::task_rows`），
-    // 前提與旗標於是同一個範圍。只留下 F5 的另外半條：一列都沒有時 MUST NOT
-    // 標 `+`——`TASKS 0/0+` 是在說「還有更舊的」卻連一筆都沒載到。
+    // P4.6 切片 C 的 F5：「只有全 pool 的數字才配得上 `+`」——`recent_truncated`
+    // 是**全 pool** 的旗標，貼到子集合的數字上等於宣稱一件沒有證據的事。
+    // 切片 B 期間這一欄本來就是全 pool，前提自動成立；**切片 C 又生出兩個
+    // 子集合**（filter 與 Unattached scope），所以 F5 的前半條要顯式寫回來：
+    // 篩選中或非 All scope 時不標 `+`。另外半條照舊：一列都沒有時也不標
+    // （`TASKS 0/0+` 是在說「還有更舊的」卻連一筆都沒載到）。
     let total = rows.len();
     let pos = if total == 0 { 0 } else { app.task_idx + 1 };
-    let more = if model.recent_truncated && total > 0 {
+    let whole_pool = !app.filter.is_active() && app.scope == crate::model::Scope::All;
+    let more = if model.recent_truncated && total > 0 && whole_pool {
         "+"
     } else {
         ""
     };
-    let title = format!("TASKS {pos}/{total}{more}");
+    // scope 進標題（footer 也印一份）：`s` 切過去之後，畫面上少了一半的列，
+    // 人得看得出那是 scope 而不是資料不見了
+    let title = format!("TASKS {pos}/{total}{more} [{}]", app.scope.label());
     f.render_widget(
         Paragraph::new(lines)
             .block(panel_block(&title, focused))
@@ -449,8 +482,9 @@ fn worker_detail(
         Line::from(format!("ready  : {}", w.ready)),
         // lineage 在 origin **之前**：邏輯歸屬是唯一的歸屬軸（P4.7 B5），
         // 物理位置是它下面的一條註腳。說不出世代的列（legacy／manual／
-        // invalid）寫 `-`——與 `origin_label` 同一個「不適用」字面，而不是
-        // 掰一條只有一節的假血緣
+        // invalid）寫 `(standalone)`——**與組標頭同一個字面**（切片 C）：同一
+        // 件事在兩個位置用兩種寫法（`-` 與 `(standalone)`），人得自己猜它們
+        // 是不是同一回事
         Line::from(format!(
             "lineage: {}",
             match breadcrumb(model, w) {
@@ -459,7 +493,7 @@ fn worker_detail(
                     Some(w) => breadcrumb_line_fit(&c, w.saturating_sub(LINEAGE_LABEL_W)),
                     None => breadcrumb_line(&c),
                 },
-                None => "-".to_string(),
+                None => STANDALONE_LABEL.to_string(),
             }
         )),
         Line::from(format!(
@@ -771,7 +805,7 @@ fn render_info(f: &mut Frame, lines: &[String]) {
 }
 
 /// 全域鍵（與選中列無關的那一段）。`?` 頁與 footer 共用同一份字面。
-const GLOBAL_KEYS: &str = "Tab/S-Tab panes \u{b7} j/k (\u{2193}\u{2191}) move \u{b7} PgUp/PgDn page \u{b7} Home/End ends \u{b7} Esc clear warnings \u{b7} ? keys \u{b7} q quit";
+const GLOBAL_KEYS: &str = "Tab/S-Tab panes \u{b7} j/k (\u{2193}\u{2191}) move \u{b7} PgUp/PgDn page \u{b7} Home/End \u{b7} / filter \u{b7} S scope \u{b7} Esc clear warn \u{b7} ? keys \u{b7} q quit";
 
 /// **當前選中列**有效的鍵（P4.6 切片 B 的 contextual footer）。
 ///
@@ -849,7 +883,66 @@ fn axis_label(
     }
 }
 
-fn render_footer(f: &mut Frame, area: Rect, model: &Model, app: &App, fresh: Freshness) {
+/// footer 的額外行數（filter 提示列＋copy-mode banner）。
+///
+/// run loop 量 `panel_heights` 時也要算同一份，否則翻頁的一頁長度會與畫面
+/// 差一行。
+pub fn footer_extra_rows(model: &Model, app: &App, blockers: &BlockerIndex) -> usize {
+    usize::from(filter_line(app).is_some())
+        + usize::from(copy_mode_banner(model, app, blockers).is_some())
+}
+
+/// filter 的狀態列（`None`＝沒在篩也沒在輸入）。
+fn filter_line(app: &App) -> Option<String> {
+    if app.filter_input {
+        // `\u{2588}` 是游標塊：輸入模式下人得看得出鍵盤此刻被誰吃掉
+        Some(format!(" /{}█", app.filter.query))
+    } else if app.filter.is_active() {
+        // Esc 在命令模式是「清警告」，**不會**清 filter——說明文字照實寫，
+        // 不要教人按一個在這裡沒有那個效果的鍵
+        Some(format!(
+            " filter: {} (press / then Esc to clear)",
+            app.filter.query
+        ))
+    } else {
+        None
+    }
+}
+
+/// copy-mode banner（P4.7 切片 C）。
+///
+/// 只消費既有的 `BlockerIndex` 快照——`pane_in_mode` 的 bounded 查詢在背景
+/// worker 那一輪就做完了，render 路徑一個 tmux 呼叫都不發（那是 §4 bounded-read
+/// 的硬條款：畫面每 500ms 重繪，render 一旦能發查詢就等於無界地打 tmux）。
+///
+/// 三態逐字對應：`Occluded`（`pane_in_mode` 回 true）→ 有 banner；`None`／
+/// `Prompt`（回 false）→ 無；`Unknown`（查不到）→ **無**（查不出就不宣稱）。
+/// 措辭沿用 `blocker_word` 那一家，不新造第二套詞彙。
+fn copy_mode_banner(model: &Model, app: &App, blockers: &BlockerIndex) -> Option<String> {
+    let (name, pane) = match app.selection(model) {
+        Sel::Worker(w) => (w.name.clone(), w.pane.clone()),
+        Sel::Task {
+            worker: Some(w), ..
+        } => (w.name.clone(), w.pane.clone()),
+        _ => return None,
+    };
+    match blockers.get(&pane) {
+        Blocker::Occluded => Some(format!(
+            " [info] '{name}' is {} — keys you send may land in the pager",
+            blocker_word(Blocker::Occluded)
+        )),
+        _ => None,
+    }
+}
+
+fn render_footer(
+    f: &mut Frame,
+    area: Rect,
+    model: &Model,
+    app: &App,
+    blockers: &BlockerIndex,
+    fresh: Freshness,
+) {
     // disk 軸恆有值：`Model::load` 不回錯，但「上次**完成**一輪掃描」永遠說得出
     // 口（F3：說得出口的只有 completed scan，不是 success）
     let (disk, disk_stale) = axis_label("disk", "500ms", Some(fresh.disk), DISK_STALE);
@@ -872,6 +965,16 @@ fn render_footer(f: &mut Frame, area: Rect, model: &Model, app: &App, fresh: Fre
         Line::from(format!(" {GLOBAL_KEYS}")),
         Line::from(status),
     ];
+    // filter 提示列：輸入中畫游標塊，篩選生效但不在輸入中則說得出「現在還篩著」
+    // ——沒有這一行，人會把「列變少了」讀成資料不見了
+    if let Some(l) = filter_line(app) {
+        lines.push(Line::from(l));
+    }
+    // copy-mode banner：**只讀 blocker 快照**（bounded 查詢在背景 worker 那一
+    // 側做過了），render 一律不發 tmux 呼叫
+    if let Some(b) = copy_mode_banner(model, app, blockers) {
+        lines.push(Line::from(b));
+    }
     // sticky 警告（最新的在最下面，人的視線落點）。畫得下幾則就畫幾則，
     // 剩下的以計數帶出——「被覆寫」與「畫面放不下但說得出還有幾則」是兩件事
     let n = app.warnings.len();
@@ -969,12 +1072,11 @@ fn render_help(f: &mut Frame, model: &Model, app: &App) {
     lines.push(Line::from(""));
     lines.push(Line::from("press any key to close"));
     // 寬度要容得下最長那行：popup 雖然會換行，但把一條規則折成兩段仍然難讀
-    // 100 而不是 84：全域鍵那一行加入翻頁鍵之後變長（切片 C），窄一點就會被
-    // popup 折成兩段——把一條規則折半仍然難讀。畫面不足 100 欄時 `popup`
-    // 自己會夾回去並改走換行
+    // 118 而不是 100：全域鍵那一行先後加入翻頁鍵與 `/`／`s`（切片 C），窄一點
+    // 就會被 popup 折成兩段。畫面不足這個寬度時 `popup` 自己會夾回去並換行
     popup(
         f,
-        100,
+        118,
         lines.len() as u16 + 2,
         "keys (current selection)",
         lines,
@@ -1068,7 +1170,10 @@ mod tests {
             // 每一列各自的舊式 tag（**不共用**）：共用的話 B2 修正輪 H2 的
             // 重複偵測會把它們全判成 invalid，這份 fixture 想要的是 legacy
             spawn_tag: format!("t1-{name}"),
-            registered_at: "2026-08-01T00:00:00Z".to_string(),
+            // 比 fixture 的 task `created_at` 早一天：切片 C 的掛載判準是
+            // **嚴格晚於** registered_at（同秒＝不可證），註冊時間與第一筆
+            // task 撞在同一秒的話，內嵌 task 列會整條消失
+            registered_at: "2026-07-31T00:00:00Z".to_string(),
             spawned,
             corrupt: false,
             // P4.7 切片 A：lineage 兩欄對這些 fixture 無關（None＝欄位缺席）
@@ -1077,8 +1182,28 @@ mod tests {
         }
     }
 
+    /// 測試用：由 task-id 前綴反推 ISO `created_at`（真實資料裡兩者同源，
+    /// **不一致是例外**——那條例外由 `attachment_needs_...` 專門驗）。
+    fn iso_from_id(id: &str) -> String {
+        let s: Vec<char> = id.chars().take(16).collect();
+        if s.len() < 16 {
+            return String::new();
+        }
+        let g = |a: usize, b: usize| -> String { s[a..b].iter().collect() };
+        format!(
+            "{}-{}-{}T{}:{}:{}Z",
+            g(0, 4),
+            g(4, 6),
+            g(6, 8),
+            g(9, 11),
+            g(11, 13),
+            g(13, 15)
+        )
+    }
+
     fn task(id: &str, to: &str, status: &str) -> InFlight {
         InFlight {
+            created_at: iso_from_id(id),
             id: id.to_string(),
             from: "boss".to_string(),
             to: to.to_string(),
@@ -1184,6 +1309,16 @@ mod tests {
         tweak(&mut model, &mut app);
         let mut t = Terminal::new(TestBackend::new(w, h)).unwrap();
         t.draw(|f| render(f, &model, &live, &blockers, &app, fresh))
+            .unwrap();
+        t.backend().buffer().clone()
+    }
+
+    /// blocker 快照也由呼叫端指定（copy-mode banner 的三態要各驗一次）。
+    fn draw_blockers(bl: BlockerIndex, tweak: impl FnOnce(&mut App)) -> Buffer {
+        let (model, live, _, mut app) = fixture();
+        tweak(&mut app);
+        let mut t = Terminal::new(TestBackend::new(120, 40)).unwrap();
+        t.draw(|f| render(f, &model, &live, &bl, &app, Freshness::default()))
             .unwrap();
         t.backend().buffer().clone()
     }
@@ -1382,7 +1517,7 @@ mod tests {
             "非 focus 面板的標題被邊框色壓暗了"
         );
         // 非 focus 面板的邊框仍應暗（TASKS 的左上角）
-        let tasks_top = layout(Rect::new(0, 0, 120, 40), 1).tasks.top();
+        let tasks_top = layout(Rect::new(0, 0, 120, 40), 1, 0).tasks.top();
         assert_eq!(
             buf[(0, tasks_top)].style().fg,
             Some(Color::DarkGray),
@@ -1395,7 +1530,7 @@ mod tests {
     fn focused_panel_is_distinguishable_from_the_rest() {
         let buf = draw();
         // TASKS 非 focus：左上角是細框且邊框色 DarkGray
-        let tasks_top = layout(Rect::new(0, 0, 120, 40), 1).tasks.top();
+        let tasks_top = layout(Rect::new(0, 0, 120, 40), 1, 0).tasks.top();
         let tasks_corner = &buf[(0, tasks_top)];
         assert_eq!(tasks_corner.symbol(), "┌");
         assert_eq!(tasks_corner.style().fg, Some(Color::DarkGray));
@@ -1583,6 +1718,9 @@ mod tests {
         assert!(t.contains("global:"), "`?` 頁缺全域區");
         assert!(t.contains("current row:"), "`?` 頁缺當前列區");
         assert!(t.contains("Tab/S-Tab panes"), "全域區缺換欄鍵");
+        // 新鍵 MUST 出現在唯一的鍵位正本上（畫面沒列出來的鍵等於不存在）
+        assert!(t.contains("/ filter"), "全域區缺 `/`");
+        assert!(t.contains("S scope"), "全域區缺 `S`");
         assert!(t.contains("Enter focus pane"), "當前列區缺該列的鍵");
         // 兩區的內容隨選中列換（TASKS 欄不該還印 worker 列那一套）
         let t = text(&draw_with(|a| {
@@ -1726,11 +1864,12 @@ mod tests {
         );
 
         // 說不出世代的列（fixture 的 worker 是 legacy 形狀：有 spawn_tag、
-        // 兩欄缺席）→ `-`，MUST NOT 畫出只有自己一節的假 breadcrumb
+        // 兩欄缺席）→ `(standalone)`（切片 C：與組標頭同一個字面），
+        // MUST NOT 畫出只有自己一節的假 breadcrumb
         let plain = detail_lines(&draw());
         assert!(
-            plain.iter().any(|l| l.contains("lineage: -")),
-            "legacy 列 MUST 誠實寫 `-`，實際：{plain:#?}"
+            plain.iter().any(|l| l.contains("lineage: (standalone)")),
+            "legacy 列 MUST 與組標頭同字面，實際：{plain:#?}"
         );
         assert!(
             !plain.iter().any(|l| l.contains("lineage: alive-w")),
@@ -1819,6 +1958,201 @@ mod tests {
         );
     }
 
+    // ── P4.7 切片 C：filter 提示列／scope／copy-mode banner ────────────
+
+    /// filter 生效時畫面要說得出「現在還篩著」，且空結果的兩種原因分得開。
+    #[test]
+    fn the_filter_says_it_is_on_and_why_the_panel_is_empty() {
+        // 輸入模式：畫游標塊
+        let t = text(&draw_with(|a| {
+            a.filter_input = true;
+            a.filter.query = "ali".into();
+        }));
+        assert!(t.contains("/ali\u{2588}"), "輸入模式 MUST 畫游標塊：\n{t}");
+
+        // 生效但不在輸入中：說得出目前篩的是什麼
+        let t = text(&draw_with(|a| a.filter.query = "ali".into()));
+        assert!(t.contains("filter: ali"), "MUST 顯示目前的 filter：\n{t}");
+
+        // 空結果：MUST 說是被篩掉的，而不是「沒有 worker」——後者按什麼都沒用，
+        // 前者按 Esc 就回得來
+        let t = text(&draw_with(|a| a.filter.query = "zzzz".into()));
+        assert!(t.contains("(no rows match the filter)"), "實際：\n{t}");
+        assert!(
+            !t.contains("(no workers registered)"),
+            "篩空 MUST NOT 說成沒註冊：\n{t}"
+        );
+    }
+
+    /// filter 生效時，組標頭的括號數字算**畫得出來的**那些。
+    #[test]
+    fn a_group_header_counts_only_the_rows_it_still_has() {
+        let root = "root-1-aaaaaaaaaaaa";
+        let buf = draw_model_with(|m, app| {
+            m.workers = vec![
+                lin("root", "%1", root, root, None),
+                lin("kid", "%2", "kid-2-bbbbbbbbbbbb", root, Some(root)),
+            ];
+            m.tasks.clear();
+            m.groups = crate::model::group_by_lineage(&m.workers);
+            app.filter.query = "kid".into();
+        });
+        let t = text(&buf);
+        assert!(t.contains("lineage root (1)"), "MUST 算可見的那些：\n{t}");
+        assert!(!t.contains("lineage root (2)"));
+    }
+
+    /// TASKS 標題帶 scope，且 Unattached 的空畫面說的是「都掛上了」而不是
+    /// 「沒有任務」——那是兩件不同的事。
+    #[test]
+    fn the_tasks_panel_shows_its_scope() {
+        let t = text(&draw());
+        assert!(t.contains("[all]"), "預設 scope MUST 在標題上：\n{t}");
+        let t = text(&draw_with(|a| a.scope = crate::model::Scope::Unattached));
+        assert!(t.contains("[unattached]"), "實際：\n{t}");
+        assert!(
+            t.contains("(every task is attached to a worker)"),
+            "空 Unattached MUST 說得出原因：\n{t}"
+        );
+
+        // **一筆任務都沒有時 MUST NOT 說「全部都掛上了」**（修正輪 R2／F5）：
+        // 全新 pool 切到 Unattached 就會踩到——那句話宣稱了一件沒有證據的事
+        let t = text(&draw_model_with(|m, a| {
+            m.recent = Vec::new();
+            a.scope = crate::model::Scope::Unattached;
+        }));
+        assert!(t.contains("(no recent tasks)"), "實際：\n{t}");
+        assert!(
+            !t.contains("(every task is attached"),
+            "空 pool MUST NOT 宣稱全部掛好了：\n{t}"
+        );
+    }
+
+    /// **Unattached 的歷史 task 被選中時，畫面 MUST NOT 認領當代同名 worker**
+    /// （修正輪 R2／F3）。
+    ///
+    /// 舊寫法（`worker_idx(&task.to)` 純名字比對）會讓 DETAIL 長出當代 pane／
+    /// blocker、footer 提示 `i`、`c` 的 payload 帶當代 pane——而同一筆 task 在
+    /// WORKERS 欄明明沒有掛在它底下。同一張畫面兩個答案。
+    #[test]
+    fn an_unattached_task_never_borrows_the_current_worker() {
+        let buf = draw_model_with(|m, app| {
+            // occl-w 於 2026-08-02 才註冊；這筆 task 是前一天建立的
+            m.workers = vec![AgentSnapshot {
+                registered_at: "2026-08-02T00:00:00Z".to_string(),
+                ..worker("occl-w", "%5", "codex", "s:@1", true)
+            }];
+            m.groups = crate::model::group_by_lineage(&m.workers);
+            m.tasks.clear();
+            m.recent = vec![task("20260801T000000Z-aaaa", "occl-w", "running")];
+            app.panel = Panel::Tasks;
+            app.task_idx = 0;
+        });
+        let d = detail_lines(&buf);
+        let joined = d.join("\n");
+        assert!(
+            joined.contains("task-id: 20260801T000000Z-aaaa"),
+            "DETAIL 仍投影這筆 task：{d:#?}"
+        );
+        assert!(
+            !joined.contains("pane   : %5") && !joined.contains("pane   : "),
+            "MUST NOT 借用當代 worker 的 pane：{d:#?}"
+        );
+        let t = text(&buf);
+        assert!(
+            !t.contains("i info"),
+            "footer MUST NOT 提示 `i`（沒有可證的 worker）：\n{t}"
+        );
+        // occl-w 在 copy-mode（fixture 的 %5），但這筆 task 不屬於它 → 無 banner
+        assert!(
+            !t.contains("[info] "),
+            "MUST NOT 替無主 task 畫別人的 copy-mode banner：\n{t}"
+        );
+    }
+
+    /// **copy-mode banner 的三態**（切片 C）：`pane_in_mode` 回 true → 有；
+    /// 回 false → 無；查不到（unknown）→ **無**（查不出就不宣稱）。
+    #[test]
+    fn the_copy_mode_banner_follows_the_three_state_snapshot() {
+        let word = "occluded (copy-mode: a human is reading)";
+        // Some(true)：occl-w（%5）在 copy-mode
+        let t = text(&draw_with(|a| a.row_idx = ROW_OCCL_W));
+        assert!(t.contains("[info] 'occl-w' is"), "MUST 有 banner：\n{t}");
+        assert!(t.contains(word), "措辭 MUST 沿用 blocker_word 家族：\n{t}");
+        // Some(false)：dead-w（%2）查得到、沒有 blocker
+        let t = text(&draw_with(|a| a.row_idx = ROW_DEAD_W));
+        assert!(!t.contains("[info] "), "非 copy-mode MUST 無 banner：\n{t}");
+        // None：整層查不到 → unknown
+        let t = text(&draw_blockers(BlockerIndex::unknown(), |a| {
+            a.row_idx = ROW_OCCL_W
+        }));
+        assert!(
+            !t.contains("[info] "),
+            "unknown MUST NOT 宣稱有人在看：\n{t}"
+        );
+    }
+
+    /// **bounded 斷言**：banner 只讀快照，render 路徑一個 tmux 呼叫都不發。
+    ///
+    /// 用計數假件證明：先讓 `BlockerIndex::query` 走一輪（計數會動），之後畫
+    /// 20 幀，計數 MUST 一格都不動。畫面每 500ms 重繪，render 一旦能發查詢
+    /// 就等於無界地打 tmux（§4 bounded-read 硬條款）。
+    #[test]
+    fn rendering_the_banner_never_touches_tmux() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        struct CountingTmux(AtomicUsize);
+        impl ab_core::tmux::TmuxClient for CountingTmux {
+            fn exec(&self, _a: &[&str]) -> Option<ab_core::tmux::TmuxOutput> {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                None
+            }
+            fn available(&self) -> bool {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                true
+            }
+            fn resolve_pane(&self, _t: &str) -> Option<String> {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                None
+            }
+            fn pane_exists(&self, _p: &str) -> bool {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                true
+            }
+            fn capture_pane(&self, _p: &str) -> Option<String> {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                None
+            }
+            fn pane_in_mode(&self, _p: &str) -> Option<bool> {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                Some(true)
+            }
+            fn send_keys(&self, _p: &str, _k: &str) -> bool {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                false
+            }
+        }
+        let tmux = CountingTmux(AtomicUsize::new(0));
+        let (model, live, _, mut app) = fixture();
+        app.row_idx = ROW_OCCL_W;
+        // 快照在**背景 worker 那一側**取得（這一步當然要打 tmux）
+        let bl = BlockerIndex::query(&tmux, &["%5".to_string()]);
+        let after_query = tmux.0.load(Ordering::SeqCst);
+        assert!(after_query > 0, "取快照本來就會打 tmux（對照組）");
+
+        let mut t = Terminal::new(TestBackend::new(120, 40)).unwrap();
+        for _ in 0..20 {
+            t.draw(|f| render(f, &model, &live, &bl, &app, Freshness::default()))
+                .unwrap();
+        }
+        assert_eq!(
+            tmux.0.load(Ordering::SeqCst),
+            after_query,
+            "render 路徑 MUST NOT 發任何 tmux 呼叫"
+        );
+        // 而且 banner 真的畫出來了（否則這條會在「什麼都沒畫」時假綠）
+        assert!(text(t.backend().buffer()).contains("[info] 'occl-w' is"));
+    }
+
     /// **gate (b) render 面**：Legacy／Manual／Invalid 三型都畫在 `(standalone)`
     /// 底下，且 MUST NOT 生出自己的 lineage 標頭——「說不出組別」與「屬於某一
     /// 組」是兩件事，畫面不得把前者演成後者。
@@ -1862,9 +2196,10 @@ mod tests {
         });
         m.groups = crate::model::group_by_lineage(&m.workers);
         // 列 0/1＝lineage 兩員（前面 1 個標頭）、列 2＝solo（前面 2 個標頭）
-        assert_eq!(worker_line_of(&m, 0), 1);
-        assert_eq!(worker_line_of(&m, 1), 2);
-        assert_eq!(worker_line_of(&m, 2), 4);
+        let nof = crate::model::Filter::default();
+        assert_eq!(worker_line_of(&m, &nof, 0), 1);
+        assert_eq!(worker_line_of(&m, &nof, 1), 2);
+        assert_eq!(worker_line_of(&m, &nof, 2), 4);
     }
 
     // ---- P4.6 切片 C：scrollbar／N-total／freshness ----
@@ -1889,7 +2224,7 @@ mod tests {
     /// TASKS 面板的位置（版面計算與 render 共用同一份 `layout`——fixture 的
     /// app 帶 1 則警告，footer 高度要跟著算）。
     fn tasks_area() -> Rect {
-        layout(Rect::new(0, 0, 120, 40), 1).tasks
+        layout(Rect::new(0, 0, 120, 40), 1, 0).tasks
     }
 
     /// 捲軸畫在中欄最右那一欄（TASKS 面板的右框上）。**只掃 TASKS 那幾列**：
@@ -1983,6 +2318,19 @@ mod tests {
         }));
         assert!(t.contains("TASKS 0/0"), "空清單的標題");
         assert!(!t.contains("TASKS 0/0+"), "0/0+ 是最無稽的那一種宣稱");
+
+        // 切片 C：filter 與 Unattached scope 各自都是**子集合**，全 pool 的
+        // 截斷旗標不得貼到它們的數字上（F5 的前半條）
+        let t = text(&draw_model_with(|m, a| {
+            with_tasks(6, true)(m, a);
+            a.filter.query = "20260801".into();
+        }));
+        assert!(!t.contains("+ ["), "篩選後的數字 MUST NOT 帶 `+`：\n{t}");
+        let t = text(&draw_model_with(|m, a| {
+            with_tasks(6, true)(m, a);
+            a.scope = crate::model::Scope::Unattached;
+        }));
+        assert!(!t.contains("+ ["), "非 All scope MUST NOT 帶 `+`：\n{t}");
     }
 
     /// 兩軸都有成功樣本的正常態。
@@ -2123,6 +2471,23 @@ mod tests {
     #[test]
     fn every_chrome_surface_is_english_only() {
         assert_no_cjk(&draw(), "dashboard");
+        // 切片 C 的兩條新 chrome：filter 提示列與 copy-mode banner
+        assert_no_cjk(
+            &draw_with(|a| {
+                a.filter_input = true;
+                a.filter.query = "ali".into();
+            }),
+            "filter prompt",
+        );
+        assert_no_cjk(
+            &draw_with(|a| a.filter.query = "zzzz".into()),
+            "filter empty",
+        );
+        assert_no_cjk(&draw_with(|a| a.row_idx = ROW_OCCL_W), "copy-mode banner");
+        assert_no_cjk(
+            &draw_with(|a| a.scope = crate::model::Scope::Unattached),
+            "unattached scope",
+        );
         assert_no_cjk(&draw_with(|a| a.help = true), "? keys page");
         assert_no_cjk(
             &draw_with(|a| a.confirm = Some("20260801T000000Z-aaaa".into())),

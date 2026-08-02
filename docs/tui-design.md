@@ -99,8 +99,20 @@ CLI 才是介面；任何 TUI 能做的事，人離開 TUI 都做得到。
 | `s` | send 任務給選中 worker | `agent-bridge send <name> --from <me> …` | 建立性 |
 | `x` | cancel 選中 task 列 | `agent-bridge cancel <task-id>` | ✔ 單確認，綁 immutable task id |
 | `e` | evict 選中 worker | `agent-bridge evict <name> --expect-pane <pane> --expect-generation <tag>` | ✔ 證據框＋CAS |
+| `/` | filter（**literal**：regex metachar 一律當字面字元；Enter 保留、Esc 清空） | — | —（純顯示面） |
+| `S` | 切 TASKS 欄的 scope（`all` ⇄ `unattached`） | — | —（純顯示面。**大寫**是因為小寫 `s` 已被本表保留給 send；同一鍵兩種語意正是 contextual footer 要消滅的漂移） |
 | `?` | 顯示**當前選中項**的合法鍵 | — | — |
 | `q` | 離開 | — | — |
+
+**`unattached` 的判準（P4.7 切片 C）**：task 掛在某個 worker 上，當且僅當
+`task.to == worker.name` 且 metadata `created_at` **嚴格晚於** registry
+`registered_at`（兩側都以 `parse_iso_to_epoch` 解析，任一側解析不出＝不可證＝
+不掛）。`unattached`＝沒有任何 registry 列掛得上的 task。
+**同秒＝不可證**：磁碟時戳只到整秒，「新 worker 先註冊、同秒派任務」與「舊 task
+先建立、同秒 respawn 同名 worker」在資料上無法區分；契約禁止的是後者
+（「同名 respawn 不自動附掛歷史 task」），故一律 fail-closed。代價是
+`register` 後同一秒派出的任務會暫時落在 `unattached`——那是**可見且可恢復**的
+（切 scope 就看得到），而錯誤歸屬是靜默的。不為此重開磁碟 schema（已裁定）。
 
 **`c` 的複製後端（v1 定案）**：寫入 **tmux buffer**（`set-buffer`），不引入
 clipboard crate、不依賴 OSC52／Wayland；人要出 tmux 世界自己 `paste-buffer`。

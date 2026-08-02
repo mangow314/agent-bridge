@@ -633,6 +633,15 @@ pub struct InFlight {
     pub from: String,
     pub to: String,
     pub status: String,
+    /// metadata 的 `created_at`（ISO 8601 UTC）。**這是記憶體 read model 的
+    /// 欄位，不是磁碟 schema 的新欄位**——metadata 本來就有它，這裡只是把它
+    /// 一起讀進來。缺失／讀不到＝空字串（呼叫端 fail-closed）。
+    ///
+    /// 為什麼 TUI 的歸屬判定要用它而不是 task-id 前綴：id 前綴只是 created_at
+    /// 的衍生副本，兩者不保證一致（測試 fixture 就有一份不一致的）。同一份
+    /// read model 對「這個 task 幾點生的」不該有兩套答案——`gc` 那條路徑
+    /// （本檔 `created_at` vs 目錄 mtime）早就選過同一邊。
+    pub created_at: String,
 }
 
 /// in-flight（非終態）任務的唯讀快照（TUI read model，tui-design.md §4）。
@@ -671,6 +680,7 @@ pub fn in_flight(paths: &Paths) -> Vec<InFlight> {
             from: json::jq_raw_field(&fields, "from").unwrap_or_default(),
             to: json::jq_raw_field(&fields, "to").unwrap_or_default(),
             status: st,
+            created_at: json::jq_raw_field(&fields, "created_at").unwrap_or_default(),
         });
     }
     // task-id 以時間戳起首，字典序＝時間序，畫面因此穩定
@@ -733,6 +743,7 @@ pub fn recent_tasks(paths: &Paths, limit: usize) -> Recent {
             from: json::jq_raw_field(&fields, "from").unwrap_or_default(),
             to: json::jq_raw_field(&fields, "to").unwrap_or_default(),
             status: st,
+            created_at: json::jq_raw_field(&fields, "created_at").unwrap_or_default(),
         });
     }
     Recent {
@@ -1390,6 +1401,67 @@ mod tests {
             assert_eq!((t.from.as_str(), t.to.as_str()), ("alice", "bob"));
             assert!(matches!(t.status.as_str(), "queued" | "running"));
         }
+    }
+
+    /// **`created_at` 的磁碟→read-model 管線**（P4.7 切片 C 修正輪 F6）。
+    ///
+    /// 兩條 loader（`in_flight`／`recent_tasks`）各自填這個欄位，而上層
+    /// （TUI 的歸屬判定）拿它當**唯一**的同世代證據。沒有這條斷言的話，任一
+    /// 條 loader 哪天誤填成空字串，所有既有測試照樣全綠——真畫面上的症狀是
+    /// 「每一筆 task 都掉進 Unattached」，而那看起來只是 scope 的行為。
+    #[test]
+    fn created_at_flows_from_metadata_into_both_read_models() {
+        let d = Dir::new("ab-core-created-at");
+        let paths = test_paths(&d);
+        let id = create_task(
+            &paths,
+            "alice",
+            "bob",
+            &MessageSource::Text("x".into()),
+            false,
+        )
+        .unwrap();
+        // 期望值直接取自磁碟上的 metadata（不是測試自己造一個時間）
+        let meta = std::fs::read_to_string(task_dir(&paths, &id).join("metadata.json")).unwrap();
+        let Ok(Value::Object(fields)) = json::parse(&meta) else {
+            panic!("metadata 應該是 JSON 物件");
+        };
+        let want = json::jq_raw_field(&fields, "created_at").unwrap_or_default();
+        assert!(!want.is_empty(), "create_task 本來就會寫 created_at");
+        assert!(
+            crate::time::parse_iso_to_epoch(&want).is_some(),
+            "寫出來的形狀 MUST 解析得回去（上層的 fail-closed 靠它）"
+        );
+
+        let rows = in_flight(&paths);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].created_at, want, "in_flight MUST 原樣帶入");
+        let rec = recent_tasks(&paths, 100);
+        assert_eq!(rec.tasks.len(), 1);
+        assert_eq!(rec.tasks[0].created_at, want, "recent_tasks MUST 原樣帶入");
+
+        // 對照組：metadata 沒有這個欄位（`seed_task` 就不寫）→ 空字串。
+        // 上層據此 fail-closed（不可證＝不掛），而不是拿一個假時間去比
+        seed_task(&paths, "20260731T000009Z-0009", "queued", None);
+        let seeded = |t: &InFlight| t.id == "20260731T000009Z-0009";
+        let rows = in_flight(&paths);
+        assert!(
+            rows.iter()
+                .find(|t| seeded(t))
+                .unwrap()
+                .created_at
+                .is_empty(),
+            "欄位缺失 MUST 是空字串"
+        );
+        let rec = recent_tasks(&paths, 100);
+        assert!(
+            rec.tasks
+                .iter()
+                .find(|t| seeded(t))
+                .unwrap()
+                .created_at
+                .is_empty()
+        );
     }
 
     /// payload byte 保真：非 UTF-8 位元組原樣進出，不得 lossy 轉換（分組 6）。

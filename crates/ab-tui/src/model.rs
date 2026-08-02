@@ -53,10 +53,10 @@ impl Model {
         }
     }
 
-    /// worker 名 → `workers` 索引（TASKS 欄的列要回頭找所屬 worker）。
-    pub fn worker_idx(&self, name: &str) -> Option<usize> {
-        self.workers.iter().position(|w| w.name == name)
-    }
+    // `worker_idx(name)`（純名字 → 索引）在切片 C 修正輪 F3 之後**刪掉**：
+    // 它是「task 屬於誰」這個判定的舊入口，而名字不是身分（同名 respawn 是
+    // 新的一代、同名多列是壞資料）。唯一的入口是 `worker_of_task`
+    // ——留著一個沒人用的名字比對，下一個人就會又拿它去接一條捷徑
 }
 
 /// worker 的 origin 標籤：spawned 且有 owner 欄→其字面值；manual→`-`；
@@ -328,6 +328,12 @@ pub fn group_by_lineage(workers: &[AgentSnapshot]) -> Vec<Group> {
     out
 }
 
+/// 「說不出世代」的畫面字面（**組標頭與 DETAIL 共用同一份**，切片 C）。
+///
+/// 同一件事在兩個位置寫成兩種樣子（`-` 與 `(standalone)`），人得自己猜它們
+/// 是不是同一回事——那是畫面在製造問題，不是在回答問題。
+pub const STANDALONE_LABEL: &str = "(standalone)";
+
 /// 一組的畫面標籤。
 ///
 /// **display-only 的 tag 剖析**（契約允許的那條界線）：禁止的是拿 name 做
@@ -338,7 +344,7 @@ pub fn group_by_lineage(workers: &[AgentSnapshot]) -> Vec<Group> {
 /// tag 的 name 段＋世代短碼＋`†`（墓碑）。
 pub fn group_label(model: &Model, g: &Group) -> String {
     let GroupKey::Lineage(key) = &g.key else {
-        return "(standalone)".to_string();
+        return STANDALONE_LABEL.to_string();
     };
     if let Some(w) = model
         .workers
@@ -972,6 +978,146 @@ pub fn window_detail(live: &LiveIndex, label: &str) -> String {
     }
 }
 
+/// `/` 的畫面過濾（P4.7 切片 C）。**純 UI 狀態**：不進 registry、不發任何
+/// 查詢，只決定哪幾列畫得出來。
+///
+/// **literal substring、case-insensitive，沒有 regex／glob**：查詢 `a.c` 不得
+/// 命中 `abc`。理由與 §4 matcher 收窄同一條——這是給人用的即時篩選，不是
+/// 給人寫小程式的地方；引入 regex 就得回答「不合法的 pattern 怎麼辦」「災難性
+/// 回溯怎麼辦」，而那兩題在一個每 500ms 重畫的面板上沒有好答案。
+#[derive(Clone, Default, PartialEq, Eq, Debug)]
+pub struct Filter {
+    /// 查詢字串（空＝停用）。**原樣保存**，比對時才降大小寫
+    pub query: String,
+}
+
+impl Filter {
+    pub fn is_active(&self) -> bool {
+        !self.query.is_empty()
+    }
+
+    /// literal substring（case-insensitive）。停用時一律命中。
+    pub fn matches(&self, hay: &str) -> bool {
+        if !self.is_active() {
+            return true;
+        }
+        hay.to_lowercase().contains(&self.query.to_lowercase())
+    }
+}
+
+/// TASKS 欄的 scope（P4.7 切片 C）。`All` 是現行語意（全 pool）。
+#[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
+pub enum Scope {
+    #[default]
+    All,
+    /// **沒有任何 registry 列**可證明掛得上去的 task（見 `attached`）
+    Unattached,
+}
+
+impl Scope {
+    pub fn toggled(self) -> Self {
+        match self {
+            Scope::All => Scope::Unattached,
+            Scope::Unattached => Scope::All,
+        }
+    }
+
+    /// footer／面板標題的字面（chrome 全英文）
+    pub fn label(self) -> &'static str {
+        match self {
+            Scope::All => "all",
+            Scope::Unattached => "unattached",
+        }
+    }
+}
+
+/// 這個 task 掛得上這一列 worker 嗎（P4.7 切片 C 的**單一事實源**）。
+///
+/// 判準：`task.to == w.name` **且** task 的 `created_at` **嚴格晚於**該 agent 的
+/// `registered_at`。
+///
+/// **為什麼是嚴格 `>`**（修正輪 R2／F1）：磁碟上的時戳只到整秒（`now_iso`），
+/// 所以「同一秒」同時涵蓋兩個真實順序，資料本身分不出來——
+/// (a) worker 先註冊、同秒被派任務（該掛）；
+/// (b) 舊 task 先建立、同秒有人 respawn 了同名 worker（**不得掛**）。
+/// §9 契約逐字禁止的是後者（「同名 respawn 不自動附掛歷史 task」、「僅由當前
+/// 同世代證據**可唯一連結**者入組」），也就是 false positive。而 false negative
+/// 是**可見且可恢復**的：那筆 task 就躺在 Unattached scope 裡，人一眼看得到；
+/// false positive 則是靜默的錯誤歸屬。兩害相權取可見的那個。
+///
+/// 代價照實記：`register` 之後**同一秒**立刻派出的任務會暫時落在 Unattached。
+/// 秒級精度是磁碟契約給的上限，不為了這個重開 schema（已裁定）。
+///
+/// **為什麼是 metadata 的 `created_at` 而不是 task-id 前綴**（修正輪 R1）：
+/// 語意上 `created_at` 就是「這個任務何時建立」，id 前綴只是它的衍生副本，
+/// 而兩者**不保證一致**——分組 41 的 fixture 就有一份 id 寫 `00:41:41`、
+/// `created_at` 寫 `04:41:42` 的任務。同一份 read model 對「這個 task 幾點
+/// 生的」不該有兩套答案；`gc` 的年齡判定早就選過同一邊（`task.rs` 的
+/// 「用 metadata 的 created_at 而不是目錄 mtime……created_at 是這個任務自己
+/// 的事實」）。
+///
+/// 為什麼判準只能是時戳：task metadata 是與 bash 逐字對齊的 CLI 契約
+/// （`version/task_id/from/to/created_at/updated_at/working_directory/status`），
+/// 不得為了畫面加欄；registry 也不回填。時戳因此是現有資料裡**唯一**的同世代
+/// 證據。
+///
+/// **任一側解析不出＝不可證＝不掛**（fail-closed）。解析走
+/// `ab_core::time::parse_iso_to_epoch`——它驗 separator 位置**並做曆日
+/// round-trip**（`2026-99-99T…`／`2026-02-31T…` 一律 `None`）。自己寫一份
+/// 「刪掉 `-` 與 `:` 再數位數」的骨架檢查，等於讓 fail-closed 這個保證變成假的
+/// （修正輪 R2／F2）。
+pub fn attached(task: &InFlight, w: &AgentSnapshot) -> bool {
+    if task.to != w.name {
+        return false;
+    }
+    match (
+        ab_core::time::parse_iso_to_epoch(&task.created_at),
+        ab_core::time::parse_iso_to_epoch(&w.registered_at),
+    ) {
+        (Some(t), Some(r)) => t > r,
+        _ => false,
+    }
+}
+
+/// 這一筆 task 說得出唯一的 worker 嗎（修正輪 R2／F3 的**單一事實源**）。
+///
+/// 回 `Some(index)` **只在恰好一列** `attached()` 成立時。0 筆＝無主
+/// （Unattached scope 看得到的那些）、>1 筆＝registry 自相矛盾（同名多列），
+/// 兩者都回 `None`。
+///
+/// 為什麼不能用 `worker_idx(&task.to)`（純名字比對，切片 C 之前的寫法）：
+/// 那會讓 Unattached 的歷史 task 一被選中就「認領」當代的同名 worker——DETAIL
+/// 顯示當代 pane／blocker、`i` 按得動、`c` 的 payload 帶當代 pane，而畫面上
+/// 同一筆 task 在 WORKERS 欄明明沒有掛在它底下。同名多列時 `position()` 還會
+/// 依檔序靜默選第一個，與「不從壞資料裡挑贏家」的裁定直接矛盾。
+pub fn worker_of_task(model: &Model, task: &InFlight) -> Option<usize> {
+    let mut hit = None;
+    for (wi, w) in model.workers.iter().enumerate() {
+        if attached(task, w) {
+            if hit.is_some() {
+                return None; // >1：不任選
+            }
+            hit = Some(wi);
+        }
+    }
+    hit
+}
+
+/// 掛在這一列 worker 底下的 in-flight task（`model.tasks` 的索引）。
+///
+/// **三處走訪的唯一來源**（`worker_rows`／`worker_row_lines`／
+/// `group_line_offsets`）：切片 B1 的三份手抄條件在同名跨 lineage 時會雙掛，
+/// 而漂移的症狀是**靜默的**（選取列被推出畫面外，畫面照畫）。
+pub fn tasks_of(model: &Model, wi: usize) -> impl Iterator<Item = usize> + '_ {
+    let w = &model.workers[wi];
+    model
+        .tasks
+        .iter()
+        .enumerate()
+        .filter(move |(_, t)| attached(t, w))
+        .map(|(ti, _)| ti)
+}
+
 /// WORKERS 欄的一列：worker 列或其下的 in-flight task 列（§2 selection
 /// model：兩者皆可選取，task 列自帶 immutable task id）。值是 `Model`
 /// 內的索引，不複製資料。
@@ -1016,75 +1162,131 @@ pub fn row_key(model: &Model, row: Row) -> RowKey {
 /// 換算成「第幾行」（見 `group_line_offsets`／`worker_row_lines`），那是純函式。
 ///
 /// worker 依組序、組內依 snapshot 序（檔名字典序），task 依 id 序。
-pub fn worker_rows(model: &Model) -> Vec<Row> {
+///
+/// **`filter` 是同一趟走訪的一部分**（P4.7 切片 C）：過濾後的列序才是畫面上的
+/// 列序，selection／捲動／stable key 全部吃它。
+pub fn worker_rows(model: &Model, filter: &Filter) -> Vec<Row> {
     let mut rows = Vec::new();
-    for g in model.groups.iter() {
-        for &wi in &g.members {
-            rows.push(Row::Worker(wi));
-            for (ti, t) in model.tasks.iter().enumerate() {
-                if t.to == model.workers[wi].name {
-                    rows.push(Row::Task {
-                        worker: wi,
-                        task: ti,
-                    });
-                }
-            }
+    walk_workers(model, filter, |ev| {
+        if let WalkEvent::Row(r) = ev {
+            rows.push(r);
         }
-    }
+    });
     rows
 }
 
 /// 每一個 `worker_rows` 列在畫面上的**行號**（組標頭佔行不佔列）。
 ///
-/// 與 `worker_rows` 逐字同一個走訪順序——兩者一旦漂開，捲動就會把選取列推出
-/// 畫面外，而那是靜默的（畫面照畫，只是看不到游標）。
-pub fn worker_row_lines(model: &Model) -> Vec<usize> {
+/// 與 `worker_rows` 逐字同一個走訪順序——三處各抄一份條件是切片 B1 留下的
+/// 債（verifier 留言：同名跨 lineage 會雙掛），而漂移的症狀是**靜默的**
+/// （捲動把選取列推出畫面外，畫面照畫）。現在三者共用 `walk_workers`。
+pub fn worker_row_lines(model: &Model, filter: &Filter) -> Vec<usize> {
     let mut out = Vec::new();
     let mut line = 0usize;
-    for g in model.groups.iter() {
-        line += 1; // 組標頭：佔一行，不佔列
-        for &wi in &g.members {
+    walk_workers(model, filter, |ev| match ev {
+        WalkEvent::GroupHead(_) => line += 1,
+        WalkEvent::Row(_) => {
             out.push(line);
             line += 1;
-            for t in model.tasks.iter() {
-                if t.to == model.workers[wi].name {
-                    out.push(line);
-                    line += 1;
-                }
-            }
         }
-    }
+    });
     out
 }
 
 /// `rows` 索引 → 「在它之前要插入哪一組的標頭」（render 端畫標頭用）。
-pub fn group_line_offsets(model: &Model) -> HashMap<usize, usize> {
+///
+/// 過濾後**只有還有存活列的組**才有標頭：一個空組的標頭等於畫面上宣稱有
+/// 一組東西，而底下一列都沒有。
+pub fn group_line_offsets(model: &Model, filter: &Filter) -> HashMap<usize, usize> {
     let mut out = HashMap::new();
     let mut row = 0usize;
+    walk_workers(model, filter, |ev| match ev {
+        WalkEvent::GroupHead(gi) => {
+            out.insert(row, gi);
+        }
+        WalkEvent::Row(_) => row += 1,
+    });
+    out
+}
+
+/// 每一組**畫得出來的** worker 數（組標頭的括號數字）。
+///
+/// 過濾中要算可見的那些，不是 `members.len()`：標頭寫 `(6)` 而底下只有兩列，
+/// 是畫面在說一件與自己相矛盾的事。
+pub fn group_visible_members(model: &Model, filter: &Filter) -> HashMap<usize, usize> {
+    let mut out: HashMap<usize, usize> = HashMap::new();
+    let mut cur: Option<usize> = None;
+    walk_workers(model, filter, |ev| match ev {
+        WalkEvent::GroupHead(gi) => cur = Some(gi),
+        WalkEvent::Row(Row::Worker(_)) => {
+            if let Some(gi) = cur {
+                *out.entry(gi).or_default() += 1;
+            }
+        }
+        WalkEvent::Row(_) => {}
+    });
+    out
+}
+
+/// 走訪過程中吐出的東西：組標頭（佔行不佔列）與可選取列。
+enum WalkEvent {
+    GroupHead(usize),
+    Row(Row),
+}
+
+/// **WORKERS 欄走訪的單一事實源**：組序 → 組內 worker → 其 in-flight task。
+///
+/// 過濾語意（切片 C）：
+/// - worker 自己命中 → 它與**全部**交錯 task 都留（人是照著 worker 名字找的，
+///   找到之後把它的任務砍一半沒有道理）
+/// - worker 沒命中、但底下有 task 命中 → worker 列**必留**（否則畫面上會有
+///   一列沒有 worker 的孤兒 task），只留命中的那幾條
+/// - 兩者皆無 → 整個 worker 連同 task 都不畫
+/// - 組標頭只在該組還有存活 worker 列時才吐
+fn walk_workers(model: &Model, filter: &Filter, mut emit: impl FnMut(WalkEvent)) {
     for (gi, g) in model.groups.iter().enumerate() {
         // 空組不可達：`group_by_lineage` 只在有成員時才建組（lineage 組來自
-        // `entry().or_default().push()`，standalone 段有 `is_empty()` 閘）。
-        // 真的來了一個空組，這裡會讓兩組共用同一個 row key，標頭少畫一行
+        // `entry().or_default().push()`，standalone 段有 `is_empty()` 閘）
         debug_assert!(
             !g.members.is_empty(),
             "空組不可達（group_by_lineage 不產生）"
         );
-        out.insert(row, gi);
+        let mut head_done = false;
         for &wi in &g.members {
-            row += 1; // worker 列
-            row += model
-                .tasks
-                .iter()
-                .filter(|t| t.to == model.workers[wi].name)
-                .count();
+            let hit_worker = filter.matches(&model.workers[wi].name);
+            let tasks: Vec<usize> = tasks_of(model, wi)
+                .filter(|&ti| hit_worker || filter.matches(&task_hay(&model.tasks[ti])))
+                .collect();
+            if !hit_worker && tasks.is_empty() {
+                continue;
+            }
+            if !head_done {
+                emit(WalkEvent::GroupHead(gi));
+                head_done = true;
+            }
+            emit(WalkEvent::Row(Row::Worker(wi)));
+            for ti in tasks {
+                emit(WalkEvent::Row(Row::Task {
+                    worker: wi,
+                    task: ti,
+                }));
+            }
         }
     }
-    out
+}
+
+/// task 列的比對面：id／from／to／status 串接（欄位間一個空格）。
+///
+/// 為什麼四欄都進來：人記得的可能是任務 id 的尾碼、也可能是「誰派給誰」或
+/// 「還在 running 的那些」。**不含 worker 名字以外的推導**——這裡串的都是
+/// task 自己身上的欄位。
+pub fn task_hay(t: &InFlight) -> String {
+    format!("{} {} {} {}", t.id, t.from, t.to, t.status)
 }
 
 /// 選取列在畫面上的行號（列號＋它前面所有組標頭）。
-pub fn worker_line_of(model: &Model, row_idx: usize) -> usize {
-    worker_row_lines(model)
+pub fn worker_line_of(model: &Model, filter: &Filter, row_idx: usize) -> usize {
+    worker_row_lines(model, filter)
         .get(row_idx)
         .copied()
         .unwrap_or(row_idx)
@@ -1096,8 +1298,14 @@ pub fn worker_line_of(model: &Model, row_idx: usize) -> usize {
 /// 兩者一差，翻頁的落點就會**跳過**中間某些列——而且是永久跳過，那些列在
 /// 任何一頁上都不出現。這裡改成先換算成行號、位移一個 viewport，再挑
 /// 「行號跨過該位置的第一個／最後一個列」，翻頁於是與畫面逐行銜接。
-pub fn worker_page_row(model: &Model, row_idx: usize, page_lines: usize, down: bool) -> usize {
-    let lines = worker_row_lines(model);
+pub fn worker_page_row(
+    model: &Model,
+    filter: &Filter,
+    row_idx: usize,
+    page_lines: usize,
+    down: bool,
+) -> usize {
+    let lines = worker_row_lines(model, filter);
     if lines.is_empty() {
         return 0;
     }
@@ -1123,8 +1331,19 @@ pub fn worker_page_row(model: &Model, row_idx: usize, page_lines: usize, down: b
 ///
 /// 附帶效果：`recent_truncated` 的 `+` 恆為誠實的——那是**全 pool** 的旗標，
 /// 而這一欄現在也正是全 pool（P4.6 切片 C 的 F5 因此自然成立）。
-pub fn task_rows(model: &Model) -> Vec<usize> {
-    (0..model.recent.len()).collect()
+pub fn task_rows(model: &Model, filter: &Filter, scope: Scope) -> Vec<usize> {
+    (0..model.recent.len())
+        .filter(|&i| filter.matches(&task_hay(&model.recent[i])))
+        .filter(|&i| match scope {
+            Scope::All => true,
+            // Unattached＝**沒有任何一列** registry 證明得了它的歸屬。
+            // 注意這是全 registry 的判定，不是「當前這一組」——一個 task 只要
+            // 掛得上某一列，它就不是無主的
+            Scope::Unattached => {
+                !(0..model.workers.len()).any(|wi| attached(&model.recent[i], &model.workers[wi]))
+            }
+        })
+        .collect()
 }
 
 /// 終態判定（`x` 的合法目標判斷用）。權威字沿用 `spec/state.md`。
@@ -1221,8 +1440,28 @@ mod tests {
         format!("AGENT_BRIDGE_SPAWN_TAG=ab-spawn-{tag}")
     }
 
+    /// 測試用：由 task-id 前綴反推 ISO `created_at`（真實資料裡兩者同源，
+    /// **不一致是例外**——那條例外由 `attachment_needs_...` 專門驗）。
+    fn iso_from_id(id: &str) -> String {
+        let s: Vec<char> = id.chars().take(16).collect();
+        if s.len() < 16 {
+            return String::new();
+        }
+        let g = |a: usize, b: usize| -> String { s[a..b].iter().collect() };
+        format!(
+            "{}-{}-{}T{}:{}:{}Z",
+            g(0, 4),
+            g(4, 6),
+            g(6, 8),
+            g(9, 11),
+            g(11, 13),
+            g(13, 15)
+        )
+    }
+
     fn inflight(id: &str, to: &str) -> InFlight {
         InFlight {
+            created_at: iso_from_id(id),
             id: id.to_string(),
             from: "alice".to_string(),
             to: to.to_string(),
@@ -1266,7 +1505,7 @@ mod tests {
         );
         assert_eq!(model.groups[1].key, GroupKey::Standalone);
         assert_eq!(
-            worker_rows(&model),
+            worker_rows(&model, &Filter::default()),
             vec![
                 Row::Worker(0),
                 Row::Task { worker: 0, task: 1 },
@@ -1340,6 +1579,7 @@ mod tests {
                 ),
             ],
             vec![InFlight {
+                created_at: "2026-07-31T00:00:09Z".into(),
                 id: "20260731T000009Z-zzzz".into(),
                 from: "A".into(),
                 to: "C".into(),
@@ -1567,6 +1807,408 @@ mod tests {
         assert_eq!(model.groups[1].members, vec![1], "invalid 列 standalone");
     }
 
+    // ── P4.7 切片 C：filter／scope／掛載判準 ───────────────────────────
+
+    /// 帶 `registered_at` 的一列（切片 C 的掛載判準吃的就是它）
+    fn at(mut w: AgentSnapshot, registered_at: &str) -> AgentSnapshot {
+        w.registered_at = registered_at.to_string();
+        w
+    }
+
+    fn task_to(id: &str, to: &str) -> InFlight {
+        InFlight {
+            created_at: iso_from_id(id),
+            id: id.to_string(),
+            from: "alice".into(),
+            to: to.to_string(),
+            status: "running".into(),
+        }
+    }
+
+    /// **`/` 是 literal，不是 regex**（gate (d)）。metachar 一律當普通字元：
+    /// 查 `a.c` 不得命中 `abc`——這是「有沒有偷偷接上 regex 引擎」的判準，
+    /// 而不是風格偏好（接上去就得回答不合法 pattern 與災難性回溯怎麼辦）。
+    #[test]
+    fn the_filter_is_literal_and_case_insensitive() {
+        let f = |q: &str| Filter { query: q.into() };
+        assert!(f("w1").matches("p4w1x"), "substring");
+        assert!(f("W1").matches("p4w1x"), "case-insensitive");
+        assert!(f("P4").matches("p4w1x"));
+        assert!(Filter::default().matches("anything"), "停用時一律命中");
+
+        // 負向：metachar 逐一驗（`.` `*` `[` `?` ＋常見的其餘幾個）
+        assert!(!f("a.c").matches("abc"), "`.` MUST NOT 當萬用字元");
+        assert!(!f("a*c").matches("ac"), "`*` MUST NOT 當重複");
+        assert!(!f("a*c").matches("abbbc"));
+        assert!(!f("[ab]").matches("a"), "`[]` MUST NOT 當字元集");
+        assert!(!f("a?c").matches("ac"), "`?` MUST NOT 當可選");
+        assert!(!f("a+").matches("aaa"), "`+` MUST NOT 當重複");
+        assert!(!f("a|b").matches("a"), "`|` MUST NOT 當交替");
+        assert!(!f("^a").matches("abc"), "`^` MUST NOT 當行首");
+        assert!(!f("c$").matches("abc"), "`$` MUST NOT 當行尾");
+        assert!(!f("(a)").matches("a"), "`()` MUST NOT 當群組");
+        assert!(!f("a\\d").matches("a1"), "`\\d` MUST NOT 當字元類");
+        // 反過來：metachar 真的出現在字串裡時**必須**命中（它是字面）
+        assert!(f("a.c").matches("xa.cx"));
+        assert!(f("[ab]").matches("x[ab]y"));
+    }
+
+    /// **掛載判準**（切片 C 的單一事實源）：同名 respawn 不承接歷史 task。
+    #[test]
+    fn attachment_needs_same_name_and_a_later_stamp() {
+        let w = at(snap("w1", true, "s:@1"), "2026-07-31T12:00:00Z");
+
+        // (a) 同世代：task 在 registered_at 之後 → 掛
+        assert!(attached(&task_to("20260731T130000Z-aaaa", "w1"), &w));
+        // **邊界：同一秒＝不可證＝不掛**（修正輪 R2／F1）。這不是筆誤：磁碟
+        // 時戳只到整秒，「先註冊後派任務」與「先建立 task 後 respawn 同名
+        // worker」在同一秒裡分不出來，而契約禁止的是後者那種 false positive。
+        // 代價（register 後同秒派的任務暫時落 Unattached）是可見且可恢復的
+        assert!(
+            !attached(&task_to("20260731T120000Z-aaaa", "w1"), &w),
+            "同秒歧義 MUST fail-closed"
+        );
+        // (b) 同名 respawn：task 早於這一代的 registered_at → 不掛
+        assert!(
+            !attached(&task_to("20260731T110000Z-aaaa", "w1"), &w),
+            "早於 registered_at 的 task 屬於前一代"
+        );
+        // (c) 時戳壞（兩側各一種）→ 不可證＝不掛（fail-closed）
+        assert!(!attached(&task_to("not-a-stamp-xxxx", "w1"), &w));
+        // `created_at` 缺失／壞形狀（修正輪 R1）：欄位讀不到就是空字串
+        let mut no_created = task_to("20260731T130000Z-aaaa", "w1");
+        no_created.created_at = String::new();
+        assert!(!attached(&no_created, &w), "created_at 缺失 → 不掛");
+        let mut bad_created = task_to("20260731T130000Z-aaaa", "w1");
+        bad_created.created_at = "31/07/2026 13:00".into();
+        assert!(!attached(&bad_created, &w), "created_at 壞形狀 → 不掛");
+
+        // **解析是真的解析**（修正輪 R2／F2）：非法曆日、separator 錯位、
+        // 長度對但內容不是日期——一律不可證。自己寫的「刪掉 `-` `:` 再數位數」
+        // 骨架檢查會把這些全部放行，fail-closed 因此只是看起來成立
+        for bad in [
+            "2026-00-00T00:00:00Z",      // 月／日為 0
+            "2026-99-99T99:99:99Z",      // 全部超界
+            "2026-02-31T12:00:00Z",      // 曆日不存在（round-trip 才抓得到）
+            "2026:07:31T12-00-00Z",      // separator 位置錯
+            "2026-07-31T12:00:00+08:00", // 帶 offset：不是本工具寫得出的形狀
+        ] {
+            let bad_w = at(snap("w1", true, ""), bad);
+            assert!(
+                !attached(&task_to("20260731T130000Z-aaaa", "w1"), &bad_w),
+                "registered_at 「{bad}」MUST 解析不出 → 不掛"
+            );
+            let mut bad_t = task_to("20260731T130000Z-aaaa", "w1");
+            bad_t.created_at = bad.into();
+            assert!(!attached(&bad_t, &w), "created_at 「{bad}」同理");
+        }
+
+        // **判準是 `created_at`，不是 task-id 前綴**（修正輪 R1 的回歸鎖）。
+        // 真實 fixture 有兩者不一致的（分組 41：id 寫 00:41:41、created_at 寫
+        // 04:41:42），拿 id 當證據會把它判成前朝遺物、內嵌 task 列整條消失。
+        let mut late_created = task_to("20260731T004141Z-41cc", "w1");
+        late_created.created_at = "2026-07-31T13:00:00Z".into();
+        assert!(
+            attached(&late_created, &w),
+            "id 前綴早於註冊、但 created_at 晚於註冊 → **掛**"
+        );
+        let mut early_created = task_to("20260731T230000Z-zzzz", "w1");
+        early_created.created_at = "2026-07-31T09:00:00Z".into();
+        assert!(
+            !attached(&early_created, &w),
+            "id 前綴晚於註冊、但 created_at 早於註冊 → **不掛**"
+        );
+        assert!(
+            !attached(
+                &task_to("20260731T130000Z-aaaa", "w1"),
+                &at(snap("w1", true, ""), "")
+            ),
+            "legacy／人工註冊沒有 registered_at → 落 Unattached"
+        );
+        assert!(!attached(
+            &task_to("20260731T130000Z-aaaa", "w1"),
+            &at(snap("w1", true, ""), "31/07/2026 12:00")
+        ));
+        // (d) 名字不同 → 不掛（世代再新也不是它的）
+        assert!(!attached(&task_to("20260731T130000Z-aaaa", "w2"), &w));
+    }
+
+    /// **task → worker 只在唯一可證時才成立**（修正輪 R2／F3）。
+    ///
+    /// 0 筆與 >1 筆都回 `None`：前者是無主任務（Unattached 看得到的那些），
+    /// 後者是 registry 自相矛盾——兩種都不得靜默認領一個當代同名 worker。
+    #[test]
+    fn a_task_binds_to_a_worker_only_when_exactly_one_can_claim_it() {
+        let cur = at(snap("w1", true, "s:@1"), "2026-07-31T12:00:00Z");
+        let model = model_of(vec![cur], Vec::new());
+        // 恰一筆
+        assert_eq!(
+            worker_of_task(&model, &task_to("20260731T130000Z-aaaa", "w1")),
+            Some(0)
+        );
+        // 0 筆：歷史 task（早於這一代註冊）→ 不得認領當代的同名 worker
+        assert_eq!(
+            worker_of_task(&model, &task_to("20260731T110000Z-aaaa", "w1")),
+            None,
+            "Unattached 的歷史 task MUST NOT 認領當代 worker"
+        );
+        // 0 筆：收件人根本不在 registry
+        assert_eq!(
+            worker_of_task(&model, &task_to("20260731T130000Z-aaaa", "gone")),
+            None
+        );
+        // >1 筆：registry 自相矛盾（同名兩列，兩列都掛得上）→ 不挑贏家
+        let dup = model_of(
+            vec![
+                at(snap("w1", true, "s:@1"), "2026-07-31T10:00:00Z"),
+                at(snap("w1", true, "s:@2"), "2026-07-31T11:00:00Z"),
+            ],
+            Vec::new(),
+        );
+        assert_eq!(
+            worker_of_task(&dup, &task_to("20260731T130000Z-aaaa", "w1")),
+            None,
+            "同名多列 MUST NOT 依檔序靜默選第一個"
+        );
+    }
+
+    /// TASKS scope：`Unattached` 只列**沒有任何一列**證明得了歸屬的 task。
+    #[test]
+    fn the_unattached_scope_lists_only_what_nobody_can_claim() {
+        let mut model = model_of(
+            vec![
+                at(snap("w1", true, "s:@1"), "2026-07-31T12:00:00Z"),
+                at(snap("w2", true, "s:@1"), "2026-07-31T12:00:00Z"),
+            ],
+            Vec::new(),
+        );
+        model.recent = vec![
+            task_to("20260731T130000Z-aaaa", "w1"),   // 掛得上 w1
+            task_to("20260731T110000Z-bbbb", "w1"),   // 前一代的 w1 → 無主
+            task_to("20260731T130000Z-cccc", "gone"), // 收件人已不在 registry
+            task_to("20260731T130000Z-dddd", "w2"),   // 掛得上 w2
+        ];
+        let all = task_rows(&model, &Filter::default(), Scope::All);
+        assert_eq!(all, vec![0, 1, 2, 3], "All＝全 pool（現行語意）");
+        assert_eq!(
+            task_rows(&model, &Filter::default(), Scope::Unattached),
+            vec![1, 2],
+            "Unattached＝證不出歸屬的那些"
+        );
+        // filter 與 scope 是兩個獨立的軸，疊起來要都成立
+        assert_eq!(
+            task_rows(
+                &model,
+                &Filter {
+                    query: "cccc".into()
+                },
+                Scope::Unattached
+            ),
+            vec![2]
+        );
+        assert_eq!(Scope::All.toggled(), Scope::Unattached);
+        assert_eq!(Scope::Unattached.toggled(), Scope::All);
+    }
+
+    /// **三處走訪必須逐字一致**（verifier B1 留言）：`worker_rows`／
+    /// `worker_row_lines`／`group_line_offsets` 曾各自手抄一份 `t.to == name`，
+    /// 同名跨 lineage 時會雙掛，而漂移的症狀是靜默的（選取列被推出畫面外）。
+    ///
+    /// fixture 刻意含**同名兩列**：兩條 lineage 各有一個叫 `dup` 的 worker，
+    /// 舊的那一代註冊得早。這種資料只在 registry 自相矛盾時可達（一名一檔），
+    /// 但正是它會讓三處走訪漂開，所以測試要造得出來。`attached()` 至少擋掉
+    /// 「歷史 task 上新一代」，其餘照裁定兩列都顯示。
+    #[test]
+    fn the_three_row_walks_never_drift() {
+        let ra = "ra-1-aaaaaaaaaaaa";
+        let rb = "rb-1-bbbbbbbbbbbb";
+        let old = at(lin("dup", ra, Some(ra), None), "2026-07-31T10:00:00Z");
+        let new = at(lin("dup", rb, Some(rb), None), "2026-07-31T20:00:00Z");
+        let other = at(
+            lin("solo", "s-2-cccccccccccc", Some(ra), Some(ra)),
+            "2026-07-31T10:00:00Z",
+        );
+        let model = model_of(
+            vec![old, other, new],
+            vec![
+                task_to("20260731T110000Z-aaaa", "dup"), // 舊那一代的
+                task_to("20260731T210000Z-bbbb", "dup"), // 新那一代的
+                task_to("20260731T110000Z-cccc", "solo"),
+            ],
+        );
+        // **filter 開／關兩種狀態各驗一次**（修正輪 R2／F4）：`worker_row_lines`
+        // 是 `worker_line_of`（捲動）與 `worker_page_row`（翻頁）唯一的行號
+        // 來源，先前兩個呼叫點都只餵 `Filter::default()`，過濾生效下那條路徑
+        // 一條斷言都沒有
+        for f in [
+            Filter::default(),
+            Filter {
+                query: "dup".into(),
+            },
+        ] {
+            let rows = worker_rows(&model, &f);
+            let lines = worker_row_lines(&model, &f);
+            let heads = group_line_offsets(&model, &f);
+            assert_eq!(rows.len(), lines.len(), "列數必須一致（filter={f:?}）");
+            assert!(
+                lines.windows(2).all(|w| w[0] < w[1]),
+                "行號必須嚴格遞增（filter={f:?}）"
+            );
+            assert_eq!(
+                lines.last().copied().unwrap_or(0) + 1,
+                rows.len() + heads.len(),
+                "總行數＝列數＋組標頭數（filter={f:?}）"
+            );
+            for (&row, _) in heads.iter() {
+                assert!(
+                    matches!(rows.get(row), Some(Row::Worker(_))),
+                    "標頭 MUST 落在某個 worker 列之前（filter={f:?}, row={row}）"
+                );
+            }
+            // 行號換算的兩個消費者也吃同一份：選中最後一列時，`worker_line_of`
+            // 回的必須就是 `lines` 的最後一項
+            let last = rows.len() - 1;
+            assert_eq!(
+                worker_line_of(&model, &f, last),
+                lines[last],
+                "worker_line_of MUST 與走訪同源（filter={f:?}）"
+            );
+        }
+        let f = Filter::default();
+        let rows = worker_rows(&model, &f);
+        let lines = worker_row_lines(&model, &f);
+        let heads = group_line_offsets(&model, &f);
+        assert_eq!(rows.len(), lines.len(), "列數必須一致");
+
+        // **歷史 task 不上新一代**（`attached()` 修掉的那一半）：11:00 那筆只
+        // 掛在 10:00 註冊的舊 dup 底下，不會出現在 20:00 註冊的新 dup 底下
+        let under = |wi: usize| -> Vec<usize> {
+            rows.iter()
+                .filter_map(|r| match r {
+                    Row::Task { worker, task } if *worker == wi => Some(*task),
+                    _ => None,
+                })
+                .collect()
+        };
+        assert_eq!(under(2), vec![1], "新一代只收得到自己註冊之後的 task");
+        assert!(
+            !under(2).contains(&0),
+            "同名 respawn MUST NOT 承接歷史 task"
+        );
+        // **同名多列時兩邊都顯示——這是裁定過的行為，不是缺口**（修正輪 R2）。
+        // 21:00 那筆同時晚於兩代的 `registered_at`，逐對判準對兩列都成立。
+        //
+        // 為什麼不收斂成「取 registered_at 最大的那一列」：`registry::snapshot`
+        // 一名一檔（`agents/<name>.json`），正常 respawn 是**同路徑覆寫**，
+        // 只會有一列。同名兩列只在 registry 被手改成自相矛盾時可達——在那種
+        // 資料上挑一個贏家，等於從壞資料裡靜默選邊；兩列都顯示，人才看得出
+        // registry 有問題
+        assert_eq!(
+            under(0),
+            vec![0, 1],
+            "同名多列時 MUST 兩列都顯示，不靜默挑一個"
+        );
+        // 行號嚴格遞增，且每一組標頭恰佔一行
+        assert!(lines.windows(2).all(|w| w[0] < w[1]), "行號必須嚴格遞增");
+        assert_eq!(
+            lines.last().copied().unwrap_or(0) + 1,
+            rows.len() + heads.len(),
+            "總行數＝列數＋組標頭數"
+        );
+        // 標頭落點必須是某一列的位置，且該列是 worker 列（組的第一個成員）
+        for (&row, _) in heads.iter() {
+            assert!(
+                matches!(rows.get(row), Some(Row::Worker(_))),
+                "標頭 MUST 落在某個 worker 列之前（row={row}）"
+            );
+        }
+    }
+
+    /// filter 的連動語意：worker 命中→其 task 全留；task 命中→其 worker 必留；
+    /// 都沒命中→整個 worker 消失；組標頭只在該組還有列時才畫。
+    #[test]
+    fn filtering_keeps_workers_and_their_tasks_together() {
+        let root = "root-1-aaaaaaaaaaaa";
+        let model = model_of(
+            vec![
+                at(lin("alpha", root, Some(root), None), "2026-07-31T00:00:00Z"),
+                at(
+                    lin("beta", "b-2-bbbbbbbbbbbb", Some(root), Some(root)),
+                    "2026-07-31T00:00:00Z",
+                ),
+                at(manual("gamma"), "2026-07-31T00:00:00Z"),
+            ],
+            vec![
+                task_to("20260731T010000Z-aaaa", "alpha"),
+                task_to("20260731T010000Z-bbbb", "alpha"),
+                task_to("20260731T010000Z-cccc", "beta"),
+            ],
+        );
+        // (a) worker 命中 → 它的兩筆 task 都留
+        let rows = worker_rows(
+            &model,
+            &Filter {
+                query: "alpha".into(),
+            },
+        );
+        assert_eq!(
+            rows,
+            vec![
+                Row::Worker(0),
+                Row::Task { worker: 0, task: 0 },
+                Row::Task { worker: 0, task: 1 },
+            ]
+        );
+        // standalone 組整組消失 → 它的標頭也不畫
+        let heads = group_line_offsets(
+            &model,
+            &Filter {
+                query: "alpha".into(),
+            },
+        );
+        assert_eq!(heads.len(), 1, "只剩一組有列，就只有一個標頭");
+        // (b) task 命中 → 它的 worker 列必留（不得有孤兒 task 列），
+        //     且**只留命中的那一筆**
+        let rows = worker_rows(
+            &model,
+            &Filter {
+                query: "cccc".into(),
+            },
+        );
+        assert_eq!(rows, vec![Row::Worker(1), Row::Task { worker: 1, task: 2 }]);
+        // (c) 都沒命中 → 空（DETAIL 端由 `Sel::None` 接手，見 app 層測試）
+        assert!(
+            worker_rows(
+                &model,
+                &Filter {
+                    query: "zzz".into()
+                }
+            )
+            .is_empty()
+        );
+        assert!(
+            group_line_offsets(
+                &model,
+                &Filter {
+                    query: "zzz".into()
+                }
+            )
+            .is_empty()
+        );
+        // (d) 標頭的括號數字算**畫得出來的**那些
+        let vis = group_visible_members(
+            &model,
+            &Filter {
+                query: "beta".into(),
+            },
+        );
+        assert_eq!(
+            vis.get(&0).copied(),
+            Some(1),
+            "組有兩員，畫得出來的只有一員"
+        );
+    }
+
     // ── DETAIL breadcrumb（P4.7 切片 B2）＋B6 防護矩陣 ──────────────────
     //
     // 主力放這一層：breadcrumb 是純函式，render 只投影（view.rs 抽樣驗字面）。
@@ -1636,6 +2278,7 @@ mod tests {
         // （`InFlight` 沒有 `Clone`，兩欄各寫一份——不為了測試動 ab-core 的
         // 公開型別，同 writer5 對 `AgentSnapshot` 的權衡）
         let temptation = || InFlight {
+            created_at: "2026-07-31T00:00:09Z".into(),
             id: "20260731T000009Z-zzzz".into(),
             from: "B".into(),
             to: "C".into(),
@@ -2030,7 +2673,10 @@ mod tests {
             // 它的任務正是人最想找回來的東西）
             inflight("20260731T000002Z-bbbb", "gone"),
         ];
-        assert_eq!(task_rows(&model), vec![0, 1]);
+        assert_eq!(
+            task_rows(&model, &Filter::default(), Scope::All),
+            vec![0, 1]
+        );
         assert!(is_terminal_status("completed") && is_terminal_status("cancelled"));
         assert!(!is_terminal_status("running"));
     }

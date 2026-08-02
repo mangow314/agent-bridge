@@ -120,6 +120,8 @@ impl Pager {
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Key {
     Char(char),
+    /// filter 輸入模式的退格（P4.7 切片 C）。命令模式下沒有語意
+    Backspace,
     Tab,
     /// `Shift+Tab`（crossterm 的 `KeyCode::BackTab`）：反向面板循環
     BackTab,
@@ -232,6 +234,14 @@ pub struct App {
     pub message: String,
     /// 各面板可視高度（PgUp／PgDn 的一頁），每幀由 run loop 回填
     pub pages: PageSizes,
+    /// `/` 的畫面過濾（P4.7 切片 C）。純 UI 狀態：只決定哪幾列畫得出來，
+    /// 不進 registry、不發查詢
+    pub filter: crate::model::Filter,
+    /// 正在輸入 filter：這個模式下**所有** `Key::Char` 都進緩衝區，不再當
+    /// 命令鍵——否則打一個 `q` 就把 dashboard 關掉了
+    pub filter_input: bool,
+    /// TASKS 欄的 scope（`s` 切換）。預設 `All`＝現行語意
+    pub scope: crate::model::Scope,
 }
 
 impl App {
@@ -251,6 +261,9 @@ impl App {
             warnings: Vec::new(),
             message: String::new(),
             pages: PageSizes::default(),
+            filter: crate::model::Filter::default(),
+            filter_input: false,
+            scope: crate::model::Scope::default(),
         }
     }
 
@@ -335,7 +348,7 @@ impl App {
     }
 
     pub fn rows(&self, model: &Model) -> Vec<Row> {
-        worker_rows(model)
+        worker_rows(model, &self.filter)
     }
 
     pub fn selected_row(&self, model: &Model) -> Option<Row> {
@@ -344,7 +357,7 @@ impl App {
 
     /// TASKS 欄的列（`model.recent` 的索引，含終態）。
     pub fn task_rows(&self, model: &Model) -> Vec<usize> {
-        task_rows(model)
+        task_rows(model, &self.filter, self.scope)
     }
 
     /// 當前聚焦面板的選中項（DETAIL 與 `r`／`i`／`c` 共用的單一入口，
@@ -359,12 +372,19 @@ impl App {
                 },
                 None => Sel::None,
             },
+            // TASKS 欄的列**沒有** `Row` 那種確切綁定（它是全 pool 的平坦
+            // 列表），所以這裡要現場判「這筆 task 說得出唯一的 worker 嗎」。
+            // 走 `worker_of_task`（＝`attached()`）而不是純名字比對：後者會讓
+            // Unattached 的歷史 task 一被選中就認領當代的同名 worker，DETAIL
+            // 於是顯示當代 pane／blocker、`i` 按得動、`c` 帶當代 pane
+            // （修正輪 R2／F3）
             Panel::Tasks => match self.task_rows(model).get(self.task_idx) {
                 Some(&ti) => {
                     let task = &model.recent[ti];
                     Sel::Task {
                         task,
-                        worker: model.worker_idx(&task.to).map(|wi| &model.workers[wi]),
+                        worker: crate::model::worker_of_task(model, task)
+                            .map(|wi| &model.workers[wi]),
                     }
                 }
                 None => Sel::None,
@@ -503,6 +523,32 @@ fn dispatch_key(app: &mut App, model: &Model, key: Key) -> Effect {
         app.info = None; // 任意鍵關閉（沿用 help overlay 的慣例）
         return Effect::None;
     }
+    // `/` 的輸入模式（P4.7 切片 C）。**攔截順序刻意排在 overlay 之後**：
+    // 確認框／pager／摘要頁是模態的，它們在的時候連 `/` 都不該進來。
+    //
+    // 進來之後所有 `Key::Char` 都是內容（含 `/` 自己）——把 `q`／`x` 留成命令
+    // 鍵的話，打字打到一半就會把 dashboard 關掉或開出一個 cancel 確認框。
+    if app.filter_input {
+        match key {
+            Key::Char(c) => app.filter.query.push(c),
+            // Backspace 目前不在 `Key` 列舉裡（crossterm 端也還沒對映），
+            // 退格走的是這一條：見 `Key::Backspace`
+            Key::Backspace => {
+                app.filter.query.pop();
+            }
+            // Enter＝收工但**保留** filter（人要的是「篩完之後開始操作」）
+            Key::Enter => app.filter_input = false,
+            // Esc＝取消：清空並離開（filter 是唯一被清掉的東西，警告不動）
+            Key::Esc => {
+                app.filter.query.clear();
+                app.filter_input = false;
+            }
+            _ => {}
+        }
+        // 列數變了：把選取夾回範圍內（走既有的 relocate／stable key 路徑）
+        app.relocate(model);
+        return Effect::None;
+    }
     if app.help {
         app.help = false; // 任意鍵關閉
         return Effect::None;
@@ -523,6 +569,23 @@ fn dispatch_key(app: &mut App, model: &Model, key: Key) -> Effect {
         }
         Key::Char('?') => {
             app.help = true;
+            Effect::None
+        }
+        // `/`：進 filter 輸入模式（P4.7 切片 C）。**不清掉既有查詢**——再按一次
+        // `/` 是「繼續編輯剛才那條」，要清空按 Esc
+        Key::Char('/') => {
+            app.filter_input = true;
+            Effect::None
+        }
+        // `S`：切 TASKS 欄的 scope（all ⇄ unattached）。純顯示面，不動任何資料。
+        //
+        // **為什麼是大寫**：§3 鍵位表把小寫 `s` 保留給 send（建立性動作，尚未
+        // 實作但從未撤回）。拿它當 scope 切換等於「文件說按 s 會 send、按下去
+        // 卻翻 scope」——那正是 contextual footer 要消滅的漂移
+        Key::Char('S') => {
+            app.scope = app.scope.toggled();
+            app.message = format!("tasks scope: {}", app.scope.label());
+            app.relocate(model);
             Effect::None
         }
         // 兩欄循環（DETAIL 不可聚焦：它只是選中項的投影）。
@@ -742,6 +805,8 @@ fn page_move(app: &App, down: bool) -> Move {
 }
 
 fn move_sel(app: &mut App, model: &Model, mv: Move) {
+    // 翻頁要換算行號，而行號吃的是**過濾後**的列（借出 `app` 之前先複製一份）
+    let filter = app.filter.clone();
     let (idx, len) = match app.panel {
         Panel::Workers => {
             let n = app.rows(model).len();
@@ -760,7 +825,7 @@ fn move_sel(app: &mut App, model: &Model, mv: Move) {
     let cur = match mv {
         Move::By(d) => *idx as i64 + d,
         Move::Page { lines, down } => {
-            crate::model::worker_page_row(model, *idx, lines, down) as i64
+            crate::model::worker_page_row(model, &filter, *idx, lines, down) as i64
         }
         Move::First => 0,
         Move::Last => len as i64 - 1,
@@ -822,13 +887,199 @@ mod tests {
         })
     }
 
+    /// 測試用：由 task-id 前綴反推 ISO `created_at`（真實資料裡兩者同源，
+    /// **不一致是例外**——那條例外由 `attachment_needs_...` 專門驗）。
+    fn iso_from_id(id: &str) -> String {
+        let s: Vec<char> = id.chars().take(16).collect();
+        if s.len() < 16 {
+            return String::new();
+        }
+        let g = |a: usize, b: usize| -> String { s[a..b].iter().collect() };
+        format!(
+            "{}-{}-{}T{}:{}:{}Z",
+            g(0, 4),
+            g(4, 6),
+            g(6, 8),
+            g(9, 11),
+            g(11, 13),
+            g(13, 15)
+        )
+    }
+
     fn task(id: &str, to: &str, status: &str) -> InFlight {
         InFlight {
+            created_at: iso_from_id(id),
             id: id.into(),
             from: "alice".into(),
             to: to.into(),
             status: status.into(),
         }
+    }
+
+    // ── P4.7 切片 C：filter 輸入模式與 scope ─────────────────────────
+
+    /// `/` 進輸入模式之後，**所有** `Key::Char` 都是內容。
+    ///
+    /// 這條鎖的是最容易踩的那個坑：把 `q`／`x` 留成命令鍵的話，打字打到一半
+    /// 就會關掉 dashboard 或開出一個 cancel 確認框。
+    #[test]
+    fn filter_input_swallows_command_keys() {
+        let m = model();
+        let mut app = App::new();
+        assert_eq!(handle_key(&mut app, &m, Key::Char('/')), Effect::None);
+        assert!(app.filter_input, "`/` MUST 進輸入模式");
+        for c in ['q', 'x', 'w', '1', '/'] {
+            assert_eq!(
+                handle_key(&mut app, &m, Key::Char(c)),
+                Effect::None,
+                "輸入模式中 '{c}' MUST NOT 觸發任何副作用"
+            );
+        }
+        assert_eq!(app.filter.query, "qxw1/", "含 `/` 本身都是內容");
+        assert!(app.confirm.is_none(), "`x` MUST NOT 開確認框");
+        // Backspace 退一格
+        handle_key(&mut app, &m, Key::Backspace);
+        assert_eq!(app.filter.query, "qxw1");
+        // Enter：離開輸入模式但**保留** filter
+        handle_key(&mut app, &m, Key::Enter);
+        assert!(!app.filter_input);
+        assert_eq!(app.filter.query, "qxw1");
+        // 離開之後 `q` 又是命令鍵
+        assert_eq!(handle_key(&mut app, &m, Key::Char('q')), Effect::Quit);
+    }
+
+    /// Esc 在輸入模式＝清空並離開；再按 `/` 是接著編輯（不自動清空）。
+    #[test]
+    fn esc_clears_the_filter_and_slash_resumes_editing() {
+        let m = model();
+        let mut app = App::new();
+        handle_key(&mut app, &m, Key::Char('/'));
+        handle_key(&mut app, &m, Key::Char('w'));
+        handle_key(&mut app, &m, Key::Esc);
+        assert!(!app.filter_input);
+        assert_eq!(app.filter.query, "", "Esc MUST 清空");
+
+        handle_key(&mut app, &m, Key::Char('/'));
+        handle_key(&mut app, &m, Key::Char('w'));
+        handle_key(&mut app, &m, Key::Enter);
+        handle_key(&mut app, &m, Key::Char('/'));
+        assert_eq!(app.filter.query, "w", "再按 `/` MUST NOT 清掉既有查詢");
+    }
+
+    /// filter 篩到一列都不剩：DETAIL 落 `Sel::None`，導航鍵不 panic。
+    #[test]
+    fn an_empty_filter_result_selects_nothing_and_never_panics() {
+        let m = model();
+        let mut app = App::new();
+        handle_key(&mut app, &m, Key::Char('/'));
+        for c in "zzz".chars() {
+            handle_key(&mut app, &m, Key::Char(c));
+        }
+        handle_key(&mut app, &m, Key::Enter);
+        assert!(app.rows(&m).is_empty());
+        assert!(app.task_rows(&m).is_empty());
+        assert!(matches!(app.selection(&m), Sel::None));
+        // 導航／動作鍵一律安全（空面板時 `move_sel` 直接返回）
+        for k in [
+            Key::Char('j'),
+            Key::Char('k'),
+            Key::Home,
+            Key::End,
+            Key::PageDown,
+            Key::PageUp,
+            Key::Char('x'),
+            Key::Char('e'),
+            Key::Char('r'),
+            Key::Enter,
+        ] {
+            handle_key(&mut app, &m, k);
+        }
+        assert!(matches!(app.selection(&m), Sel::None));
+    }
+
+    /// filter 生效時 selection 走的仍是既有的 stable key／`relocate` 路徑：
+    /// 篩掉選中列之後不得指到別人身上。
+    #[test]
+    fn filtering_reanchors_the_selection_through_the_stable_key() {
+        let m = model();
+        let mut app = App::new();
+        // 先選到 w2（列序：w1、w1 的 task、w2）
+        handle_key(&mut app, &m, Key::Char('j'));
+        handle_key(&mut app, &m, Key::Char('j'));
+        assert!(matches!(app.selection(&m), Sel::Worker(w) if w.name == "w2"));
+        // 篩掉 w2：選取必須落在還在的列上，而不是留著舊索引指向別人
+        handle_key(&mut app, &m, Key::Char('/'));
+        for c in "w1".chars() {
+            handle_key(&mut app, &m, Key::Char(c));
+        }
+        handle_key(&mut app, &m, Key::Enter);
+        assert!(app.rows(&m).iter().all(|r| !matches!(
+            r,
+            Row::Worker(wi) if m.workers[*wi].name == "w2"
+        )));
+        match app.selection(&m) {
+            Sel::Worker(w) => assert_eq!(w.name, "w1"),
+            Sel::Task { task, .. } => assert_eq!(task.to, "w1"),
+            Sel::None => panic!("還有列在，不該落 None"),
+        }
+    }
+
+    /// **無主 task 的 caps**（修正輪 R2／F3）：TASKS 欄選中一筆掛不上任何
+    /// worker 的 task 時，`Sel::Task.worker` MUST 是 `None`，`i` 也 MUST NOT
+    /// 可按——`row_caps` 是 footer 提示與 `dispatch_key` 的同一份正本，
+    /// 這裡一鬆，畫面就會提示一個按下去只會誤導人的鍵。
+    #[test]
+    fn an_unattached_task_has_no_worker_and_no_info() {
+        let mut m = model();
+        // w1 於 12:00 才註冊；這筆 task 是 11:00 建立的（前一代的）
+        m.workers[0].registered_at = "2026-07-31T12:00:00Z".into();
+        m.recent = vec![task("20260731T110000Z-aaaa", "w1", "running")];
+        m.tasks = vec![task("20260731T110000Z-aaaa", "w1", "running")];
+        let mut app = App::new();
+        app.panel = Panel::Tasks;
+        app.task_idx = 0;
+        match app.selection(&m) {
+            Sel::Task { task, worker } => {
+                assert_eq!(task.id, "20260731T110000Z-aaaa");
+                assert!(worker.is_none(), "MUST NOT 認領當代同名 worker");
+            }
+            _ => panic!("應該選中一筆 task"),
+        }
+        assert!(!row_caps(&app, &m).info, "`i` MUST NOT 可按");
+        // 按下去也只有訊息，不發任何 Effect
+        assert_eq!(handle_key(&mut app, &m, Key::Char('i')), Effect::None);
+
+        // 對照組：同一筆 task 換成 13:00 建立（晚於註冊）→ 掛得上，`i` 可按
+        m.recent = vec![task("20260731T130000Z-bbbb", "w1", "running")];
+        m.tasks = vec![task("20260731T130000Z-bbbb", "w1", "running")];
+        let mut app2 = App::new();
+        app2.panel = Panel::Tasks;
+        assert!(row_caps(&app2, &m).info, "掛得上時 `i` MUST 可按（對照組）");
+    }
+
+    /// `S` 切 TASKS scope（純顯示面：不動任何資料，也不影響 WORKERS 欄）。
+    /// 小寫 `s` MUST NOT 有作用——§3 把它保留給 send。
+    #[test]
+    fn shift_s_toggles_the_tasks_scope() {
+        let m = model();
+        let mut app = App::new();
+        assert_eq!(app.scope, crate::model::Scope::All);
+        let workers_before = app.rows(&m);
+        assert_eq!(handle_key(&mut app, &m, Key::Char('s')), Effect::None);
+        assert_eq!(
+            app.scope,
+            crate::model::Scope::All,
+            "小寫 s 是 §3 保留給 send 的鍵，不得成為 scope 切換"
+        );
+        assert_eq!(handle_key(&mut app, &m, Key::Char('S')), Effect::None);
+        assert_eq!(app.scope, crate::model::Scope::Unattached);
+        assert!(app.message.contains("unattached"), "實際：{}", app.message);
+        // fixture 的兩筆 recent 都掛得上 w1（時戳晚於 registered_at）→ 空
+        assert!(app.task_rows(&m).is_empty(), "Unattached 應為空");
+        assert_eq!(app.rows(&m), workers_before, "WORKERS 欄不受 scope 影響");
+        handle_key(&mut app, &m, Key::Char('S'));
+        assert_eq!(app.scope, crate::model::Scope::All);
+        assert_eq!(app.task_rows(&m).len(), 2);
     }
 
     /// `x` 的合法目標只有 task 列：worker 列上按 x 必須提示且不開確認框
@@ -1669,8 +1920,9 @@ mod tests {
     fn paging_across_group_headers_never_skips_a_row() {
         let m = lineages(9);
         // 行號：標頭 0、row0=1、標頭 2、row1=3、…、row_i = 2i+1
-        assert_eq!(crate::model::worker_line_of(&m, 0), 1);
-        assert_eq!(crate::model::worker_line_of(&m, 4), 9);
+        let nof = crate::model::Filter::default();
+        assert_eq!(crate::model::worker_line_of(&m, &nof, 0), 1);
+        assert_eq!(crate::model::worker_line_of(&m, &nof, 4), 9);
         let mut app = App::new();
         app.pages = pages(8, 8);
 
@@ -1700,7 +1952,7 @@ mod tests {
                 let m = lineages(n);
                 let mut app = App::new();
                 app.pages = pages(h, h);
-                let lines = crate::model::worker_row_lines(&m);
+                let lines = crate::model::worker_row_lines(&m, &crate::model::Filter::default());
                 assert_eq!(lines.len(), n, "每個單成員組恰一列");
                 let mut seen = vec![false; n];
                 // 每一頁看得到的列＝行號落在 [scroll, scroll+h) 的那些列

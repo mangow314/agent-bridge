@@ -180,7 +180,10 @@ pub fn info_page(
         "in-flight tasks:".to_string(),
     ];
     let mut any = false;
-    for t in model.tasks.iter().filter(|t| t.to == w.name) {
+    // **與 WORKERS 欄同一條判準**（修正輪 R2／F3）：純名字比對是第四處手抄，
+    // 它會讓 w1 於 20:00 respawn 之後，11:00 建立的舊 task 在 WORKERS 欄正確
+    // 地不掛、按 `i` 卻列得出來——同一張畫面兩個答案
+    for t in model.tasks.iter().filter(|t| crate::model::attached(t, w)) {
         // status 一律權威字，不縮寫不造詞
         lines.push(format!("  {}  {}", t.id, t.status));
         any = true;
@@ -507,6 +510,7 @@ mod tests {
 
     fn task(id: &str) -> ab_core::task::InFlight {
         ab_core::task::InFlight {
+            created_at: "2026-08-01T00:00:00Z".to_string(),
             id: id.to_string(),
             from: "alice".to_string(),
             to: "w1".to_string(),

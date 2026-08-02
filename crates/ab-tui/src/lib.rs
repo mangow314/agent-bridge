@@ -132,7 +132,13 @@ fn event_loop(
             })
             .map_err(|e| Error::new(format!("draw failed: {e}")))?;
         // 一頁多長只有版面知道：量到之後回填給狀態機（PgUp／PgDn 用）
-        app.pages = view::panel_heights(frame, app.warnings.len());
+        // footer 的額外行（filter 提示列／copy-mode banner）也吃版面：一頁
+        // 多長要與 render 算的是同一份，否則翻頁會差一行
+        app.pages = view::panel_heights(
+            frame,
+            app.warnings.len(),
+            view::footer_extra_rows(&model, &app, blockers_view),
+        );
         if selftest_panic {
             panic!("AB_TUI_SELFTEST_PANIC: test-triggered panic exit (terminal restore check)");
         }
@@ -456,6 +462,9 @@ fn translate(code: KeyCode) -> Option<Key> {
         KeyCode::PageDown => Some(Key::PageDown),
         KeyCode::Home => Some(Key::Home),
         KeyCode::End => Some(Key::End),
+        // filter 輸入模式的退格（P4.7 切片 C）。命令模式下 `dispatch_key`
+        // 沒有對應分支，等同無效鍵
+        KeyCode::Backspace => Some(Key::Backspace),
         _ => None,
     }
 }
