@@ -327,6 +327,9 @@ focus 跨 window 語意、CAS（cancel 綁 id）。
 
 ## 9. 驗收判準
 
+測試執行分級（phase 內 `TEST_GROUPS=<受影響分組>`；收案必跑全套）依
+`docs/testing-policy.md`——partial run 輸出不得作為收案證據。
+
 固定 fixture：12 worker／20 task／3 異常（1 **origin window 已消失的 worker**
 〔P4.7 前記為「dead owner」〕、1 blocked prompt、1 orphaned worker）。worker 分布
 在 3 個 spawn 來源 window——P4.7 B5 起 **owner 是物理位置不是歸屬軸**，它只出現
@@ -493,9 +496,10 @@ ISO parser 而 repo 早有 `parse_iso_to_epoch`、UI 端與取得路徑各截一
 以及**假件只證明得了我方送出去的東西**（`tail_args` 的 argv 測試綠著、而它
 斷言的 tmux 語意是錯的，直到真 tmux 分組 45 才釘住）。
 
-**Backlog（非相位項）**：`notify-failed` 的 `pane-gone` 桶混淆「tmux 查詢失敗」
-與「pane 真不存在」（codex sandbox 擋 tmux socket 時誤報 pane-gone，實例
-2026-08-01T13:03:58Z pane=%139 活著）——建議拆出 `query-failed` reason。
+**Backlog（非相位項）**：~~`notify-failed` 的 `pane-gone` 桶混淆「tmux 查詢
+失敗」與「pane 真不存在」——建議拆出 `query-failed` reason~~（**已完成
+2026-08-03**：HOOK-NOTIFY-4 值域五者，同批含 await blocker 探測
+CLI-AWAIT-3/4；動機實例 2026-08-01T13:03:58Z pane=%139 活著被記 pane-gone）。
 其餘：`group_label` 的 `?†` 分支無測試（既有缺口）；production 未設
 `panic::set_hook`，worker panic 訊息會直接印上 alternate screen（evict 路徑
 同病，非 P4.7 引入）；replay 的 `p4_key_ok()` allowlist 是 **P4 步數量測的
