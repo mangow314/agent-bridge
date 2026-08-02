@@ -177,13 +177,14 @@ fn pane_accepts_keys(
     match tmux.pane_in_mode(pane) {
         Some(false) => {}
         Some(true) => return Err(NotifyFailReason::CopyMode),
-        // mode 查不到＝tmux 查詢失敗／逾時／pane 已不在，fail-closed 同 capture 失敗
-        None => return Err(NotifyFailReason::PaneGone),
+        // mode 查不到＝tmux 查詢失敗／逾時，fail-closed；歸 query-failed 桶
+        // （pane 是否存在前面已驗過，這裡的 None 是查詢層失敗，不是 pane 不在）
+        None => return Err(NotifyFailReason::QueryFailed),
     }
     match tmux.capture_pane(pane) {
         Some(screen) if screen_has_prompt(&screen) => Err(NotifyFailReason::Prompt),
         Some(_) => Ok(()),
-        None => Err(NotifyFailReason::PaneGone),
+        None => Err(NotifyFailReason::QueryFailed),
     }
 }
 
@@ -193,10 +194,13 @@ fn pane_accepts_keys(
 /// 誰擋的分不出來。2026-08-01 那次 matcher 誤判調查最大的阻力就是這個缺口
 /// ——只能靠「哪些 runtime／哪些 cmd 失敗率高」的事後統計反推根因。
 ///
-/// 四個值是**分類桶**，不是關卡的一對一映射：`PaneGone` 同時吃下「pane 真的
-/// 不在」與「pane 狀態查不到」（無效 pane id、tmux 起不來、mode／capture 查詢
-/// 回 None）——兩者對呼叫端的處置相同（fail-closed，訊息留 mailbox），硬拆只會
-/// 讓消費端多分支卻分不出可行動的差別。
+/// 五個值是**分類桶**，不是關卡的一對一映射。原本 `PaneGone` 同時吃下
+/// 「pane 真的不在」與「pane 狀態查不到」；2026-08-03 拆出 `QueryFailed`：
+/// codex sandbox 擋 tmux socket 時查詢層整排失敗，全記 `pane-gone` 會把
+/// **活著的 pane** 誤報成消失（實例 2026-08-01T13:03:58Z pane=%139 活著），
+/// 事後分析與 await 的 blocker 探測都需要分開「暫時查不到（別當死亡證據）」
+/// 與「確認不在」。兩者對送鍵呼叫端的處置仍相同（fail-closed，訊息留
+/// mailbox）——拆的是**證據語意**，不是處置分支。
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum NotifyFailReason {
     /// pane 停在 tmux copy-mode（AB-COPYMODE-1）
@@ -209,8 +213,11 @@ pub enum NotifyFailReason {
     /// 根因，所以字面值 MUST 是 `send-keys-failed` 而不是 `-timeout`，
     /// 免得事後分析把「pane 剛好消失」誤讀成「tmux 卡住」。
     SendKeysFailed,
-    /// pane 不存在、pane id 非法、tmux 不可用，或 pane 狀態查不到
+    /// pane 確認不存在，或 pane id 非法（資料層壞掉，pane 實質不可用）
     PaneGone,
+    /// tmux 查詢層失敗（mode／capture 回 None、tmux 不可用）：pane 可能
+    /// 還活著，只是此刻查不到——MUST NOT 當成 pane 死亡的證據
+    QueryFailed,
 }
 
 impl NotifyFailReason {
@@ -221,7 +228,48 @@ impl NotifyFailReason {
             NotifyFailReason::Prompt => "prompt",
             NotifyFailReason::SendKeysFailed => "send-keys-failed",
             NotifyFailReason::PaneGone => "pane-gone",
+            NotifyFailReason::QueryFailed => "query-failed",
         }
+    }
+}
+
+/// await 的 blocker 探測結果（唯讀，不送鍵）。與 `NotifyFailReason` 分開：
+/// 這裡是「pane 現在處於什麼狀態」的觀測，不是「一次送鍵敗在哪」的事故分類。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum PaneBlocker {
+    /// 畫面正常，無阻塞跡象
+    Clear,
+    /// 停在 copy-mode——通常是人正在介入（捲動查看），不是卡死
+    CopyMode,
+    /// 停在權限／計畫確認框——無人值守時的黑洞來源
+    Prompt,
+    /// pane 確認不存在
+    Gone,
+    /// 查詢層失敗（tmux 不可用、mode／capture 回 None、pane id 非法）：
+    /// 此刻無法判定，呼叫端 MUST NOT 據此警告或歸零去抖計數
+    Unknown,
+}
+
+/// `agent-bridge await` 的週期性 blocker 探測（CLI-AWAIT-3：唯讀，只做 tmux
+/// 查詢，不寫檔、不寫事件、不送任何鍵）。重用送鍵防線同一套判定
+/// （`pane_in_mode`＋`capture_pane`＋`screen_has_prompt`），避免兩套 matcher
+/// 各自漂移。誤判防護（去抖、grace）是呼叫端的責任——本函式只回單次觀測。
+pub fn probe_blocker(tmux: &dyn TmuxClient, pane: &str) -> PaneBlocker {
+    if !is_valid_pane(pane) || !tmux.available() {
+        return PaneBlocker::Unknown;
+    }
+    if !tmux.pane_exists(pane) {
+        return PaneBlocker::Gone;
+    }
+    match tmux.pane_in_mode(pane) {
+        Some(true) => return PaneBlocker::CopyMode,
+        Some(false) => {}
+        None => return PaneBlocker::Unknown,
+    }
+    match tmux.capture_pane(pane) {
+        Some(screen) if screen_has_prompt(&screen) => PaneBlocker::Prompt,
+        Some(_) => PaneBlocker::Clear,
+        None => PaneBlocker::Unknown,
     }
 }
 
@@ -243,8 +291,9 @@ pub fn notify_pane_reason(
     if !is_valid_pane(pane) {
         return Err(NotifyFailReason::PaneGone);
     }
+    // tmux 整個不可用＝查詢層失敗：分不出 pane 死活，不得記 pane-gone
     if !tmux.available() {
-        return Err(NotifyFailReason::PaneGone);
+        return Err(NotifyFailReason::QueryFailed);
     }
     if !tmux.pane_exists(pane) {
         return Err(NotifyFailReason::PaneGone);
@@ -827,23 +876,24 @@ mod tests {
             Err(NotifyFailReason::Prompt)
         );
 
-        // pane 狀態查不到與 pane id 非法同歸 pane-gone（分類桶，見 enum 註解）
+        // pane 狀態查不到＝查詢層失敗（2026-08-03 拆桶：不再與 pane-gone 混同）
         let unknown = FakeTmux::new(None, Some("$ ls\n"));
         assert_eq!(
             notify_pane_reason(&unknown, "%1", "x"),
-            Err(NotifyFailReason::PaneGone)
+            Err(NotifyFailReason::QueryFailed)
         );
+        // pane id 非法＝資料層壞掉，維持 pane-gone
         let bad = FakeTmux::new(Some(false), Some("$ ls\n"));
         assert_eq!(
             notify_pane_reason(&bad, "%1 ; kill-server", "x"),
             Err(NotifyFailReason::PaneGone)
         );
 
-        // capture 讀不出來也是 pane-gone
+        // capture 讀不出來也是查詢層失敗
         let nocap = FakeTmux::new(Some(false), None);
         assert_eq!(
             notify_pane_reason(&nocap, "%1", "x"),
-            Err(NotifyFailReason::PaneGone)
+            Err(NotifyFailReason::QueryFailed)
         );
 
         // 前兩道關卡都過、卡在送鍵本身 → send-keys-failed（唯一走得到的路徑）
@@ -869,5 +919,27 @@ mod tests {
             "send-keys-failed"
         );
         assert_eq!(NotifyFailReason::PaneGone.as_str(), "pane-gone");
+        assert_eq!(NotifyFailReason::QueryFailed.as_str(), "query-failed");
+    }
+
+    /// probe_blocker：單次觀測的分類正確性（去抖與 grace 在 task.rs 測）。
+    #[test]
+    fn probe_blocker_classifies_each_state() {
+        let clear = FakeTmux::new(Some(false), Some("$ ls\n"));
+        assert_eq!(probe_blocker(&clear, "%1"), PaneBlocker::Clear);
+
+        let copy = FakeTmux::new(Some(true), Some("$ ls\n"));
+        assert_eq!(probe_blocker(&copy, "%1"), PaneBlocker::CopyMode);
+
+        let prompt = FakeTmux::new(Some(false), Some("Do you want to proceed?\nEsc to cancel"));
+        assert_eq!(probe_blocker(&prompt, "%1"), PaneBlocker::Prompt);
+
+        // 查詢層失敗（mode／capture 回 None、pane id 非法）→ Unknown，不得當死亡
+        let nomode = FakeTmux::new(None, Some("$ ls\n"));
+        assert_eq!(probe_blocker(&nomode, "%1"), PaneBlocker::Unknown);
+        let nocap = FakeTmux::new(Some(false), None);
+        assert_eq!(probe_blocker(&nocap, "%1"), PaneBlocker::Unknown);
+        let bad_id = FakeTmux::new(Some(false), Some("$ ls\n"));
+        assert_eq!(probe_blocker(&bad_id, "%1 ; kill"), PaneBlocker::Unknown);
     }
 }

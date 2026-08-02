@@ -39,9 +39,11 @@ const USAGE: &str = r#"用法：
   agent-bridge cancel <task-id>                 取消任務（queued/delivered/running 可）
   agent-bridge status <task-id>                 印裸狀態字（queued/delivered/running/completed/failed/cancelled）
   agent-bridge read <task-id>                   讀回覆（completed/failed 可；標頭走 stderr、response 原文走 stdout）
-  agent-bridge await <task-id> [--timeout <secs>]
+  agent-bridge await <task-id> [--timeout <secs>] [--on-blocker warn|return|off] [--blocker-grace <secs>]
                                                 阻塞等待 task 到終態，印裸狀態字後 exit 0；
                                                 逾時以 exit 124 退出（其他錯誤一律非 124，供呼叫端區分）
+                                                --on-blocker（預設 warn）：worker pane 卡權限框時警告；
+                                                return＝持續滿 --blocker-grace（預設 60s）以 exit 125 提前返回
   agent-bridge spawn <name> --runtime <codex|claude|agy> [--model <model>] [--window]
                                                 spawn 一個 worker pane 並註冊；stdout 只印 pane-id
                                                 （--model 不給＝該 CLI 的使用者預設模型）
@@ -683,33 +685,114 @@ fn cmd_read(paths: &Paths, args: &[String]) -> Result<()> {
 /// cmd_await:822 — 唯讀輪詢 status 檔（不寫 events、不取鎖），在只讀 sandbox
 /// 內也能用。**逾時以專屬 exit 124 退出**，其他錯誤一律非 124——呼叫端要能把
 /// 「等到期限」與「await 自己壞掉」分開處置（cmd_await:866-871）。
+///
+/// blocker 探測（CLI-AWAIT-3／CLI-AWAIT-4）：`--on-blocker warn`（預設）在
+/// worker pane 確立停在權限框時印一次 stderr 警告續等；`return` 再加上
+/// 持續滿 `--blocker-grace`（預設 60s）即以 **exit 125** 提前返回（125≠124：
+/// worker 活著、在等人，不是逾時）；`off` 全關。探測唯讀、不送鍵；stdout
+/// 終態契約不變（只有 exit 0 印終態字）。
 fn cmd_await(paths: &Paths, args: &[String]) -> Result<()> {
     if args.is_empty() {
         return Err(Error::new(
-            "用法：agent-bridge await <task-id> [--timeout <secs>]",
+            "用法：agent-bridge await <task-id> [--timeout <secs>] [--on-blocker warn|return|off] [--blocker-grace <secs>]",
         ));
     }
     let id = &args[0];
     task::check_task_id(id)?;
     let mut timeout: u64 = 0;
+    let mut on_blocker = "warn".to_string();
+    let mut grace_secs: u64 = 60;
+    let parse_secs = |flag: &str, v: &str, max_len: usize| -> Result<u64> {
+        let ok = !v.is_empty() && v.len() <= max_len && v.bytes().all(|b| b.is_ascii_digit());
+        if !ok {
+            return Err(Error::new(format!(
+                "{flag} 需為非負整數（秒，至多 {max_len} 位）：{v}"
+            )));
+        }
+        // 前導零比照 bash `10#$1` 強制十進位
+        Ok(v.parse().unwrap_or(0))
+    };
     let mut it = args[1..].iter();
     while let Some(a) = it.next() {
         match a.as_str() {
             "--timeout" => {
                 let v = it.next().ok_or_else(|| Error::new("--timeout 需要參數"))?;
-                let ok = !v.is_empty() && v.len() <= 9 && v.bytes().all(|b| b.is_ascii_digit());
-                if !ok {
-                    return Err(Error::new(format!(
-                        "--timeout 需為非負整數（秒，至多 9 位），0＝不逾時：{v}"
-                    )));
+                timeout = parse_secs("--timeout", v, 9)?;
+            }
+            "--on-blocker" => {
+                let v = it
+                    .next()
+                    .ok_or_else(|| Error::new("--on-blocker 需要參數（warn|return|off）"))?;
+                match v.as_str() {
+                    "warn" | "return" | "off" => on_blocker = v.clone(),
+                    other => {
+                        return Err(Error::new(format!(
+                            "--on-blocker 需為 warn|return|off：{other}"
+                        )));
+                    }
                 }
-                // 前導零比照 bash `10#$1` 強制十進位
-                timeout = v.parse().unwrap_or(0);
+            }
+            "--blocker-grace" => {
+                let v = it
+                    .next()
+                    .ok_or_else(|| Error::new("--blocker-grace 需要參數"))?;
+                grace_secs = parse_secs("--blocker-grace", v, 9)?;
             }
             other => return Err(Error::new(format!("未知參數：{other}"))),
         }
     }
-    match task::await_task(paths, id, timeout)? {
+
+    // pane 解析走 task meta 的 to → registry；任一步缺料（task 無 to、agent 未
+    // 註冊、registry 無 pane）都**退化成不帶探測的純輪詢**——await 的可用性
+    // 不得因 registry 狀態而變（在只讀 sandbox、人工註冊等情境仍要能等）。
+    let tmux = SubprocessTmux;
+    let mut watch_pane: Option<String> = None;
+    if on_blocker != "off" {
+        if let Ok(dir) = task::require_task_dir(paths, id)
+            && let Ok(to) = task::meta_str(&dir, "to")
+        {
+            let agent_file = paths.agents_dir.join(format!("{to}.json"));
+            if agent_file.is_file() {
+                let pane = registry::read_pane(&agent_file);
+                if !pane.is_empty() {
+                    watch_pane = Some(pane);
+                }
+            }
+        }
+        if watch_pane.is_none() {
+            err_line(
+                "await：查不到 worker pane（task 無 to／agent 未註冊），blocker 探測停用，改純輪詢",
+            );
+        }
+    }
+    let on_warn = |b: notify::PaneBlocker, sustained: u64| {
+        let msg = match b {
+            notify::PaneBlocker::Prompt => format!(
+                "await 警告：worker pane 停在權限確認框（已持續 {sustained}s）——需要人到 pane 裁決；agent 不得代按（詳 orchestrator-brief）"
+            ),
+            notify::PaneBlocker::CopyMode => {
+                "await 提示：worker pane 在 copy-mode（可能有人正在介入查看）".to_string()
+            }
+            notify::PaneBlocker::Gone => {
+                "await 警告：worker pane 已不存在——等待只能靠 task 終態或逾時收斂".to_string()
+            }
+            _ => return,
+        };
+        err_line(&msg);
+    };
+    let watch = watch_pane.as_ref().map(|pane| task::BlockerWatch {
+        tmux: &tmux,
+        pane: pane.clone(),
+        policy: if on_blocker == "return" {
+            task::BlockerPolicy::Return
+        } else {
+            task::BlockerPolicy::Warn
+        },
+        grace_secs,
+        on_warn: &on_warn,
+    });
+
+    match task::await_task_watched(paths, id, timeout, watch.as_ref())? {
         task::AwaitOutcome::Terminal(st) => {
             println!("{st}");
             Ok(())
@@ -720,6 +803,13 @@ fn cmd_await(paths: &Paths, args: &[String]) -> Result<()> {
             ));
             // 專屬退出碼：不走 main 的統一收斂層（那裡一律 1）
             std::process::exit(124);
+        }
+        task::AwaitOutcome::Blocked { status, since_secs } => {
+            err_line(&format!(
+                "await 提前返回：worker pane 停在權限確認框已 {since_secs}s（task {id} 狀態 {status}）——去 pane 裁決後可重新 await"
+            ));
+            // 125＝blocker 提前返回；124 保留給真逾時（CLI-AWAIT-4）
+            std::process::exit(125);
         }
     }
 }

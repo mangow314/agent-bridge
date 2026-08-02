@@ -229,6 +229,17 @@ back empty.
 - After dispatching a long task, use `agent-bridge await`; sending
   while `list` shows `starting` is legal — the message is not lost,
   only the notification may lag.
+- **Unattended dispatch: always await with `--on-blocker return`.**
+  A worker parked on a permission prompt with no human watching is a
+  wall-clock black hole (measured: one hour, 2026-08-01). `await
+  --on-blocker return` exits 125 the moment the prompt is confirmed
+  sustained (debounced + grace), so your loop can escalate — surface
+  the pane to the human — instead of sleeping until timeout. The
+  default (`warn`) only prints to stderr and keeps waiting, which is
+  right when a human is around, useless when nobody reads it. Exit
+  125 means "worker alive, waiting on a human" — never treat it as a
+  timeout, and never answer the prompt yourself (no self-authorization,
+  cross-pane included).
 - **On `await` timeout do not `evict` blindly — diagnose with
   `tmux capture-pane -p` first.** The worker may be still running,
   parked on a permission dialog waiting for a human, or dead — three

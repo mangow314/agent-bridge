@@ -839,20 +839,172 @@ pub fn read_response(paths: &Paths, id: &str) -> Result<ReadOutcome> {
     })
 }
 
-/// await 的兩種正常終局。**逾時必須與操作性失敗分得開**：呼叫端（evict）只在
+/// await 的正常終局。**逾時必須與操作性失敗分得開**：呼叫端（evict）只在
 /// 真逾時才走「筆記沒落地仍回收」，其他非零是 await 自己壞掉——worker 可能還
 /// 活著、根本沒等到期限，這時回收等於把活的 context 當逾時殺掉。
+///
+/// `Blocked` 只可能出自 `await_task_watched` 帶 `BlockerPolicy::Return`：
+/// worker pane 持續停在權限確認框（去抖＋grace 都滿）。它**不是逾時**——
+/// worker 還活著，只是在等一個人；呼叫端的正確處置是去 pane 前裁決或告警，
+/// 不是回收（CLI-AWAIT-4）。
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum AwaitOutcome {
     Terminal(String),
     Timeout(String),
+    /// status＝返回當下的 task 狀態；since_secs＝權限框持續秒數（去抖確立起算）
+    Blocked {
+        status: String,
+        since_secs: u64,
+    },
+}
+
+/// blocker 偵測到時的行為（CLI `--on-blocker`；預設 Warn）。
+///
+/// 預設不是 Return 的理由：`screen_has_prompt` 有誤判史（收窄前 19/24），
+/// warn 誤報的代價是一行 stderr，Return 誤報會讓協調者把工作中的 worker
+/// 當成卡死去處置。無人值守派工的 await 應顯式帶 `--on-blocker return`
+/// （orchestrator-brief 的派工紀律）。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum BlockerPolicy {
+    Warn,
+    Return,
+}
+
+/// `await_task_watched` 的探測設定。`on_warn(blocker, sustained_secs)` 由呼叫
+/// 端呈現（core 不印字）；每種 blocker 至多喚一次，狀態清空後才會再喚。
+pub struct BlockerWatch<'a> {
+    pub tmux: &'a dyn crate::tmux::TmuxClient,
+    pub pane: String,
+    pub policy: BlockerPolicy,
+    /// Prompt 去抖確立後，還要持續這麼多秒才觸發 Return（Warn 不受此限）
+    pub grace_secs: u64,
+    pub on_warn: &'a dyn Fn(crate::notify::PaneBlocker, u64),
+}
+
+/// 每幾輪 status 輪詢做一次 blocker 探測（攤薄 tmux 查詢成本；預設輪詢 1s
+/// 間隔下約每 5 秒一次）。
+const PROBE_EVERY: u32 = 5;
+/// Prompt 須連續命中幾次探測才算確立（同 TUI `BLOCKER_DEBOUNCE_ROUNDS`；
+/// 單次誤判不觸發任何行為）。
+const PROBE_DEBOUNCE: u32 = 2;
+
+/// 探測結果 → 行為的純狀態機（時間注入，單測不需睡眠）。
+///
+/// 語意（CLI-AWAIT-4）：Prompt 連續 `PROBE_DEBOUNCE` 次確立 → 喚 warn 一次；
+/// 確立起算持續滿 grace → 報 blocked（是否據此返回是呼叫端的 policy）。
+/// Clear/CopyMode＝確認非權限框 → 去抖與持續計時歸零、解除後允許再警告；
+/// CopyMode 與 Gone 各至多警告一次；Unknown（查詢層失敗）**不歸零不警告**
+/// ——查不到不是「已解除」的證據。
+struct BlockerTracker {
+    prompt_hits: u32,
+    prompt_since: Option<std::time::Instant>,
+    warned_prompt: bool,
+    warned_copy: bool,
+    warned_gone: bool,
+}
+
+/// 一次觀測產出的行為：warn 至多一個、blocked 至多一個（同次可並發：
+/// 確立當下 grace=0 時警告與返回同時成立）。
+struct BlockerActions {
+    warn: Option<(crate::notify::PaneBlocker, u64)>,
+    blocked_since: Option<u64>,
+}
+
+impl BlockerTracker {
+    fn new() -> Self {
+        BlockerTracker {
+            prompt_hits: 0,
+            prompt_since: None,
+            warned_prompt: false,
+            warned_copy: false,
+            warned_gone: false,
+        }
+    }
+
+    fn observe(
+        &mut self,
+        seen: crate::notify::PaneBlocker,
+        policy: BlockerPolicy,
+        grace_secs: u64,
+        now: std::time::Instant,
+    ) -> BlockerActions {
+        use crate::notify::PaneBlocker as B;
+        let mut act = BlockerActions {
+            warn: None,
+            blocked_since: None,
+        };
+        match seen {
+            B::Prompt => {
+                self.prompt_hits = self.prompt_hits.saturating_add(1);
+                if self.prompt_hits >= PROBE_DEBOUNCE {
+                    let since = *self.prompt_since.get_or_insert(now);
+                    let sustained = now.saturating_duration_since(since).as_secs();
+                    if !self.warned_prompt {
+                        act.warn = Some((B::Prompt, sustained));
+                        self.warned_prompt = true;
+                    }
+                    if policy == BlockerPolicy::Return && sustained >= grace_secs {
+                        act.blocked_since = Some(sustained);
+                    }
+                }
+            }
+            B::Clear | B::CopyMode => {
+                self.prompt_hits = 0;
+                self.prompt_since = None;
+                self.warned_prompt = false;
+                if seen == B::CopyMode && !self.warned_copy {
+                    act.warn = Some((B::CopyMode, 0));
+                    self.warned_copy = true;
+                }
+            }
+            B::Gone => {
+                // Gone 是「確認不存在」的觀測，不是查詢失敗——Prompt 狀態
+                // 一併歸零（codex 複核 2026-08-03：否則 Prompt→Gone→Prompt
+                // 會被當連續兩次而誤確立；pane id 重用時尤其危險）。
+                // 「不歸零」的特權只屬於 Unknown。
+                self.prompt_hits = 0;
+                self.prompt_since = None;
+                self.warned_prompt = false;
+                if !self.warned_gone {
+                    act.warn = Some((B::Gone, 0));
+                    self.warned_gone = true;
+                }
+            }
+            B::Unknown => {}
+        }
+        act
+    }
 }
 
 /// cmd_await:822 的等待主體（唯讀輪詢 status 檔，不寫 events、不取鎖）。
 /// CLI 的 `await` 與 evict 的第二段共用同一份（審查 F6：分家就會漂移）。
 ///
-/// **函式內不印任何字**：逾時的呈現（CLI 印一行再 exit 124）由呼叫端決定。
+/// 簽名保持不變的薄殼：evict 的呼叫端**顯式不帶 watch**（evict 的逾時語意
+/// 不得被 Blocked 提前返回改寫），CLI 要探測時走 `await_task_watched`。
 pub fn await_task(paths: &Paths, id: &str, timeout: u64) -> Result<AwaitOutcome> {
+    await_task_watched(paths, id, timeout, None)
+}
+
+/// `await_task` 的帶探測版本（CLI-AWAIT-3／CLI-AWAIT-4）。
+///
+/// watch 為 `Some` 時，每 `PROBE_EVERY` 輪對 worker pane 做一次唯讀 blocker
+/// 探測（`notify::probe_blocker`，只查詢不送鍵）：
+/// - `Prompt` 連續 `PROBE_DEBOUNCE` 次確立後喚 `on_warn` 一次；policy 為
+///   `Return` 且持續滿 `grace_secs` → 回 `AwaitOutcome::Blocked`。
+/// - `CopyMode`（人在介入）與 `Gone`（pane 沒了）各喚 `on_warn` 一次，
+///   **永不**提前返回——前者不是卡死，後者由 task 狀態軸自己收斂。
+/// - `Unknown`（查詢層失敗）不警告、**不歸零** Prompt 的去抖與持續計時：
+///   查不到不是「已解除」的證據（與 notify 拆出 query-failed 同一理由）。
+///
+/// **函式內不印任何字**：逾時／警告的呈現由呼叫端決定（on_warn 回呼）。
+pub fn await_task_watched(
+    paths: &Paths,
+    id: &str,
+    timeout: u64,
+    watch: Option<&BlockerWatch<'_>>,
+) -> Result<AwaitOutcome> {
+    use crate::notify::PaneBlocker;
+
     let dir = require_task_dir(paths, id)?;
 
     // 輪詢間隔在進迴圈前就驗：壞值在 bash 會讓 sleep 立刻報錯、await 毫秒級
@@ -895,6 +1047,8 @@ pub fn await_task(paths: &Paths, id: &str, timeout: u64) -> Result<AwaitOutcome>
     };
 
     let started = std::time::Instant::now();
+    let mut poll_round: u32 = 0;
+    let mut tracker = BlockerTracker::new();
     loop {
         let st = read_status(&dir).map_err(|_| {
             Error::new(format!(
@@ -906,6 +1060,22 @@ pub fn await_task(paths: &Paths, id: &str, timeout: u64) -> Result<AwaitOutcome>
         }
         if timeout > 0 && started.elapsed().as_secs() >= timeout {
             return Ok(AwaitOutcome::Timeout(st));
+        }
+        if let Some(w) = watch {
+            poll_round = poll_round.wrapping_add(1);
+            if poll_round.is_multiple_of(PROBE_EVERY) {
+                let seen: PaneBlocker = crate::notify::probe_blocker(w.tmux, &w.pane);
+                let act = tracker.observe(seen, w.policy, w.grace_secs, std::time::Instant::now());
+                if let Some((b, sustained)) = act.warn {
+                    (w.on_warn)(b, sustained);
+                }
+                if let Some(since_secs) = act.blocked_since {
+                    return Ok(AwaitOutcome::Blocked {
+                        status: st,
+                        since_secs,
+                    });
+                }
+            }
         }
         std::thread::sleep(poll_sleep(interval));
     }
@@ -966,6 +1136,87 @@ mod tests {
         for bad in ["1.", "", ".", "1.2.3", "-1", "1e3", "abc", " 1", "1 "] {
             assert!(!poll_interval_shape_ok(bad), "應拒絕：{bad}");
         }
+    }
+
+    /// BlockerTracker 去抖／grace／warn-once 的純邏輯驗證（時間注入，不睡眠）。
+    #[test]
+    fn blocker_tracker_debounces_and_respects_grace() {
+        use crate::notify::PaneBlocker as B;
+        let t0 = std::time::Instant::now();
+        let at = |s: u64| t0 + std::time::Duration::from_secs(s);
+
+        // (1) 單次 Prompt 不觸發任何行為（去抖）
+        let mut tr = BlockerTracker::new();
+        let a = tr.observe(B::Prompt, BlockerPolicy::Return, 60, at(0));
+        assert!(a.warn.is_none() && a.blocked_since.is_none());
+
+        // (2) 第二次確立：warn 一次；grace 未滿不 blocked
+        let a = tr.observe(B::Prompt, BlockerPolicy::Return, 60, at(5));
+        assert_eq!(a.warn, Some((B::Prompt, 0)));
+        assert!(a.blocked_since.is_none());
+
+        // (3) 持續滿 grace → blocked（warn 不重發）
+        let a = tr.observe(B::Prompt, BlockerPolicy::Return, 60, at(70));
+        assert!(a.warn.is_none());
+        assert_eq!(a.blocked_since, Some(65));
+
+        // (4) Warn policy 永不 blocked，即使持續再久
+        let mut tw = BlockerTracker::new();
+        tw.observe(B::Prompt, BlockerPolicy::Warn, 0, at(0));
+        let a = tw.observe(B::Prompt, BlockerPolicy::Warn, 0, at(600));
+        assert!(a.blocked_since.is_none());
+
+        // (5) Clear 歸零：去抖重來、解除後允許再警告
+        let mut tc = BlockerTracker::new();
+        tc.observe(B::Prompt, BlockerPolicy::Return, 60, at(0));
+        tc.observe(B::Prompt, BlockerPolicy::Return, 60, at(5));
+        tc.observe(B::Clear, BlockerPolicy::Return, 60, at(10));
+        let a = tc.observe(B::Prompt, BlockerPolicy::Return, 60, at(15));
+        assert!(a.warn.is_none(), "歸零後單次 Prompt 不得觸發");
+        let a = tc.observe(B::Prompt, BlockerPolicy::Return, 60, at(20));
+        assert_eq!(a.warn, Some((B::Prompt, 0)), "重新確立要再警告一次");
+
+        // (6) Unknown 不歸零也不警告：確立狀態跨越查詢失敗仍持續計時
+        let mut tu = BlockerTracker::new();
+        tu.observe(B::Prompt, BlockerPolicy::Return, 60, at(0));
+        tu.observe(B::Prompt, BlockerPolicy::Return, 60, at(5));
+        let a = tu.observe(B::Unknown, BlockerPolicy::Return, 60, at(30));
+        assert!(a.warn.is_none() && a.blocked_since.is_none());
+        let a = tu.observe(B::Prompt, BlockerPolicy::Return, 60, at(70));
+        assert_eq!(a.blocked_since, Some(65), "Unknown 不得重置持續計時");
+
+        // (7) CopyMode／Gone 各警告一次，永不 blocked
+        let mut tm = BlockerTracker::new();
+        let a = tm.observe(B::CopyMode, BlockerPolicy::Return, 0, at(0));
+        assert_eq!(a.warn, Some((B::CopyMode, 0)));
+        let a = tm.observe(B::CopyMode, BlockerPolicy::Return, 0, at(5));
+        assert!(a.warn.is_none(), "CopyMode 只警告一次");
+        let a = tm.observe(B::Gone, BlockerPolicy::Return, 0, at(10));
+        assert_eq!(a.warn, Some((B::Gone, 0)));
+        let a = tm.observe(B::Gone, BlockerPolicy::Return, 0, at(15));
+        assert!(a.warn.is_none() && a.blocked_since.is_none());
+
+        // (8) Gone 歸零 Prompt 狀態（codex 複核 2026-08-03）：
+        //     Prompt→Gone→Prompt 不得算連續兩次
+        let mut tg = BlockerTracker::new();
+        tg.observe(B::Prompt, BlockerPolicy::Return, 0, at(0));
+        tg.observe(B::Gone, BlockerPolicy::Return, 0, at(5));
+        let a = tg.observe(B::Prompt, BlockerPolicy::Return, 0, at(10));
+        assert!(
+            a.warn.is_none() && a.blocked_since.is_none(),
+            "Gone 之後的單次 Prompt 不得確立"
+        );
+        //     已確立的 Prompt 經 Gone 後重新出現：grace 起點必須重算
+        let mut tg2 = BlockerTracker::new();
+        tg2.observe(B::Prompt, BlockerPolicy::Return, 60, at(0));
+        tg2.observe(B::Prompt, BlockerPolicy::Return, 60, at(5)); // 確立於 t=5
+        tg2.observe(B::Gone, BlockerPolicy::Return, 60, at(10));
+        tg2.observe(B::Prompt, BlockerPolicy::Return, 60, at(100));
+        let a = tg2.observe(B::Prompt, BlockerPolicy::Return, 60, at(105));
+        assert!(
+            a.blocked_since.is_none(),
+            "Gone 後重新確立，grace 不得沿用舊起點（t=105-105=0 < 60）"
+        );
     }
 
     struct Dir {

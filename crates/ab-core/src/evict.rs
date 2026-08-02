@@ -315,6 +315,17 @@ pub fn evict(
     // despawn 等於把活的 context 當逾時殺掉，審計還記成 timeout
     let final_st = match task::await_task(paths, &task_id, req.timeout) {
         Ok(AwaitOutcome::Terminal(st)) => st,
+        // evict 走不帶 watch 的 await_task，Blocked 不可能出現（CLI-AWAIT-4：
+        // 只有顯式帶 BlockerPolicy::Return 的 watched await 會回它）。真出現
+        // 代表 await 契約被改壞——當操作性失敗中止，不得當逾時去回收 pane
+        Ok(AwaitOutcome::Blocked { status, .. }) => {
+            ev(EvictEvent::Warn(format!(
+                "await 回報 Blocked（狀態 {status}）——evict 未帶 blocker watch，不應發生"
+            )));
+            return Err(Error::new(format!(
+                "evict 中止：await 回報非預期的 Blocked，pane 未動（agent '{name}' 仍在）；收尾任務 {task_id} 留存可查"
+            )));
+        }
         Ok(AwaitOutcome::Timeout(st)) => {
             // bash 的 cmd_await 在 subshell 內先印自己的逾時行才 exit 124；
             // 那行是呼叫端追查「等到什麼狀態」的唯一線索，不能吞

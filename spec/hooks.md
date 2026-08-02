@@ -181,12 +181,16 @@ Source: notify_pane / screen_has_prompt
 
 ### HOOK-NOTIFY-4 [tested: 8a, 39]
 notify-failed 事件 MUST 帶 `reason=<copy-mode|prompt|send-keys-failed|
-pane-gone>`，值域即此四者。欄位 MUST **additive**（append 在既有 `pane=`／
-`cmd=` 之後，不得挪動既有欄位順序）。沒有這個欄位，四個關卡在事後只剩同一個
-notify-failed，根因只能靠統計反推（2026-08-01 誤判調查的最大阻力）。
-兩個值是**分類桶**，命名 MUST 誠實反映這件事，不得暗示未經證實的根因：
-`pane-gone` 涵蓋「pane 真的不在」與「pane 狀態查不到」（無效 pane id、tmux
-不可用、mode／capture 查詢失敗）；`send-keys-failed` 涵蓋 `send-keys` 這步
+pane-gone|query-failed>`，值域即此五者。欄位 MUST **additive**（append 在
+既有 `pane=`／`cmd=` 之後，不得挪動既有欄位順序）。沒有這個欄位，關卡在
+事後只剩同一個 notify-failed，根因只能靠統計反推（2026-08-01 誤判調查的
+最大阻力）。
+值是**分類桶**，命名 MUST 誠實反映這件事，不得暗示未經證實的根因：
+`pane-gone` 限「pane 確認不存在」與「pane id 非法」；`query-failed`
+（2026-08-03 自 pane-gone 拆出）涵蓋查詢層失敗——tmux 不可用、mode／
+capture 查詢回 None——pane 可能還活著，MUST NOT 當成 pane 死亡的證據
+（codex sandbox 擋 tmux socket 時整排查詢失敗、%139 活著被記 pane-gone
+的實例即拆桶動機）；`send-keys-failed` 涵蓋 `send-keys` 這步
 的**所有**失敗——逾時、非零退出、TOCTOU 空窗內 pane 消失、子行程沒起來——
 實作只拿得到一個 bool，**MUST NOT** 命名成 `send-keys-timeout`。
 bash 正本自 M4 凍結、不實作本條款，SRC_KIND=bash 下相關斷言顯式 SKIP。

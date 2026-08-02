@@ -5,7 +5,8 @@
 ### CLI-GEN-1 [tested: 2, 3]
 exit code：`0`＝成功；凡實作明確偵測的錯誤（用法錯、狀態機拒絕、驗證
 失敗）MUST 以 `1` 終止並將 `agent-bridge: <訊息>` 前綴的錯誤寫入 stderr；
-`124` 保留給 await 逾時（見 CLI-AWAIT-2），MUST NOT 用於其他語意。
+`124` 保留給 await 逾時（見 CLI-AWAIT-2）、`125` 保留給 await 的 blocker
+提前返回（見 CLI-AWAIT-4），MUST NOT 用於其他語意。
 Note: 未被偵測的內部工具失敗（如 list 遇損壞 registry 時的 jq 解析錯）
 可能以工具自身的非零碼與裸錯誤訊息傳出——呼叫端只能依賴「非 0＝失敗、
 124＝逾時」，不得依賴「失敗必為 1」。
@@ -175,6 +176,28 @@ Source: cmd_await
 被移走、sleep 失敗）MUST 以 exit 1 立即終止，MUST NOT 被誤分類為逾時或
 繼續輪詢。不可放寬（呼叫端以 124 觸發回收決策，誤報會殺活 worker）。
 Source: cmd_await
+
+### CLI-AWAIT-3 [tested: 46]
+blocker 探測 MUST 唯讀：只做 tmux 查詢（mode／capture／exists），MUST NOT
+送鍵、寫檔、寫事件——await 的「只讀 sandbox 可用」性質（CLI-AWAIT-1）不因
+探測而改變。探測重用送鍵防線同一套 matcher（`screen_has_prompt`），MUST NOT
+另養一套。pane 解析不到（task 無 `to`、agent 未註冊、registry 無 pane）MUST
+降級為純輪詢並 stderr 提示一次，MUST NOT 因此失敗。
+Source: cmd_await / notify::probe_blocker
+
+### CLI-AWAIT-4 [tested: 46]
+`--on-blocker warn|return|off`（預設 `warn`）＋`--blocker-grace <secs>`
+（預設 60）。Prompt MUST 連續兩次探測確立才行動（單次不動作）；確立喚
+stderr 警告一次。`return` 下確立起算持續滿 grace MUST 以 **exit 125**
+提前返回；`125` 僅限此語意，MUST NOT 挪用；逾時語意不變（Blocked 不得
+吃掉 124）。CopyMode／Gone 各至多警告一次、MUST NOT 提前返回；查詢層失敗
+（Unknown）MUST NOT 觸發警告、MUST NOT 歸零去抖與持續計時（查不到不是
+「已解除」的證據）。stdout 終態契約不變：僅 exit 0 印終態字。
+預設是 warn 而非 return：matcher 有誤判史，Return 誤報會讓協調者把工作中
+的 worker 當卡死處置；無人值守派工的 await 應顯式帶 `--on-blocker return`
+（orchestrator-brief 派工紀律）。evict 的內部 await MUST NOT 帶探測
+（回收決策只認終態與真逾時）。
+Source: cmd_await / task::await_task_watched
 
 ---
 
