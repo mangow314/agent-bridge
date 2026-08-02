@@ -5502,34 +5502,86 @@ P4P07="$(tmx list-panes -t "$W44B" -F '#{pane_id}' | head -1)"
 P4P08="$(tmx split-window -dP -F '#{pane_id}' -t "$W44B" "$pane_cmd")"
 P4P10="$(tmx split-window -dP -F '#{pane_id}' -t "$W44B" "$pane_cmd")"
 P4P11="$(tmx split-window -dP -F '#{pane_id}' -t "$W44B" "$pane_cmd")"
+# p4w12 的 pane（B2 修正輪 H4）：**它必須活著**。異常 3／3 是「origin window
+# 已消失」，pane 若也不在，這一列同時是第二個 orphan——三個異常會變成四個
+# 事實，而 oracle 只鎖三個，多出來的那一個是靜默的。pane 借住在 owner B 的
+# window 裡：owner 記的是「誰派出它」，pane 在哪是另一回事
+P4P12="$(tmx split-window -dP -F '#{pane_id}' -t "$W44B" "$pane_cmd")"
 tmx select-layout -t "$W44B" even-vertical
 OWN44B="zzb:$W44B"
-# owner C：建完就 kill——它的 window id 於是不存在＝dead owner 異常
+# owner C：建完就 kill——它的 window id 於是不存在。異常本體是**底下那個
+# worker**（p4w12）而不是這個 window：P4.7 B5 起 owner 不是歸屬軸，它降成
+# DETAIL 的 origin 證據列（舊記法「dead owner」＝現在的「origin window 已消失」）
 W44C="$(tmx new-window -dP -F '#{window_id}' -t it "$pane_cmd")"
 tmx kill-window -t "$W44C" 2>/dev/null || true
 OWN44C="zzc:$W44C"
 
-# registry：12 個 worker／3 個 owner。名字一律 p4wNN（**中性命名**：名字不
-# 洩漏誰是異常，異常的字典序位置因此不是為了好看而挑的）
-w44() { # w44 <name> <pane> <owner>
-  printf '{"name":"%s","pane_id":"%s","registered_at":"2026-07-31T00:00:00Z","spawned":true,"ready":true,"runtime":"codex","spawn_tag":"t44-%s","owner":"%s"}\n' \
-    "$1" "$2" "$1" "$3" > "$D44/agents/$1.json"
+# ---- lineage 拓撲（P4.7 切片 B2 補完 C1）----
+# gate (c) 的「scope 軸改 lineage」要求量測發生在**新軸的真實形狀**上：12 列
+# 全 legacy 時整個 registry 退化成一個 standalone 段，量到的是舊世界的殘影。
+# 三條 lineage，照原三 owner 的分佈改編（owner 分佈與異常語意逐條保留）：
+#
+#   L1（根在場＝p4w01）      p4w01 ─┬─ p4w02  p4w03  p4w04  p4w05
+#                                   └─ p4w05 ─ p4w06   ← 異常 2／3 blocked
+#   L2（根在場＝p4w07）      p4w07 ─┬─ p4w08 ─ p4w09   ← 異常 1／3 orphaned
+#                                   └─ p4w10  p4w11
+#   L3（根**缺席**＝p4z9）   p4z9† ─ p4z8†（中間代亦缺席）─ p4w12
+#                                                       ← 異常 3／3 origin 消失
+#
+# L3 是這一輪特意加的：根與中間代都不在 registry，於是畫面上真的有一個墓碑
+# 組標頭（`lineage p4z9† (c3c3)`）與一條墓碑 breadcrumb——P4.7 的核心賣點應該
+# 在效率量測的那張畫面上在場，而不是只活在單元測試裡。
+#
+# 組序（`group_by_lineage` 依 generation key 字典序、standalone 恆在最後）：
+# `p4w01…` < `p4w07…` < `p4z9…`（`w` < `z`），所以 L3 在最後、p4w12 是列序
+# 最後一列——replay 的 `End` 因此仍然一步就把選取送到它身上。
+p4tag() { printf 'AGENT_BRIDGE_SPAWN_TAG=ab-spawn-%s-%s-%s' "$1" "$2" "$3"; }
+P4T01="$(p4tag p4w01 101 a1a1a1a1a1a1)"
+P4T02="$(p4tag p4w02 102 a2a2a2a2a2a2)"
+P4T03="$(p4tag p4w03 103 a3a3a3a3a3a3)"
+P4T04="$(p4tag p4w04 104 a4a4a4a4a4a4)"
+P4T05="$(p4tag p4w05 105 a5a5a5a5a5a5)"
+P4T06="$(p4tag p4w06 106 a6a6a6a6a6a6)"
+P4T07="$(p4tag p4w07 107 b7b7b7b7b7b7)"
+P4T08="$(p4tag p4w08 108 b8b8b8b8b8b8)"
+P4T09="$(p4tag p4w09 109 b9b9b9b9b9b9)"
+P4T10="$(p4tag p4w10 110 0a0a0a0a0a0a)"
+P4T11="$(p4tag p4w11 111 0b0b0b0b0b0b)"
+P4T12="$(p4tag p4w12 112 0c0c0c0c0c0c)"
+# L1／L2 的根就是 p4w01／p4w07 自己；L3 的根與中間代**不建 registry 列**
+P4L1="$P4T01"
+P4L2="$P4T07"
+P4L3="$(p4tag p4z9 119 c3c3c3c3c3c3)"
+P4L3MID="$(p4tag p4z8 118 d4d4d4d4d4d4)"
+
+# registry：12 個 worker／3 個 owner／3 條 lineage。名字一律 p4wNN（**中性
+# 命名**：名字不洩漏誰是異常，異常的字典序位置因此不是為了好看而挑的）
+w44() { # w44 <name> <pane> <owner> <spawn_tag> <lineage_root> [parent_agent]
+  # 根（自成根）的形狀是 `lineage_root` 在、`parent_agent` **欄位缺席**
+  # ——寫成空字串是另一種形狀（invalid），不得混用
+  local _lin="\"lineage_root\":\"$5\""
+  [[ -n "${6:-}" ]] && _lin="$_lin,\"parent_agent\":\"$6\""
+  printf '{"name":"%s","pane_id":"%s","registered_at":"2026-07-31T00:00:00Z","spawned":true,"ready":true,"runtime":"codex","spawn_tag":"%s","owner":"%s",%s}\n' \
+    "$1" "$2" "$4" "$3" "$_lin" > "$D44/agents/$1.json"
 }
-w44 p4w01 "$P4P01" "$OWN44A"
-w44 p4w02 "$P4P02" "$OWN44A"
-w44 p4w03 "$P4P03" "$OWN44A"
-w44 p4w04 "$P4P04" "$OWN44A"
-w44 p4w05 "$P4P05" "$OWN44A"
-# 異常 2／3：blocked prompt（pane 活著，畫面是權限框）——掃描序中的第 6 個
-w44 p4w06 "$P4P06" "$OWN44A"
-w44 p4w07 "$P4P07" "$OWN44B"
-w44 p4w08 "$P4P08" "$OWN44B"
+w44 p4w01 "$P4P01" "$OWN44A" "$P4T01" "$P4L1"
+w44 p4w02 "$P4P02" "$OWN44A" "$P4T02" "$P4L1" "$P4T01"
+w44 p4w03 "$P4P03" "$OWN44A" "$P4T03" "$P4L1" "$P4T01"
+w44 p4w04 "$P4P04" "$OWN44A" "$P4T04" "$P4L1" "$P4T01"
+w44 p4w05 "$P4P05" "$OWN44A" "$P4T05" "$P4L1" "$P4T01"
+# 異常 2／3：blocked prompt（pane 活著，畫面是權限框）——掃描序中的第 6 個。
+# 它掛在 p4w05 底下（第三代）：breadcrumb 於是有一條走得完的三節鏈
+w44 p4w06 "$P4P06" "$OWN44A" "$P4T06" "$P4L1" "$P4T05"
+w44 p4w07 "$P4P07" "$OWN44B" "$P4T07" "$P4L2"
+w44 p4w08 "$P4P08" "$OWN44B" "$P4T08" "$P4L2" "$P4T07"
 # 異常 1／3：orphaned worker（registry 有、pane 不在，owner 仍活著）
-w44 p4w09 "%94409" "$OWN44B"
-w44 p4w10 "$P4P10" "$OWN44B"
-w44 p4w11 "$P4P11" "$OWN44B"
-# 異常 3／3：dead owner 底下的 worker（owner window 已被 kill）
-w44 p4w12 "%94412" "$OWN44C"
+w44 p4w09 "%94409" "$OWN44B" "$P4T09" "$P4L2" "$P4T08"
+w44 p4w10 "$P4P10" "$OWN44B" "$P4T10" "$P4L2" "$P4T07"
+w44 p4w11 "$P4P11" "$OWN44B" "$P4T11" "$P4L2" "$P4T07"
+# 異常 3／3：origin window 已消失的 worker（spawn 當下那個 window 已被 kill；
+# 舊稱「dead owner 底下的 worker」——軸換成 lineage 之後，異常說的是這一列）。
+# 它同時是墓碑鏈的末端：root（p4z9）與 parent（p4z8）都不在 registry
+w44 p4w12 "$P4P12" "$OWN44C" "$P4T12" "$P4L3" "$P4L3MID"
 
 # 20 個 task（目錄名後綴必須是 hex，task.rs:378 會拒非 hex）。12 個 in-flight
 # ＋8 個終態：WORKERS 欄因此有 task 列（導航噪音），TASKS 欄有東西可讀
@@ -5572,6 +5624,42 @@ $OWN44A 6
 $OWN44B 5
 $OWN44C 1
 EOF
+# lineage 面同理逐字比對（P4.7 切片 B2 補完 C1）。三條防線各擋一種靜默退化：
+#   (a) 12 個 spawn_tag 全是 canonical generation key——寫成舊的 `t44-xxx` 會
+#       讓整份 registry 判成 legacy、退回一個 standalone 段，而畫面看起來只是
+#       「少了組標頭」，步數照樣量得出來
+#   (b) lineage 集合恰 3 條、分佈 6／5／1
+#   (c) L3 的根與中間代 MUST NOT 在 registry——墓碑組標頭與墓碑 breadcrumb 的
+#       唯一來源就是它們的缺席
+P4GENKEY='^AGENT_BRIDGE_SPAWN_TAG=ab-spawn-[A-Za-z0-9_-]+-[0-9]+-[0-9a-f]{12}$'
+# shellcheck disable=SC2329  # 經 assert 的 "$@" 間接呼叫
+p4_bad_tags() { jq -r '.spawn_tag' "$1"/agents/*.json | grep -cvE "$P4GENKEY" || true; }
+assert "44 前置：12 列的 spawn_tag 全是 canonical generation key" \
+  test "$(p4_bad_tags "$D44")" -eq 0
+jq -r '.lineage_root' "$D44"/agents/*.json | sort -u > "$P4OUT/lineages.actual"
+printf '%s\n' "$P4L1" "$P4L2" "$P4L3" | sort > "$P4OUT/lineages.expect"
+assert "44 前置：lineage 集合恰為 3 條、逐字相符（防「全 legacy」退化）" \
+  diff -q "$P4OUT/lineages.expect" "$P4OUT/lineages.actual"
+# shellcheck disable=SC2329  # 經 assert 的 "$@" 間接呼叫
+p4_lineage_count() { jq -r --arg l "$2" 'select(.lineage_root==$l) | .name' "$1"/agents/*.json | wc -l; }
+while read -r _lin _want; do
+  [[ -z "$_lin" ]] && continue
+  assert "44 前置：lineage ${_lin##*ab-spawn-} 底下恰 $_want 個 worker" \
+    test "$(p4_lineage_count "$D44" "$_lin")" -eq "$_want"
+done <<EOF
+$P4L1 6
+$P4L2 5
+$P4L3 1
+EOF
+# H4：p4w12 的 pane MUST 活著。它是「origin window 已消失」那一個異常的唯一
+# 標的；pane 若也不在，它同時變成第二個 orphan（畫面上多一個 ✗dead），而
+# 標記面的 oracle 只鎖兩筆——多出來的事實會靜默通過
+assert "44 前置：p4w12 的 pane 存活（擋 fixture 回退成雙異常）" pane_alive "$P4P12"
+assert_fails "44 前置：p4w09 的 pane 不存在（orphan 異常的來源）" pane_alive "%94409"
+jq -r '.spawn_tag' "$D44"/agents/*.json | sort > "$P4OUT/tags.actual"
+assert "44 前置：L3 的根與中間代不在 registry（墓碑組標頭／breadcrumb 的來源）" \
+  bash -c '! grep -qxF "$2" "$1" && ! grep -qxF "$3" "$1"' _ \
+  "$P4OUT/tags.actual" "$P4L3" "$P4L3MID"
 
 # blocked prompt 的畫面：用**真的長得像權限框**的內容（notify::screen_has_prompt
 # 的第一組錨：`Do you want to …` ＋ `Esc to cancel`），不依賴 matcher 的誤判面
@@ -5699,7 +5787,7 @@ assert "44 TUI：成功送出的按鍵數＝script 導出的步數（$_k vs $STE
 #   (1) 標記面 `<worker>\t<mark>`：worker 列自己說得出口的事實（blocked／
 #       ✗dead／copy-mode）。逐幀抽、跨幀取聯集。
 #   (2) 出身面 `<selected worker>\t<origin>`：**同一幀**裡的選取標記與 DETAIL
-#       的 origin 行綁在一起——dead owner 這條事實只有這裡說得出口。
+#       的 origin 行綁在一起——「origin window 已消失」這條事實只有這裡說得出口。
 p4_frame_marks() {
   local f="$1" line name mark
   # 邊框字元**兩種都要當終止符**：focus 的面板畫的是粗框 `┃`，只擋 `│` 的話
@@ -5754,31 +5842,74 @@ for _f in "$P4OUT"/tui-step[0-9]*.cap; do
   p4_frame_origin "$_f" >> "$P4OUT/tui.origins"
 done
 # 標記面：異常＝worker 自己帶標記。其餘（正常 worker）一律不得出現在答案裡
-# ——誤標會多一行，漏標會少一行，兩邊都紅
+# ——誤標會多一行，漏標會少一行，兩邊都紅。
+#
+# B2 修正輪 H4：p4w12 的 pane 現在**活著**，所以標記面只剩兩筆。三個異常沒有
+# 變少——第三個（origin window 已消失）本來就不是列標記說得出口的事，它在
+# 出身面。舊 fixture 讓 p4w12 的 pane 也不存在，等於偷偷多了一個 orphan：
+# 畫面上四個事實、oracle 只鎖三個，多出來的那一個永遠不會紅。
 awk -F'\t' '$2 != "none"' "$P4OUT/tui.marks" | sort -u > "$P4OUT/tui.answer"
 printf '%s\t%s\n' \
   p4w06 blocked \
-  p4w09 dead \
-  p4w12 dead | sort > "$P4OUT/tui.expect"
+  p4w09 dead | sort > "$P4OUT/tui.expect"
 printf '  [P4] TUI canonical answer（標記面）：\n'
 sed 's/^/    /' "$P4OUT/tui.answer"
-assert "44 TUI：三個異常的標記逐幀綁定、無多餘命中" \
+assert "44 TUI：標記面兩個異常逐幀綁定、無多餘命中（第三個在出身面）" \
   diff -q "$P4OUT/tui.expect" "$P4OUT/tui.answer"
 # 出身面：整輪 replay 中**恰好一筆** `(gone)` 綁定，且它是 p4w12。
-# 這是兩條 dead 異常分得開的依據——但要誠實說清楚它證明了什麼：
+# 誠實說清楚它證明了什麼：
 #   證明了：p4w12 的 origin window 已消失（DETAIL 逐字說出 `(gone)`）；
-#   **沒有**證明 p4w09 的 owner 還活著——replay 沒有把選取移到 p4w09 上，
-#   它的 origin 從頭到尾是**未觀測**，不是已否證。
-# 「恰一筆」鎖的是「MUST NOT 有第二個 worker 被標成 origin 已消失」，
-# 這對這份 fixture 已經足夠：p4w09 若也被誤標，答案就會多一行而紅。
+#   **沒有**證明 p4w09 的 origin 還活著——replay 沒有把選取移到 p4w09 上。
+#   那半條負向證據由下面的 44h 診斷段補（在步數之外，不影響量測）。
+# 「恰一筆」鎖的是「MUST NOT 有第二個 worker 被標成 origin 已消失」。
 # （「worker 的 pane 死了」與「它的 origin window 沒了」是兩個獨立的軸；
 # 前者在標記面，後者在出身面。）
 grep -F '(gone)' "$P4OUT/tui.origins" | sort -u > "$P4OUT/tui.gone"
 printf '%s\t%s (gone)\n' p4w12 "$OWN44C" > "$P4OUT/tui.gone.expect"
 printf '  [P4] TUI canonical answer（出身面）：\n'
 sed 's/^/    /' "$P4OUT/tui.gone"
-assert "44 TUI：dead owner 的證據與 worker 名來自同一幀、且僅此一筆" \
+assert "44 TUI：origin window 已消失的證據與 worker 名來自同一幀、且僅此一筆" \
   diff -q "$P4OUT/tui.gone.expect" "$P4OUT/tui.gone"
+
+# lineage 面（P4.7 切片 B2 補完 C1）：量測畫面上 MUST 真的有新軸的形狀，
+# 否則 gate (c) 量到的是「舊世界跑在新版面上」。兩條各鎖一半：
+#   (a) 組標頭：根缺席的那一條畫成墓碑（`†`＋世代短碼），不冒用任何在場者的名字
+#   (b) breadcrumb：p4w12 的 DETAIL 逐字畫出 `root† → … → parent†`
+#       （needle 只取前 34 欄——DETAIL 只有 43 欄內寬，整條 breadcrumb 會換行，
+#        needle 取到換行點之後就會永遠對不上）
+# 兩條都吃**既有的 capture**，不送任何按鍵，故不進步數。
+assert "44 TUI：根缺席的 lineage 組標頭是墓碑（新軸的形狀在量測畫面上在場）" \
+  grep -qF "lineage p4z9† (c3c3) (1)" "$P4OUT/tui-step0.cap"
+assert "44 TUI：p4w12 的 DETAIL breadcrumb 是墓碑鏈（root† → … → parent†）" \
+  bash -c 'grep -qhF "$2" "$1"/tui-step[0-9]*.cap' _ "$P4OUT" \
+  "lineage: p4z9† (c3c3) → … → p4z8†"
+
+# 44h：p4w09 的 origin 負向證據（B2 修正輪 H5）。
+# **不是新分組**（標題刻意不用 `# ---- NN` 的形狀，同 44g）：它是分組 44 的
+# 診斷段，check-contract 的分組抽取不該把它當成一個要在 traceability 掛號的
+# 新編號。
+# **不屬 P4 的步數量測**：按鍵在 replay script 之外，步數斷言此時已完成。
+# 為什麼要這一段：出身面的「恰一筆 gone」只證明「沒有第二個 worker 被標成
+# origin 消失」，不證明 p4w09 的 origin 還活著——replay 從沒把選取移到它身上，
+# 那是**未觀測**不是已否證。這裡把選取移過去，讓那半條負向證據真的被觀測到。
+# 選取此刻在最後一列（replay 的 End），p4w09 在它上面 6 列（列序：p4w12／
+# p4w11 的 task／p4w11／p4w10 的 task／p4w10／p4w09 的 task／p4w09）。
+# 捕捉檔另存成 tui-diag.cap：tui-step[0-9]*.cap 的聯集已經算完，這一幀不得
+# 混進去（它會多一筆 origin 綁定，把「恰一筆」的語意變成另一件事）。
+for _ in 1 2 3 4 5 6; do
+  tmx send-keys -t "$TUI44" k
+  sleep 0.3
+done
+# shellcheck disable=SC2329  # 經 wait_for 間接呼叫
+ui44_on_p4w09() {
+  tmx capture-pane -p -t "$TUI44" > "$P4OUT/tui-diag.cap" 2>/dev/null \
+    && grep -qE '▶ ▸ p4w09' "$P4OUT/tui-diag.cap"
+}
+assert "44h 前置：選取移到 p4w09（診斷段的前提）" wait_for 10 ui44_on_p4w09
+p4_frame_origin "$P4OUT/tui-diag.cap" > "$P4OUT/diag.origins"
+assert "44h：綁定的確實是 p4w09" grep -qF 'p4w09' "$P4OUT/diag.origins"
+assert "44h：p4w09 的 origin MUST NOT 是 (gone)（orphan ≠ origin 消失，兩軸獨立）" \
+  bash -c '! grep -qF "(gone)" "$1"' _ "$P4OUT/diag.origins"
 
 # 44g：BLOCKER 軸的 occluded 分支（§4 v1 契約的第二項，結構性 `pane_in_mode`）。
 # **不屬 P4 的步數量測**（按鍵在 replay script 之外，步數斷言此時已完成）：

@@ -134,10 +134,60 @@ enum Shape {
     Invalid,
 }
 
+/// `spawn_tag` → 該列的索引，**重複的 tag 一律不進來**（B2 修正輪 H2）。
+///
+/// 為什麼重複要當成「查不到」而不是「取一列」：`spawn_tag` 是這套系統唯一的
+/// 身分軸，兩列同 tag 時**沒有任何證據**說得出哪一列才是那個世代——HashMap
+/// 靜默留下最後寫入的那一列，等於用目錄序決定身分（切片 A 對 ambiguous
+/// parent 已經裁過同一件事：不依目錄序任選）。
+pub struct TagIndex<'a> {
+    /// 唯一可證的列
+    uniq: HashMap<&'a str, &'a AgentSnapshot>,
+    /// 出現過兩次以上的 tag（**不可證**，查詢一律回 `None`）
+    dup: std::collections::HashSet<&'a str>,
+}
+
+impl<'a> TagIndex<'a> {
+    pub fn build(workers: &'a [AgentSnapshot]) -> Self {
+        let mut uniq: HashMap<&'a str, &'a AgentSnapshot> = HashMap::new();
+        let mut dup: std::collections::HashSet<&'a str> = Default::default();
+        for w in workers
+            .iter()
+            .filter(|w| !w.corrupt && !w.spawn_tag.is_empty())
+        {
+            let k = w.spawn_tag.as_str();
+            if dup.contains(k) {
+                continue;
+            }
+            if uniq.insert(k, w).is_some() {
+                // 第二次看到：把已收的那一列也撤掉——「先來的算數」同樣是
+                // 目錄序決定身分
+                uniq.remove(k);
+                dup.insert(k);
+            }
+        }
+        TagIndex { uniq, dup }
+    }
+
+    /// 唯一可證的那一列。缺席與重複回**同一個答案**（`None`）：兩者都是
+    /// 「這份 registry 說不出這個世代是誰」，畫面上也就都是墓碑。
+    fn get(&self, key: &str) -> Option<&'a AgentSnapshot> {
+        self.uniq.get(key).copied()
+    }
+
+    fn is_dup(&self, key: &str) -> bool {
+        self.dup.contains(key)
+    }
+}
+
 /// 逐列判形狀。**registry 兩欄是 worker 可寫面**，所以每一種缺漏／矛盾都要
 /// 有明確歸屬，不能靠「大概是舊版寫的」放行。
-fn row_shape(w: &AgentSnapshot, by_tag: &HashMap<&str, &AgentSnapshot>) -> Shape {
+fn row_shape(w: &AgentSnapshot, idx: &TagIndex) -> Shape {
     if w.corrupt {
+        return Shape::Invalid;
+    }
+    // H2：自己的 tag 就是重複的 → 這一列的身分無法證明，不參與任何組
+    if !w.spawn_tag.is_empty() && idx.is_dup(&w.spawn_tag) {
         return Shape::Invalid;
     }
     if w.spawn_tag.is_empty() {
@@ -149,6 +199,12 @@ fn row_shape(w: &AgentSnapshot, by_tag: &HashMap<&str, &AgentSnapshot>) -> Shape
         } else {
             Shape::Invalid
         };
+    }
+    // H1.2：有 spawn_tag 卻不是 spawn 出來的。spawn 寫入必帶 `spawned:true`
+    // （切片 A 的 parent 比對也只認 `spawned == true` 的列），這一列於是在說
+    // 一件寫入路徑產不出來的事
+    if !w.spawned {
+        return Shape::Invalid;
     }
     match (&w.lineage_root, w.parent_agent.as_deref()) {
         // legacy：**兩欄皆缺席**（欄位永不 backfill）
@@ -170,12 +226,23 @@ fn row_shape(w: &AgentSnapshot, by_tag: &HashMap<&str, &AgentSnapshot>) -> Shape
                     if p == w.spawn_tag {
                         return Shape::Invalid;
                     }
-                    // parent 在場但分屬不同 lineage：兩欄互相矛盾，不猜哪一邊對
-                    if let Some(pw) = by_tag.get(p)
-                        && let Some(proot) = valid_root(pw)
-                        && proot != root
-                    {
+                    // H1.1：自稱是根、卻又寫著 parent。兩欄互相矛盾（根的
+                    // 定義就是「沒有 parent」），不猜哪一邊對
+                    if root == w.spawn_tag {
                         return Shape::Invalid;
+                    }
+                    // parent 在場時要能接得上（重複 tag ＝不可證，見 `TagIndex`）
+                    if let Some(pw) = idx.get(p) {
+                        match valid_root(pw) {
+                            // 分屬不同 lineage：兩欄互相矛盾，不猜哪一邊對
+                            Some(proot) if proot != root => return Shape::Invalid,
+                            // H1.3：parent 說不出自己的 lineage（legacy／值不合
+                            // 文法）。切片 A 的 fallback 語意是「退 parent 自身
+                            // spawn_tag」，所以子代的 root **只能**是 parent 的
+                            // tag；指向別的 R 等於憑空生出一個組
+                            None if root != p => return Shape::Invalid,
+                            _ => {}
+                        }
                     }
                 }
                 // 沒有 parent 的新式列只有一種說得通的形狀：**它自己就是根**。
@@ -194,15 +261,16 @@ fn row_shape(w: &AgentSnapshot, by_tag: &HashMap<&str, &AgentSnapshot>) -> Shape
 /// 單列的歸屬判定（B6 防護中**歸組會用到的那部分**：非 generation key／
 /// 自指／跨 lineage 不一致／半殘形狀 → invalid → standalone，不參與任何組）。
 ///
-/// `by_tag` 是「spawn_tag → 該列」的索引，`roots` 是本輪**已通過形狀驗證的**
-/// lineage 列所宣告的組別 key。兩者都由呼叫端在同一份快照上建好——registry
-/// 兩欄是 worker 可寫面，**不得假設它們構成一棵樹**。
+/// `idx` 是「spawn_tag → 該列」的索引（`TagIndex`：重複的 tag 查不到），
+/// `roots` 是本輪**已通過形狀驗證的** lineage 列所宣告的組別 key。兩者都由
+/// 呼叫端在同一份快照上建好——registry 兩欄是 worker 可寫面，**不得假設它們
+/// 構成一棵樹**。
 pub fn worker_affiliation(
     w: &AgentSnapshot,
     roots: &std::collections::HashSet<String>,
-    by_tag: &HashMap<&str, &AgentSnapshot>,
+    idx: &TagIndex,
 ) -> Affiliation {
-    match row_shape(w, by_tag) {
+    match row_shape(w, idx) {
         Shape::Lineage(root) => Affiliation::Lineage(root),
         // legacy 的唯一歸組理由：**別人**以它的 spawn_tag 為根（子代側的證據）
         Shape::Legacy => {
@@ -219,20 +287,16 @@ pub fn worker_affiliation(
 
 /// 把一份 registry 快照攤成 WORKERS 欄的分組（P4.7 切片 B）。
 ///
-/// 三趟：`by_tag`（不依賴任何判定）→ 逐列形狀＋收 `roots`（**只收形狀合法的
-/// lineage 列**）→ legacy 吸附。第二、三趟不能合併：legacy 要不要歸組取決於
-/// 全部子代看完之後的 `roots`。
+/// 三趟：`TagIndex`（不依賴任何判定）→ 逐列形狀＋收 `roots`（**只收形狀合法
+/// 的 lineage 列**）→ legacy 吸附。第二、三趟不能合併：legacy 要不要歸組取決
+/// 於全部子代看完之後的 `roots`。
 pub fn group_by_lineage(workers: &[AgentSnapshot]) -> Vec<Group> {
-    let by_tag: HashMap<&str, &AgentSnapshot> = workers
-        .iter()
-        .filter(|w| !w.corrupt && !w.spawn_tag.is_empty())
-        .map(|w| (w.spawn_tag.as_str(), w))
-        .collect();
+    let idx = TagIndex::build(workers);
     // 第一趟：所有**說得出口的**組別 key。invalid 列的 root 不進來——否則
     // 一列自相矛盾的 registry 就能讓一個 legacy 列被吸進不存在的組
     let roots: std::collections::HashSet<String> = workers
         .iter()
-        .filter_map(|w| match row_shape(w, &by_tag) {
+        .filter_map(|w| match row_shape(w, &idx) {
             Shape::Lineage(r) => Some(r),
             _ => None,
         })
@@ -243,7 +307,7 @@ pub fn group_by_lineage(workers: &[AgentSnapshot]) -> Vec<Group> {
     let mut lineage: std::collections::BTreeMap<String, Vec<usize>> = Default::default();
     let mut standalone: Vec<usize> = Vec::new();
     for (i, w) in workers.iter().enumerate() {
-        match worker_affiliation(w, &roots, &by_tag) {
+        match worker_affiliation(w, &roots, &idx) {
             Affiliation::Lineage(k) => lineage.entry(k).or_default().push(i),
             Affiliation::Legacy | Affiliation::Manual | Affiliation::Invalid => standalone.push(i),
         }
@@ -288,6 +352,176 @@ pub fn group_label(model: &Model, g: &Group) -> String {
         // 連剖析都失敗：只說得出「這個 key 存在」，不編故事
         None => "lineage ?\u{2020}".to_string(),
     }
+}
+
+/// DETAIL breadcrumb 的一節（P4.7 切片 B2）。
+///
+/// `Gap` 是**斷層**不是節點：它說的是「這中間還有幾代，但這份 registry 說不
+/// 出是誰」。畫成省略號而不是猜一個名字——猜出來的祖先跟真的長得一模一樣。
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum Crumb {
+    Node {
+        /// 畫面字面。在場＝agent 名；缺席＝`<name>† (<hex4>)` 墓碑
+        label: String,
+        /// 這一節的 registry 列不在場（純 display 標記，不參與任何判定）
+        tombstone: bool,
+    },
+    /// 中間有斷不掉的未知世代（`root → … → parent`）
+    Gap,
+}
+
+/// breadcrumb traversal 的 hop 上限：**當輪 registry 列數＋1**。
+///
+/// 為什麼是列數＋1：鏈上每一個「走得過去」的節點都必須是一列在場且沒走過的
+/// registry 列（最多就是列數），最後**還可以再收一個缺席的祖先**當墓碑——那一
+/// 節不在場，走不下去，但它是 self 兩欄裡寫著的證據，不該被上限吃掉。
+///
+/// 誠實話：有了 `visited` 之後這條界線在正常路徑上到不了。留著是因為兩道防護
+/// 擋的是不同的東西——`visited` 擋「回到走過的節點」，這條擋「節點數本身失
+/// 控」，而 traversal 的輸入是 worker 可寫面。拔掉 `visited` 時它就是唯一讓
+/// cycle 停下來的東西（見 `a_cycle_cannot_walk_forever`）。
+fn hop_limit(model: &Model) -> usize {
+    model.workers.len() + 1
+}
+
+/// **DETAIL breadcrumb**：`root → … → parent† → self`（P4.7 切片 B2）。
+///
+/// 純函式（吃快照回節點序列），render 只投影。硬界線逐條：
+/// - **僅由 `lineage_root`／`parent_agent` 兩欄重建**。不看 task 的 `from`／
+///   `to`（那是訊息往來不是出身）、不看檔名、不由名字查表——每一跳都是
+///   generation key 全串比對。名字只在**產生 label 的最後一步**出現。
+/// - 節點在場（有一列 `spawn_tag` 等於該 key）→ 顯示它的 agent 名；缺席 →
+///   `tag_display_parts` 的墓碑形式（唯一合法的 tag 剖析點，且僅 display）。
+/// - 走不上去就**省略號**：第一個缺席的祖先之後，這份 registry 對「它的
+///   parent 是誰」沒有任何證據，於是 `root` 與該節之間補一個 `Gap`。
+/// - 形狀不合法的列（Legacy／Manual／Invalid）**沒有 breadcrumb**（`None`）
+///   ——它們身上沒有說得出口的世代，畫一條線出來就是無中生有。
+///
+/// B6 防護：`visited` 擋 cycle（A→B→A）、`hop_limit` 擋鏈長失控、`row_shape`
+/// 擋自指／自稱根卻有 parent／跨 lineage 矛盾（一律 `None`）、`TagIndex` 擋
+/// 重複 tag（不可證＝墓碑）。
+pub fn breadcrumb(model: &Model, w: &AgentSnapshot) -> Option<Vec<Crumb>> {
+    let idx = TagIndex::build(&model.workers);
+    let Shape::Lineage(root) = row_shape(w, &idx) else {
+        return None;
+    };
+
+    // 自 self 沿 parent 往上走，收 generation key。走得動的條件有三：這一節
+    // 不是 root、它說得出 parent、那個 parent 唯一可證——任何一項不成立就停
+    let limit = hop_limit(model);
+    let mut chain: Vec<&str> = vec![w.spawn_tag.as_str()];
+    let mut visited: std::collections::HashSet<&str> =
+        std::collections::HashSet::from([w.spawn_tag.as_str()]);
+    let mut cur = w;
+    // root 早停：形狀驗證之後（H1.1：自稱根就不得有 parent）根本身沒有 parent，
+    // 走到根自然會停在下面那個 `else break`——這條於是是**冗餘的**。留著是因為
+    // 迴圈的終止條件不該依賴另一個函式的不變量
+    while cur.spawn_tag != root && chain.len() < limit {
+        // 這裡不再驗 parent 的文法：`row_shape` 已對 self 驗過，往上每一節都是
+        // 唯一可證的 registry 列，取它的 parent 前一樣要通過同一道形狀驗證
+        let Some(p) = cur.parent_agent.as_deref() else {
+            break;
+        };
+        if !visited.insert(p) {
+            break;
+        }
+        chain.push(p);
+        let Some(pw) = idx.get(p) else {
+            // parent 缺席**或 tag 重複**：它的 parent 是誰，這份 registry 一個
+            // 字都說不出來（重複＝有兩列自稱是它，證不出哪一列才是）
+            break;
+        };
+        // 在場的祖先也要說得通才續走（半殘的中繼列不得把 self 的線拉長）
+        if !matches!(row_shape(pw, &idx), Shape::Lineage(ref r) if *r == root) {
+            break;
+        }
+        cur = pw;
+    }
+
+    let reached_root = chain.last() == Some(&root.as_str());
+    let mut out: Vec<Crumb> = Vec::new();
+    if !reached_root {
+        out.push(crumb_of(&root, &idx));
+        out.push(Crumb::Gap);
+    }
+    out.extend(chain.iter().rev().map(|k| crumb_of(k, &idx)));
+    Some(out)
+}
+
+/// generation key → 一節的畫面字面（唯一可證用名、缺席／重複立墓碑）。
+fn crumb_of(key: &str, idx: &TagIndex) -> Crumb {
+    match idx.get(key) {
+        Some(w) => Crumb::Node {
+            label: w.name.clone(),
+            tombstone: false,
+        },
+        None => Crumb::Node {
+            label: match tag_display_parts(key) {
+                Some((name, code)) => format!("{name}\u{2020} ({code})"),
+                // 連剖析都失敗：只說得出「這一節存在」，不編故事（同 group_label）
+                None => "?\u{2020}".to_string(),
+            },
+            tombstone: true,
+        },
+    }
+}
+
+/// breadcrumb 的畫面字串：節點以 ` → ` 相接，斷層畫成 `…`。
+///
+/// 放 model 層是因為它是**字面契約**（gate (a) 的 `root → … → B† → C`）：
+/// 驗它的測試不該被迫先起一個 terminal。
+pub fn breadcrumb_line(crumbs: &[Crumb]) -> String {
+    crumbs
+        .iter()
+        .map(|c| match c {
+            Crumb::Node { label, .. } => label.as_str(),
+            Crumb::Gap => "\u{2026}",
+        })
+        .collect::<Vec<_>>()
+        .join(" \u{2192} ")
+}
+
+/// 在**寬度上限內**的 breadcrumb 字面（B2 修正輪 H3）。
+///
+/// 底條模式（DETAIL 走整寬、只有 `DETAIL_STRIP_H` 那麼高）下 breadcrumb 一旦
+/// 換行，就會把底下的等價 CLI 原文推出畫面——而那一行是薄殼原則的憑證。
+/// 收縮順序（全部 display-only，不動節點序列本身）：
+/// 1. 整條放得下 → 原樣
+/// 2. 放不下 → **只留 root 與 self**，中間一律 `…`（兩端是這條線最說得出口
+///    的兩節：從哪裡來、現在是誰）
+/// 3. 連兩端都放不下 → 硬截到寬度並以 `…` 收尾（寧可截也不換行；換行等於
+///    畫面上少一條命令）
+pub fn breadcrumb_line_fit(crumbs: &[Crumb], width: usize) -> String {
+    let full = breadcrumb_line(crumbs);
+    if full.chars().count() <= width {
+        return full;
+    }
+    let ends: Vec<&Crumb> = match (crumbs.first(), crumbs.last()) {
+        (Some(a), Some(b)) if crumbs.len() > 1 => vec![a, b],
+        _ => return truncate_with_ellipsis(&full, width),
+    };
+    let collapsed = format!(
+        "{} \u{2192} \u{2026} \u{2192} {}",
+        breadcrumb_line(&[ends[0].clone()]),
+        breadcrumb_line(&[ends[1].clone()])
+    );
+    if collapsed.chars().count() <= width {
+        collapsed
+    } else {
+        truncate_with_ellipsis(&collapsed, width)
+    }
+}
+
+fn truncate_with_ellipsis(s: &str, width: usize) -> String {
+    if width == 0 {
+        return String::new();
+    }
+    if s.chars().count() <= width {
+        return s.to_string();
+    }
+    let mut out: String = s.chars().take(width.saturating_sub(1)).collect();
+    out.push('\u{2026}');
+    out
 }
 
 /// canonical generation key → `(name 段, 世代短碼)`，**display only**。
@@ -1158,12 +1392,8 @@ mod tests {
         );
         let roots: std::collections::HashSet<String> =
             std::collections::HashSet::from([canon(root)]);
-        let by_tag: HashMap<&str, &AgentSnapshot> = model
-            .workers
-            .iter()
-            .map(|w| (w.spawn_tag.as_str(), w))
-            .collect();
-        let aff = |i: usize| worker_affiliation(&model.workers[i], &roots, &by_tag);
+        let idx = TagIndex::build(&model.workers);
+        let aff = |i: usize| worker_affiliation(&model.workers[i], &roots, &idx);
         assert_eq!(
             aff(0),
             Affiliation::Lineage(canon(root)),
@@ -1224,14 +1454,9 @@ mod tests {
             vec![ghost, rootless, parent_only, foreign, manual("real-manual")],
             Vec::new(),
         );
-        let by_tag: HashMap<&str, &AgentSnapshot> = model
-            .workers
-            .iter()
-            .filter(|w| !w.spawn_tag.is_empty())
-            .map(|w| (w.spawn_tag.as_str(), w))
-            .collect();
+        let idx = TagIndex::build(&model.workers);
         let roots: std::collections::HashSet<String> = std::collections::HashSet::new();
-        let aff = |i: usize| worker_affiliation(&model.workers[i], &roots, &by_tag);
+        let aff = |i: usize| worker_affiliation(&model.workers[i], &roots, &idx);
         assert_eq!(
             aff(0),
             Affiliation::Invalid,
@@ -1332,18 +1557,466 @@ mod tests {
         );
         let roots: std::collections::HashSet<String> =
             std::collections::HashSet::from([canon(ra), canon(rb)]);
-        let by_tag: HashMap<&str, &AgentSnapshot> = model
-            .workers
-            .iter()
-            .map(|w| (w.spawn_tag.as_str(), w))
-            .collect();
+        let idx = TagIndex::build(&model.workers);
         assert_eq!(
-            worker_affiliation(&model.workers[1], &roots, &by_tag),
+            worker_affiliation(&model.workers[1], &roots, &idx),
             Affiliation::Invalid,
             "兩欄互相矛盾時不猜哪一邊對"
         );
         assert_eq!(model.groups[1].key, GroupKey::Standalone);
         assert_eq!(model.groups[1].members, vec![1], "invalid 列 standalone");
+    }
+
+    // ── DETAIL breadcrumb（P4.7 切片 B2）＋B6 防護矩陣 ──────────────────
+    //
+    // 主力放這一層：breadcrumb 是純函式，render 只投影（view.rs 抽樣驗字面）。
+
+    /// 共用的四代鏈 root→A→B→C。tag 的 name 段刻意用大寫，墓碑字面才與
+    /// gate (a) 的 `B†` 逐字對得上（`is_generation_key` 的 name 段允許大寫，
+    /// 只有 12 位 hex 段禁止）。
+    const T_ROOT: &str = "root-1-aaaaaaaaaaaa";
+    const T_A: &str = "A-2-bbbbbbbbbbbb";
+    const T_B: &str = "B-3-cccccccccccc";
+    const T_C: &str = "C-4-dddddddddddd";
+
+    /// 某一列的 breadcrumb 畫面字串（`None`＝這一列沒有說得出口的世代）
+    fn bc(model: &Model, name: &str) -> Option<String> {
+        let w = model
+            .workers
+            .iter()
+            .find(|w| w.name == name)
+            .expect("fixture 裡沒有這個 worker");
+        breadcrumb(model, w).map(|c| breadcrumb_line(&c))
+    }
+
+    /// **gate (a) render 面的字面契約**：root→A→B→C 移除 A／B 之後，C 的
+    /// breadcrumb ＝ `root → … → B† → C`——A 無資料成省略號、B 留墓碑。
+    ///
+    /// 三件事同時被釘住：省略號的語意（「這中間還有幾代，說不出是誰」）、
+    /// 墓碑只在 display 出現（`B† (cccc)` 的 name 段來自 **tag 剖析**，
+    /// 不是拿名字查表）、以及 root 在場時用它的 agent 名。
+    #[test]
+    fn gate_a_breadcrumb_reads_root_gap_tombstone_self() {
+        let model = model_of(
+            vec![
+                lin("root", T_ROOT, Some(T_ROOT), None),
+                lin("C", T_C, Some(T_ROOT), Some(T_B)),
+                // **同名誘惑**：畫面上真的有一個 agent 叫 `B`，但它是另一代
+                // （另一個 spawn_tag）。以名字查表的實作會在這裡把墓碑換成
+                // 這個活人——每一跳只比對 generation key 全串才不會上當
+                AgentSnapshot {
+                    lineage_root: None,
+                    parent_agent: None,
+                    ..lin("B", "decoy-9-999999999999", None, None)
+                },
+            ],
+            Vec::new(),
+        );
+        assert_eq!(
+            bc(&model, "C").as_deref(),
+            Some("root \u{2192} \u{2026} \u{2192} B\u{2020} (cccc) \u{2192} C"),
+            "gate (a)：root → … → B† → C（同名的在場者不得冒充那一節）"
+        );
+        // 節點層的形狀（畫面字串之外，render 還要知道哪一節是墓碑）
+        let w = &model.workers[1];
+        let crumbs = breadcrumb(&model, w).expect("C 是合法的 lineage 列");
+        assert_eq!(crumbs.len(), 4);
+        assert_eq!(crumbs[1], Crumb::Gap, "root 與 parent 之間是斷層");
+        assert!(
+            matches!(&crumbs[0], Crumb::Node { tombstone, .. } if !tombstone),
+            "root 在場：不是墓碑"
+        );
+        assert!(
+            matches!(&crumbs[2], Crumb::Node { tombstone, .. } if *tombstone),
+            "parent 缺席：墓碑"
+        );
+
+        // **負向：MUST NOT 由 task 推導**。加一筆 `from` 恰好叫 "B"（甚至
+        // 叫 "A"）的 task，等於把「誰跟誰講過話」擺在最誘人的位置
+        // （`InFlight` 沒有 `Clone`，兩欄各寫一份——不為了測試動 ab-core 的
+        // 公開型別，同 writer5 對 `AgentSnapshot` 的權衡）
+        let temptation = || InFlight {
+            id: "20260731T000009Z-zzzz".into(),
+            from: "B".into(),
+            to: "C".into(),
+            status: "queued".into(),
+        };
+        let mut tempted = model_of(
+            vec![
+                lin("root", T_ROOT, Some(T_ROOT), None),
+                lin("C", T_C, Some(T_ROOT), Some(T_B)),
+            ],
+            vec![temptation()],
+        );
+        tempted.recent = vec![temptation()];
+        assert_eq!(
+            bc(&tempted, "C"),
+            bc(&model, "C"),
+            "task 的 from/to 不參與 breadcrumb（在場的 B 也不會因此變成非墓碑）"
+        );
+    }
+
+    /// 節點數的三種形狀：self 即 root（單節點）／parent 即 root（兩節點、
+    /// **無**省略號）／祖先全在場（走得完就走完，不無中生有一個斷層）。
+    #[test]
+    fn breadcrumb_shapes_follow_what_the_registry_can_prove() {
+        // self 即 root
+        let solo = model_of(vec![lin("root", T_ROOT, Some(T_ROOT), None)], Vec::new());
+        assert_eq!(bc(&solo, "root").as_deref(), Some("root"));
+
+        // parent 即 root
+        let two = model_of(
+            vec![
+                lin("root", T_ROOT, Some(T_ROOT), None),
+                lin("A", T_A, Some(T_ROOT), Some(T_ROOT)),
+            ],
+            Vec::new(),
+        );
+        assert_eq!(bc(&two, "A").as_deref(), Some("root \u{2192} A"));
+
+        // 四代全在場：每一跳都有證據，於是一節省略號都沒有
+        let full = model_of(
+            vec![
+                lin("root", T_ROOT, Some(T_ROOT), None),
+                lin("A", T_A, Some(T_ROOT), Some(T_ROOT)),
+                lin("B", T_B, Some(T_ROOT), Some(T_A)),
+                lin("C", T_C, Some(T_ROOT), Some(T_B)),
+            ],
+            Vec::new(),
+        );
+        assert_eq!(
+            bc(&full, "C").as_deref(),
+            Some("root \u{2192} A \u{2192} B \u{2192} C")
+        );
+        assert_eq!(
+            bc(&full, "B").as_deref(),
+            Some("root \u{2192} A \u{2192} B")
+        );
+    }
+
+    /// **root 缺席降級**：連 root 的 registry 都不在了，它也只能是墓碑——
+    /// 而墓碑仍然說得出「這條 lineage 是哪一條」（generation key 的短碼）。
+    #[test]
+    fn an_absent_root_degrades_to_a_tombstone_not_to_silence() {
+        let model = model_of(vec![lin("C", T_C, Some(T_ROOT), Some(T_B))], Vec::new());
+        assert_eq!(
+            bc(&model, "C").as_deref(),
+            Some("root\u{2020} (aaaa) \u{2192} \u{2026} \u{2192} B\u{2020} (cccc) \u{2192} C")
+        );
+
+        // parent 即 root 且 root 缺席：兩節點、**無**省略號（沒有中間世代
+        // 可言，畫一個斷層等於宣稱有一段不存在的血緣）
+        let two = model_of(vec![lin("A", T_A, Some(T_ROOT), Some(T_ROOT))], Vec::new());
+        assert_eq!(
+            bc(&two, "A").as_deref(),
+            Some("root\u{2020} (aaaa) \u{2192} A")
+        );
+
+        // 剖析不出來的 key（合文法但短碼取不到）不編故事。這裡直接驗
+        // `crumb_of` 的退路字面：`?†`
+        let idx = TagIndex::build(&[]);
+        assert_eq!(
+            crumb_of("not-a-generation-key", &idx),
+            Crumb::Node {
+                label: "?\u{2020}".to_string(),
+                tombstone: true
+            }
+        );
+    }
+
+    /// **B6：cycle**。兩列互為 parent（B↔C，同一個 root），traversal MUST
+    /// 停得下來且 MUST NOT 讓同一節出現兩次。
+    ///
+    /// mutation 證據：拔掉 `visited` 這道防護，走法會變成 C→B→C→B…，由
+    /// `hop_limit` 截斷，字串長出重複節點 → 本測試紅。
+    #[test]
+    fn a_cycle_cannot_walk_forever() {
+        let model = model_of(
+            vec![
+                lin("root", T_ROOT, Some(T_ROOT), None),
+                lin("B", T_B, Some(T_ROOT), Some(T_C)),
+                lin("C", T_C, Some(T_ROOT), Some(T_B)),
+            ],
+            Vec::new(),
+        );
+        let line = bc(&model, "C").expect("形狀合法（cycle 的傷害在 traversal）");
+        assert_eq!(
+            line, "root \u{2192} \u{2026} \u{2192} B \u{2192} C",
+            "繞回走過的節點就停，斷掉的地方誠實補省略號"
+        );
+        assert_eq!(line.matches(" C").count(), 1, "同一節不得出現兩次");
+
+        // **自指的另一種形狀**：一列宣稱自己是 root，卻又寫著 parent。
+        // 修正輪 H1.1 起這是**矛盾形**（根的定義就是沒有 parent），整列
+        // Invalid → 沒有 breadcrumb。
+        //
+        // 前一版把它鎖成「單節點 A」——那等於用畫面掩蓋一列自相矛盾的
+        // registry，是錯誤行為被斷言鎖定，不是保護
+        let self_root = model_of(
+            vec![
+                lin("A", T_ROOT, Some(T_ROOT), Some(T_B)),
+                lin("B", T_B, Some(T_ROOT), Some(T_ROOT)),
+            ],
+            Vec::new(),
+        );
+        assert_eq!(bc(&self_root, "A"), None, "自稱根卻有 parent＝矛盾形");
+        // B 的 root 指向 A 的 tag、parent 也是 A——但 A 這一列 invalid，
+        // 走到它就停（在場，所以是名字不是墓碑）
+        assert_eq!(bc(&self_root, "B").as_deref(), Some("A \u{2192} B"));
+    }
+
+    /// **H1（修正輪）：三個先前放行的漏形**。三者都會讓一列自相矛盾的
+    /// registry 混進歸屬判定，且畫面上看起來完全正常。
+    #[test]
+    fn contradictory_rows_are_invalid_not_lineage() {
+        // (1) 自稱根卻有 parent
+        let self_root = lin("self-root", T_ROOT, Some(T_ROOT), Some(T_B));
+        // (2) 有 spawn_tag、卻不是 spawn 出來的（寫入路徑產不出這種列）
+        let not_spawned = AgentSnapshot {
+            spawned: false,
+            ..lin("not-spawned", T_A, Some(T_ROOT), Some(T_ROOT))
+        };
+        // (3) parent 是 legacy（說不出自己的 lineage），子代卻宣稱屬於別的 R
+        //     ——切片 A 的 fallback 是「退 parent 自身 spawn_tag」，所以合法的
+        //     子代只能宣稱 root ＝ parent 的 tag
+        let legacy_parent = AgentSnapshot {
+            lineage_root: None,
+            parent_agent: None,
+            ..lin("legacy-parent", T_B, None, None)
+        };
+        let false_claim = lin("false-claim", T_C, Some(T_ROOT), Some(T_B));
+        let model = model_of(
+            vec![
+                lin("root", T_ROOT, Some(T_ROOT), None),
+                self_root,
+                not_spawned,
+                legacy_parent,
+                false_claim,
+            ],
+            Vec::new(),
+        );
+        let roots: std::collections::HashSet<String> =
+            std::collections::HashSet::from([canon(T_ROOT)]);
+        let idx = TagIndex::build(&model.workers);
+        let aff = |i: usize| worker_affiliation(&model.workers[i], &roots, &idx);
+        assert_eq!(aff(1), Affiliation::Invalid, "自稱根卻有 parent");
+        assert_eq!(
+            aff(2),
+            Affiliation::Invalid,
+            "spawn_tag 在、spawned 不是 true"
+        );
+        assert_eq!(
+            aff(4),
+            Affiliation::Invalid,
+            "legacy parent 之下的假 root 宣稱"
+        );
+        for name in ["self-root", "not-spawned", "false-claim"] {
+            assert_eq!(bc(&model, name), None, "{name} MUST NOT 有 breadcrumb");
+        }
+
+        // 對照組：同一個 legacy parent 之下，root ＝ parent 自身 tag 就合法
+        let ok = model_of(
+            vec![
+                AgentSnapshot {
+                    lineage_root: None,
+                    parent_agent: None,
+                    ..lin("legacy-parent", T_B, None, None)
+                },
+                lin("kid", T_C, Some(T_B), Some(T_B)),
+            ],
+            Vec::new(),
+        );
+        assert_eq!(
+            bc(&ok, "kid").as_deref(),
+            Some("legacy-parent \u{2192} kid"),
+            "legacy parent ＝這一條 lineage 的根（切片 A 的 fallback 語意）"
+        );
+    }
+
+    /// **H2（修正輪）：`spawn_tag` 重複＝身分不可證**。
+    ///
+    /// HashMap 靜默保留最後寫入的那一列，等於**用目錄序決定身分**——切片 A
+    /// 對 ambiguous parent 已經裁過同一件事（不任選）。兩件事要成立：
+    /// 重複的列自己一律 Invalid；別人指向它時只能得到墓碑。
+    #[test]
+    fn a_duplicated_spawn_tag_proves_nothing() {
+        let other = "other-9-999999999999";
+        // P1／P2 同 tag、不同 root：誰也不能代表這個世代
+        let dup_a = lin("dup-a", T_B, Some(T_B), None);
+        let dup_b = lin("dup-b", T_B, Some(other), Some(other));
+        let child = lin("C", T_C, Some(T_ROOT), Some(T_B));
+        let model = model_of(
+            vec![lin("root", T_ROOT, Some(T_ROOT), None), dup_a, dup_b, child],
+            Vec::new(),
+        );
+        let roots: std::collections::HashSet<String> =
+            std::collections::HashSet::from([canon(T_ROOT)]);
+        let idx = TagIndex::build(&model.workers);
+        assert_eq!(
+            worker_affiliation(&model.workers[1], &roots, &idx),
+            Affiliation::Invalid,
+            "重複 tag 的列自己也證不出身分"
+        );
+        assert_eq!(
+            worker_affiliation(&model.workers[2], &roots, &idx),
+            Affiliation::Invalid
+        );
+        // C 指向重複的 P → 墓碑（不得拿任一列當在場證據）
+        assert_eq!(
+            bc(&model, "C").as_deref(),
+            Some("root \u{2192} \u{2026} \u{2192} B\u{2020} (cccc) \u{2192} C")
+        );
+
+        // **換檔名序結果不變**：兩列對調之後每一條斷言逐字相同。靜默任選的
+        // 實作會在這裡分岔（它取到的是另一列）
+        let swapped = model_of(
+            vec![
+                lin("root", T_ROOT, Some(T_ROOT), None),
+                lin("dup-b", T_B, Some(other), Some(other)),
+                lin("dup-a", T_B, Some(T_B), None),
+                lin("C", T_C, Some(T_ROOT), Some(T_B)),
+            ],
+            Vec::new(),
+        );
+        let idx2 = TagIndex::build(&swapped.workers);
+        assert_eq!(
+            worker_affiliation(&swapped.workers[1], &roots, &idx2),
+            Affiliation::Invalid
+        );
+        assert_eq!(
+            worker_affiliation(&swapped.workers[2], &roots, &idx2),
+            Affiliation::Invalid
+        );
+        assert_eq!(bc(&swapped, "C"), bc(&model, "C"), "答案不依目錄序");
+        assert_eq!(swapped.groups, model.groups, "分組也不依目錄序");
+    }
+
+    /// **H3（修正輪）：寬度上限內的 breadcrumb**。底條模式一換行就會把等價
+    /// CLI 原文推出畫面，所以過長時收縮成「root → … → self」，再不夠就硬截。
+    #[test]
+    fn a_breadcrumb_collapses_before_it_wraps() {
+        let crumbs = vec![
+            Crumb::Node {
+                label: "root".into(),
+                tombstone: false,
+            },
+            Crumb::Node {
+                label: "middle-one".into(),
+                tombstone: false,
+            },
+            Crumb::Node {
+                label: "middle-two".into(),
+                tombstone: false,
+            },
+            Crumb::Node {
+                label: "self".into(),
+                tombstone: false,
+            },
+        ];
+        let full = "root \u{2192} middle-one \u{2192} middle-two \u{2192} self";
+        assert_eq!(breadcrumb_line(&crumbs), full);
+        assert_eq!(breadcrumb_line_fit(&crumbs, 80), full, "放得下就原樣");
+        assert_eq!(
+            breadcrumb_line_fit(&crumbs, 20),
+            "root \u{2192} \u{2026} \u{2192} self",
+            "放不下 → 只留兩端"
+        );
+        // 連兩端都放不下：硬截（寧可截也不換行）
+        let fit = breadcrumb_line_fit(&crumbs, 8);
+        assert_eq!(fit.chars().count(), 8);
+        assert!(fit.ends_with('\u{2026}'));
+        // 單節點沒有「中間」可收縮，直接走硬截那一支
+        let solo = vec![Crumb::Node {
+            label: "a-very-long-single-node".into(),
+            tombstone: false,
+        }];
+        assert_eq!(breadcrumb_line_fit(&solo, 6), "a-ver\u{2026}");
+    }
+
+    /// **B6：超長鏈**。八代全在場時走得完（hop 上限不得誤殺合法的長鏈），
+    /// 且節點序是 root→…→self。
+    #[test]
+    fn a_long_chain_walks_all_the_way_up() {
+        let tags: Vec<String> = (0..8).map(|i| format!("g{i}-{}-{i:012x}", i + 1)).collect();
+        let workers: Vec<AgentSnapshot> = (0..8)
+            .map(|i| {
+                lin(
+                    &format!("g{i}"),
+                    &tags[i],
+                    Some(&tags[0]),
+                    if i == 0 { None } else { Some(&tags[i - 1]) },
+                )
+            })
+            .collect();
+        let model = model_of(workers, Vec::new());
+        assert_eq!(
+            bc(&model, "g7").as_deref(),
+            Some(
+                "g0 \u{2192} g1 \u{2192} g2 \u{2192} g3 \u{2192} g4 \u{2192} g5 \u{2192} g6 \u{2192} g7"
+            )
+        );
+        // hop 上限＝列數＋1：八代八列，剛好走得完（＋1 留給最後一個缺席的
+        // 祖先當墓碑，見 `hop_limit`）
+        assert_eq!(hop_limit(&model), 9);
+    }
+
+    /// **B6：四型與矛盾列沒有 breadcrumb**。legacy／manual／invalid 身上
+    /// 沒有說得出口的世代；`parent 在場但 root 不一致`／自指同理（形狀驗證
+    /// 就把它們擋在 traversal 之外）。
+    #[test]
+    fn rows_without_a_provable_generation_have_no_breadcrumb() {
+        let other_root = "other-9-999999999999";
+        let model = model_of(
+            vec![
+                // legacy：兩欄缺席
+                AgentSnapshot {
+                    lineage_root: None,
+                    parent_agent: None,
+                    ..lin("legacy", T_A, None, None)
+                },
+                manual("manual"),
+                // invalid：自己是自己的 parent
+                lin("self-parent", T_B, Some(T_ROOT), Some(T_B)),
+                // invalid：parent 在場，但兩人的 root 對不上
+                lin("P", other_root, Some(other_root), None),
+                lin("cross", T_C, Some(T_ROOT), Some(other_root)),
+                // invalid：registry 損壞
+                AgentSnapshot {
+                    corrupt: true,
+                    ..lin("broken", "bk-7-777777777777", Some(T_ROOT), Some(T_ROOT))
+                },
+            ],
+            Vec::new(),
+        );
+        for name in ["legacy", "manual", "self-parent", "cross", "broken"] {
+            assert_eq!(bc(&model, name), None, "{name} 不該畫出 breadcrumb");
+        }
+        // 對照組：同一份快照裡形狀合法的那一列照樣有 breadcrumb
+        assert_eq!(bc(&model, "P").as_deref(), Some("P"));
+    }
+
+    /// **B6：半殘的中繼列不得把線拉長**。C 的 parent（X）在場，但 X 自己是
+    /// 一列 invalid（root 指向別處）——走到它就停，斷層誠實補省略號。
+    ///
+    /// 這條擋的是「祖先在場」與「祖先說得通」被當成同一件事：前者只證明有
+    /// 一列同名 tag 的 registry，後者才是把它接進這條 lineage 的理由。
+    #[test]
+    fn a_broken_intermediate_stops_the_walk() {
+        let model = model_of(
+            vec![
+                lin("root", T_ROOT, Some(T_ROOT), None),
+                // X 在場、`lineage_root` 也對得上（所以 C 自己仍合法），但它
+                // **憑空認領**：說自己屬於 root 這一組，卻不說自己是誰的子代
+                lin("X", T_B, Some(T_ROOT), None),
+                lin("C", T_C, Some(T_ROOT), Some(T_B)),
+            ],
+            Vec::new(),
+        );
+        assert_eq!(
+            bc(&model, "C").as_deref(),
+            Some("root \u{2192} \u{2026} \u{2192} X \u{2192} C"),
+            "走到說不通的祖先就停（它在場，所以是名字不是墓碑）"
+        );
     }
 
     /// TASKS 欄（P4.7 切片 B）：**不再過濾**——scope 軸隨 ORIGINS 一起退場，

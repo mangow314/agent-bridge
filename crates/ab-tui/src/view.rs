@@ -22,8 +22,8 @@ use crate::action::{cancel_cmdline, evidence};
 use crate::app::{App, EnterAct, Panel, Sel};
 use crate::model::{
     Blocker, BlockerIndex, DISK_STALE, Freshness, LiveIndex, Liveness, Model, Row, TMUX_STALE,
-    age_is_worth_showing, group_label, group_line_offsets, origin_label, pane_liveness,
-    window_detail, worker_line_of,
+    age_is_worth_showing, breadcrumb, breadcrumb_line, breadcrumb_line_fit, group_label,
+    group_line_offsets, origin_label, pane_liveness, window_detail, worker_line_of,
 };
 use crate::theme;
 
@@ -40,9 +40,21 @@ const DETAIL_W: u16 = 43 + 2;
 /// 兩欄並排（中欄＋DETAIL）的最小寬。ORIGINS 退場後少了 24 欄，同一台 80 欄
 /// 終端機因此更容易走得進並排版面
 const TWO_COL_MIN_W: u16 = MID_MIN_W + DETAIL_W;
-/// 底條模式下 DETAIL 的高度：task 細節 5 行＋空行＋`evidence:`＋2 條命令＋
-/// 上下邊框。
-const DETAIL_STRIP_H: u16 = 11;
+/// 底條模式下 DETAIL 的高度。由**最長的那一種選取**回推，而不是照 task 那
+/// 一種抓個大概——DETAIL 的等價 CLI 原文是薄殼原則的憑證（見 `layout`），
+/// 少一行就等於畫面上沒有那條命令。
+///
+/// - worker：name／pane／runtime／ready／lineage／origin／state＋blocker ＝8
+///   ＋空行＋`evidence:`＋1 條命令 ＝**11**
+/// - task：task-id／from／to／status／pane／blocker ＝6
+///   ＋空行＋`evidence:`＋2 條命令 ＝10
+///
+/// 取 11＋上下邊框＝13。（P4.7 切片 B2 從 11 調上來：breadcrumb 那一列把
+/// worker 這一支推長了一行，而舊值連調整前的 `evidence:` 都已經壓在邊界上。）
+const DETAIL_STRIP_H: u16 = 13;
+/// DETAIL 各列的 label 寬（`lineage: ` 等，冒號後一個空格）。breadcrumb 收縮
+/// 時要從可用欄寬裡先扣掉它。
+const LINEAGE_LABEL_W: usize = 9;
 /// footer 一次畫得出的 sticky 警告則數（多的以「另有 N 則」帶出，見
 /// `render_footer`）。
 const WARN_ROWS: usize = 3;
@@ -55,6 +67,9 @@ struct Areas {
     tasks: Rect,
     detail: Rect,
     footer: Rect,
+    /// DETAIL 走的是整寬底條（寬度不足的那一支）。底條**高度固定**，所以
+    /// 它裡面的長字串不能換行——換一行就把底下的等價 CLI 原文推出畫面
+    detail_strip: bool,
 }
 
 /// footer 高度隨 sticky 警告伸縮（major #2：警告不得被單行 message 覆寫，
@@ -83,7 +98,8 @@ fn layout(area: Rect, warnings: usize) -> Areas {
     // 三者相加要 92 欄，80 欄的終端機放不下——**寬度不足時 DETAIL 改走整寬
     // 底條**，而不是壓縮任何一方。80 欄下底條有整整 78 欄，命令原文照樣成行；
     // 犧牲的只是垂直空間，那是列表捲動本來就處理得了的。
-    let (mid, detail) = if main.width >= TWO_COL_MIN_W {
+    let strip = main.width < TWO_COL_MIN_W;
+    let (mid, detail) = if !strip {
         let [m, d] = Layout::horizontal([Constraint::Min(MID_MIN_W), Constraint::Length(DETAIL_W)])
             .areas(main);
         (m, d)
@@ -99,6 +115,7 @@ fn layout(area: Rect, warnings: usize) -> Areas {
         tasks,
         detail,
         footer,
+        detail_strip: strip,
     }
 }
 
@@ -128,7 +145,7 @@ pub fn render(
 
     render_workers(f, workers_area, model, live, blockers, app);
     render_tasks(f, tasks_area, model, app);
-    render_detail(f, detail_area, model, live, blockers, app);
+    render_detail(f, detail_area, model, live, blockers, app, a.detail_strip);
     render_footer(f, footer, model, app, fresh);
 
     // overlay 優先序：確認框（cancel／evict）> 全文 pager > 摘要頁 > 合法鍵
@@ -325,13 +342,16 @@ fn render_detail(
     live: &LiveIndex,
     blockers: &BlockerIndex,
     app: &App,
+    strip: bool,
 ) {
     let sel = app.selection(model);
     let mut lines: Vec<Line> = Vec::new();
     match &sel {
         Sel::None => lines.push(Line::from("(nothing selected)")),
         Sel::Worker(w) => {
-            for l in worker_detail(w, live) {
+            // 底條模式：breadcrumb 必須壓進**一行**（見 `Areas::detail_strip`）
+            let fit = strip.then(|| area.width.saturating_sub(2) as usize);
+            for l in worker_detail(model, w, live, fit) {
                 lines.push(l);
             }
             // BLOCKER 是與 ACTIVITY 正交的另一軸（§4 雙軸狀態）：獨立一欄，
@@ -405,7 +425,13 @@ fn blocker_line(b: Blocker) -> Line<'static> {
 /// 「這個 worker 是誰在哪裡 spawn 出來的、那個 window 現在如何」，後者講的是
 /// 「這個 worker 自己的 pane 還在不在」。P4.5 之前只有一列，兩件事被壓成一件
 /// ——那正是使用者回饋題 2／5／7 的來源。
-fn worker_detail(w: &ab_core::registry::AgentSnapshot, live: &LiveIndex) -> Vec<Line<'static>> {
+fn worker_detail(
+    model: &Model,
+    w: &ab_core::registry::AgentSnapshot,
+    live: &LiveIndex,
+    // `Some(可用欄寬)`＝這一行不得換行（底條模式）；`None`＝照舊 wrap
+    fit: Option<usize>,
+) -> Vec<Line<'static>> {
     vec![
         Line::from(format!("name   : {}", w.name)),
         Line::from(format!(
@@ -421,6 +447,21 @@ fn worker_detail(w: &ab_core::registry::AgentSnapshot, live: &LiveIndex) -> Vec<
             }
         )),
         Line::from(format!("ready  : {}", w.ready)),
+        // lineage 在 origin **之前**：邏輯歸屬是唯一的歸屬軸（P4.7 B5），
+        // 物理位置是它下面的一條註腳。說不出世代的列（legacy／manual／
+        // invalid）寫 `-`——與 `origin_label` 同一個「不適用」字面，而不是
+        // 掰一條只有一節的假血緣
+        Line::from(format!(
+            "lineage: {}",
+            match breadcrumb(model, w) {
+                // 收縮只發生在底條模式，且是 display-only：節點序列本身不變
+                Some(c) => match fit {
+                    Some(w) => breadcrumb_line_fit(&c, w.saturating_sub(LINEAGE_LABEL_W)),
+                    None => breadcrumb_line(&c),
+                },
+                None => "-".to_string(),
+            }
+        )),
         Line::from(format!(
             "origin : {}",
             window_detail(live, &origin_label(w))
@@ -1024,7 +1065,9 @@ mod tests {
             runtime: runtime.to_string(),
             owner: owner.to_string(),
             ready: "ready".to_string(),
-            spawn_tag: "t1".to_string(),
+            // 每一列各自的舊式 tag（**不共用**）：共用的話 B2 修正輪 H2 的
+            // 重複偵測會把它們全判成 invalid，這份 fixture 想要的是 legacy
+            spawn_tag: format!("t1-{name}"),
             registered_at: "2026-08-01T00:00:00Z".to_string(),
             spawned,
             corrupt: false,
@@ -1127,9 +1170,19 @@ mod tests {
     /// 再加一層：連 freshness 都由呼叫端指定（stale 顯示與降級要驗得到）。
     /// 預設 `Freshness::default()`＝兩軸都是 0，也就是「剛更新」。
     fn draw_fresh(fresh: Freshness, tweak: impl FnOnce(&mut Model, &mut App)) -> Buffer {
+        draw_at(120, 40, fresh, tweak)
+    }
+
+    /// 指定終端機尺寸的版本：窄畫面（DETAIL 走整寬底條）只有這樣才畫得出來。
+    fn draw_at(
+        w: u16,
+        h: u16,
+        fresh: Freshness,
+        tweak: impl FnOnce(&mut Model, &mut App),
+    ) -> Buffer {
         let (mut model, live, blockers, mut app) = fixture();
         tweak(&mut model, &mut app);
-        let mut t = Terminal::new(TestBackend::new(120, 40)).unwrap();
+        let mut t = Terminal::new(TestBackend::new(w, h)).unwrap();
         t.draw(|f| render(f, &model, &live, &blockers, &app, fresh))
             .unwrap();
         t.backend().buffer().clone()
@@ -1624,6 +1677,146 @@ mod tests {
             "根不在場 MUST 標 †＋世代短碼，實際畫面：{t}"
         );
         assert!(!t.contains("(standalone)"));
+    }
+
+    /// DETAIL 欄逐列的字元（**只取 DETAIL 的 x 範圍**）。
+    ///
+    /// breadcrumb 的字面帶 `→`／`…`／`†`，全是 East Asian Ambiguous（單寬），
+    /// 但整條 needle 只可能落在一列裡——逐列取字串再 `contains`，比 `find_in`
+    /// 的滑動視窗少一層「跨列拼接」的誤判空間。
+    fn detail_lines(buf: &Buffer) -> Vec<String> {
+        (0..buf.area().height)
+            .map(|y| {
+                (DETAIL_X0..buf.area().width)
+                    .map(|x| buf[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect()
+    }
+
+    /// **gate (a) render 面的 breadcrumb**：選中 C 時 DETAIL 投影
+    /// `root → … → B† → C`。防護矩陣的主力在 model 層（純函式），這裡抽樣
+    /// 驗兩件只有畫面說得準的事：字面真的畫得出來、以及說不出世代的列
+    /// 寫 `-` 而不是一條假血緣。
+    #[test]
+    fn detail_projects_the_lineage_breadcrumb() {
+        let root = "root-1-aaaaaaaaaaaa";
+        let buf = draw_model_with(|m, app| {
+            m.workers = vec![
+                lin("root", "%1", root, root, None),
+                // parent B 的 registry 不在了 → 墓碑；B 的 parent（A）無從得知
+                // → 省略號
+                lin(
+                    "C",
+                    "%4",
+                    "C-4-dddddddddddd",
+                    root,
+                    Some("B-3-cccccccccccc"),
+                ),
+            ];
+            m.tasks.clear();
+            m.groups = crate::model::group_by_lineage(&m.workers);
+            app.row_idx = 1; // 選中 C（DETAIL 只投影選中列）
+        });
+        let want = "lineage: root \u{2192} \u{2026} \u{2192} B\u{2020} (cccc) \u{2192} C";
+        let lines = detail_lines(&buf);
+        assert!(
+            lines.iter().any(|l| l.contains(want)),
+            "DETAIL MUST 畫出「{want}」，實際：{lines:#?}"
+        );
+
+        // 說不出世代的列（fixture 的 worker 是 legacy 形狀：有 spawn_tag、
+        // 兩欄缺席）→ `-`，MUST NOT 畫出只有自己一節的假 breadcrumb
+        let plain = detail_lines(&draw());
+        assert!(
+            plain.iter().any(|l| l.contains("lineage: -")),
+            "legacy 列 MUST 誠實寫 `-`，實際：{plain:#?}"
+        );
+        assert!(
+            !plain.iter().any(|l| l.contains("lineage: alive-w")),
+            "MUST NOT 把 self 自己畫成一條 lineage"
+        );
+    }
+
+    /// **底條模式**（寬度不足 → DETAIL 走整寬底條）：breadcrumb 與等價 CLI
+    /// 原文 MUST 都還在畫面上。
+    ///
+    /// 這條在 B2 之前不存在，而 `DETAIL_STRIP_H` 也就沒人守：breadcrumb 讓
+    /// worker 那一支長了一行，舊值 11 會把 `evidence:` 連同命令一起推出畫面
+    /// ——薄殼原則（`layout` 的註解）說那等於畫面上沒有那條命令。
+    #[test]
+    fn the_detail_strip_still_fits_the_breadcrumb_and_the_command() {
+        // **會換行的鏈**才驗得到 H3：八代、每個名字 13 欄，整條 125 欄，
+        // 遠超過底條的 68 欄內寬
+        let names: Vec<String> = (1..=8).map(|i| format!("relay-node-{i:02}")).collect();
+        let tags: Vec<String> = (1..=8)
+            .map(|i| format!("relay-node-{i:02}-{i}-{i:012x}"))
+            .collect();
+        let ws: Vec<AgentSnapshot> = (0..8)
+            .map(|i| {
+                lin(
+                    &names[i],
+                    &format!("%{}", i + 1),
+                    &tags[i],
+                    &tags[0],
+                    if i == 0 { None } else { Some(&tags[i - 1]) },
+                )
+            })
+            .collect();
+        // 70 欄 < TWO_COL_MIN_W（27＋45）→ DETAIL 走整寬底條
+        let buf = draw_at(70, 24, Freshness::default(), |m, app| {
+            m.workers = ws;
+            m.tasks.clear();
+            m.groups = crate::model::group_by_lineage(&m.workers);
+            app.row_idx = 7; // 選中最後一代
+        });
+        let t = text(&buf);
+        assert!(
+            t.contains("lineage: relay-node-01 \u{2192} \u{2026} \u{2192} relay-node-08"),
+            "底條模式的 breadcrumb MUST 收縮成一行（保留 root 與 self）：\n{t}"
+        );
+        assert!(
+            !t.contains("relay-node-01 \u{2192} relay-node-02"),
+            "收縮 MUST 真的發生（整條展開就會換行，把命令推出畫面）：\n{t}"
+        );
+        assert!(
+            t.contains("$ agent-bridge list --long"),
+            "底條模式 MUST 留住等價 CLI 原文（薄殼原則），實際畫面：\n{t}"
+        );
+    }
+
+    /// 全高（兩欄）模式**不收縮**：那裡 DETAIL 高度不固定，wrap 是既有行為，
+    /// H3 的收縮只針對底條（不得順手改掉另一支的顯示）。
+    #[test]
+    fn the_two_column_detail_still_wraps_instead_of_collapsing() {
+        let names: Vec<String> = (1..=8).map(|i| format!("relay-node-{i:02}")).collect();
+        let tags: Vec<String> = (1..=8)
+            .map(|i| format!("relay-node-{i:02}-{i}-{i:012x}"))
+            .collect();
+        let ws: Vec<AgentSnapshot> = (0..8)
+            .map(|i| {
+                lin(
+                    &names[i],
+                    &format!("%{}", i + 1),
+                    &tags[i],
+                    &tags[0],
+                    if i == 0 { None } else { Some(&tags[i - 1]) },
+                )
+            })
+            .collect();
+        let buf = draw_model_with(|m, app| {
+            m.workers = ws;
+            m.tasks.clear();
+            m.groups = crate::model::group_by_lineage(&m.workers);
+            app.row_idx = 7;
+        });
+        let lines = detail_lines(&buf);
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains("relay-node-01 \u{2192} relay-node-02")),
+            "兩欄模式 MUST 照舊展開＋wrap，實際：{lines:#?}"
+        );
     }
 
     /// **gate (b) render 面**：Legacy／Manual／Invalid 三型都畫在 `(standalone)`

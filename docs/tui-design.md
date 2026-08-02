@@ -275,8 +275,11 @@ focus 跨 window 語意、CAS（cancel 綁 id）。
 
 ## 9. 驗收判準
 
-固定 fixture：3 owner／12 worker／20 task／3 異常
-（1 dead owner、1 blocked prompt、1 orphaned worker）。
+固定 fixture：12 worker／20 task／3 異常（1 **origin window 已消失的 worker**
+〔P4.7 前記為「dead owner」〕、1 blocked prompt、1 orphaned worker）。worker 分布
+在 3 個 spawn 來源 window——P4.7 B5 起 **owner 是物理位置不是歸屬軸**，它只出現
+在 DETAIL 的 origin 證據列（baseline 的 CLI 側仍有 OWNER 欄，那是 CLI 的事實，
+不是 TUI 的軸）。歸屬軸一律是 lineage。
 
 ### Phases × Gates
 
@@ -290,7 +293,7 @@ focus 跨 window 語意、CAS（cancel 綁 id）。
 | P4.5 視覺樣式層 | `theme` 模組＋ANSI 16 語意色（additive 純樣式：狀態字上色但權威字原文不變、liveness／blocker 語意色、focus Thick 邊框、選取列背景色、footer 警告 Yellow——顏色編碼軸固定五種：status／liveness／blocker／focus／warning；不動 selection 起點／鍵位／面板順序）**［P4.6 起為六種：增 content-syntax，見 P4.6 列］** | (a) render 單元測試（ratatui `TestBackend`）：指定 cell 的 fg/bg/modifier 符合 theme 對映（每個語意色至少一條）＋buffer 字元內容仍含六個權威字原文與 ●/✗/⛔ glyph；(b) P4 replay 重跑步數不變仍達標（樣式不進 capture 計數，重跑確認非假設） |
 | P4.6 UX truthfulness | 使用者實跑回饋（2026-08-01，9 題）第一段：ORIGINS 平坦視圖取代假 owner 樹（origin 誠實標籤 `session:window-name`＋live/gone/unknown，不做推測分組）；DETAIL 拆 agent state／origin window 兩列；Enter 分面板（OWNERS→WORKERS、worker→focus、task→read，`r` 保留）＋contextual footer；chrome 全英文；TASKS scrollbar＋`N/total`＋PgUp/PgDn/Home/End；pager markdown-lite 高亮（標題/fence/清單/中繼標頭；diff 僅限明確 diff 區段；bytes 不變，色彩契約加第六軸 content-syntax）；selection 改存 stable key（task id／(name,spawn_tag)）；freshness 顯示（disk/tmux age，逾時 stale 降級）。零協定改動 | (a) P1 gate 重跑（Enter matrix 動 focus 語意）；(b) P2 read bytes gate 重跑；(c) P4 replay 依新鍵位/文字重寫後 TUI ≤ baseline 50% 且正確率 100%；(d) render 測試新增斷言：英文 chrome（buffer 無中文 chrome 字元）、origin 標籤三態、scrollbar 首/中/末 thumb、reload 重排後 selection 依 stable key 不跳列、stale 降級顯示；(e) pager 高亮測試：同一 bytes 前後字元層完全相同＋fence/標題命中＋散文 +/- 不染 |
 | P4.7 lineage provenance | 第二段（**2026-08-02 開批**；契約經 codex plan-stage 審查＋使用者兩裁定細化，見 §11）：registry additive optional 欄位 `lineage_root`＋`parent_agent`——**值為 generation key（canonical `spawn_tag` 全串，非名稱）**；spawn 於既有 agents-registry 鎖內，將呼叫者環境 tag 前綴化後與各 registry `spawn_tag` byte-for-byte 比對，**恰一匹配**才認 parent（0 筆＝自成根；≥2 筆＝ambiguous→自成根＋可見警告，不得依目錄序任選）；parent 缺 `lineage_root` 退 parent 自身 `spawn_tag`；無 parent 時 `parent_agent` **缺席**（非空字串）、`lineage_root`＝自身 `spawn_tag`；`register` 不寫兩欄、legacy 不 backfill；兩欄僅 provenance/display，不升格 auth/CAS；`AGENT_BRIDGE_PASS_ENV` 排除 reserved 變數（`SPAWN_TAG`／`RELAY_DEPTH`，雙 runtime＋spec 同步）；TUI 依 lineage 分組（**唯一邏輯軸**：WORKERS 分組與 TASKS scope 皆以 lineage generation key 為準，ORIGINS 面板退場、物理位置留 DETAIL）＋DETAIL breadcrumb `root → … → parent† → self`（僅由兩欄重建：缺席節點 tombstone、中間斷層省略號；traversal 具 cycle／最大 hop／invalid 防護，invalid 列 standalone）；`/` literal filter；copy-mode info banner（消費既有 bounded `pane_in_mode` 三態）；`L` 尾行預覽（one-shot、行/byte/時間三重有界，bounded 必須成立於資料取得路徑）；TASKS All/Unattached scope（僅由當前同世代證據可唯一連結者入組；同名 respawn 不自動附掛歷史 task） | (a) lineage fixture root→A→B→C：移除 A/B registry 後 C 及其 tasks 仍歸同一 lineage（generation key 比對）、breadcrumb 為 `root → … → B† → C`（A 無資料＝省略號、B 留 tombstone；使用者 2026-08-02 裁定不擴充 lineage_path）、不得由 task `from` 推導（負向 case 含同名誘惑）；(b) 新舊 registry 混合：legacy 列不誤併（僅自身 `spawn_tag` 等於某 lineage root key 者歸該組）、既有 owner／spawn／evict／CAS 行為逐字不變、雙 runtime 以同組 golden case 驗語意對等；(c) P4 fixture 異常定義重寫（scope 軸改 lineage）後重量 ≤50%；(d) filter（regex metachar 當 literal）／`L`（hanging tmux、超長行、selection 換代晚到）／banner（三態）各自 bounded 斷言 |
-| P5 理解驗收 | 歸屬樹測驗（**順延至 P4.7 之後**，rubric 改驗 lineage→worker→task 歸屬；2026-08-01 使用者裁定） | **human judgment**：受測者 10 秒內畫出 lineage→worker→in-flight task 正確歸屬樹（理由：關聯可見性是原始痛點，步數量不到它）；rubric 見下（P4.7 落地時同步改寫） |
+| P5 理解驗收 | 歸屬樹測驗（**順延至 P4.7 之後**，rubric 改驗 lineage→worker→task 歸屬；2026-08-01 使用者裁定） | **human judgment**：受測者 10 秒內畫出 lineage→worker→in-flight task 正確歸屬樹（理由：關聯可見性是原始痛點，步數量不到它）；rubric 見下（**已於 P4.7 切片 B2 依 lineage 軸改寫**） |
 
 P4 附註：replay script 是 fixture 的一部分（固定初始 selection 與異常排序位置），
 量的是「固定操作序列下的步數差」，不宣稱量到任意操作者的自由行為。
@@ -304,11 +307,30 @@ P4 附註：replay script 是 fixture 的一部分（固定初始 selection 與�
 命中）。BLOCKER 軸（§4 v1 契約）在本輪一併補齊，否則 TUI 側定位不到
 blocked prompt，量到的會是功能缺口而不是效率差距。
 
+**P4.7 量測史（切片 B2，分組 44）**：歸屬軸換成 lineage 之後 fixture 一併重寫
+——12 列全部改帶 canonical `spawn_tag` ＋兩欄，組成 3 條 lineage（其中一條的
+root 與中間代都不在 registry，畫面上因此有墓碑組標頭與墓碑 breadcrumb），
+p4w12 的 pane 改成活的（舊 fixture 讓它同時是第二個 orphan，四個事實只鎖三個）。
+同一份任務下 TUI 降為 **1 步／baseline 7 步＝14%**：ORIGINS 面板退場後，
+三個異常裡有兩個在步 0 就已經在同一張畫面上標出來（不再被 owner scope 藏在
+別的分頁裡），只剩「origin window 已消失」那一個要把選取移過去讀 DETAIL 的
+證據行。**步數變少不是因為換了異常，是因為前兩個異常不再被 scope 藏住。**
+baseline 仍是 7 步（CLI 沒有 blocker 軸這件事沒有改變）。
+
 ### P5 rubric（每條可由證據答是／否）
 
-1. 受測者畫出的樹中，3 個 owner 的 worker 歸屬全部正確？
-2. 3 個異常標的（dead owner／blocked prompt／orphaned worker）全部被指認？
-3. 每個 in-flight task 都掛在正確的 worker 下？
+驗的是 **lineage → worker → in-flight task** 這條歸屬鏈（P4.7 B2 改寫；
+版面已無 ORIGINS，WORKERS 依 lineage 分組，DETAIL 有 breadcrumb）。
+
+1. 受測者畫出的樹中，每一條 lineage 的 worker 成員全部正確——含**中間世代已
+   不在場、DETAIL breadcrumb 只剩墓碑**的那一條（墓碑節點答成「這一代已不在，
+   但它在過」即算對，指成某個在場的同名者算錯）——且說不出世代的列
+   （legacy／manual／invalid）落在 standalone、未被併進任何一條 lineage？
+2. 每個 in-flight task 都掛在正確的 worker 下——且**只有**當前同世代證據可唯一
+   連結的那些被掛上去？（連結不到的 task 受測者應指到 Unattached，而不是硬掛
+   給某個 worker；同名 respawn **不承接**前一代的歷史 task，掛上去算錯）
+3. 3 個異常標的（origin window 已消失的 worker／blocked prompt／orphaned
+   worker）全部被指認？
 4. 作答時間 ≤10 秒（碼表計時）？
 
 ## 10. 開放問題（已全數定案；2026-08-01 使用者拍板回填）
