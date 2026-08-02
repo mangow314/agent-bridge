@@ -1535,6 +1535,12 @@ cmd_relay() {
     tmux select-window -t "$pane" 2>/dev/null || true
     tmux select-pane -t "$pane" 2>/dev/null || true
   fi
+  # CLI-RELAY-4：手動起的 session（呼叫者環境無 spawn tag）是接力鏈上唯一
+  # 會彈權限框的形狀，而那個框沒有任何機制偵測得到（tui-design §1 known
+  # gap：偵測＝常駐輪詢，已裁定不做）。這一行提醒就是該 gap 的全部緩解
+  if [[ -z "${AGENT_BRIDGE_SPAWN_TAG:-}" ]]; then
+    info "提醒：本 session 為手動起（非 spawn 出身）。手動 session 的權限框不會被任何機制偵測，鏈上若仍有手動 pane 請自行盯守（spawn 出身的接手者不受影響）。" || true
+  fi
   if [[ -n "$prev" ]]; then
     info "已交棒給 '$name'；'$prev' 將由對方在接手後回收" || true
   else

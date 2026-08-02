@@ -288,6 +288,15 @@ kill→確認→清 registry→審計順序）。預設把 tmux 焦點切至新 
 `--no-select` 不切；焦點切換失敗 MUST NOT 影響 relay 成功。
 Source: cmd_relay / relay_prompt_arg
 
+### CLI-RELAY-4 [tested: 23]
+呼叫者環境無 `AGENT_BRIDGE_SPAWN_TAG`（手動起的 session，多為接力鏈
+第一棒）時，relay 成功後 MUST 在 stderr 印**恰一行**盯守提醒；有該變數時
+MUST NOT 印。理由：手動 session 的權限框沒有任何機制偵測得到（spawn 出身
+的 worker 帶 skip-permission 設定不彈框；偵測＝常駐輪詢，已裁定不做——
+docs/tui-design.md §1 known gap），此行是該 gap 的唯一緩解。此行 MUST NOT
+改變 relay 的 exit code 與 stdout 契約。
+Source: cmd_relay
+
 ## `despawn`
 
 ### CLI-DESPAWN-1 [tested: 18]

@@ -1023,6 +1023,17 @@ fn cmd_relay(paths: &Paths, args: &[String]) -> Result<()> {
         let _ = tmux.exec(&["select-window", "-t", &pane]);
         let _ = tmux.exec(&["select-pane", "-t", &pane]);
     }
+    // CLI-RELAY-4：手動起的 session（呼叫者環境無 spawn tag）是接力鏈上唯一
+    // 會彈權限框的形狀，而那個框沒有任何機制偵測得到（tui-design §1 known
+    // gap：偵測＝常駐輪詢，已裁定不做）。這一行提醒就是該 gap 的全部緩解。
+    if std::env::var(config::ENV_SPAWN_TAG)
+        .unwrap_or_default()
+        .is_empty()
+    {
+        eprintln!(
+            "提醒：本 session 為手動起（非 spawn 出身）。手動 session 的權限框不會被任何機制偵測，鏈上若仍有手動 pane 請自行盯守（spawn 出身的接手者不受影響）。"
+        );
+    }
     if prev.is_empty() {
         eprintln!(
             "已交棒給 '{}'（前一棒未指定自動回收，請自行收尾）",

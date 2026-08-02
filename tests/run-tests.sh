@@ -2192,7 +2192,7 @@ done
 fi  # end grp 22
 # ---- 23. relay：交棒給接手者 ----
 if grp 23; then
-# spec: CLI-RELAY-1 CLI-RELAY-2 CLI-RELAY-3 ENV-DEPTH-1 ENV-DEPTH-2 ENV-BRIEF-2
+# spec: CLI-RELAY-1 CLI-RELAY-2 CLI-RELAY-3 CLI-RELAY-4 ENV-DEPTH-1 ENV-DEPTH-2 ENV-BRIEF-2
 # relay 與 spawn 共用整條 pane 生命週期（cap／tag／回滾／夭折偵測／registry），
 # 差別只有注入哪份 brief、切不切焦點、以及要不要請接手者回收前一棒。
 # 故這裡只測那三處差異＋交接檔路徑的防線，不重測 spawn 已覆蓋的部分。
@@ -2447,6 +2447,32 @@ assert "前導零 008 解析為 8，下傳 9（非八進位）" \
 # 接手者若留著，後面 idle／evict 那些以 pane 佈局為前提的段落會被推歪
 for rdn in rd1 rd2 rd5 rd12; do
   assert "23h 收尾：despawn $rdn（pane 還回共享池）" ab "$DDEPTH" despawn "$rdn"
+done
+
+# 23i. CLI-RELAY-4：手動呼叫者（無 spawn tag）→ stderr 恰一行盯守提醒；
+# spawn 出身（有 tag）→ 不印。手動 session 的權限框無從偵測（tui-design §1
+# known gap），這行是唯一緩解，兩個方向都要釘死才不會（a）靜默消失或
+# （b）對 spawn 出身的接手者洗版。env -u／顯式設值缺一不可：套件本身可能
+# 由任一種身分執行（人工終端無 tag、spawn 出身的協調者有 tag），不控變數
+# 這兩條會隨執行者身分假綠
+RHERR="$TESTROOT/relay-hint-manual.err"
+env -u AGENT_BRIDGE_SPAWN_TAG AGENT_BRIDGE_DATA="$DRELAY" AGENT_BRIDGE_READY_TIMEOUT=0 \
+  PATH="$SHIM:$PATH" \
+  "$BRIDGE" relay rh1 --runtime codex --handoff "$HANDOFF" --no-select \
+  >/dev/null 2>"$RHERR"; rc=$?
+assert "手動呼叫者 relay：exit 0（提醒不影響成功契約）" test "$rc" -eq 0
+assert "手動呼叫者：stderr 有盯守提醒" grep -q '手動起' "$RHERR"
+assert "提醒恰一行（不得洗版）" \
+  bash -c "test \"\$(grep -c '手動起' '$RHERR')\" -eq 1"
+RHERR2="$TESTROOT/relay-hint-spawned.err"
+env AGENT_BRIDGE_SPAWN_TAG='ab-spawn-rhx-1-0123456789ab' \
+  AGENT_BRIDGE_DATA="$DRELAY" AGENT_BRIDGE_READY_TIMEOUT=0 PATH="$SHIM:$PATH" \
+  "$BRIDGE" relay rh2 --runtime codex --handoff "$HANDOFF" --no-select \
+  >/dev/null 2>"$RHERR2"; rc=$?
+assert "spawn 出身呼叫者 relay：exit 0" test "$rc" -eq 0
+assert_fails "spawn 出身呼叫者：不印提醒" grep -q '手動起' "$RHERR2"
+for rhn in rh1 rh2; do
+  assert "23i 收尾：despawn $rhn（pane 還回共享池）" ab "$DRELAY" despawn "$rhn"
 done
 
 fi  # end grp 23

@@ -35,7 +35,7 @@
 | 20b | readiness 參數建 pane 前驗 | CLI-SPAWN-2, ENV-READY-1, ENV-READY-2 |
 | 21 | 解鎖失敗不得靜默 | STATE-LOCK-2 |
 | 22 | worker brief 注入 | ENV-BRIEF-1, CLI-SPAWN-7 |
-| 23 | relay 交棒 | CLI-RELAY-1, CLI-RELAY-2, CLI-RELAY-3, ENV-DEPTH-1, ENV-DEPTH-2, ENV-BRIEF-2 |
+| 23 | relay 交棒 | CLI-RELAY-1, CLI-RELAY-2, CLI-RELAY-3, CLI-RELAY-4, ENV-DEPTH-1, ENV-DEPTH-2, ENV-BRIEF-2 |
 | 24 | disposable | CLI-DISPOSABLE-1 |
 | 25 | idle 決策視圖 | CLI-IDLE-1, CLI-IDLE-2 |
 | 26 | evict 三段式 | CLI-EVICT-1, CLI-EVICT-2, CLI-EVICT-3 |
