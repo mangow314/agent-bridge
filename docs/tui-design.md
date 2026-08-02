@@ -406,6 +406,37 @@ C filter＋TASKS scope＋banner／D `L` 尾行預覽；gate (a)(b) 拆 A（資�
 與 B（render 面）兩段驗，gate (c) 於 B 建立新 fixture 後首跑、C/D 動鍵位
 後重跑。
 
+**P4.7 收案（2026-08-02）**：五片全數落地——A0 `26f7004`／A `6fe6f7b`／
+B1 `be4b202`／B2 `d606ed1`／C `209d01a`／D `1b7295e`。收案時 gate：
+cargo **274**（core 123＋tui 151）、`SRC_KIND=rust` 全套 **1120 PASS 0 FAIL**
+（含新分組 45）、`check-contract.sh` 4/4、`SRC_KIND=bash` 787 PASS 1 FAIL
+（22e，**環境既有紅**，stash 基準對照證實非本批）。gate 逐字覆核：
+(a) `a_lineage_survives_the_removal_of_its_middle_generations`＋負向「不得由
+task `from` 推導」與同名誘惑＋分組 44 的墓碑組標頭／breadcrumb 兩條；
+(b) `legacy_manual_and_invalid_rows_follow_the_contract`、
+`an_invalid_rows_root_never_creates_a_group_for_a_legacy_row`、雙 runtime 錨
+`spawn.rs` 的 `GEN_KEY_RE` 對照；(c) 分組 44 **1 vs 7＝14%**（C/D 動鍵位後
+重跑仍成立）；(d) filter 的 11 條 metachar 負向、banner 三態＋
+`rendering_the_banner_never_touches_tmux`（計數假件真證明）、`L` 的三界＋
+晚到丟棄＋單一 in-flight＋UI 不凍結＋分組 45。
+
+**C／D 期新增裁定**：`unattached` 判準與同秒 fail-closed（見 §3）／同名多列
+只在 registry 自相矛盾時可達，此時**兩列都顯示**而不靜默挑贏家／scope 鍵取
+大寫 `S`（小寫 `s` 由 §3 保留給 send）／`L` 的行界不查 pane height 換取「精確
+n 行」（多一次 tmux 往返等於多一個要有界的表面；真正的資源上限是 byte 界）。
+
+**本批的方法論教訓（值得帶去下一批）**：C 與 D 被覆核打出來的紅，根因高度
+一致——**同一條判準／界線寫了不只一份**（`t.to == name` 手抄五處、自寫的弱
+ISO parser 而 repo 早有 `parse_iso_to_epoch`、UI 端與取得路徑各截一次），
+以及**假件只證明得了我方送出去的東西**（`tail_args` 的 argv 測試綠著、而它
+斷言的 tmux 語意是錯的，直到真 tmux 分組 45 才釘住）。
+
 **Backlog（非相位項）**：`notify-failed` 的 `pane-gone` 桶混淆「tmux 查詢失敗」
 與「pane 真不存在」（codex sandbox 擋 tmux socket 時誤報 pane-gone，實例
 2026-08-01T13:03:58Z pane=%139 活著）——建議拆出 `query-failed` reason。
+其餘：`group_label` 的 `?†` 分支無測試（既有缺口）；production 未設
+`panic::set_hook`，worker panic 訊息會直接印上 alternate screen（evict 路徑
+同病，非 P4.7 引入）；replay 的 `p4_key_ok()` allowlist 是 **P4 步數量測的
+防灌水閘**，`[a-z]` 不涵蓋 `/`／`S`／`L`——**刻意不放寬**：`p4-tui.keys` 沒用到
+這三鍵，為了未用到的鍵放寬閘門會削弱步數量測的可信度；哪天量測情境真要按
+它們，再連同理由一起放寬。
