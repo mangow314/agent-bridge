@@ -299,14 +299,14 @@ fn render_workers(
     // 位置，而那正是捲軸唯一的用途。
     let lines_total = rows.len() + heads.len();
     let line = worker_line_of(model, &app.filter, app.row_idx);
+    // 捲軸與內容吃同一個視窗起點——分開算兩次的話，thumb 會指到畫面沒捲到的位置
+    let offset = scroll_offset(line, area);
     let block = panel_block(&title, focused);
     f.render_widget(
-        Paragraph::new(lines)
-            .block(block)
-            .scroll((scroll_offset(line, area), 0)),
+        Paragraph::new(lines).block(block).scroll((offset, 0)),
         area,
     );
-    render_scrollbar(f, area, lines_total, line);
+    render_scrollbar(f, area, lines_total, offset as usize);
 }
 
 /// TASKS 欄（§2）：**全 pool** 的任務平坦列表（P4.7 切片 B1 起不再依 owner
@@ -376,32 +376,52 @@ fn render_tasks(f: &mut Frame, area: Rect, model: &Model, app: &App) {
     // scope 進標題（footer 也印一份）：`s` 切過去之後，畫面上少了一半的列，
     // 人得看得出那是 scope 而不是資料不見了
     let title = format!("TASKS {pos}/{total}{more} [{}]", app.scope.label());
+    // 捲軸與內容吃同一個視窗起點（見 `render_scrollbar`）
+    let offset = scroll_offset(app.task_idx, area);
     f.render_widget(
         Paragraph::new(lines)
             .block(panel_block(&title, focused))
-            .scroll((scroll_offset(app.task_idx, area), 0)),
+            .scroll((offset, 0)),
         area,
     );
-    render_scrollbar(f, area, total, app.task_idx);
+    render_scrollbar(f, area, total, offset as usize);
 }
 
 /// 列表面板的捲軸（P4.6 切片 C 起用於 TASKS，P5.1 起 WORKERS 共用同一份）。
 ///
 /// **只在真的捲得動時才畫**：列數塞得進畫面時畫一條空軌道，等於用一欄寬度說
-/// 一句沒有資訊量的話。thumb 位置由 (選取序位, 總數) 決定——首列在頂、末列在
-/// 底、中段在中，人用它判斷「我在清單的哪裡」。
+/// 一句沒有資訊量的話。
 ///
-/// `total`／`pos` 的單位由呼叫端決定，但**必須與該面板的捲動單位同一種**：
+/// **thumb 表達的是「視窗在清單的哪一段」，不是「選取在第幾項」**（2026-08-03
+/// 真實終端目視三輪的發現）：先前直接把選取序位餵進去，於是在同一頁內上下移動
+/// 選取時——畫面一行都沒捲——thumb 卻在滑動，讀起來像「上面還有內容被捲掉了」。
+/// 那正是 P5 v1 敗因那一族的毛病：畫面提示與實際可見範圍不符。呼叫端因此傳
+/// `scroll_offset` 算出來的**視窗起點**，與 `Paragraph::scroll` 同一個值。
+///
+/// `total`／`offset` 的單位由呼叫端決定，但**必須與該面板的捲動單位同一種**：
 /// TASKS 一列一行、兩者等價；WORKERS 的組標頭佔行不佔列，所以它傳的是行號
 /// （見 `render_workers`）。混用會讓 thumb 指到畫面沒捲到的地方。
 ///
 /// 樣式走 theme 語意層（P4.5：view 內零個 `Style::` 字面）。
-fn render_scrollbar(f: &mut Frame, area: Rect, total: usize, pos: usize) {
+fn render_scrollbar(f: &mut Frame, area: Rect, total: usize, offset: usize) {
     let viewport = area.height.saturating_sub(2) as usize;
     if total <= viewport {
         return;
     }
-    let mut state = ScrollbarState::new(total).position(pos);
+    // `total > viewport` 已由上面擋掉，這裡必 > 0
+    let max_offset = total - viewport;
+    let offset = offset.min(max_offset);
+    // ratatui 的 `position` 軸是 0..=total-1（thumb 只在 position 走到頂時才貼
+    // 軌道底），而我們手上的是視窗起點 0..=max_offset。等比映射過去，「視窗
+    // 捲到底」才等於「thumb 貼底」；直接餵 offset 的話捲到底的 thumb 會停在
+    // 軌道六成處，畫面等於宣稱底下還有東西
+    let pos = offset * (total - 1) / max_offset;
+    let mut state = ScrollbarState::new(total)
+        .position(pos)
+        // 視窗長度決定 thumb 的長度。不設的話 ratatui 退回用軌道所在 Rect 的
+        // 高度——現在恰好等於 viewport，但那是 `Margin{vertical:1}` 的巧合，
+        // 寫明才不會在版面一改時靜默失準
+        .viewport_content_length(viewport);
     f.render_stateful_widget(
         Scrollbar::new(ScrollbarOrientation::VerticalRight).style(theme::scrollbar_style()),
         // 上下各留一格給邊框：軌道畫在框內，不蓋掉面板的上下框線
@@ -2508,13 +2528,43 @@ mod tests {
             "末列（行 60／共 61）的 thumb MUST 貼著軌道最下格"
         );
 
-        // 關鍵那一格：22/61 而不是 20/40。用列數畫會落在 [7,8,9,10]
+        // 關鍵那一格：視窗起點由行位置 22/61 算出（22+1-17＝6／可捲 44），
+        // 用列數算會是 20+1-17＝4／可捲 23——thumb 長度因此差一格
         assert_eq!(
             cells(20),
-            vec![6, 7, 8],
-            "列 20 的 thumb MUST 反映行位置 22/61 與行總數 61\
-             （用列數畫會是 [7,8,9,10]；軌道 {track_top}..={track_bottom}）"
+            vec![4, 5, 6],
+            "列 20 的 thumb MUST 反映行單位的視窗起點（6/44）與行總數 61\
+             （用列數畫會是 [4,5,6,7]；軌道 {track_top}..={track_bottom}）"
         );
+    }
+
+    /// **thumb 追的是視窗，不是選取**（2026-08-03 真實終端目視三輪的發現）。
+    ///
+    /// 同一頁之內把選取往下移，畫面一行都沒捲——thumb 必須原地不動。先前直接
+    /// 餵選取序位的版本在這裡會滑掉三分之一條軌道，讀起來像「上面還有內容被
+    /// 捲掉了」，而其實沒有。捲出第一頁之後才准動。
+    #[test]
+    fn the_workers_thumb_follows_the_viewport_not_the_selection() {
+        let at = |idx: usize| {
+            workers_scrollbar_col(
+                &draw_model_with(move |m, a| {
+                    with_workers(40)(m, a);
+                    a.row_idx = idx;
+                }),
+                "█",
+            )
+        };
+        let first = at(0);
+        assert!(!first.is_empty(), "40 列該畫得出捲軸");
+        // 1..=10 保守地落在第一頁內（視窗遠不只 11 行），視窗起點一律是 0
+        for idx in 1..=10 {
+            assert_eq!(
+                at(idx),
+                first,
+                "列 {idx} 仍在第一頁內、畫面沒捲，thumb 不得移動"
+            );
+        }
+        assert_ne!(at(39), first, "捲到末列時 thumb 必須跟著視窗走到底");
     }
 
     /// WORKERS 捲軸：thumb 首/中/末各在頂/中/底，且塞得下時一格都不畫。
