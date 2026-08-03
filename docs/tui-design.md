@@ -348,7 +348,7 @@ focus 跨 window 語意、CAS（cancel 綁 id）。
 | P4.5 視覺樣式層 | `theme` 模組＋ANSI 16 語意色（additive 純樣式：狀態字上色但權威字原文不變、liveness／blocker 語意色、focus Thick 邊框、選取列背景色、footer 警告 Yellow——顏色編碼軸固定五種：status／liveness／blocker／focus／warning；不動 selection 起點／鍵位／面板順序）**［P4.6 起為六種：增 content-syntax，見 P4.6 列］** | (a) render 單元測試（ratatui `TestBackend`）：指定 cell 的 fg/bg/modifier 符合 theme 對映（每個語意色至少一條）＋buffer 字元內容仍含六個權威字原文與 ●/✗/⛔ glyph；(b) P4 replay 重跑步數不變仍達標（樣式不進 capture 計數，重跑確認非假設） |
 | P4.6 UX truthfulness | 使用者實跑回饋（2026-08-01，9 題）第一段：ORIGINS 平坦視圖取代假 owner 樹（origin 誠實標籤 `session:window-name`＋live/gone/unknown，不做推測分組）；DETAIL 拆 agent state／origin window 兩列；Enter 分面板（OWNERS→WORKERS、worker→focus、task→read，`r` 保留）＋contextual footer；chrome 全英文；TASKS scrollbar＋`N/total`＋PgUp/PgDn/Home/End；pager markdown-lite 高亮（標題/fence/清單/中繼標頭；diff 僅限明確 diff 區段；bytes 不變，色彩契約加第六軸 content-syntax）；selection 改存 stable key（task id／(name,spawn_tag)）；freshness 顯示（disk/tmux age，逾時 stale 降級）。零協定改動 | (a) P1 gate 重跑（Enter matrix 動 focus 語意）；(b) P2 read bytes gate 重跑；(c) P4 replay 依新鍵位/文字重寫後 TUI ≤ baseline 50% 且正確率 100%；(d) render 測試新增斷言：英文 chrome（buffer 無中文 chrome 字元）、origin 標籤三態、scrollbar 首/中/末 thumb、reload 重排後 selection 依 stable key 不跳列、stale 降級顯示；(e) pager 高亮測試：同一 bytes 前後字元層完全相同＋fence/標題命中＋散文 +/- 不染 |
 | P4.7 lineage provenance | 第二段（**2026-08-02 開批**；契約經 codex plan-stage 審查＋使用者兩裁定細化，見 §11）：registry additive optional 欄位 `lineage_root`＋`parent_agent`——**值為 generation key（canonical `spawn_tag` 全串，非名稱）**；spawn 於既有 agents-registry 鎖內，將呼叫者環境 tag 前綴化後與各 registry `spawn_tag` byte-for-byte 比對，**恰一匹配**才認 parent（0 筆＝自成根；≥2 筆＝ambiguous→自成根＋可見警告，不得依目錄序任選）；parent 缺 `lineage_root` 退 parent 自身 `spawn_tag`；無 parent 時 `parent_agent` **缺席**（非空字串）、`lineage_root`＝自身 `spawn_tag`；`register` 不寫兩欄、legacy 不 backfill；兩欄僅 provenance/display，不升格 auth/CAS；`AGENT_BRIDGE_PASS_ENV` 排除 reserved 變數（`SPAWN_TAG`／`RELAY_DEPTH`，雙 runtime＋spec 同步）；TUI 依 lineage 分組（**唯一邏輯軸**：WORKERS 分組與 TASKS scope 皆以 lineage generation key 為準，ORIGINS 面板退場、物理位置留 DETAIL）＋DETAIL breadcrumb `root → … → parent† → self`（僅由兩欄重建：缺席節點 tombstone、中間斷層省略號；traversal 具 cycle／最大 hop／invalid 防護，invalid 列 standalone）；`/` literal filter；copy-mode info banner（消費既有 bounded `pane_in_mode` 三態）；`L` 尾行預覽（one-shot、行/byte/時間三重有界，bounded 必須成立於資料取得路徑）；TASKS All/Unattached scope（僅由當前同世代證據可唯一連結者入組；同名 respawn 不自動附掛歷史 task） | (a) lineage fixture root→A→B→C：移除 A/B registry 後 C 及其 tasks 仍歸同一 lineage（generation key 比對）、breadcrumb 為 `root → … → B† → C`（A 無資料＝省略號、B 留 tombstone；使用者 2026-08-02 裁定不擴充 lineage_path）、不得由 task `from` 推導（負向 case 含同名誘惑）；(b) 新舊 registry 混合：legacy 列不誤併（僅自身 `spawn_tag` 等於某 lineage root key 者歸該組）、既有 owner／spawn／evict／CAS 行為逐字不變、雙 runtime 以同組 golden case 驗語意對等；(c) P4 fixture 異常定義重寫（scope 軸改 lineage）後重量 ≤50%；(d) filter（regex metachar 當 literal）／`L`（hanging tmux、超長行、selection 換代晚到）／banner（三態）各自 bounded 斷言 |
-| P5 理解驗收 | 歸屬樹測驗 v1（**2026-08-02 實測未通過，判定作廢**；v2 改兩層驗收，見下方 rubric v2） | v1 gate 作廢；v2 gate 見 rubric v2（page 層機器判定＋human judgment、dashboard 層機器判定＋human judgment 各一組） |
+| P5 理解驗收 | 歸屬樹測驗 v1（**2026-08-02 實測未通過，判定作廢**；v2 改兩層驗收，見下方 rubric v2） | v1 gate 作廢；v2 gate 見 rubric v2。**現況：page 層四條全過＝PG4 收案（2026-08-03 第三輪）；dashboard 層 human judgment 第一輪 1/3 未過（PD1，2026-08-04），機器判定條 1／3 認列本相位不驗（依賴未開批的版面演進）** |
 | P5.1 可見性補洞 | WORKERS 補 scrollbar＋`N/total`（P5 v1 敗因的直接機制修復；照 P4.6c TASKS 既成範式） | render 測試（比照 TASKS 既有測試）：WORKERS 首／中／末 thumb＋`N/total` 標題；分組 44／45 與 P4 replay 重跑不退步 |
 | P5.2 relay 提醒 | `relay` 由手動（非 spawn-born）session 呼叫時印一行盯守提醒（known gap 的零成本緩解） | 輸出斷言兩則：呼叫者環境無 `AGENT_BRIDGE_SPAWN_TAG` → stderr 恰一行提醒；有 → 不印。協定行為零改變 |
 | P5.1b 捲軸語意 | thumb 改追**視窗**而非選取序位（2026-08-03 真實終端目視三輪的發現：同一頁內移動選取時畫面一行沒捲，thumb 卻在滑，讀起來像「上面還有內容被捲掉了」——與 P5 v1 敗因同一族的「畫面提示與可見範圍不符」） | render 測試：同頁內移動選取 thumb MUST 不動、捲到末列 MUST 貼軌道底；既有「捲軸吃行不吃列」的絕對格位斷言隨單位更新 |
@@ -473,6 +473,40 @@ agent 會被拒，孤兒 task 的正解也可能是 cancel 或改派。契約回
 非唯讀指令白付 2N 次 tmux 查詢 ④`fail` 為一則通知整份重讀 response.md ＋
 建全池 registry snapshot，改 bounded 前綴讀＋單檔 lookup。三條測試鑑別力
 nit 亦一併補（通知斷言鎖回同一則、狀態字 fallback 的負向斷言）。
+
+### PD1：dashboard 層 human judgment 實測（2026-08-04，第一輪未通過）
+
+量測載具 `tests/p5-fixture.sh`（3 owner／12 worker／20 task／3 條 lineage／
+3 個異常＋P5 擴充；機械不變式 40 條，實測前全綠）。三題可開面板查證，
+rubric 判準是 60 秒內 3/3 並指出畫面證據。**結果 1/3，未通過。**
+
+| rubric 題目 | 受測者作答 | 判定 |
+|---|---|---|
+| 1 誰派生此 blocker | 「p4w06」 | **未過**（p4w06 是卡住的那一個；正解直系 p4w05、root p4w01） |
+| 2 缺席哪一代 | 「p4z9† 底下卻只有 p4w12，用 † 顯示（但我個人認為不夠直觀）」 | **過**（root 那一半答對且給了畫面證據；中間代 p4z8 的省略號未被看見） |
+| 3 此 task 為何 unattached | 「window/pane 都不在了？」 | **未過**（三筆裡兩筆的收件人 p4w01／p4w07 pane 好端端活著） |
+
+三個缺口，**第三題與 PG4 條 3 同構**——畫面說得出「是什麼」，說不出
+「為什麼」：
+
+1. **unattached 沒有理由欄（最嚴重）**。三筆是三種完全不同的不可證——u1
+   收件人活著但 task 早於其 `registered_at`（同名 respawn 的歷史 task）、
+   u2 收件人從來不在 registry、u3 同秒＝不可證——畫面把三者呈現得一模一樣。
+   受測者只能拿畫面上唯一看得見的失敗形狀（pane 死活）去猜，於是猜錯。
+2. **直系 parent 是二級資訊**。分組標頭只給 root，要知道「誰派生它」得先
+   選取該列再讀 DETAIL 的 breadcrumb；第一眼看不到，受測者於是報出 blocker
+   本人。
+3. **墓碑鏈只看得見一代**。† 標記受測者當場說「不夠直觀」，中間代缺席的
+   省略號完全沒被注意到——缺兩代，畫面只讓人看見一代。
+
+**rubric 機器判定條 1／3 認列「本相位不驗」（2026-08-04 使用者裁定）**：
+「啟動首屏 buffer 無 lineage tree」與 P4.7「lineage 是唯一邏輯軸、ORIGINS
+退場」的裁定相反；「返回時停在同一個 attention event」的 `attention` 在實作
+中不存在（全 repo 只有本文件提及）。兩條都預設了本節開頭注意事項所說、
+**尚未開批**的版面演進（attention 排最上、lineage 移二級鍵），rubric 自己
+也註明 P5.1／P5.2 不依賴它。**解鎖條件＝該版面演進開批**，屆時連同驗。
+條 2（分組／breadcrumb 符合 generation 證據）已有覆蓋：p5-fixture 40 條
+＋分組 44 ＋ `ab-tui` 單元層的 breadcrumb 測試。
 
 ### 真實終端目視三輪的 known gap（2026-08-03，記錄不修）
 
