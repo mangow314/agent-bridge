@@ -428,9 +428,34 @@ breadcrumb 全部符合 generation 證據；返回時停在同一個 attention e
 
 **page 層實作指標（2026-08-03，PG0–PG3 落地）**：條 1–4 的機器判定已有實作
 可驗——單元層在 `crates/ab-core/src/page.rs`，CLI 層在 `tests/run-tests.sh`
-分組 47，契約在 `spec/cli.md` CLI-SCAN-1/2/3、CLI-PAGE-1/2 與 `spec/env.md`
-ENV-PAGE-1。**human judgment 那一條（10 個混合事件、只看通知說得出「哪個
-agent、為何現在需要我」）仍未做**——agent 不自證，待使用者實測。
+分組 47，契約在 `spec/cli.md` CLI-SCAN-1/2/3、CLI-PAGE-1/2/3 與 `spec/env.md`
+ENV-PAGE-1。
+
+### PG4：page 層 human judgment 實測（2026-08-03，第一輪未通過）
+
+量測載具 `tests/pg4-fixture.sh`（10 步：正例 5、負例 5，通知走
+`AGENT_BRIDGE_NOTIFY_CMD` 同時記日誌與彈桌面通知；機械不變式 24 條）。
+
+**第一輪作廢**：通知全數送達 dunst 卻沒進到受測者眼裡——`follow = none`
+＋`monitor = 0` 把 notification layer 畫在副螢幕（`hyprctl layers` 實證）。
+量測環境問題，非被測物。**這件事本身是 rubric 的隱含前提**：條 3「不開面板
+即可判斷」預設人看得到那則通知，而通知落在哪台螢幕由 notification daemon
+決定，不在 agent-bridge 手上——遠端與多螢幕情境都要記得先驗這一層。
+
+**第二輪結果（修正 dunst 後）**：
+
+| rubric 條目 | 判定 | 受測者原話 |
+|---|---|---|
+| 1 通知含 agent 名 | **過** | 「都有 pg4 開頭分辨與有問題的情況」 |
+| 2 含事件類別與 task id | **半過** | 類別看得出；task id 較長，實際仍得切去 ui 看 |
+| 3 不開面板即可判斷要不要出手 | **未過** | 「大概知道死了、失敗，但一時間不確定要不要切去看」 |
+| 4 十則零雜訊 | **過** | 步驟 6 起通知停止（負例全靜音），當場說得出來 |
+
+條 2／3 的缺口是**兩件事**，各自有修：①通知沒說 agent 在哪，「切過去」這個
+動作沒有起點 → 標題加 `session:window`；②「進了 failed 終態」是狀態字不是
+決策依據 → 內文首行改成失敗原因本身。契約落在 CLI-PAGE-3，實作在
+`PageDetails`／`resolve_location`。**條 2／3 待第三輪複測**——文案改完不等於
+通過，仍須使用者實測。
 
 ### 真實終端目視三輪的 known gap（2026-08-03，記錄不修）
 

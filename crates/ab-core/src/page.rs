@@ -56,6 +56,114 @@ pub enum PageEvent {
     },
 }
 
+/// 通知**呈現**用的兩個易變欄位。與 `PageEvent` 分成兩個型別是刻意的：
+/// `PageEvent` 是事件的**身分**（去重軸就從它算），這裡是「給人看的補充」。
+///
+/// 兩者混在同一個型別裡，遲早有人把地點寫進 `key()`——那會讓「window 改個
+/// 名字」或「worker 換一個 session」變成一則新事件重推一次。分成兩個型別，
+/// 那個錯誤就不再是一行之差，而是要跨型別搬欄位（PG4 使用者實測後裁定）。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PageDetails {
+    /// agent 所在位置，`session:window索引 window名` 的形狀（例：`dev:3 build`）。
+    /// **PG4 rubric 條 3 的一半**：受測者說得出「誰、出了什麼事」，但「要不要
+    /// 切過去看」卡住——通知沒說切去哪裡，那個動作因此沒有起點。
+    pub location: Option<String>,
+    /// 失敗原因的第一行。**條 3 的另一半**：決定「要不要現在出手」的是原因
+    /// 本身，不是「進了 failed 終態」這個狀態字。
+    pub reason: Option<String>,
+}
+
+/// 通知文字的長度上限（字元數，非 byte）。桌面通知與 tmux status line 都會
+/// 自行截斷，與其讓它們攔腰砍在任意位置，不如自己截並補省略號。
+const MAX_REASON: usize = 80;
+const MAX_LOCATION: usize = 40;
+
+/// 把不可信字串修成「能安全放進一行通知」的樣子。
+///
+/// 兩個來源都不可信：`reason` 來自 worker 寫的 response.md（架構 §3 的 payload
+/// 紅線），`location` 來自 tmux 的 window 名（使用者或任何程式改得到）。控制
+/// 字元會把單行通知撐成多行、把 tmux status line 洗掉；截斷一律按**字元**，
+/// 按 byte 切會把多位元組字元剖半。
+fn one_line(s: &str, max: usize) -> Option<String> {
+    let cleaned: String = s
+        .chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect();
+    let trimmed = cleaned.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    if trimmed.chars().count() <= max {
+        return Some(trimmed.to_string());
+    }
+    Some(trimmed.chars().take(max).collect::<String>() + "…")
+}
+
+impl PageDetails {
+    /// 從失敗訊息取原因：**第一個非空行**。worker 的失敗訊息常是多行（stack
+    /// trace、指令輸出），第一行通常就是那句話。
+    pub fn with_reason(mut self, message: &str) -> Self {
+        self.reason = message.lines().find_map(|l| one_line(l, MAX_REASON));
+        self
+    }
+
+    fn location_suffix(&self) -> String {
+        match &self.location {
+            Some(l) => format!(" · {l}"),
+            None => String::new(),
+        }
+    }
+}
+
+/// 這串真的是一個地點，還是 tmux 對著不存在的目標吐出來的空殼。
+///
+/// **`display-message` 對已死的 pane 是 exit 0 ＋ 空展開**（實測 tmux 3.7b，
+/// 分組 47 逮到）：格式裡每個欄位都空掉，結果是 `":"`。它非空、無控制字元，
+/// 於是一路通過 `one_line`，被當成有效地點回傳——最需要 fallback 的
+/// `WorkerDied`（pane 依定義已經死了）因此永遠停在第一條路徑上，window 那條
+/// 根本走不到，通知裡的地點是一個冒號。
+///
+/// 判準取 `window_index` **是數字**：那是這個格式裡唯一有形狀可驗的欄位，
+/// session 名與 window 名都可以是任意字串。
+fn plausible_location(s: &str) -> bool {
+    let Some((session, rest)) = s.split_once(':') else {
+        return false;
+    };
+    let index = rest.split(' ').next().unwrap_or("");
+    !session.is_empty() && !index.is_empty() && index.chars().all(|c| c.is_ascii_digit())
+}
+
+/// agent 現在人在哪：`session:window索引 window名`。
+///
+/// 先問 pane，pane 沒了（`WorkerDied` 的常態）再退到 registry 的 `owner` 欄
+/// ——它的形狀是 `session:@winid`，window 通常還活著。兩條都問不到就回 `None`，
+/// 通知照發、只是少一段地點（**推播失敗不得改變呼叫端行為**，少一個欄位更
+/// 不該讓事件發不出去）。
+///
+/// 每則事件多一次 bounded tmux 呼叫。事件本來就罕見（掃到才發、發過不重發），
+/// 而 `scan` 只對**已判定死掉**的 agent 走這裡——健康的池子一次都不會問。
+pub fn resolve_location(
+    tmux: &dyn crate::tmux::TmuxClient,
+    pane: &str,
+    owner: &str,
+) -> Option<String> {
+    const FMT: &str = "#{session_name}:#{window_index} #{window_name}";
+    let ask = |target: &str| {
+        tmux.exec(&["display-message", "-p", "-t", target, FMT])
+            .and_then(|o| o.ok_stdout())
+            .and_then(|s| one_line(&s, MAX_LOCATION))
+            .filter(|s| plausible_location(s))
+    };
+    if !pane.is_empty()
+        && let Some(loc) = ask(pane)
+    {
+        return Some(loc);
+    }
+    // owner＝`session:@winid`；window id 才是穩定的目標（session 可能改名）
+    let win = owner.split_once(":@").map(|(_, w)| format!("@{w}"))?;
+    ask(&win)
+}
+
 impl PageEvent {
     /// 去重軸。同一個 key **至多推一次**，跨行程、跨重啟都算數（key 落在磁碟
     /// 上，不在記憶體裡——行程重啟不重推是 rubric v2 page 層條 2 的一半）。
@@ -79,23 +187,40 @@ impl PageEvent {
         }
     }
 
-    /// 通知標題。**帶 agent 名**——rubric v2 的 human judgment 要求受測者只看
-    /// 通知就說得出「哪個 agent」，名字不在標題裡就等著人去開面板查。
-    pub fn title(&self) -> String {
+    /// 通知標題：**誰、出了什麼事、人在哪**。
+    ///
+    /// 三件事都在標題，是因為 PG4 實測（2026-08-03）打出來的：受測者答得出
+    /// 「哪個 agent」與「失敗還是死了」，卻卡在「要不要切過去看」——通知從
+    /// 沒說過切去哪裡。地點解不出來就整段省略，不留空殼。
+    ///
+    /// **不再自帶 `agent-bridge:` 前綴**：來源改由各通道用自己的慣用法標記
+    /// ——桌面通知走 `notify-send -a agent-bridge`（appname 欄），tmux status
+    /// line 由 `SystemPager` 自己接前綴。前綴擠在標題裡只是把最貴的前幾個字
+    /// 讓給一段每則都一樣的字。
+    pub fn title(&self, d: &PageDetails) -> String {
+        let at = d.location_suffix();
         match self {
-            PageEvent::TaskFailed { agent, .. } => format!("agent-bridge: {agent} 任務失敗"),
-            PageEvent::WorkerDied { agent, .. } => format!("agent-bridge: {agent} 死了"),
+            PageEvent::TaskFailed { agent, .. } => format!("{agent} 任務失敗{at}"),
+            PageEvent::WorkerDied { agent, .. } => format!("{agent} 死了{at}"),
         }
     }
 
-    /// 通知內文。**說出「為何現在需要我」**，不只是報一個狀態字。
-    pub fn body(&self) -> String {
+    /// 通知內文：**第一行答「要不要現在出手」，第二行是 task id**。
+    ///
+    /// 失敗的那句原因就是決策依據（PG4 使用者裁定）；狀態字「進了 failed
+    /// 終態」不是——它只是把標題再說一次。原因取不到才退回狀態字。
+    ///
+    /// task id 留在最後一行而不是拿掉：它是 `ab read <id>` 的把手，拿掉就
+    /// 複製不到，而同一個 agent 同時有多筆 task 時也對不起來。
+    pub fn body(&self, d: &PageDetails) -> String {
+        let task = self.task();
         match self {
-            PageEvent::TaskFailed { task, .. } => {
-                format!("task {task} 進 failed 終態，回覆已在信箱等你讀")
-            }
-            PageEvent::WorkerDied { task, .. } => {
-                format!("pane 已不存在，task {task} 還掛在它身上——沒有人會回這一則")
+            PageEvent::TaskFailed { .. } => match &d.reason {
+                Some(r) => format!("{r}\n{task}"),
+                None => format!("已進 failed 終態，回覆在信箱\n{task}"),
+            },
+            PageEvent::WorkerDied { .. } => {
+                format!("pane 已不存在，這一筆沒人會回\n{task}")
             }
         }
     }
@@ -241,8 +366,12 @@ impl<'a> SystemPager<'a> {
                 .run(&[cmd.clone(), title.to_string(), body.to_string()]);
         }
         if self.env.desktop_usable() {
+            // `-a`：來源掛在 appname 欄，不佔標題的前幾個字（標題最貴的位置
+            // 要留給 agent 名與地點）
             return self.runner.run(&[
                 "notify-send".to_string(),
+                "-a".to_string(),
+                "agent-bridge".to_string(),
                 title.to_string(),
                 body.to_string(),
             ]);
@@ -262,7 +391,9 @@ impl<'a> SystemPager<'a> {
         else {
             return false;
         };
-        let msg = format!("{title} — {body}");
+        // status line 是單行，內文的換行要壓平；來源前綴在這一層自己接
+        // （桌面通知那一層走 `-a`，見 `page_desktop`）
+        let msg = format!("agent-bridge: {title} — {}", body.replace('\n', " "));
         let mut sent = false;
         for client in out.lines().filter(|l| !l.is_empty()) {
             // `-l` 讓訊息原文照印：事件文字裡的 `#{...}` 不得被當成 tmux format
@@ -339,7 +470,12 @@ fn key_is_frameable(key: &str) -> bool {
 /// 真正的 exactly-once 需要具 ack／idempotency key 的 outbox 協定，而收件端是
 /// `notify-send` 或使用者的任意一支腳本——那個保證在這一層根本無從建立。
 /// 明講取捨，不冒充完成。
-pub fn emit(paths: &Paths, event: &PageEvent, pager: &dyn Pager) -> Result<EmitOutcome> {
+pub fn emit(
+    paths: &Paths,
+    event: &PageEvent,
+    details: &PageDetails,
+    pager: &dyn Pager,
+) -> Result<EmitOutcome> {
     let key = event.key();
     if !key_is_frameable(&key) {
         return Ok(EmitOutcome::Rejected);
@@ -353,11 +489,11 @@ pub fn emit(paths: &Paths, event: &PageEvent, pager: &dyn Pager) -> Result<EmitO
             guard.release();
             return Ok(EmitOutcome::AlreadySeen);
         }
-        let r = append_event(paths, event).and_then(|()| mark_seen(paths, &key));
+        let r = append_event(paths, event, details).and_then(|()| mark_seen(paths, &key));
         guard.release();
         r?;
     }
-    let paged = pager.page(&event.title(), &event.body());
+    let paged = pager.page(&event.title(details), &event.body(details));
     Ok(EmitOutcome::Emitted { paged })
 }
 
@@ -392,15 +528,21 @@ fn append_line(path: &std::path::Path, line: &str) -> Result<()> {
         .map_err(|e| Error::new(format!("無法寫入 {}：{e}", path.display())))
 }
 
-fn append_event(paths: &Paths, event: &PageEvent) -> Result<()> {
-    // 欄位序＝人讀 jsonl 時的掃描序：時間、類別、誰、哪一筆、去重軸、給人看的話
+fn append_event(paths: &Paths, event: &PageEvent, details: &PageDetails) -> Result<()> {
+    // 欄位序＝人讀 jsonl 時的掃描序：時間、類別、誰、在哪、哪一筆、去重軸、
+    // 給人看的話。`location` 進事件流是為了事後回查「當時它在哪」——window
+    // 後來被關掉或改名，這裡仍留著當時解出來的值
     let mut obj = serde_json::Map::new();
     obj.insert("ts".into(), now_iso().into());
     obj.insert("kind".into(), event.kind().into());
     obj.insert("agent".into(), event.agent().into());
+    obj.insert(
+        "location".into(),
+        details.location.clone().unwrap_or_default().into(),
+    );
     obj.insert("task".into(), event.task().into());
     obj.insert("key".into(), event.key().into());
-    obj.insert("message".into(), event.body().into());
+    obj.insert("message".into(), event.body(details).into());
     let line = format!("{}\n", serde_json::Value::Object(obj));
     append_line(&events_path(paths), &line)
 }
@@ -461,6 +603,12 @@ pub fn scan(
         if a.pane.is_empty() || alive.contains(a.pane.as_str()) {
             continue;
         }
+        // 地點只對**已判定死掉**的 agent 解一次：健康的池子一次 tmux 都不多問，
+        // 同一個 agent 掛著三筆 task 也只解一次
+        let details = PageDetails {
+            location: resolve_location(tmux, &a.pane, &a.owner),
+            reason: None,
+        };
         for t in &tasks {
             if !task_belongs_to(t, a) {
                 continue;
@@ -470,7 +618,7 @@ pub fn scan(
                 spawn_tag: a.spawn_tag.clone(),
                 task: t.id.clone(),
             };
-            if let Ok(o) = emit(paths, &event, pager) {
+            if let Ok(o) = emit(paths, &event, &details, pager) {
                 out.push(o);
             }
         }
@@ -508,6 +656,13 @@ pub fn task_belongs_to(
 mod tests {
     use super::*;
     use std::cell::RefCell;
+
+    /// 沒有地點也沒有原因——去重與落盤那幾條與呈現無關，用空的最不容易誤讀。
+    /// 文案本身另有專門的條目測。
+    const D: PageDetails = PageDetails {
+        location: None,
+        reason: None,
+    };
 
     /// 記錄被推播了幾次、內容是什麼。
     struct RecordingPager {
@@ -717,11 +872,11 @@ mod tests {
         let paths = tmp_paths("dedup");
         let pager = RecordingPager::new(true);
         assert_eq!(
-            emit(&paths, &failed("t1"), &pager).unwrap(),
+            emit(&paths, &failed("t1"), &D, &pager).unwrap(),
             EmitOutcome::Emitted { paged: true }
         );
         assert_eq!(
-            emit(&paths, &failed("t1"), &pager).unwrap(),
+            emit(&paths, &failed("t1"), &D, &pager).unwrap(),
             EmitOutcome::AlreadySeen
         );
         assert_eq!(pager.count(), 1, "重複事件 MUST NOT 重推");
@@ -734,10 +889,10 @@ mod tests {
     fn a_restarted_process_does_not_page_the_same_event_again() {
         let paths = tmp_paths("restart");
         let first = RecordingPager::new(true);
-        emit(&paths, &failed("t1"), &first).unwrap();
+        emit(&paths, &failed("t1"), &D, &first).unwrap();
         let second = RecordingPager::new(true);
         assert_eq!(
-            emit(&paths, &failed("t1"), &second).unwrap(),
+            emit(&paths, &failed("t1"), &D, &second).unwrap(),
             EmitOutcome::AlreadySeen
         );
         assert_eq!(second.count(), 0, "行程重啟 MUST NOT 重推");
@@ -750,7 +905,7 @@ mod tests {
         let paths = tmp_paths("broken");
         let pager = NullPager;
         assert_eq!(
-            emit(&paths, &failed("t1"), &pager).unwrap(),
+            emit(&paths, &failed("t1"), &D, &pager).unwrap(),
             EmitOutcome::Emitted { paged: false }
         );
         let lines = event_lines(&paths);
@@ -772,8 +927,8 @@ mod tests {
     fn distinct_events_each_get_their_own_page() {
         let paths = tmp_paths("distinct");
         let pager = RecordingPager::new(true);
-        emit(&paths, &failed("t1"), &pager).unwrap();
-        emit(&paths, &failed("t2"), &pager).unwrap();
+        emit(&paths, &failed("t1"), &D, &pager).unwrap();
+        emit(&paths, &failed("t2"), &D, &pager).unwrap();
         emit(
             &paths,
             &PageEvent::WorkerDied {
@@ -781,6 +936,7 @@ mod tests {
                 spawn_tag: "ab-spawn-w1-1-aaaaaaaaaaaa".into(),
                 task: "t1".into(),
             },
+            &D,
             &pager,
         )
         .unwrap();
@@ -800,8 +956,8 @@ mod tests {
             spawn_tag: tag.into(),
             task: "t1".into(),
         };
-        emit(&paths, &died("ab-spawn-w1-1-aaaaaaaaaaaa"), &pager).unwrap();
-        emit(&paths, &died("ab-spawn-w1-2-bbbbbbbbbbbb"), &pager).unwrap();
+        emit(&paths, &died("ab-spawn-w1-1-aaaaaaaaaaaa"), &D, &pager).unwrap();
+        emit(&paths, &died("ab-spawn-w1-2-bbbbbbbbbbbb"), &D, &pager).unwrap();
         assert_eq!(pager.count(), 2, "換代 MUST 是新事件");
     }
 
@@ -917,7 +1073,7 @@ mod tests {
         let tmux = FakeTmux::unavailable();
         let pager = pager_with(PagerEnv::default(), &runner, &tmux);
         assert_eq!(
-            emit(&paths, &failed("t1"), &pager).unwrap(),
+            emit(&paths, &failed("t1"), &D, &pager).unwrap(),
             EmitOutcome::Emitted { paged: false }
         );
         assert_eq!(event_lines(&paths).len(), 1);
@@ -1069,7 +1225,7 @@ mod tests {
                 let barrier = std::sync::Arc::clone(&barrier);
                 std::thread::spawn(move || {
                     barrier.wait();
-                    emit(&paths, &failed("t1"), pager.as_ref())
+                    emit(&paths, &failed("t1"), &D, pager.as_ref())
                 })
             })
             .collect();
@@ -1092,14 +1248,20 @@ mod tests {
             spawn_tag: "ab-spawn-w1-1-aaaa\ndied:w1:x:t1".into(),
             task: "t1".into(),
         };
-        assert_eq!(emit(&paths, &evil, &pager).unwrap(), EmitOutcome::Rejected);
+        assert_eq!(
+            emit(&paths, &evil, &D, &pager).unwrap(),
+            EmitOutcome::Rejected
+        );
         assert_eq!(pager.count(), 0, "不可信的 key MUST NOT 推");
         assert!(
             !events_path(&paths).exists() || event_lines(&paths).is_empty(),
             "不可信的 key MUST NOT 落盤"
         );
         // 重掃也一樣，不會因為「沒記進 seen」而變成無限的通知源
-        assert_eq!(emit(&paths, &evil, &pager).unwrap(), EmitOutcome::Rejected);
+        assert_eq!(
+            emit(&paths, &evil, &D, &pager).unwrap(),
+            EmitOutcome::Rejected
+        );
         assert_eq!(pager.count(), 0);
     }
 
@@ -1167,18 +1329,189 @@ mod tests {
     #[test]
     fn the_page_text_names_the_agent_and_the_task() {
         let e = failed("20260803T000000Z-abcd");
-        assert!(e.title().contains("w1"), "標題要有 agent 名：{}", e.title());
         assert!(
-            e.body().contains("20260803T000000Z-abcd"),
+            e.title(&D).contains("w1"),
+            "標題要有 agent 名：{}",
+            e.title(&D)
+        );
+        assert!(
+            e.body(&D).contains("20260803T000000Z-abcd"),
             "內文要有 task id：{}",
-            e.body()
+            e.body(&D)
         );
         let d = PageEvent::WorkerDied {
             agent: "w9".into(),
             spawn_tag: "ab-spawn-w9-1-cccccccccccc".into(),
             task: "t7".into(),
         };
-        assert!(d.title().contains("w9"), "標題要有 agent 名：{}", d.title());
-        assert!(d.body().contains("t7"), "內文要有 task id：{}", d.body());
+        assert!(
+            d.title(&D).contains("w9"),
+            "標題要有 agent 名：{}",
+            d.title(&D)
+        );
+        assert!(
+            d.body(&D).contains("t7"),
+            "內文要有 task id：{}",
+            d.body(&D)
+        );
+    }
+
+    /// **標題要說得出「切去哪裡」**（PG4 實測 2026-08-03）：受測者答得出誰、
+    /// 出了什麼事，卻卡在「要不要切過去看」——因為通知從沒說過切去哪。
+    #[test]
+    fn the_title_says_where_to_go() {
+        let d = PageDetails {
+            location: Some("dev:3 build".into()),
+            reason: None,
+        };
+        let t = failed("t1").title(&d);
+        assert!(t.contains("w1"), "標題要有 agent 名：{t}");
+        assert!(t.contains("dev:3 build"), "標題要有地點：{t}");
+        // 解不出地點時整段省略，不留 ` · ` 這種空殼
+        let bare = failed("t1").title(&D);
+        assert!(!bare.contains('·'), "沒有地點時 MUST NOT 留分隔符：{bare}");
+    }
+
+    /// **內文第一行是失敗原因**（同上）：決定「要不要現在出手」的是原因本身，
+    /// 「進了 failed 終態」只是把標題再說一次。task id 退到最後一行但**必須
+    /// 還在**——它是 `ab read <id>` 的把手。
+    #[test]
+    fn the_body_leads_with_the_reason_and_keeps_the_task_id() {
+        let d = PageDetails::default().with_reason("編譯失敗：缺 libfoo\n第二行不該進通知");
+        let b = failed("20260803T000000Z-abcd").body(&d);
+        let mut lines = b.lines();
+        assert_eq!(
+            lines.next(),
+            Some("編譯失敗：缺 libfoo"),
+            "首行要是原因：{b}"
+        );
+        assert_eq!(
+            lines.next(),
+            Some("20260803T000000Z-abcd"),
+            "末行要是 task id：{b}"
+        );
+        assert!(
+            !b.contains("第二行不該進通知"),
+            "只取第一行，多行訊息 MUST NOT 整份灌進通知：{b}"
+        );
+        // 原因取不到（空訊息）才退回狀態字，且 task id 照樣在
+        let empty = PageDetails::default().with_reason("\n  \n");
+        let fallback = failed("t1").body(&empty);
+        assert!(fallback.contains("failed"), "退路要說得出狀態：{fallback}");
+        assert!(
+            fallback.contains("t1"),
+            "退路 MUST 保留 task id：{fallback}"
+        );
+    }
+
+    /// 不可信輸入不得撐破單行通知：worker 寫得到 response.md，window 名也是
+    /// 任人改的。控制字元一律壓成空白，過長按**字元**截斷（按 byte 切會把
+    /// 多位元組字元剖半）。
+    #[test]
+    fn untrusted_text_cannot_break_a_one_line_notification() {
+        let d = PageDetails::default().with_reason("壞掉了\r\n偽造的第二則通知");
+        let r = d.reason.as_deref().unwrap_or("");
+        assert!(!r.contains('\n'), "原因 MUST NOT 帶換行：{r:?}");
+        assert_eq!(r, "壞掉了", "只取第一行");
+
+        let long = "字".repeat(MAX_REASON + 20);
+        let cut = PageDetails::default().with_reason(&long);
+        let c = cut.reason.as_deref().unwrap_or("");
+        assert_eq!(
+            c.chars().count(),
+            MAX_REASON + 1,
+            "MUST 截到上限再補省略號：{c}"
+        );
+        assert!(c.ends_with('…'));
+        // 截斷點若按 byte 算，這裡會 panic 在 char boundary 上
+        assert!(c.starts_with('字'));
+    }
+
+    /// pane 死了就退到 owner 的 window——`WorkerDied` 的常態正是「pane 沒了」，
+    /// 只問 pane 的話最需要地點的那一類事件永遠拿不到地點。
+    #[test]
+    fn a_dead_pane_falls_back_to_the_owner_window() {
+        /// 只認得出 `@7` 這個 target。問死掉的 pane 時**照抄真實 tmux 的行為**
+        /// ——exit 0 ＋ 每個欄位空展開（結果是 `":"`），不是失敗。第一版的假件
+        /// 回 `None`，於是實作的 fail-open 在單元層一路綠到分組 47 才被逮到。
+        struct LocTmux {
+            asked: RefCell<Vec<String>>,
+        }
+        impl crate::tmux::TmuxClient for LocTmux {
+            fn exec(&self, args: &[&str]) -> Option<crate::tmux::TmuxOutput> {
+                let target = args.get(3).copied().unwrap_or("");
+                self.asked.borrow_mut().push(target.to_string());
+                Some(crate::tmux::TmuxOutput {
+                    status_ok: true,
+                    stdout: if target == "@7" {
+                        "dev:3 build\n"
+                    } else {
+                        ":\n"
+                    }
+                    .to_string(),
+                    stderr: String::new(),
+                })
+            }
+            fn available(&self) -> bool {
+                true
+            }
+            fn resolve_pane(&self, _t: &str) -> Option<String> {
+                None
+            }
+            fn pane_exists(&self, _p: &str) -> bool {
+                false
+            }
+            fn capture_pane(&self, _p: &str) -> Option<String> {
+                None
+            }
+            fn pane_in_mode(&self, _p: &str) -> Option<bool> {
+                Some(false)
+            }
+            fn send_keys(&self, _p: &str, _k: &str) -> bool {
+                true
+            }
+        }
+
+        let t = LocTmux {
+            asked: RefCell::new(Vec::new()),
+        };
+        assert_eq!(
+            resolve_location(&t, "%99", "zzb:@7").as_deref(),
+            Some("dev:3 build"),
+            "pane 問不到 MUST 退到 owner 的 window"
+        );
+        assert_eq!(
+            t.asked.borrow().as_slice(),
+            &["%99".to_string(), "@7".to_string()],
+            "順序 MUST 是先 pane 後 window"
+        );
+        // 兩條都問不到就是沒有地點——通知照發，只是少一段
+        let t2 = LocTmux {
+            asked: RefCell::new(Vec::new()),
+        };
+        assert_eq!(resolve_location(&t2, "%99", "沒有冒號at的字串"), None);
+    }
+
+    /// 地點與原因**不得進去重軸**：window 改個名、失敗訊息換句話說，都不是
+    /// 新事件。它們分屬兩個型別就是為了防這件事，這條把它釘死。
+    #[test]
+    fn presentation_details_never_change_the_dedup_key() {
+        let e = failed("t1");
+        let plain = e.key();
+        let dressed = PageDetails {
+            location: Some("dev:3 build".into()),
+            reason: Some("完全不同的原因".into()),
+        };
+        assert_eq!(e.key(), plain, "key MUST NOT 隨呈現欄位改變");
+        // 同一個事件配不同的 details，推播仍只有一次
+        let paths = tmp_paths("details-dedup");
+        let pager = RecordingPager::new(true);
+        emit(&paths, &e, &D, &pager).unwrap();
+        assert_eq!(
+            emit(&paths, &e, &dressed, &pager).unwrap(),
+            EmitOutcome::AlreadySeen,
+            "換一組 details MUST NOT 變成新事件"
+        );
+        assert_eq!(pager.count(), 1);
     }
 }

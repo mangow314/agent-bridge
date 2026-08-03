@@ -582,11 +582,22 @@ fn cmd_start(paths: &Paths, args: &[String]) -> Result<()> {
 /// **一律吞掉錯誤**：推播是副作用，呼叫端的 exit code 與輸出契約零改變
 /// （§1 非目標）。事件流寫不進去（唯讀 sandbox、磁碟滿）也一樣——那時人本來
 /// 就有更大的問題要處理，不該讓 `fail` 因為通知不出去而失敗。
-fn emit_page(paths: &Paths, event: &page::PageEvent) {
+fn emit_page(paths: &Paths, event: &page::PageEvent, details: &page::PageDetails) {
     let tmux = SubprocessTmux;
     let runner = page::SubprocessRunner;
     let pager = page::SystemPager::new(&runner, &tmux);
-    let _ = page::emit(paths, event, &pager);
+    let _ = page::emit(paths, event, details, &pager);
+}
+
+/// 這個 agent 現在人在哪（`session:window索引 window名`）。
+///
+/// registry 查不到（agent 已除名、檔案壞了）就回 `None`——通知照發、只是少一
+/// 段地點。**MUST NOT 因此讓事件發不出去**：地點是補充，不是事件成立的前提。
+fn agent_location(paths: &Paths, agent: &str) -> Option<String> {
+    let snap = registry::snapshot(paths)
+        .into_iter()
+        .find(|a| a.name == agent)?;
+    page::resolve_location(&SubprocessTmux, &snap.pane, &snap.owner)
 }
 
 /// cmd_scan — 顯式掃一輪 page 層事件（Rust 獨有，bash 正本自 M4 凍結）。
@@ -645,12 +656,22 @@ fn respond_task(
     // 不需要另外寫排除條件（rubric v2 page 層條 3）。
     if final_state == TaskState::Failed {
         let to = task::meta_str(&dir, "to").unwrap_or_default();
+        // 原因讀**剛寫好的 response.md**，不從 `src` 再取一次：`--message-file -`
+        // 的 stdin 已經被讀完，重取只會拿到空的。內容是 worker 寫的不可信
+        // payload（可能非 UTF-8），只當顯示字串用，走 lossy
+        let msg = std::fs::read(dir.join("response.md")).unwrap_or_default();
+        let details = page::PageDetails {
+            location: agent_location(paths, &to),
+            ..Default::default()
+        }
+        .with_reason(&String::from_utf8_lossy(&msg));
         emit_page(
             paths,
             &page::PageEvent::TaskFailed {
                 agent: to,
                 task: id.to_string(),
             },
+            &details,
         );
     }
 

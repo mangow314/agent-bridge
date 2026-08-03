@@ -587,7 +587,11 @@ session（`WAYLAND_DISPLAY`／`DISPLAY`）**且非** SSH（`SSH_CONNECTION` 不�
 → `notify-send`；③一律再對每個 attached client 送一次 `display-message -c
 <client> -l`（`-l` 保證事件文字不被當 tmux format 展開）。SSH 下 MUST NOT
 走桌面通知：遠端的 `DISPLAY` 指的是遠端那台的螢幕，彈在沒有人的地方比不
-通知更糟。通知 MUST 帶 agent 名與 task id（rubric v2 page 層 human judgment）。
+通知更糟。
+
+來源標記由各通道用自己的慣用法承擔，MUST NOT 佔用標題：桌面那一層走
+`notify-send -a agent-bridge`（appname 欄），tmux status line 由 pager 自行
+接前綴並把內文的換行壓平（status line 是單行）。
 
 自訂命令 MUST 以三個 stdio 全接 null 的方式執行：`Command::status()` 預設
 繼承 stdin，而掃描跑在 CLI 路徑上——`send/reply/fail --message-file -` 的
@@ -602,6 +606,32 @@ attach 時仍可能走本機 `notify-send`；反向殘留的 `SSH_CONNECTION` �
 要精準到 viewer 需改成 client-aware 設計，MUST NOT 再堆 `SSH_TTY`／
 `SSH_CLIENT` 之類的猜測。
 Source: ab_core::page::SystemPager / SubprocessRunner
+
+### CLI-PAGE-3 [tested: 47]
+通知文字的內容契約（PG4 human judgment 實測 2026-08-03 定案）。標題 MUST
+帶 **agent 名**，且在解得出時 MUST 帶 **地點**（`session:window索引
+window名`）；內文首行 MUST 是**決策依據**——`task-failed` 取失敗訊息的第一
+個非空行，取不到才退回狀態字；末行 MUST 是 **task id**（`ab read <id>` 的
+把手，同一 agent 併發多筆時的辨識軸）。
+
+理由是實測打回來的：受測者答得出「誰、出了什麼事」，卻卡在「要不要切過去
+看」——通知既沒說切去哪裡（缺地點），也沒說不管它會怎樣（只有狀態字）。
+
+地點 MUST 先問 pane、pane 問不到再退到 registry `owner` 欄的 window
+（`session:@winid`）：`worker-died` 依定義 pane 已死，只問 pane 等於最需要
+地點的那一類永遠沒有地點。**tmux 對已死的 target 是 exit 0 ＋ 空展開**
+（結果如 `":"`），故解析結果 MUST 驗形（window 索引為數字）才算數，否則
+fallback 永遠走不到。兩條都問不到 MUST 只是少一段地點，MUST NOT 讓事件發
+不出去。人工註冊的 agent 無 owner 欄（38c），其 pane 一死即無地點可解——
+這是既有裁定的後果，不是缺陷。
+
+地點與失敗原因 MUST NOT 進 event key：window 改名、失敗訊息換句話說都不是
+新事件。兩者以獨立型別（`PageDetails`）承載，與事件身分分離。
+
+不可信文字 MUST 被壓成單行並截斷：失敗原因來自 worker 寫的 response.md、
+window 名任人可改，控制字元 MUST 轉空白（否則單行通知被撐開、status line
+被洗掉），截斷 MUST 按字元而非 byte。
+Source: ab_core::page::{PageDetails, resolve_location, plausible_location}
 
 ---
 

@@ -69,6 +69,18 @@ cleanup() {
   tmx kill-server 2>/dev/null || true
   "$REAL_TMUX" -L agent-bridge-test-b -f /dev/null kill-server 2>/dev/null || true
   "$REAL_TMUX" -L agent-bridge-test-c -f /dev/null kill-server 2>/dev/null || true
+  # 掃掉還指著 $TESTROOT 的行程再刪目錄。**`tmx kill-server` 掃不到它們**：
+  # 假 runtime 是背景 `&` 起的，父 subshell 一退就 reparent 到 init，從此與
+  # tmux socket 無關。2026-08-03 在使用者機器上撈到兩支這樣的孤兒——`rtbin36o`
+  # 的假 codex，各自活了 3.2 天、燒掉 36 分鐘 CPU，而它們的 TESTROOT 早被這
+  # 支 cleanup 刪光了（假件活得比 fixture 久）。
+  #
+  # 為什麼那兩支沒有照它自己的 500 圈上限退出，**沒有查明**——證據隨行程一起
+  # 消失了。所以這裡補的是**兜底**而不是根因修復：`$TESTROOT` 是 mktemp 出來
+  # 的唯一路徑，拿它當 pattern 不會誤傷別人的行程。
+  if [[ -n "${TESTROOT:-}" && "$TESTROOT" == */agent-bridge-tests.* ]]; then
+    pkill -f -- "$TESTROOT" 2>/dev/null || true
+  fi
   if [[ -n "${TESTROOT:-}" && -d "$TESTROOT" ]]; then
     rm -rf -- "$TESTROOT"
   fi
@@ -6349,6 +6361,15 @@ ab47() {
 }
 ev47_count() { test -f "$EV47" && grep -c . "$EV47" || echo 0; }
 ev47_kind() { grep -c "\"kind\":\"$1\"" "$EV47" 2>/dev/null || echo 0; }
+# 該類別的事件**全部**都帶得出地點（`-s` 一次吃完整份，斷言因此與行序無關；
+# 逐行跑的話 jq -e 的退出碼只反映最後一行，前面幾筆空的地點會靜默通過）。
+# 寫成具名函式而不是 `bash -c`：jq 的 `$l` 在內層 shell 的雙引號裡會先被吃掉，
+# jq 收到的是 `startswith()`——第一版就是這樣假紅的
+ev47_loc_ok() { # ev47_loc_ok <kind> <expected-prefix>
+  jq -se --arg k "$1" --arg l "$2" \
+    'map(select(.kind == $k)) | length > 0 and all(.[]; .location | startswith($l))' \
+    "$EV47" >/dev/null
+}
 
 # 前置：兩個 worker，各自一個真 pane
 W47="$(tmx new-window -dP -F '#{window_id}' -t it "$pane_cmd")"
@@ -6358,14 +6379,31 @@ ab47 register w47a "$P47A" >/dev/null 2>&1
 ab47 register w47b "$P47B" >/dev/null 2>&1
 
 # (1) fail → 恰一筆 task-failed，且自訂通知命令收到 agent 名與 task id
+#
+# **這一組的 title／body 斷言是 PG4 實測（2026-08-03）打回來的**：受測者說得出
+# 「誰、出了什麼事」，卻卡在「要不要切過去看」。所以地點與失敗原因是契約的
+# 一部分，不是文案品味——而且它們的產生點（`agent_location`、從 response.md
+# 取第一行）都只活在 CLI 層，ab-core 的單元測試碰不到，只有這裡守得住。
+LOC47="$(tmx display-message -p -t "$P47A" '#{session_name}:#{window_index}')"
 id47a="$(ab47 send w47a --from boss --message "去做 a" 2>/dev/null)"
 ab47 receive "$id47a" >/dev/null 2>&1
-ab47 fail "$id47a" --message "做不到" >/dev/null 2>&1
+ab47 fail "$id47a" --message "磁碟滿了寫不進去
+第二行不該進通知" >/dev/null 2>&1
 assert "47(1)：fail 恰落一筆 task-failed（rubric v2 page 條 1）" \
   test "$(ev47_kind task-failed)" -eq 1
 assert "47(1)：通知標題帶 agent 名（不必開面板就知道是誰）" \
   grep -q 'w47a' "$PAGER47_LOG"
 assert "47(1)：通知內文帶 task id" grep -qF "$id47a" "$PAGER47_LOG"
+# 地點：PG4 條 3 的一半——「要切過去看」這動作得有起點
+assert "47(1)：通知標題帶 session:window（PG4：說得出切去哪裡）" \
+  grep -qF "$LOC47" "$PAGER47_LOG"
+# 原因：條 3 的另一半——決定要不要現在出手的是原因，不是狀態字
+assert "47(1)：通知內文首行是失敗原因（PG4：說得出要不要出手）" \
+  grep -qF "磁碟滿了寫不進去" "$PAGER47_LOG"
+assert_fails "47(1)：多行失敗訊息 MUST NOT 整份灌進通知（只取第一行）" \
+  grep -qF "第二行不該進通知" "$PAGER47_LOG"
+# 事件流也要留下當時的地點（事後回查用；window 後來改名或關掉都還原得回來）
+assert "47(1)：事件流記下當時的 location" ev47_loc_ok task-failed "$LOC47"
 
 # (2) reply（completed）零推播——rubric v2 page 條 3
 before47="$(ev47_count)"
@@ -6380,6 +6418,14 @@ ab47 cancel "$id47c" >/dev/null 2>&1
 assert "47(3)：cancel MUST NOT 推播" test "$(ev47_count)" -eq "$before47"
 
 # (4) pane 死了卻還掛著非終態 task → scan 恰一則；再掃零則（去重）
+#
+# 先補上 owner 欄再殺 pane：**人工註冊本來就沒有 owner**（38c 的既有裁定，
+# 不是缺陷），而 page 層真正的服務對象是 spawn 出身的 worker——那一類一定有
+# owner。地點的 fallback 只有在有 owner 時才有標的，所以這裡把 w47b 補成
+# spawn 出身的形狀，否則測到的是「人工註冊 ＋ pane 已死」這個天生無解的角落。
+own47="$(tmx display-message -p -t "$P47B" '#{session_name}:#{window_id}')"
+jq --arg o "$own47" '.owner = $o' "$D47/agents/w47b.json" > "$TESTROOT/w47b.tmp" \
+  && mv "$TESTROOT/w47b.tmp" "$D47/agents/w47b.json"
 id47d="$(ab47 send w47b --from boss --message "會被丟下的活" 2>/dev/null)"
 tmx kill-pane -t "$P47B" 2>/dev/null || true
 assert "47(4) 前置：w47b 的 pane 真的不在了" \
@@ -6389,6 +6435,11 @@ n47="$(ab47 scan 2>/dev/null)"
 assert "47(4)：pane 死掛非終態 task → scan 恰推一則" test "$n47" -eq 1
 assert "47(4)：事件流裡是 worker-died" test "$(ev47_kind worker-died)" -eq 1
 assert "47(4)：通知內文帶被丟下的 task id" grep -qF "$id47d" "$PAGER47_LOG"
+# **pane 死了仍要說得出地點**：worker-died 正是最需要「切去哪」的那一類，而
+# 它的 pane 依定義已經不在了——地點只能退到 owner 的 window 才解得出來。
+# 只問 pane 的實作會在這裡靜默地少一段（`resolve_location` 的 fallback）
+assert "47(4)：pane 已死仍解得出地點（退到 owner 的 window）" \
+  ev47_loc_ok worker-died "$LOC47"
 n47b="$(ab47 scan 2>/dev/null)"
 assert "47(4)：重掃 MUST NOT 重推（rubric v2 page 條 2）" test "$n47b" -eq 0
 assert "47(4)：重掃 MUST NOT 重複落盤" test "$(ev47_kind worker-died)" -eq 1
