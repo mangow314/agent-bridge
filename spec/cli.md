@@ -543,6 +543,12 @@ Source: cmd_scan / ab_core::page::scan
 區分，兩者都壓成「整輪不掃」。前者的事實可能正是「整池 pane 都死了」，那些
 事件於是**永遠**發不出去，不是「晚一輪」。要涵蓋這一格需要能證明 server 身分
 的 schema，屬另立設計裁定，不在本相位。
+
+**每輪的 tmux 成本 MUST 與「有沒有新事件」成正比**：地點 MUST 只在該 agent
+還有未推事件時才解。掃描掛在每個成功的非唯讀子指令後面，若每個死列都先解
+一次地點，N 筆殘留死列（沒有 task、只剩終態 task、已推過）會讓每次
+`fail`／`reply`／`send` 白付最多 2N 次串行 tmux 查詢。這一篩是鎖外的效能篩，
+權威的去重覆核仍在 `emit` 的鎖內那一次（CLI-PAGE-1）。
 Source: ab_core::page::scan / task_belongs_to
 
 ### CLI-SCAN-3 [tested: 47]
@@ -628,10 +634,23 @@ fallback 永遠走不到。兩條都問不到 MUST 只是少一段地點，MUST 
 地點與失敗原因 MUST NOT 進 event key：window 改名、失敗訊息換句話說都不是
 新事件。兩者以獨立型別（`PageDetails`）承載，與事件身分分離。
 
+`worker-died` 的內文 MUST 說得出下一步（清理或改派），MUST NOT 只陳述
+「沒人會回」；同時 MUST NOT 內嵌可複製的指令——`despawn` 對人工註冊的 agent
+會被拒，孤兒 task 的正解也可能是 cancel 或改派（使用者 2026-08-04 裁定）。
+
 不可信文字 MUST 被壓成單行並截斷：失敗原因來自 worker 寫的 response.md、
 window 名任人可改，控制字元 MUST 轉空白（否則單行通知被撐開、status line
-被洗掉），截斷 MUST 按字元而非 byte。
-Source: ab_core::page::{PageDetails, resolve_location, plausible_location}
+被洗掉），截斷 MUST 按字元而非 byte。「控制字元」MUST 涵蓋 `is_control()`
+以外的 U+2028／U+2029 與 bidi 控制字元（U+202A–U+202E、U+2066–U+2069、
+U+200E／U+200F／U+061C）：前者仍會在 GUI 通知裡換行，後者能把地點與 task id
+在人眼前重排成別的字。
+
+通知文字 MUST 以 positional 身分抵達 notifier：`notify-send` 的 argv MUST 在
+title／body 前加 `--`。agent 名文法允許 `-` 開頭而標題以 agent 名開頭，
+GLib 的 option parser 會把 `--help` 這種值重新解析成旗標（實測印 help、
+exit 0、一則都沒送），而事件已先記 seen 不會重試。
+Source: ab_core::page::{PageDetails, resolve_location, plausible_location,
+SystemPager}
 
 ---
 

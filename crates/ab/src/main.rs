@@ -589,15 +589,39 @@ fn emit_page(paths: &Paths, event: &page::PageEvent, details: &page::PageDetails
     let _ = page::emit(paths, event, details, &pager);
 }
 
+/// 從失敗訊息取原因時，最多讀進來的位元組數。原因只取第一個非空行的前 80 個
+/// 字元；8 KiB 對那件事綽綽有餘，而 payload 本身沒有大小上限。
+const REASON_PREFIX_BYTES: u64 = 8192;
+
+/// 讀一個檔的前 `max` 個位元組。讀不到（不存在、沒權限、不是普通檔）回空的
+/// ——呼叫端只拿它當顯示字串，沒有原因就少一段話，不是錯誤。
+fn read_prefix(path: &std::path::Path, max: u64) -> Vec<u8> {
+    use std::io::Read;
+    let Ok(f) = std::fs::File::open(path) else {
+        return Vec::new();
+    };
+    let mut buf = Vec::new();
+    let _ = f.take(max).read_to_end(&mut buf);
+    buf
+}
+
 /// 這個 agent 現在人在哪（`session:window索引 window名`）。
 ///
 /// registry 查不到（agent 已除名、檔案壞了）就回 `None`——通知照發、只是少一
 /// 段地點。**MUST NOT 因此讓事件發不出去**：地點是補充，不是事件成立的前提。
+///
+/// **走單檔 lookup，不建全池 snapshot**（跨廠複核 should-fix 4）：為了找一個
+/// agent 而讀完 `agents/` 底下每一個 `*.json`，會讓一個不相關的巨大檔或 FIFO
+/// 拖住整個 `fail`——而那時 task 已經轉 failed、鎖也放掉了，重試又會被終態擋
+/// 下。單檔路徑也是 registry 其他讀取點（`read_pane`／`read_field`）的既有慣例。
 fn agent_location(paths: &Paths, agent: &str) -> Option<String> {
-    let snap = registry::snapshot(paths)
-        .into_iter()
-        .find(|a| a.name == agent)?;
-    page::resolve_location(&SubprocessTmux, &snap.pane, &snap.owner)
+    if !ab_core::validate::is_valid_name(agent) {
+        return None;
+    }
+    let file = paths.agents_dir.join(format!("{agent}.json"));
+    let pane = registry::read_pane(&file);
+    let owner = registry::read_field(&file, "owner", "");
+    page::resolve_location(&SubprocessTmux, &pane, &owner)
 }
 
 /// cmd_scan — 顯式掃一輪 page 層事件（Rust 獨有，bash 正本自 M4 凍結）。
@@ -659,7 +683,11 @@ fn respond_task(
         // 原因讀**剛寫好的 response.md**，不從 `src` 再取一次：`--message-file -`
         // 的 stdin 已經被讀完，重取只會拿到空的。內容是 worker 寫的不可信
         // payload（可能非 UTF-8），只當顯示字串用，走 lossy
-        let msg = std::fs::read(dir.join("response.md")).unwrap_or_default();
+        //
+        // **只讀前緣，不整份載入**（跨廠複核 should-fix 4）：要的只是第一個
+        // 非空行的前 80 個字元，整份 `read` 會為一則通知再付一次 O(size) I/O
+        // 與記憶體——而 payload 大小沒有上限。讀不到就沒有原因，通知照發。
+        let msg = read_prefix(&dir.join("response.md"), REASON_PREFIX_BYTES);
         let details = page::PageDetails {
             location: agent_location(paths, &to),
             ..Default::default()

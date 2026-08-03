@@ -84,10 +84,16 @@ const MAX_LOCATION: usize = 40;
 /// 紅線），`location` 來自 tmux 的 window 名（使用者或任何程式改得到）。控制
 /// 字元會把單行通知撐成多行、把 tmux status line 洗掉；截斷一律按**字元**，
 /// 按 byte 切會把多位元組字元剖半。
+///
+/// **控制字元不只 `is_control()` 那一組**（跨廠複核 should-fix 2）：Rust 對
+/// U+2028／U+2029（line／paragraph separator）與 bidi 控制字元一律回 `false`，
+/// `str::lines()` 也不把 U+2028 當換行——它們會原樣穿過去，在 GUI 通知裡換行，
+/// 或用 U+202E／U+2066 把後面的 task id 與地點在人眼前重排成別的字。這一層是
+/// **給人看的信任面**，視覺注入就是這一層要擋的東西。
 fn one_line(s: &str, max: usize) -> Option<String> {
     let cleaned: String = s
         .chars()
-        .map(|c| if c.is_control() { ' ' } else { c })
+        .map(|c| if is_display_hostile(c) { ' ' } else { c })
         .collect();
     let trimmed = cleaned.trim();
     if trimmed.is_empty() {
@@ -97,6 +103,19 @@ fn one_line(s: &str, max: usize) -> Option<String> {
         return Some(trimmed.to_string());
     }
     Some(trimmed.chars().take(max).collect::<String>() + "…")
+}
+
+/// 會撐開單行、或讓人眼讀到的順序不等於實際字串的字元。
+fn is_display_hostile(c: char) -> bool {
+    c.is_control()
+        // line／paragraph separator：`is_control()` 不認，GUI 通知會照斷
+        || matches!(c, '\u{2028}' | '\u{2029}')
+        // bidi embedding／override（LRE..RLO ＋ PDF）
+        || matches!(c, '\u{202a}'..='\u{202e}')
+        // bidi isolate（LRI..PDI）
+        || matches!(c, '\u{2066}'..='\u{2069}')
+        // bidi 標記（LRM／RLM／ALM）
+        || matches!(c, '\u{200e}' | '\u{200f}' | '\u{061c}')
 }
 
 impl PageDetails {
@@ -220,7 +239,11 @@ impl PageEvent {
                 None => format!("已進 failed 終態，回覆在信箱\n{task}"),
             },
             PageEvent::WorkerDied { .. } => {
-                format!("pane 已不存在，這一筆沒人會回\n{task}")
+                // 「需要清理或改派」而不是「這一筆沒人會回」：PG4 第三輪的作答
+                // 卡在「知道它死了，然後呢」。**不寫可複製的指令**（使用者
+                // 2026-08-04 裁定）——`despawn` 對人工註冊的 agent 會被拒，
+                // 孤兒 task 的正解也可能是 cancel 或改派給別人。
+                format!("pane 已不存在，需要清理或改派\n{task}")
             }
         }
     }
@@ -368,10 +391,18 @@ impl<'a> SystemPager<'a> {
         if self.env.desktop_usable() {
             // `-a`：來源掛在 appname 欄，不佔標題的前幾個字（標題最貴的位置
             // 要留給 agent 名與地點）
+            //
+            // `--` 是必要的，不是禮貌（跨廠複核 should-fix 1）：標題現在以
+            // agent 名開頭（前綴移進 `-a` 之後），而 agent 名文法允許 `-` 開頭；
+            // reason 來自 worker 的 payload 更是隨便它寫。GLib 的 option parser
+            // 會把 `--help` 這種 positional 重新解析成旗標——實測
+            // `notify-send -a agent-bridge 'safe title' '--help'` 印出 help 並
+            // exit 0，**完全沒送通知**。而 `emit` 已經先記了 seen，不會重試。
             return self.runner.run(&[
                 "notify-send".to_string(),
                 "-a".to_string(),
                 "agent-bridge".to_string(),
+                "--".to_string(),
                 title.to_string(),
                 body.to_string(),
             ]);
@@ -603,22 +634,34 @@ pub fn scan(
         if a.pane.is_empty() || alive.contains(a.pane.as_str()) {
             continue;
         }
-        // 地點只對**已判定死掉**的 agent 解一次：健康的池子一次 tmux 都不多問，
-        // 同一個 agent 掛著三筆 task 也只解一次
+        let events: Vec<PageEvent> = tasks
+            .iter()
+            .filter(|t| task_belongs_to(t, a))
+            .map(|t| PageEvent::WorkerDied {
+                agent: a.name.clone(),
+                spawn_tag: a.spawn_tag.clone(),
+                task: t.id.clone(),
+            })
+            .collect();
+        // **有新事件才解地點**（跨廠複核 should-fix 3）：解一次地點是 1–2 次
+        // tmux 呼叫，而機會式掃描掛在每個成功的非唯讀子指令後面。先前是死一個
+        // agent 就解一次，於是 N 筆殘留死列會讓每次 `fail`／`reply`／`send`
+        // 白付最多 2N 次串行 tmux 查詢——沒有 task、只剩終態 task、已推過的
+        // 事件都照付。這一篩純粹是效能篩（鎖外、可能過時）：權威的去重覆核
+        // 仍在 `emit` 的鎖內那一次。
+        if events
+            .iter()
+            .all(|e| is_seen(paths, &e.key()).unwrap_or(false))
+        {
+            continue;
+        }
+        // 地點對這個 agent 只解一次：同一個 agent 掛著三筆 task 也只解一次
         let details = PageDetails {
             location: resolve_location(tmux, &a.pane, &a.owner),
             reason: None,
         };
-        for t in &tasks {
-            if !task_belongs_to(t, a) {
-                continue;
-            }
-            let event = PageEvent::WorkerDied {
-                agent: a.name.clone(),
-                spawn_tag: a.spawn_tag.clone(),
-                task: t.id.clone(),
-            };
-            if let Ok(o) = emit(paths, &event, &details, pager) {
+        for event in &events {
+            if let Ok(o) = emit(paths, event, &details, pager) {
                 out.push(o);
             }
         }
@@ -1009,7 +1052,40 @@ mod tests {
             over_ssh: false,
         };
         assert!(pager_with(env, &runner, &tmux).page("T", "B"));
-        assert_eq!(runner.progs(), vec!["notify-send".to_string()]);
+        // argv **逐字**驗：`--` 掉了就是「以 `-` 開頭的標題被當旗標、通知靜默
+        // 消失」，而 `progs()` 只看 argv[0] 看不見那件事
+        assert_eq!(
+            runner.argvs.borrow()[0],
+            vec!["notify-send", "-a", "agent-bridge", "--", "T", "B"]
+        );
+    }
+
+    /// 標題或內文以 `-` 開頭時，argv 仍 MUST 把它們留在 `--` 之後。
+    ///
+    /// 這不是假想輸入：agent 名文法允許 `-` 開頭（`validate::is_valid_name`），
+    /// 而標題現在就是以 agent 名開頭；reason 更是 worker 寫的 payload。實測
+    /// `notify-send -a agent-bridge 'safe title' '--help'` 印 help、exit 0、
+    /// **一則通知都沒送**，而 `emit` 已先記 seen 不會重試（跨廠複核 should-fix 1）。
+    #[test]
+    fn a_dash_leading_title_or_body_stays_positional() {
+        let runner = FakeRunner::new(true);
+        let tmux = FakeTmux::with_clients("/dev/pts/3\n");
+        let env = PagerEnv {
+            notify_cmd: None,
+            has_display: true,
+            over_ssh: false,
+        };
+        assert!(pager_with(env, &runner, &tmux).page("--help 任務失敗", "--version"));
+        let argv = runner.argvs.borrow()[0].clone();
+        let dashdash = argv
+            .iter()
+            .position(|a| a == "--")
+            .expect("argv MUST 有 --");
+        assert_eq!(
+            &argv[dashdash + 1..],
+            &["--help 任務失敗".to_string(), "--version".to_string()],
+            "以 `-` 開頭的標題／內文 MUST 全部落在 `--` 之後：{argv:?}"
+        );
     }
 
     /// 自訂命令取代桌面那一層，並收到 `<title> <body>` 兩個參數——這是 SSH／
@@ -1177,6 +1253,48 @@ mod tests {
         let pager = RecordingPager::new(true);
         scan(&paths, &FakeTmux::with_panes("%1\n"), &pager);
         assert_eq!(pager.count(), 0, "上一代的歷史 task MUST NOT 推");
+    }
+
+    /// **沒有新事件就不為了地點多問 tmux**（跨廠複核 should-fix 3）。
+    ///
+    /// 機會式掃描掛在每個成功的非唯讀子指令後面，所以「沒有新事件」才是最常
+    /// 走到的那條路。先前是每個死列都先解一次地點（1–2 次串行 tmux 查詢），
+    /// N 筆殘留死列就讓每次 `fail`／`reply`／`send` 白付最多 2N 次。
+    #[test]
+    fn a_scan_with_nothing_new_asks_tmux_nothing_extra() {
+        // (a) 死列、但一筆 task 都沒掛：連解地點都不該發生
+        let paths = tmp_paths("scan-cost-notask");
+        write_agent(&paths, "w1", "%99");
+        let pager = RecordingPager::new(true);
+        let tmux = FakeTmux::with_panes("%1\n");
+        scan(&paths, &tmux, &pager);
+        assert!(
+            tmux.display_calls().is_empty(),
+            "沒有 task 的死列 MUST NOT 解地點：{:?}",
+            tmux.display_calls()
+        );
+
+        // (b) 事件已經推過：第二輪不得再解一次地點
+        let paths = tmp_paths("scan-cost-seen");
+        write_agent(&paths, "w1", "%99");
+        write_task(
+            &paths,
+            "20260802T000000Z-aa01",
+            "w1",
+            "running",
+            "2026-08-02T00:00:00Z",
+        );
+        let pager = RecordingPager::new(true);
+        let tmux = FakeTmux::with_panes("%1\n");
+        scan(&paths, &tmux, &pager);
+        let first = tmux.display_calls().len();
+        assert!(first >= 1, "第一輪 MUST 解一次地點");
+        scan(&paths, &tmux, &pager);
+        assert_eq!(
+            tmux.display_calls().len(),
+            first,
+            "已推過的事件 MUST NOT 再解一次地點"
+        );
     }
 
     /// **tmux 查不出 pane 清單時整輪不掃**：照抄送鍵路徑的 fail-closed（查詢
@@ -1425,6 +1543,20 @@ mod tests {
         assert!(c.ends_with('…'));
         // 截斷點若按 byte 算，這裡會 panic 在 char boundary 上
         assert!(c.starts_with('字'));
+
+        // `is_control()` 不認的那一組：U+2028 會在 GUI 通知裡真的換行，
+        // U+202E／U+2066 會把後面的 task id 與地點在人眼前重排（跨廠複核
+        // should-fix 2）。reason 與 location 兩個來源都要擋
+        let sneaky = "壞了\u{2028}偽造第二行\u{202e}dnepsus\u{2066}";
+        let d = PageDetails::default().with_reason(sneaky);
+        let r = d.reason.as_deref().unwrap_or("");
+        for c in ['\u{2028}', '\u{2029}', '\u{202e}', '\u{2066}'] {
+            assert!(!r.contains(c), "reason MUST NOT 留下 {c:?}：{r:?}");
+        }
+        let loc = one_line(sneaky, MAX_LOCATION).unwrap_or_default();
+        for c in ['\u{2028}', '\u{2029}', '\u{202e}', '\u{2066}'] {
+            assert!(!loc.contains(c), "location MUST NOT 留下 {c:?}：{loc:?}");
+        }
     }
 
     /// pane 死了就退到 owner 的 window——`WorkerDied` 的常態正是「pane 沒了」，

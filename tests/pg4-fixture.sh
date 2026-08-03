@@ -205,6 +205,10 @@ EOF
     grep -qF "編譯失敗：缺 libfoo" "$NOTES"
   assert "失敗通知帶原因而非狀態字（步驟 2）" \
     grep -qF "測試 3 紅：逾時" "$NOTES"
+  # 「帶原因」與「不退回狀態字」是兩件事：兩者都印也會讓上面兩條綠
+  # （跨廠複核 nit 3）
+  assert "有原因時 MUST NOT 再印狀態字 fallback" \
+    bash -c '! grep -qF "已進 failed 終態" "$1"' _ "$NOTES"
 
   # 5) 負例的名字一個都不准出現在通知裡
   assert "pg4-echo（死 pane＋終態 task）MUST NOT 出現在通知" \

@@ -6365,6 +6365,15 @@ ev47_kind() { grep -c "\"kind\":\"$1\"" "$EV47" 2>/dev/null || echo 0; }
 # 逐行跑的話 jq -e 的退出碼只反映最後一行，前面幾筆空的地點會靜默通過）。
 # 寫成具名函式而不是 `bash -c`：jq 的 `$l` 在內層 shell 的雙引號裡會先被吃掉，
 # jq 收到的是 `startswith()`——第一版就是這樣假紅的
+# 推播記錄是「title 一行、body 各一行」順序寫下的，整份 grep 分不出哪一段
+# 屬於哪一則——另一則帶了地點就能替這一則作假（跨廠複核 nit 2）。這兩個
+# helper 把斷言鎖回**同一則通知**。同樣寫成具名函式而不是 `bash -c`
+pager47_title_has() { # <標題片段> <期望片段>
+  grep -F "$1" "$PAGER47_LOG" | grep -qF "$2"
+}
+pager47_adjacent() { # <前一行> <下一行>：兩行 MUST 相鄰＝同一則通知的內文
+  grep -A1 -Fx "$1" "$PAGER47_LOG" | grep -Fxq "$2"
+}
 ev47_loc_ok() { # ev47_loc_ok <kind> <expected-prefix>
   jq -se --arg k "$1" --arg l "$2" \
     'map(select(.kind == $k)) | length > 0 and all(.[]; .location | startswith($l))' \
@@ -6402,6 +6411,9 @@ assert "47(1)：通知內文首行是失敗原因（PG4：說得出要不要出�
   grep -qF "磁碟滿了寫不進去" "$PAGER47_LOG"
 assert_fails "47(1)：多行失敗訊息 MUST NOT 整份灌進通知（只取第一行）" \
   grep -qF "第二行不該進通知" "$PAGER47_LOG"
+# 原因與 task id MUST 是同一則通知的兩行（整份 grep 分不出這件事）
+assert "47(1)：原因與 task id 同屬一則通知的內文" \
+  pager47_adjacent "磁碟滿了寫不進去" "$id47a"
 # 事件流也要留下當時的地點（事後回查用；window 後來改名或關掉都還原得回來）
 assert "47(1)：事件流記下當時的 location" ev47_loc_ok task-failed "$LOC47"
 
@@ -6440,6 +6452,13 @@ assert "47(4)：通知內文帶被丟下的 task id" grep -qF "$id47d" "$PAGER47
 # 只問 pane 的實作會在這裡靜默地少一段（`resolve_location` 的 fallback）
 assert "47(4)：pane 已死仍解得出地點（退到 owner 的 window）" \
   ev47_loc_ok worker-died "$LOC47"
+# 事件流有地點、通知標題卻漏掉——這條的 oracle 換成**那一則通知本身**，
+# 免得事件流替通知作保（跨廠複核 nit 2）
+assert "47(4)：死訊通知的標題自己就帶得出地點" \
+  pager47_title_has "w47b 死了" "$LOC47"
+# 死訊內文 MUST 指出「然後要做什麼」（PG4 第三輪：知道它死了之後卡住）
+assert "47(4)：死訊內文說得出下一步（清理或改派）" \
+  pager47_adjacent "pane 已不存在，需要清理或改派" "$id47d"
 n47b="$(ab47 scan 2>/dev/null)"
 assert "47(4)：重掃 MUST NOT 重推（rubric v2 page 條 2）" test "$n47b" -eq 0
 assert "47(4)：重掃 MUST NOT 重複落盤" test "$(ev47_kind worker-died)" -eq 1

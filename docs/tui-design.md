@@ -431,10 +431,10 @@ breadcrumb 全部符合 generation 證據；返回時停在同一個 attention e
 分組 47，契約在 `spec/cli.md` CLI-SCAN-1/2/3、CLI-PAGE-1/2/3 與 `spec/env.md`
 ENV-PAGE-1。
 
-### PG4：page 層 human judgment 實測（2026-08-03，第一輪未通過）
+### PG4：page 層 human judgment 實測（2026-08-03，第三輪通過收案）
 
 量測載具 `tests/pg4-fixture.sh`（10 步：正例 5、負例 5，通知走
-`AGENT_BRIDGE_NOTIFY_CMD` 同時記日誌與彈桌面通知；機械不變式 24 條）。
+`AGENT_BRIDGE_NOTIFY_CMD` 同時記日誌與彈桌面通知；機械不變式 28 條）。
 
 **第一輪作廢**：通知全數送達 dunst 卻沒進到受測者眼裡——`follow = none`
 ＋`monitor = 0` 把 notification layer 畫在副螢幕（`hyprctl layers` 實證）。
@@ -456,6 +456,23 @@ ENV-PAGE-1。
 決策依據 → 內文首行改成失敗原因本身。契約落在 CLI-PAGE-3，實作在
 `PageDetails`／`resolve_location`。**條 2／3 待第三輪複測**——文案改完不等於
 通過，仍須使用者實測。
+
+**第三輪結果（2026-08-03，四條全過＝PG4 收案）**：條 1／4 維持，條 2 由半過
+轉過（task id 仍長，但標題已答得出「誰、在哪」），條 3 轉過——受測者原話
+「原則上是任務失敗要切過去看，pane 死了不存在可能要自己 despawn」。
+
+該句同時暴露一個新缺口：`worker-died` 給了地點也沒用，pane 已經不在，
+「切過去看」沒有標的。2026-08-04 使用者裁定內文改成點出動作類別
+（「需要清理或改派」）而**不內嵌可複製的指令**——`despawn` 對人工註冊的
+agent 會被拒，孤兒 task 的正解也可能是 cancel 或改派。契約回填在 CLI-PAGE-3。
+
+**跨廠覆核（codex `20260803T161651Z-e8b1`）**：0 blocker、4 should-fix 全收
+——①`notify-send` argv 缺 `--`（以 `-` 開頭的標題／原因被重解析成旗標，實測
+印 help、exit 0、一則都沒送）②`one_line` 漏 U+2028／U+2029 與 bidi 控制字元
+（`is_control()` 不認）③地點在確認「有未推事件」之前就解，殘留死列讓每個
+非唯讀指令白付 2N 次 tmux 查詢 ④`fail` 為一則通知整份重讀 response.md ＋
+建全池 registry snapshot，改 bounded 前綴讀＋單檔 lookup。三條測試鑑別力
+nit 亦一併補（通知斷言鎖回同一則、狀態字 fallback 的負向斷言）。
 
 ### 真實終端目視三輪的 known gap（2026-08-03，記錄不修）
 
