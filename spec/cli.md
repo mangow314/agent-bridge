@@ -518,10 +518,58 @@ Source: cmd_ui / ab_tui::run / ab_core::evict
 
 ---
 
+## `scan`
+
+### CLI-SCAN-1 [tested: 47]
+`scan`：掃一輪 page 層事件並推播（設計正本 `docs/tui-design.md` §1 的 page
+層）。**Rust 獨有**——bash 正本自 M4 凍結、不含 page 層，這是設計上的分歧
+而非漂移（比照 `notify` 的 agy 權限框那組）。不吃參數；stdout MUST 只印
+一個十進位整數＝這一輪**新**推的事件數（已推過的不計），說明走 stderr。
+事件恰兩類，不得擴充：`task-failed`（`fail` 的收斂點同步發）與
+`worker-died`（pane 不存在但掛著非終態 task）。
+Source: cmd_scan / ab_core::page::scan
+
+### CLI-SCAN-2 [tested: 47]
+`worker-died` 的判定 MUST **先取得整份 pane 清單**再比對，MUST NOT 逐 pane
+查詢後把「查不到」當成「死了」：tmux 不可用時整輪 MUST 零推播（回空），
+不得把整池 worker 判成死。task 是否掛在該 agent 身上，判準與 TUI 的歸屬軸
+同一條——收件人名相符**且** task `created_at` 嚴格晚於該 agent 的
+`registered_at`（同秒＝不可證＝不掛，同名 respawn 不承接上一代的歷史 task）。
+Source: ab_core::page::scan / task_belongs_to
+
+### CLI-SCAN-3 [tested: 47]
+每個**非唯讀**子指令進場時 MUST 順手掃一輪（沒有 daemon，事件只能由呼叫者
+發現）；`scan` 自身與 `ui` MUST 排除——前者否則計數恆為 0，後者否則
+dashboard 的啟動反過來取決於 page 層（§4 bounded-read：tmux 掛住時 TUI 仍
+MUST 畫得出磁碟 read model）。唯讀指令 MUST NOT 觸發（CLI-RO-1）。
+Source: main dispatch
+
+### CLI-PAGE-1 [tested: 47]
+去重與落盤：每則事件有一個 event key（`failed:<task-id>`／
+`died:<agent>:<spawn-tag>:<task-id>`，後者帶 generation key，故同名 respawn
+是新事件、行程重啟不是）。同一 key MUST 恰落盤一次、恰推播一次。順序 MUST
+是**先落盤後推播**：推播管道全滅時事件 MUST 仍在
+`state/page-events.jsonl`，且呼叫端 MUST exit 0——推播是副作用，任何子指令的
+退出碼與 stdout 契約 MUST NOT 因它改變。
+Source: ab_core::page::emit
+
+### CLI-PAGE-2 [tested: 47]
+推播管道分層：①`AGENT_BRIDGE_NOTIFY_CMD` 有設 → 以它為 **argv[0]**、後接
+`<title> <body>` 兩個參數（一支可執行檔，不是 shell 字串）；②否則有本機圖形
+session（`WAYLAND_DISPLAY`／`DISPLAY`）**且非** SSH（`SSH_CONNECTION` 不在）
+→ `notify-send`；③一律再對每個 attached client 送一次 `display-message -c
+<client> -l`（`-l` 保證事件文字不被當 tmux format 展開）。SSH 下 MUST NOT
+走桌面通知：遠端的 `DISPLAY` 指的是遠端那台的螢幕，彈在沒有人的地方比不
+通知更糟。通知 MUST 帶 agent 名與 task id（rubric v2 page 層 human judgment）。
+Source: ab_core::page::SystemPager
+
+---
+
 ## 唯讀指令的 sandbox 契約
 
-### CLI-RO-1 [tested: 31]
-`status`／`await`／`idle`／`list` MUST 全程不寫檔、不建目錄；`status` 與
-`await` 另 MUST 不依賴 jq。`hook` 自理依賴檢查與目錄建立且失敗全吞
+### CLI-RO-1 [tested: 31, 47]
+`status`／`await`／`idle`／`list` MUST 全程不寫檔、不建目錄（含 page 層的
+機會式掃描——它會寫事件流，故 MUST NOT 掛在唯讀指令上，見 CLI-SCAN-3）；
+`status` 與 `await` 另 MUST 不依賴 jq。`hook` 自理依賴檢查與目錄建立且失敗全吞
 （CLI-HOOK-1）。其餘指令啟動時自動補建資料目錄。
 Source: main（require_jq / ensure_dirs 豁免表）

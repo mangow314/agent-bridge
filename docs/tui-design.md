@@ -351,6 +351,9 @@ focus 跨 window 語意、CAS（cancel 綁 id）。
 | P5 理解驗收 | 歸屬樹測驗 v1（**2026-08-02 實測未通過，判定作廢**；v2 改兩層驗收，見下方 rubric v2） | v1 gate 作廢；v2 gate 見 rubric v2（page 層機器判定＋human judgment、dashboard 層機器判定＋human judgment 各一組） |
 | P5.1 可見性補洞 | WORKERS 補 scrollbar＋`N/total`（P5 v1 敗因的直接機制修復；照 P4.6c TASKS 既成範式） | render 測試（比照 TASKS 既有測試）：WORKERS 首／中／末 thumb＋`N/total` 標題；分組 44／45 與 P4 replay 重跑不退步 |
 | P5.2 relay 提醒 | `relay` 由手動（非 spawn-born）session 呼叫時印一行盯守提醒（known gap 的零成本緩解） | 輸出斷言兩則：呼叫者環境無 `AGENT_BRIDGE_SPAWN_TAG` → stderr 恰一行提醒；有 → 不印。協定行為零改變 |
+| P5.1b 捲軸語意 | thumb 改追**視窗**而非選取序位（2026-08-03 真實終端目視三輪的發現：同一頁內移動選取時畫面一行沒捲，thumb 卻在滑，讀起來像「上面還有內容被捲掉了」——與 P5 v1 敗因同一族的「畫面提示與可見範圍不符」） | render 測試：同頁內移動選取 thumb MUST 不動、捲到末列 MUST 貼軌道底；既有「捲軸吃行不吃列」的絕對格位斷言隨單位更新 |
+| PG0/PG3 page 層地基 | `ab-core::page`：事件恰兩類、event key（帶 generation key）、`state/page-events.jsonl` 落盤＋`page-seen` 去重；推播 ladder（`AGENT_BRIDGE_NOTIFY_CMD` → 本機桌面 `notify-send` → tmux status line 逐 client） | rubric v2 page 層條 1／2／4 的單元層：重複事件／行程重啟／已 seen 只落一筆只推一次；同名 respawn 是新事件；notifier 全滅仍落盤。ladder：SSH 下 MUST NOT 呼叫 notify-send（遠端 `DISPLAY` 是沒有人看的螢幕）、自訂命令收到 `<title> <body>` argv、逐 client 送且用 `-l` |
+| PG1/PG2 接上 CLI | E1 接 `respond_task` 的 failed 收斂點（`reply`／`cancel` 天然零推）；E2＝`page::scan`＋新 `scan` 子指令＋非唯讀子指令進場的機會式掃描（使用者裁定：不主動改使用者的 tmux 設定） | 分組 47（CLI-SCAN-1/2/3、CLI-PAGE-1/2、ENV-PAGE-1）：fail 恰一則、reply／cancel 零則、pane 死掛非終態恰一則且重掃不重推、唯讀指令零觸發、推播全滅仍落盤仍 exit 0。**掃描的 fail-closed 方向與送鍵路徑相反**：拿不到 pane 清單就整輪不掃（照抄「查不到當作死」會在 tmux 一掛時把整池推爆）；`ui` 排除在機會式之外（否則 dashboard 啟動反過來取決於 page 層，§4 bounded-read） |
 
 P4 附註：replay script 是 fixture 的一部分（固定初始 selection 與異常排序位置），
 量的是「固定操作序列下的步數差」，不宣稱量到任意操作者的自由行為。
@@ -419,9 +422,30 @@ breadcrumb 全部符合 generation 證據；返回時停在同一個 attention e
 此 task 為何 unattached」三題，受測者可開面板查證，60 秒內 3/3 並指出
 畫面證據？
 
-注意：v2 的 page 層與「首屏 triage 排序」隱含的版面演進（attention 排最上、
-lineage 視圖移二級鍵，對齊 k9s／btop「樹放二級鍵」準則）尚未開批；P5.1／
-P5.2 是其前置，不依賴它。
+注意：「首屏 triage 排序」隱含的版面演進（attention 排最上、lineage 視圖移
+二級鍵，對齊 k9s／btop「樹放二級鍵」準則）尚未開批；P5.1／P5.2 是其前置，
+不依賴它。
+
+**page 層實作指標（2026-08-03，PG0–PG3 落地）**：條 1–4 的機器判定已有實作
+可驗——單元層在 `crates/ab-core/src/page.rs`，CLI 層在 `tests/run-tests.sh`
+分組 47，契約在 `spec/cli.md` CLI-SCAN-1/2/3、CLI-PAGE-1/2 與 `spec/env.md`
+ENV-PAGE-1。**human judgment 那一條（10 個混合事件、只看通知說得出「哪個
+agent、為何現在需要我」）仍未做**——agent 不自證，待使用者實測。
+
+### 真實終端目視三輪的 known gap（2026-08-03，記錄不修）
+
+P5.1 的三輪成果首次在真實終端目視（120x40／80x24／60x18 各一輪＋互動輪）。
+主要發現已修（P5.1b）；以下四條認列不修，留給未來的 UI 輪：
+
+1. 80 欄下捲軸緊貼文字、無間隔欄（`…44a1  runnin║`）——P4.6 給 TASKS 時就
+   有的既有行為，非 P5.1 引入。
+2. 面板高 ≤3 時 ratatui 的頭尾箭頭放不下，**整條捲軸不畫**——偏偏那是最需要
+   提示「底下還有 26 列」的時候。緩解物是 P5.1 的 `N/total` 標題，實測仍在
+   （`WORKERS 1/27`），資訊沒有全丟。
+3. 60x18 直向堆疊時 DETAIL 拿 8 行、WORKERS／TASKS 各剩 1 行——triage 主體被
+   壓成一列而次要面板最大，配比是反的。
+4. 未聚焦的面板仍印 `N/total`，但 `▶` 標記整個消失：標題說第 9 列，畫面上
+   找不到第 9 列是哪一列。
 
 ## 10. 開放問題（已全數定案；2026-08-01 使用者拍板回填）
 

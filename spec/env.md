@@ -128,3 +128,13 @@ Source: cmd_relay
 空字串或非數字 MUST 以錯誤終止；`0` ＝解除上限。達上限時 relay MUST 拒絕
 並提示需人工介入。
 Source: cmd_relay
+
+### ENV-PAGE-1 [tested: 47]
+`AGENT_BRIDGE_NOTIFY_CMD`：page 層推播的自訂命令（設計正本
+`docs/tui-design.md` §1 的 page 層；Rust 獨有）。值是**一支可執行檔的路徑
+＝argv[0]**，不是一段 shell 字串；呼叫時後接 `<title> <body>` 兩個參數。
+設了就取代桌面通知那一層——這是 SSH／無桌面環境的逃生口（遠端的
+`DISPLAY` 指的是遠端那台的螢幕，桌面通知在那裡等於彈給沒有人看）。
+未設定或空 MUST 視為未設定。命令不存在或非零退出 MUST NOT 影響呼叫端的
+退出碼（CLI-PAGE-1）。
+Source: config::ENV_NOTIFY_CMD / page::SystemPager

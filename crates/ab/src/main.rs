@@ -122,6 +122,9 @@ fn print_implemented_commands() {
         "register",
         "relay",
         "reply",
+        // Rust 獨有（bash 正本凍結在 M4 時沒有 page 層）；仍列入，因為
+        // 「已完整實作的契約子指令」是這張表的語意，而 CLI-SCAN-1 是契約
+        "scan",
         "send",
         "spawn",
         "start",
