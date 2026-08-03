@@ -12,6 +12,7 @@ use ab_core::evict;
 use ab_core::hook::{self, HookOutcome};
 use ab_core::lock::acquire_lock;
 use ab_core::notify;
+use ab_core::page;
 use ab_core::paths::Paths;
 use ab_core::registry;
 use ab_core::send;
@@ -61,6 +62,11 @@ const USAGE: &str = r#"用法：
   agent-bridge gc [--older-than <days>] [--apply] [--include-notes]
                                                 清掉夠舊的終態 task（預設 14 天）；未完成的與
                                                 evict 收尾筆記一律保留。預設只試算，--apply 才刪
+  agent-bridge scan                             掃一輪 page 層事件（pane 死了卻還掛著非終態
+                                                task），該通知的推播、印出這一輪推了幾則。
+                                                每個非唯讀子指令進場時也會順手掃一次，所以
+                                                平常不必手動跑；要即時發現可自行掛在 tmux
+                                                hook／鍵位／cron 上
   agent-bridge ui                               alternate-screen dashboard（OWNERS/WORKERS、
                                                 Enter focus、x cancel；q 離開；docs/tui-design.md）
   agent-bridge hook <stop|prompt-submit|notification>
@@ -225,6 +231,27 @@ fn main() -> ExitCode {
         return ExitCode::from(1);
     }
 
+    // Page 層的機會式掃描（tui-design §1；使用者 2026-08-03 裁定）：沒有
+    // daemon，所以「pane 死了卻還掛著非終態 task」只能靠有人呼叫時順手發現。
+    // 掛在**非唯讀**子指令上——唯讀指令 MUST NOT 寫任何東西（CLI-RO-1），而
+    // 掃描會寫事件流。`scan` 自己排除在外，否則它印出來的計數永遠是 0
+    // （前置掃描已經把該推的都推完了）。
+    //
+    // `ui` 也排除：掃描要問 tmux，而 §4 的 bounded-read 硬條款下 TUI 必須在
+    // **tmux 整個掛住**時照樣畫得出磁碟 read model（分組 40i／40j）。把一個
+    // 會問 tmux 的前置動作擺在它啟動之前，等於讓 dashboard 的存活反過來取決
+    // 於 page 層——優先序顛倒了。TUI 自己那一輪輪詢會看到同樣的事實。
+    //
+    // 失敗一律吞掉：它是副作用，不得改變任何子指令的退出碼。
+    if !readonly && cmd != "scan" && cmd != "ui" {
+        let tmux = SubprocessTmux;
+        let runner = page::SubprocessRunner;
+        let pager = page::SystemPager::new(&runner, &tmux);
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            page::scan(&paths, &tmux, &pager)
+        }));
+    }
+
     let result = match cmd.as_str() {
         "register" => cmd_register(&paths, rest),
         "unregister" => cmd_unregister(&paths, rest),
@@ -246,6 +273,7 @@ fn main() -> ExitCode {
         "disposable" => cmd_disposable(&paths, rest),
         "idle" => cmd_idle(&paths, rest),
         "evict" => cmd_evict(&paths, rest),
+        "scan" => cmd_scan(&paths, rest),
         "ui" => cmd_ui(rest),
         _ => {
             print_usage();
@@ -542,6 +570,42 @@ fn cmd_start(paths: &Paths, args: &[String]) -> Result<()> {
     Ok(())
 }
 
+/// Page 層（tui-design §1）：把一則「需要人現在出手」的事件送出去。
+///
+/// **一律吞掉錯誤**：推播是副作用，呼叫端的 exit code 與輸出契約零改變
+/// （§1 非目標）。事件流寫不進去（唯讀 sandbox、磁碟滿）也一樣——那時人本來
+/// 就有更大的問題要處理，不該讓 `fail` 因為通知不出去而失敗。
+fn emit_page(paths: &Paths, event: &page::PageEvent) {
+    let tmux = SubprocessTmux;
+    let runner = page::SubprocessRunner;
+    let pager = page::SystemPager::new(&runner, &tmux);
+    let _ = page::emit(paths, event, &pager);
+}
+
+/// cmd_scan — 顯式掃一輪 page 層事件（Rust 獨有，bash 正本自 M4 凍結）。
+///
+/// 平常不必手動跑（每個非唯讀子指令進場都會順手掃）；這一支是給「要即時
+/// 發現」的人自己掛 tmux hook／鍵位／cron 用的——我們**不主動去改使用者的
+/// tmux 設定**（使用者 2026-08-03 裁定）。
+///
+/// stdout 只印一個數字（這一輪新推了幾則），比照其他子指令的「stdout 是機器
+/// 讀的、說明走 stderr」。
+fn cmd_scan(paths: &Paths, args: &[String]) -> Result<()> {
+    if !args.is_empty() {
+        return Err(Error::new("用法：agent-bridge scan（不吃參數）"));
+    }
+    let tmux = SubprocessTmux;
+    let runner = page::SubprocessRunner;
+    let pager = page::SystemPager::new(&runner, &tmux);
+    let fresh = page::scan(paths, &tmux, &pager)
+        .into_iter()
+        .filter(|o| matches!(o, page::EmitOutcome::Emitted { .. }))
+        .count();
+    println!("{fresh}");
+    eprintln!("page 層掃描完成：新事件 {fresh} 則");
+    Ok(())
+}
+
 /// respond_task:686 — reply／fail 的共用主體：寫 response.md、轉終態、
 /// 通知 sender 讀回覆。
 fn respond_task(
@@ -568,6 +632,20 @@ fn respond_task(
     })();
     guard.release();
     outcome?;
+
+    // Page 層事件 1／2（§1）：**只有 fail 推**。這裡是 failed 終態的單一收斂點
+    // ——`reply` 走同一支但帶 `Completed`，所以 completed／cancelled 天然零推播，
+    // 不需要另外寫排除條件（rubric v2 page 層條 3）。
+    if final_state == TaskState::Failed {
+        let to = task::meta_str(&dir, "to").unwrap_or_default();
+        emit_page(
+            paths,
+            &page::PageEvent::TaskFailed {
+                agent: to,
+                task: id.to_string(),
+            },
+        );
+    }
 
     // 通知 sender 來讀回覆；sender 未註冊（或已除名）就只是不通知，不是錯誤。
     let from = task::meta_str(&dir, "from")?;

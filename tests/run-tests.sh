@@ -147,7 +147,7 @@ declare -A GRP_NEEDS=(
   # 語意 fixture，變數掃描抓不到 manual-x 這種字串依賴）
   [17]="16" [18]="16"
 )
-GRP_KNOWN=" 1 2 3 4 5 6 7 8 8a 8b 9 10 11 12 13 14 15 16 17 18 18b 18c 19 20 20b 21 22 23 24 25 26 27 28 29 30 31 32 33 34 34.5+ 35 36 37 38 39 40 41 42 43 44 45 46 "
+GRP_KNOWN=" 1 2 3 4 5 6 7 8 8a 8b 9 10 11 12 13 14 15 16 17 18 18b 18c 19 20 20b 21 22 23 24 25 26 27 28 29 30 31 32 33 34 34.5+ 35 36 37 38 39 40 41 42 43 44 45 46 47 "
 GRP_SELECTED=""
 GRP_SKIPPED=0
 if [[ -n "${TEST_GROUPS:-}" ]]; then
@@ -6319,6 +6319,114 @@ else
 fi
 
 fi  # end grp 46
+# ---- 47. page 層：兩類事件的推播與去重（tui-design §1／§9 rubric v2） ----
+if grp 47; then
+# 動機：page 層是「推到人面前、不用打開任何東西」那一層。單元測試已鎖住
+# 模型與 ladder（ab-core `page.rs`）；這裡鎖的是**真的走完整支 CLI** 之後
+# 的可觀察事實——事件流落了幾筆、自訂通知命令收到什麼、哪些子指令零推播。
+# 與 40–46 同理只對 Rust 執行（bash 正本凍結在 M4，page 層是 Rust 獨有）。
+if [[ "$SRC_KIND" == rust ]]; then
+
+D47="$TESTROOT/d47"
+mkdir -p "$D47"
+EV47="$D47/state/page-events.jsonl"
+# 自訂推播命令：把 argv 原樣記下來。用它取代桌面通知那一層，測試因此
+# **不會真的去彈使用者的通知**，而且看得到 title／body 的實際內容
+# NOTIFY_CMD 的契約是 **argv[0]**（一支可執行檔，後接 title、body 兩個參數），
+# 不是一段 shell 字串——所以這裡要有 shebang 而不是 `bash <script>`
+cat > "$TESTROOT/pager47.sh" <<'PEOF'
+#!/usr/bin/env bash
+printf '%s\n' "$1" >> "$PAGER47_LOG"
+printf '%s\n' "$2" >> "$PAGER47_LOG"
+PEOF
+chmod +x "$TESTROOT/pager47.sh"
+PAGER47_LOG="$TESTROOT/pager47.log"
+: > "$PAGER47_LOG"
+ab47() {
+  env AGENT_BRIDGE_DATA="$D47" PATH="$SHIM:$PATH" \
+    AGENT_BRIDGE_NOTIFY_CMD="$TESTROOT/pager47.sh" \
+    PAGER47_LOG="$PAGER47_LOG" "$BRIDGE" "$@"
+}
+ev47_count() { test -f "$EV47" && grep -c . "$EV47" || echo 0; }
+ev47_kind() { grep -c "\"kind\":\"$1\"" "$EV47" 2>/dev/null || echo 0; }
+
+# 前置：兩個 worker，各自一個真 pane
+W47="$(tmx new-window -dP -F '#{window_id}' -t it "$pane_cmd")"
+P47A="$(tmx list-panes -t "$W47" -F '#{pane_id}' | head -1)"
+P47B="$(tmx split-window -dP -F '#{pane_id}' -t "$W47" "$pane_cmd")"
+ab47 register w47a "$P47A" >/dev/null 2>&1
+ab47 register w47b "$P47B" >/dev/null 2>&1
+
+# (1) fail → 恰一筆 task-failed，且自訂通知命令收到 agent 名與 task id
+id47a="$(ab47 send w47a --from boss --message "去做 a" 2>/dev/null)"
+ab47 receive "$id47a" >/dev/null 2>&1
+ab47 fail "$id47a" --message "做不到" >/dev/null 2>&1
+assert "47(1)：fail 恰落一筆 task-failed（rubric v2 page 條 1）" \
+  test "$(ev47_kind task-failed)" -eq 1
+assert "47(1)：通知標題帶 agent 名（不必開面板就知道是誰）" \
+  grep -q 'w47a' "$PAGER47_LOG"
+assert "47(1)：通知內文帶 task id" grep -qF "$id47a" "$PAGER47_LOG"
+
+# (2) reply（completed）零推播——rubric v2 page 條 3
+before47="$(ev47_count)"
+id47b="$(ab47 send w47b --from boss --message "去做 b" 2>/dev/null)"
+ab47 receive "$id47b" >/dev/null 2>&1
+ab47 reply "$id47b" --message "做好了" >/dev/null 2>&1
+assert "47(2)：reply 完成 MUST NOT 推播" test "$(ev47_count)" -eq "$before47"
+
+# (3) cancel 零推播
+id47c="$(ab47 send w47a --from boss --message "去做 c" 2>/dev/null)"
+ab47 cancel "$id47c" >/dev/null 2>&1
+assert "47(3)：cancel MUST NOT 推播" test "$(ev47_count)" -eq "$before47"
+
+# (4) pane 死了卻還掛著非終態 task → scan 恰一則；再掃零則（去重）
+id47d="$(ab47 send w47b --from boss --message "會被丟下的活" 2>/dev/null)"
+tmx kill-pane -t "$P47B" 2>/dev/null || true
+assert "47(4) 前置：w47b 的 pane 真的不在了" \
+  bash -c '! '"$REAL_TMUX"' -L '"$SOCK"' -f /dev/null list-panes -a -F "#{pane_id}" | grep -qFx "$1"' \
+  _ "$P47B"
+n47="$(ab47 scan 2>/dev/null)"
+assert "47(4)：pane 死掛非終態 task → scan 恰推一則" test "$n47" -eq 1
+assert "47(4)：事件流裡是 worker-died" test "$(ev47_kind worker-died)" -eq 1
+assert "47(4)：通知內文帶被丟下的 task id" grep -qF "$id47d" "$PAGER47_LOG"
+n47b="$(ab47 scan 2>/dev/null)"
+assert "47(4)：重掃 MUST NOT 重推（rubric v2 page 條 2）" test "$n47b" -eq 0
+assert "47(4)：重掃 MUST NOT 重複落盤" test "$(ev47_kind worker-died)" -eq 1
+
+# (5) 唯讀子指令 MUST NOT 寫事件流（CLI-RO-1；掃描只掛非唯讀指令）
+rm -f "$D47/state/page-seen"          # 讓「該推的」重新變成新事件
+before47ro="$(ev47_count)"
+ab47 list >/dev/null 2>&1
+ab47 status "$id47d" >/dev/null 2>&1
+assert "47(5)：唯讀指令 MUST NOT 觸發掃描（事件流不變）" \
+  test "$(ev47_count)" -eq "$before47ro"
+
+# (6) 機會式掃描：非唯讀子指令進場時順手發現同一件事（沒有 daemon 的代價
+# 與補償——使用者 2026-08-03 裁定）
+ab47 gc >/dev/null 2>&1
+assert "47(6)：非唯讀子指令進場會順手掃出 pane-exit" \
+  test "$(ev47_count)" -gt "$before47ro"
+
+# (7) 推播管道全滅仍落盤、仍 exit 0（rubric v2 page 條 4）
+# **tmux 要是好的**：壞掉的 tmux 會讓掃描整輪不跑（沒有證據就不叫人），
+# 那樣測到的是「沒有事件」而不是「推不出去」。這裡三層各自失敗的方式是：
+# 自訂命令指向不存在的檔、測試 socket 上沒有 attached client（display-message
+# 於是無處可送）、桌面通知那一層被自訂命令取代
+rm -f "$D47/state/page-seen"
+before47f="$(ev47_count)"
+env AGENT_BRIDGE_DATA="$D47" PATH="$SHIM:$PATH" \
+  AGENT_BRIDGE_NOTIFY_CMD="/nonexistent/pager-47" \
+  "$BRIDGE" scan >/dev/null 2>&1; rc47=$?
+assert "47(7)：推播全滅時 scan 仍 exit 0" test "$rc47" -eq 0
+assert "47(7)：推播全滅時事件仍落盤" test "$(ev47_count)" -gt "$before47f"
+
+tmx kill-window -t "$W47" 2>/dev/null || true
+
+else
+  printf 'SKIP: 47 page 層（SRC_KIND=bash：page 層是 Rust 獨有，bash 正本凍結在 M4）\n'
+fi
+
+fi  # end grp 47
 # ---- 總結 ----
 if [[ -n "$GRP_SELECTED" ]]; then
   printf '\n⚠ PARTIAL RUN（TEST_GROUPS=%s → 實跑:%s，跳過 %d 組）——不得作為收案／merge 證據\n' \

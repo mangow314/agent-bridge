@@ -353,6 +353,89 @@ fn mark_seen(paths: &Paths, key: &str) -> Result<()> {
     append_line(&seen_path(paths), &format!("{key}\n"))
 }
 
+/// Page 層事件 2／2：**pane 死了，但還掛著非終態 task**。
+///
+/// 沒有 daemon（§1 非目標），所以沒有人會「即時」發現 pane 沒了。這支掃描器
+/// 由兩個地方叫：顯式的 `agent-bridge scan`，以及每個非唯讀子指令進場時的
+/// 機會式呼叫（使用者 2026-08-03 裁定）。代價明擺著：沒人呼叫就沒人發現。
+///
+/// # 沒有證據就不叫人
+///
+/// `TmuxClient::pane_exists` 在 tmux 查詢失敗時回 `false`（送鍵路徑的
+/// fail-closed 方向）。照抄那個方向到這裡是**錯的**：tmux 一沒起來，整池
+/// worker 會同時被判定為死，一次推爆使用者的通知中心。呼叫器的 fail-closed
+/// 方向相反——**拿不到 pane 清單就整輪不掃**，寧可晚一輪，不可假警報。
+/// 所以這裡自己抓一次 `list-panes -a`，而不是逐 pane 問。
+///
+/// # 哪些 task 算「掛在它身上」
+///
+/// 與 TUI 的歸屬判定同一條規則（`ab-tui` `model.rs` 的 `attached()`）：收件人
+/// 名字相符**且** task 的 `created_at` 嚴格晚於該 agent 的 `registered_at`。
+/// 只比名字的話，同名 respawn 會把上一代的歷史 task 認領過來——那是把一件
+/// 不成立的事推到人面前。同秒（相等）＝不可證＝不掛。
+///
+/// 兩份實作而非共用一份函式，是因為 `ab-core` 不依賴 `ab-tui`；共同的
+/// oracle 是 `tests/p5-fixture.sh` 的 u1／u3 兩筆。
+pub fn scan(
+    paths: &Paths,
+    tmux: &dyn crate::tmux::TmuxClient,
+    pager: &dyn Pager,
+) -> Vec<EmitOutcome> {
+    if !tmux.available() {
+        return Vec::new();
+    }
+    let Some(list) = tmux
+        .exec(&["list-panes", "-a", "-F", "#{pane_id}"])
+        .and_then(|o| o.ok_stdout())
+    else {
+        // 拿不到清單＝沒有證據，整輪不掃（見上面的說明）
+        return Vec::new();
+    };
+    let alive: std::collections::HashSet<&str> = list
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .collect();
+
+    let agents = crate::registry::snapshot(paths);
+    let tasks = crate::task::in_flight(paths);
+    let mut out = Vec::new();
+    for a in &agents {
+        // pane 欄空的（人工 register 沒給 pane）不是「死了」，是沒有這個軸
+        if a.pane.is_empty() || alive.contains(a.pane.as_str()) {
+            continue;
+        }
+        for t in &tasks {
+            if !task_belongs_to(t, a) {
+                continue;
+            }
+            let event = PageEvent::WorkerDied {
+                agent: a.name.clone(),
+                spawn_tag: a.spawn_tag.clone(),
+                task: t.id.clone(),
+            };
+            if let Ok(o) = emit(paths, &event, pager) {
+                out.push(o);
+            }
+        }
+    }
+    out
+}
+
+/// 見 `scan` 的說明：名字相符**且** created_at 嚴格晚於 registered_at。
+fn task_belongs_to(task: &crate::task::InFlight, agent: &crate::registry::AgentSnapshot) -> bool {
+    if task.to != agent.name {
+        return false;
+    }
+    match (
+        crate::time::parse_iso_to_epoch(&task.created_at),
+        crate::time::parse_iso_to_epoch(&agent.registered_at),
+    ) {
+        (Some(t), Some(r)) => t > r,
+        _ => false,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -413,6 +496,8 @@ mod tests {
     /// 一個有兩個 attached client 的 tmux。`exec` 記下每一次呼叫。
     struct FakeTmux {
         clients: Option<&'static str>,
+        /// `list-panes -a` 的回答。`None`＝查詢失敗（沒有證據）。
+        panes: Option<&'static str>,
         calls: RefCell<Vec<Vec<String>>>,
         available: bool,
     }
@@ -421,6 +506,7 @@ mod tests {
         fn with_clients(clients: &'static str) -> Self {
             FakeTmux {
                 clients: Some(clients),
+                panes: Some(""),
                 calls: RefCell::new(Vec::new()),
                 available: true,
             }
@@ -428,8 +514,27 @@ mod tests {
         fn unavailable() -> Self {
             FakeTmux {
                 clients: None,
+                panes: None,
                 calls: RefCell::new(Vec::new()),
                 available: false,
+            }
+        }
+        /// 活著的 pane 清單（`list-clients` 一律有一個 client）。
+        fn with_panes(panes: &'static str) -> Self {
+            FakeTmux {
+                clients: Some("/dev/pts/3\n"),
+                panes: Some(panes),
+                calls: RefCell::new(Vec::new()),
+                available: true,
+            }
+        }
+        /// `list-panes` 查不出來（tmux 掛了／逾時）。
+        fn panes_unknown() -> Self {
+            FakeTmux {
+                clients: Some("/dev/pts/3\n"),
+                panes: None,
+                calls: RefCell::new(Vec::new()),
+                available: true,
             }
         }
         fn display_calls(&self) -> Vec<Vec<String>> {
@@ -447,16 +552,23 @@ mod tests {
             self.calls
                 .borrow_mut()
                 .push(args.iter().map(|s| s.to_string()).collect());
-            let stdout = if args.first() == Some(&"list-clients") {
-                self.clients.unwrap_or("").to_string()
-            } else {
-                String::new()
-            };
-            Some(crate::tmux::TmuxOutput {
-                status_ok: true,
-                stdout,
-                stderr: String::new(),
-            })
+            match args.first().copied() {
+                Some("list-clients") => Some(crate::tmux::TmuxOutput {
+                    status_ok: true,
+                    stdout: self.clients.unwrap_or("").to_string(),
+                    stderr: String::new(),
+                }),
+                Some("list-panes") => self.panes.map(|p| crate::tmux::TmuxOutput {
+                    status_ok: true,
+                    stdout: p.to_string(),
+                    stderr: String::new(),
+                }),
+                _ => Some(crate::tmux::TmuxOutput {
+                    status_ok: true,
+                    stdout: String::new(),
+                    stderr: String::new(),
+                }),
+            }
         }
         fn available(&self) -> bool {
             self.available
@@ -722,6 +834,130 @@ mod tests {
             EmitOutcome::Emitted { paged: false }
         );
         assert_eq!(event_lines(&paths).len(), 1);
+    }
+
+    // ---- scan（page 層事件 2／2）----
+
+    const REG_AT: &str = "2026-08-01T00:00:00Z";
+
+    fn write_agent(paths: &Paths, name: &str, pane: &str) {
+        let json = format!(
+            r#"{{"name":"{name}","pane_id":"{pane}","registered_at":"{REG_AT}","spawned":true,"ready":true,"runtime":"codex","spawn_tag":"AGENT_BRIDGE_SPAWN_TAG=ab-spawn-{name}-1-aaaaaaaaaaaa","owner":"s:@1"}}"#
+        );
+        std::fs::write(paths.agents_dir.join(format!("{name}.json")), json).unwrap();
+    }
+
+    /// task 目錄名必須是本工具生成的形狀（`in_flight` 只認那一種）。
+    fn write_task(paths: &Paths, id: &str, to: &str, status: &str, created: &str) {
+        let dir = paths.tasks_dir.join(id);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("status"), format!("{status}\n")).unwrap();
+        std::fs::write(
+            dir.join("metadata.json"),
+            format!(
+                r#"{{"version":1,"task_id":"{id}","from":"boss","to":"{to}","created_at":"{created}","updated_at":"{created}","working_directory":"/tmp","status":"{status}"}}"#
+            ),
+        )
+        .unwrap();
+    }
+
+    /// 掛著非終態 task 的 pane 死了 → **恰推一次**（rubric v2 page 層條 1）。
+    #[test]
+    fn a_dead_pane_holding_live_work_pages_exactly_once() {
+        let paths = tmp_paths("scan-hit");
+        write_agent(&paths, "w1", "%99");
+        write_task(
+            &paths,
+            "20260802T000000Z-aa01",
+            "w1",
+            "running",
+            "2026-08-02T00:00:00Z",
+        );
+        let pager = RecordingPager::new(true);
+        let tmux = FakeTmux::with_panes("%1\n%2\n");
+        assert_eq!(scan(&paths, &tmux, &pager).len(), 1);
+        assert_eq!(pager.count(), 1);
+        // 再掃一次不重推（機會式掃描掛在每個子指令上，這是最常走到的路）
+        scan(&paths, &tmux, &pager);
+        assert_eq!(pager.count(), 1, "重複掃描 MUST NOT 重推");
+    }
+
+    /// 零推播的四種情形（rubric v2 page 層條 3）。
+    #[test]
+    fn nothing_worth_waking_someone_for_pages_nobody() {
+        // (a) pane 活著
+        let paths = tmp_paths("scan-alive");
+        write_agent(&paths, "w1", "%1");
+        write_task(
+            &paths,
+            "20260802T000000Z-aa01",
+            "w1",
+            "running",
+            "2026-08-02T00:00:00Z",
+        );
+        let pager = RecordingPager::new(true);
+        scan(&paths, &FakeTmux::with_panes("%1\n"), &pager);
+        assert_eq!(pager.count(), 0, "pane 活著 MUST NOT 推");
+
+        // (b) pane 死了但沒有掛任何 task
+        let paths = tmp_paths("scan-notask");
+        write_agent(&paths, "w1", "%99");
+        let pager = RecordingPager::new(true);
+        scan(&paths, &FakeTmux::with_panes("%1\n"), &pager);
+        assert_eq!(pager.count(), 0, "沒有 task 的 pane-exit MUST NOT 推");
+
+        // (c) pane 死了、task 已進終態
+        let paths = tmp_paths("scan-done");
+        write_agent(&paths, "w1", "%99");
+        write_task(
+            &paths,
+            "20260802T000000Z-aa01",
+            "w1",
+            "completed",
+            "2026-08-02T00:00:00Z",
+        );
+        let pager = RecordingPager::new(true);
+        scan(&paths, &FakeTmux::with_panes("%1\n"), &pager);
+        assert_eq!(pager.count(), 0, "終態 task MUST NOT 推");
+
+        // (d) stale generation：task 早於這一代的 registered_at＝上一代的歷史
+        // 任務，同名 respawn 不承接（與 TUI `attached()` 同一條規則）
+        let paths = tmp_paths("scan-stale");
+        write_agent(&paths, "w1", "%99");
+        write_task(
+            &paths,
+            "20260731T000000Z-aa01",
+            "w1",
+            "running",
+            "2026-07-31T00:00:00Z",
+        );
+        let pager = RecordingPager::new(true);
+        scan(&paths, &FakeTmux::with_panes("%1\n"), &pager);
+        assert_eq!(pager.count(), 0, "上一代的歷史 task MUST NOT 推");
+    }
+
+    /// **tmux 查不出 pane 清單時整輪不掃**：照抄送鍵路徑的 fail-closed（查詢
+    /// 失敗＝當作死）會在 tmux 一掛掉時把整池 worker 一次推爆。呼叫器的方向
+    /// 相反：沒有證據就不叫人。
+    #[test]
+    fn a_tmux_outage_never_turns_the_whole_pool_into_alarms() {
+        let paths = tmp_paths("scan-outage");
+        for n in ["w1", "w2", "w3"] {
+            write_agent(&paths, n, "%99");
+            write_task(
+                &paths,
+                &format!("20260802T00000{}Z-aa01", n.len()),
+                n,
+                "running",
+                "2026-08-02T00:00:00Z",
+            );
+        }
+        let pager = RecordingPager::new(true);
+        assert!(scan(&paths, &FakeTmux::panes_unknown(), &pager).is_empty());
+        assert_eq!(pager.count(), 0, "拿不到 pane 清單 MUST NOT 推任何一則");
+        let pager2 = RecordingPager::new(true);
+        assert!(scan(&paths, &FakeTmux::unavailable(), &pager2).is_empty());
+        assert_eq!(pager2.count(), 0, "tmux 不在 MUST NOT 推");
     }
 
     /// 通知文字本身要答得出「哪個 agent、為何現在需要我」——不必打開任何面板
