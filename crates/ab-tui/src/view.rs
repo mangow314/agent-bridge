@@ -302,10 +302,7 @@ fn render_workers(
     // 捲軸與內容吃同一個視窗起點——分開算兩次的話，thumb 會指到畫面沒捲到的位置
     let offset = scroll_offset(line, area);
     let block = panel_block(&title, focused);
-    f.render_widget(
-        Paragraph::new(lines).block(block).scroll((offset, 0)),
-        area,
-    );
+    f.render_widget(Paragraph::new(lines).block(block).scroll((offset, 0)), area);
     render_scrollbar(f, area, lines_total, offset as usize);
 }
 
