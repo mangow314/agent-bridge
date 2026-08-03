@@ -1068,17 +1068,12 @@ impl Scope {
 /// round-trip**（`2026-99-99T…`／`2026-02-31T…` 一律 `None`）。自己寫一份
 /// 「刪掉 `-` 與 `:` 再數位數」的骨架檢查，等於讓 fail-closed 這個保證變成假的
 /// （修正輪 R2／F2）。
+/// **實作正本在 `ab_core::page::task_belongs_to`**（跨廠複核 should-fix 3）：
+/// page 層要用同一條規則，而依賴方向是 `ab-tui → ab-core`，所以規則下沉、
+/// 這裡只留一個轉呼叫。上面那一整段推理仍是這條規則的論證，別因為函式縮成
+/// 一行就把它搬走。
 pub fn attached(task: &InFlight, w: &AgentSnapshot) -> bool {
-    if task.to != w.name {
-        return false;
-    }
-    match (
-        ab_core::time::parse_iso_to_epoch(&task.created_at),
-        ab_core::time::parse_iso_to_epoch(&w.registered_at),
-    ) {
-        (Some(t), Some(r)) => t > r,
-        _ => false,
-    }
+    ab_core::page::task_belongs_to(task, w)
 }
 
 /// 這一筆 task 說得出唯一的 worker 嗎（修正輪 R2／F3 的**單一事實源**）。

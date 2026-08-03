@@ -234,27 +234,6 @@ fn main() -> ExitCode {
         return ExitCode::from(1);
     }
 
-    // Page 層的機會式掃描（tui-design §1；使用者 2026-08-03 裁定）：沒有
-    // daemon，所以「pane 死了卻還掛著非終態 task」只能靠有人呼叫時順手發現。
-    // 掛在**非唯讀**子指令上——唯讀指令 MUST NOT 寫任何東西（CLI-RO-1），而
-    // 掃描會寫事件流。`scan` 自己排除在外，否則它印出來的計數永遠是 0
-    // （前置掃描已經把該推的都推完了）。
-    //
-    // `ui` 也排除：掃描要問 tmux，而 §4 的 bounded-read 硬條款下 TUI 必須在
-    // **tmux 整個掛住**時照樣畫得出磁碟 read model（分組 40i／40j）。把一個
-    // 會問 tmux 的前置動作擺在它啟動之前，等於讓 dashboard 的存活反過來取決
-    // 於 page 層——優先序顛倒了。TUI 自己那一輪輪詢會看到同樣的事實。
-    //
-    // 失敗一律吞掉：它是副作用，不得改變任何子指令的退出碼。
-    if !readonly && cmd != "scan" && cmd != "ui" {
-        let tmux = SubprocessTmux;
-        let runner = page::SubprocessRunner;
-        let pager = page::SystemPager::new(&runner, &tmux);
-        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            page::scan(&paths, &tmux, &pager)
-        }));
-    }
-
     let result = match cmd.as_str() {
         "register" => cmd_register(&paths, rest),
         "unregister" => cmd_unregister(&paths, rest),
@@ -283,6 +262,31 @@ fn main() -> ExitCode {
             Err(Error::new(format!("未知指令：{cmd}")))
         }
     };
+
+    // Page 層的機會式掃描（tui-design §1；使用者 2026-08-03 裁定）：沒有
+    // daemon，所以「pane 死了卻還掛著非終態 task」只能靠有人呼叫時順手發現。
+    //
+    // **擺在指令成功完成之後**（跨廠複核 should-fix 4）。放在 dispatch 之前
+    // 有三個壞處，全都不是退出碼層面而是終局層面：參數打錯／未知指令也會推
+    // 播；`ready` 這條熱路徑會先跑 N 支外部通知才寫 ready，把 spawn 的等待
+    // 推向逾時；`fail`／`cancel` 會先推一則**本次指令正要解除**的
+    // `worker-died`。跑在後面，這三件事都不成立。
+    //
+    // 排除項：唯讀指令（MUST NOT 寫任何東西，CLI-RO-1，而掃描寫事件流）、
+    // 失敗的指令（它的前提沒成立，不該替它發事件）、`scan` 自己（否則它印的
+    // 計數恆為 0）、`ui`（掃描要問 tmux，而 §4 bounded-read 下 TUI 在 tmux
+    // 整個掛住時仍 MUST 畫得出磁碟 read model——分組 40i／40j 實測轉紅過；
+    // 讓 dashboard 的存活取決於 page 層是把優先序顛倒）。
+    //
+    // 失敗一律吞掉：它是副作用，不得改變任何子指令的退出碼。
+    if result.is_ok() && !readonly && cmd != "scan" && cmd != "ui" {
+        let tmux = SubprocessTmux;
+        let runner = page::SubprocessRunner;
+        let pager = page::SystemPager::new(&runner, &tmux);
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            page::scan(&paths, &tmux, &pager)
+        }));
+    }
 
     match result {
         Ok(()) => ExitCode::from(0),

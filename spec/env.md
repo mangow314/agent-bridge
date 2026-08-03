@@ -1,6 +1,7 @@
 # 環境變數契約
 
-全部 16 個 `AGENT_BRIDGE_*` 變數。通則：
+全部 17 個 `AGENT_BRIDGE_*` 變數（總數由 `tests/check-contract.sh` 第 1 項的
+集合 diff 守著，不是手工維護的宣稱）。通則：
 
 ### ENV-GEN-1 [untested]
 未設定（unset）時每個變數 MUST 取本檔載明的預設值；本檔未列的

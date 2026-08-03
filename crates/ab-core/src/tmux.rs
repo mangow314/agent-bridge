@@ -468,7 +468,10 @@ fn run_bounded(args: &[&str]) -> Option<BoundedOutput> {
 ///
 /// 輪詢間隔取 20ms：正常的 tmux 查詢是毫秒級，這個粒度不會讓常見路徑多等一
 /// 個可感知的量，又不至於在逾時窗裡空轉太多次。
-fn wait_with_timeout(
+/// （`page::SubprocessRunner` 共用同一份：自訂 notifier 也是不可信的外部行程，
+/// 「等不到就殺、不留殭屍」的推理逐字適用，另寫一份只會讓 EINTR 與溢位那兩個
+/// 教訓少一邊。）
+pub(crate) fn wait_with_timeout(
     child: &mut std::process::Child,
     timeout: Option<Duration>,
 ) -> Option<std::process::ExitStatus> {

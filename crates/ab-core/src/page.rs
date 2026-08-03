@@ -18,7 +18,11 @@
 //! 呼叫端（`fail`／`reply`／`scan`…）的既有 invocation 語意**零改變**是 §1 的
 //! 硬非目標。推播是副作用：notify-send 不在、tmux 沒起來、使用者的自訂命令
 //! 掛了——一律只影響「人有沒有被叫到」，不影響 exit code 與 stdout 契約。
-//! 事件本身一定落盤（rubric v2 page 層條 4），所以事後回頭查得到。
+//! 事件本身照樣落盤（rubric v2 page 層條 4），所以事後回頭查得到。
+//!
+//! 保證的強度是 **durable record ＋ 至多嘗試推播一次**，不是 exactly-once；
+//! crash window 明列在 `emit` 的文件裡。唯一不落盤的情形是 key 本身不可信
+//! （`key_is_frameable`）。
 
 use std::fs::OpenOptions;
 use std::io::Write;
@@ -53,8 +57,9 @@ pub enum PageEvent {
 }
 
 impl PageEvent {
-    /// 去重軸。**同一個 key 只會推一次**，跨行程、跨重啟都算數（key 落在磁碟
+    /// 去重軸。同一個 key **至多推一次**，跨行程、跨重啟都算數（key 落在磁碟
     /// 上，不在記憶體裡——行程重啟不重推是 rubric v2 page 層條 2 的一半）。
+    /// 「至多」而非「恰」的理由見 `emit` 的保證強度那一節。
     pub fn key(&self) -> String {
         match self {
             PageEvent::TaskFailed { task, .. } => format!("failed:{task}"),
@@ -132,8 +137,21 @@ pub trait CmdRunner {
     fn run(&self, argv: &[String]) -> bool;
 }
 
-/// 真的去跑。stdout／stderr 一律丟掉：推播是副作用，它的雜訊不得混進呼叫端的
-/// 輸出契約（§1 非目標）。
+/// 自訂 notifier 的執行上限。**沒有解除的逃生口**（對比 tmux 那條的
+/// `AGENT_BRIDGE_TMUX_TIMEOUT=0`）：一支要跑超過五秒的「通知」不是通知，而
+/// 且它卡住的是一個正在寫盤的原子指令——那正是跨廠複核 blocker 1 的形狀。
+const NOTIFY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// 真的去跑。
+///
+/// **三個 stdio 全部接 null**（跨廠複核 blocker 1）：`Command::status()` 預設
+/// **繼承**三者，而機會式掃描跑在 dispatch 路徑上——`send/reply/fail
+/// --message-file -` 的 payload 會先被使用者的自訂 notifier 讀走，指令照樣
+/// 成功但落盤內容已被截短。stdout／stderr 接 null 另有一層理由：推播的雜訊
+/// 不得混進呼叫端的輸出契約（§1 非目標）。
+///
+/// **有界**（同一個 blocker 的另一半）：`.status()` 會無限期等，一支不退出的
+/// 自訂命令能讓原子指令永遠沒有終局。逾時＝殺掉＋收屍＋視同失敗。
 pub struct SubprocessRunner;
 
 impl CmdRunner for SubprocessRunner {
@@ -141,11 +159,16 @@ impl CmdRunner for SubprocessRunner {
         let Some((prog, rest)) = argv.split_first() else {
             return false;
         };
-        std::process::Command::new(prog)
+        let Ok(mut child) = std::process::Command::new(prog)
             .args(rest)
+            .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
-            .status()
+            .spawn()
+        else {
+            return false;
+        };
+        crate::tmux::wait_with_timeout(&mut child, Some(NOTIFY_TIMEOUT))
             .map(|s| s.success())
             .unwrap_or(false)
     }
@@ -268,10 +291,26 @@ impl Pager for SystemPager<'_> {
 /// `emit` 的結果。呼叫端通常不看它——它是給測試與 `scan` 的計數用的。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EmitOutcome {
-    /// 事件是新的：已落盤，且推播已嘗試（`paged` 說明有沒有送出去）。
+    /// 事件是新的：已落盤，且推播已**嘗試過一次**（`paged` 說明有沒有送出去）。
     Emitted { paged: bool },
     /// 這個 key 先前已處理過——事件流不再多一筆，也不再推一次。
     AlreadySeen,
+    /// key 本身不可信（含換行／控制字元），**不落盤也不推**。見 `key_is_frameable`。
+    Rejected,
+}
+
+/// 一行一個 key 的檔案格式撐得住這個 key 嗎。
+///
+/// **registry 的 `spawn_tag` 與 agent name 對本程式是不可信輸入**（worker 寫得
+/// 到那個檔）。含換行的 tag 會讓 `mark_seen` 把一個 key 寫成兩行，而 `is_seen`
+/// 逐行比對永遠比不中原 key——於是每一輪掃描都重新落盤、重新推播，去重整個
+/// 失效（跨廠複核 should-fix 1）。`display-message -l` 只防 tmux format 展開，
+/// 防不到持久化格式的 framing。
+///
+/// 這裡 fail-closed：**證明不了就不叫人**。方向與 `scan` 拿不到 pane 清單時
+/// 一致——寧可漏一則，不可把一個壞掉的 registry 變成無限的通知源。
+fn key_is_frameable(key: &str) -> bool {
+    !key.is_empty() && !key.chars().any(|c| c.is_control())
 }
 
 /// 發一則事件：**先落盤、後推播**。
@@ -286,8 +325,25 @@ pub enum EmitOutcome {
 ///
 /// seen 在推播**之前**寫：notifier 若壞掉，這一則就此作罷而不是每次呼叫重推
 /// 同一則洗版。事件流裡有它，事後查得到（rubric v2 page 層條 4）。
+///
+/// # 保證的強度：durable record ＋ **至多嘗試一次**，不是 exactly-once
+///
+/// （跨廠複核 blocker 2 的更正。先前 spec 寫「恰推一次」，那句話這份實作
+/// 兌現不了，而且不是調換兩行寫入順序就能兌現的。）事件流與 seen 是兩次獨立
+/// 的 append，兩個 crash window 明擺著：
+///
+/// - `append_event` 成功、`mark_seen` 之前行程死掉 → 重啟後同一 key 會再落一筆。
+/// - `mark_seen` 成功、`pager.page` 之前行程死掉 → 之後永遠 `AlreadySeen`，
+///   這一則實際推播 **0 次**（事件流裡仍找得到）。
+///
+/// 真正的 exactly-once 需要具 ack／idempotency key 的 outbox 協定，而收件端是
+/// `notify-send` 或使用者的任意一支腳本——那個保證在這一層根本無從建立。
+/// 明講取捨，不冒充完成。
 pub fn emit(paths: &Paths, event: &PageEvent, pager: &dyn Pager) -> Result<EmitOutcome> {
     let key = event.key();
+    if !key_is_frameable(&key) {
+        return Ok(EmitOutcome::Rejected);
+    }
     if is_seen(paths, &key)? {
         return Ok(EmitOutcome::AlreadySeen);
     }
@@ -422,8 +478,20 @@ pub fn scan(
     out
 }
 
-/// 見 `scan` 的說明：名字相符**且** created_at 嚴格晚於 registered_at。
-fn task_belongs_to(task: &crate::task::InFlight, agent: &crate::registry::AgentSnapshot) -> bool {
+/// 這一筆 task 掛在這一代的這個 agent 身上嗎：收件人名相符**且** task 的
+/// `created_at` 嚴格晚於該 agent 的 `registered_at`。
+///
+/// 只比名字的話，同名 respawn 會把上一代的歷史 task 認領過來。同秒（相等）
+/// ＝不可證＝不掛。時間戳解析不出來也不掛（fail-closed）。
+///
+/// **單一事實源**（跨廠複核 should-fix 3）：page 層與 TUI 的歸屬軸是同一條
+/// 規則，先前各寫一份。依賴方向本來就是 `ab-tui → ab-core`，所以正本放這裡，
+/// `ab_tui::model::attached` 轉呼叫。共同的 oracle 是 `tests/p5-fixture.sh`
+/// 的 u1／u3 兩筆。
+pub fn task_belongs_to(
+    task: &crate::task::InFlight,
+    agent: &crate::registry::AgentSnapshot,
+) -> bool {
     if task.to != agent.name {
         return false;
     }
@@ -465,6 +533,25 @@ mod tests {
                 .borrow_mut()
                 .push((title.to_string(), body.to_string()));
             self.ok
+        }
+    }
+
+    /// 只數次數，但跨執行緒可用（`RecordingPager` 的 `RefCell` 不是 `Sync`）。
+    #[derive(Default)]
+    struct CountingPager {
+        n: std::sync::atomic::AtomicUsize,
+    }
+
+    impl CountingPager {
+        fn count(&self) -> usize {
+            self.n.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    impl Pager for CountingPager {
+        fn page(&self, _title: &str, _body: &str) -> bool {
+            self.n.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            true
         }
     }
 
@@ -942,11 +1029,13 @@ mod tests {
     #[test]
     fn a_tmux_outage_never_turns_the_whole_pool_into_alarms() {
         let paths = tmp_paths("scan-outage");
-        for n in ["w1", "w2", "w3"] {
+        // 三筆各自不同的 task id：撞成同一個目錄的話，讀者會誤以為這條在測
+        // 別的東西（跨廠複核 should-fix 5 的可讀性一項）
+        for (i, n) in ["w1", "w2", "w3"].iter().enumerate() {
             write_agent(&paths, n, "%99");
             write_task(
                 &paths,
-                &format!("20260802T00000{}Z-aa01", n.len()),
+                &format!("20260802T00000{i}Z-aa0{i}"),
                 n,
                 "running",
                 "2026-08-02T00:00:00Z",
@@ -958,6 +1047,119 @@ mod tests {
         let pager2 = RecordingPager::new(true);
         assert!(scan(&paths, &FakeTmux::unavailable(), &pager2).is_empty());
         assert_eq!(pager2.count(), 0, "tmux 不在 MUST NOT 推");
+    }
+
+    /// **同一則事件被兩個行程同時發現時只推一次**（跨廠複核 should-fix 5）。
+    ///
+    /// 先前只有序列呼叫的測試：把鎖內那次 `is_seen` 覆核刪掉、只留鎖外的
+    /// fast path，測試照樣綠。機會式掃描掛在每個非唯讀子指令上，兩個 CLI
+    /// 同時撞上同一件事是常態，不是稀有情形。
+    ///
+    /// 用 barrier 讓 N 條執行緒盡量同時進入 `emit`。**它只會漏抓、不會誤紅**：
+    /// 沒撞上時斷言照樣成立，撞上了才有機會抓到少一道覆核的實作。
+    #[test]
+    fn two_processes_finding_the_same_event_at_once_still_page_once() {
+        let paths = tmp_paths("race");
+        let pager = std::sync::Arc::new(CountingPager::default());
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(8));
+        let handles: Vec<_> = (0..8)
+            .map(|_| {
+                let paths = paths.clone();
+                let pager = std::sync::Arc::clone(&pager);
+                let barrier = std::sync::Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    emit(&paths, &failed("t1"), pager.as_ref())
+                })
+            })
+            .collect();
+        for h in handles {
+            let _ = h.join();
+        }
+        assert_eq!(pager.count(), 1, "同時發現 MUST 只推一次");
+        assert_eq!(event_lines(&paths).len(), 1, "同時發現 MUST 只落盤一筆");
+    }
+
+    /// worker 寫得到 registry，所以 `spawn_tag` 是不可信輸入。含換行的 tag 會
+    /// 把一個 seen key 寫成兩行，之後逐行比對永遠比不中——去重整個失效，每輪
+    /// 掃描重推同一則（跨廠複核 should-fix 1）。fail-closed：不落盤、不推。
+    #[test]
+    fn a_key_that_the_seen_file_cannot_frame_is_refused_outright() {
+        let paths = tmp_paths("framing");
+        let pager = RecordingPager::new(true);
+        let evil = PageEvent::WorkerDied {
+            agent: "w1".into(),
+            spawn_tag: "ab-spawn-w1-1-aaaa\ndied:w1:x:t1".into(),
+            task: "t1".into(),
+        };
+        assert_eq!(emit(&paths, &evil, &pager).unwrap(), EmitOutcome::Rejected);
+        assert_eq!(pager.count(), 0, "不可信的 key MUST NOT 推");
+        assert!(
+            !events_path(&paths).exists() || event_lines(&paths).is_empty(),
+            "不可信的 key MUST NOT 落盤"
+        );
+        // 重掃也一樣，不會因為「沒記進 seen」而變成無限的通知源
+        assert_eq!(emit(&paths, &evil, &pager).unwrap(), EmitOutcome::Rejected);
+        assert_eq!(pager.count(), 0);
+    }
+
+    /// 自訂命令**取代**桌面那一層，不是加在它前面：runner 的呼叫總數恰 1。
+    /// 先前只斷言第 0 次 argv，實作若同時又跑一次 notify-send 照樣會綠
+    /// （跨廠複核 should-fix 5）。
+    #[test]
+    fn a_custom_notify_command_is_the_only_desktop_call() {
+        let runner = FakeRunner::new(true);
+        let tmux = FakeTmux::with_clients("/dev/pts/3\n");
+        let env = PagerEnv {
+            notify_cmd: Some("/usr/local/bin/my-pager".into()),
+            has_display: true,
+            over_ssh: false,
+        };
+        pager_with(env, &runner, &tmux).page("T", "B");
+        assert_eq!(
+            runner.argvs.borrow().len(),
+            1,
+            "自訂命令 MUST 取代桌面層而不是疊加：{:?}",
+            runner.progs()
+        );
+    }
+
+    /// **自訂 notifier 不得繼承 stdin**（跨廠複核 blocker 1）：機會式掃描跑在
+    /// CLI 路徑上，`send --message-file -` 的 payload 會被它讀走。真的跑一支
+    /// 會吸乾 stdin 的腳本，然後確認我方 stdin 一個 byte 都沒少。
+    ///
+    /// 另一半（不退出的命令要有界）由 `NOTIFY_TIMEOUT` 守著；這裡順帶量它
+    /// 真的會回來，不是永遠等下去。
+    #[test]
+    fn a_custom_notifier_neither_eats_our_stdin_nor_hangs_forever() {
+        let dir = std::env::temp_dir().join(format!("ab-core-page-stdin-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let script = dir.join("greedy.sh");
+        std::fs::write(
+            &script,
+            "#!/usr/bin/env bash\ncat > /dev/null\nsleep 0.2\nexit 0\n",
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let started = std::time::Instant::now();
+        let ok = SubprocessRunner.run(&[
+            script.to_string_lossy().into_owned(),
+            "T".into(),
+            "B".into(),
+        ]);
+        // `cat` 讀到的是 /dev/null（stdin 已被接掉），所以它會立刻 EOF 而不是
+        // 卡住等我方的 tty／pipe——這正是「沒有繼承 stdin」的可觀察證據
+        assert!(ok, "腳本應正常退出");
+        assert!(
+            started.elapsed() < NOTIFY_TIMEOUT,
+            "MUST NOT 卡到逾時（實測 {:?}）",
+            started.elapsed()
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// 通知文字本身要答得出「哪個 agent、為何現在需要我」——不必打開任何面板

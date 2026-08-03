@@ -6407,6 +6407,46 @@ ab47 gc >/dev/null 2>&1
 assert "47(6)：非唯讀子指令進場會順手掃出 pane-exit" \
   test "$(ev47_count)" -gt "$before47ro"
 
+# (8) **自訂 notifier 不得讀得到呼叫端的 stdin**（跨廠複核 blocker 1）。
+#
+# 鑑別力來自「挑一個自己不讀 stdin 的子指令」：`scan` 不碰 stdin，所以管線
+# 裡的哨兵會原封不動留著——notifier 若繼承了 stdin 就讀得到它，接掉就讀不到。
+# （用 `send --message-file -` 測不出來：那條路徑早在掃描之前就把 stdin 讀完
+# 了，`.stdin(null)` 在不在都會綠——第一版這條測試就是這樣假綠的。）
+cat > "$TESTROOT/sniffer47.sh" <<'GEOF'
+#!/usr/bin/env bash
+# 讀得到什麼就記下來；讀不到（stdin 已被接成 /dev/null）就立刻 EOF
+head -c 200 >> "$SNIFF47_LOG"
+GEOF
+chmod +x "$TESTROOT/sniffer47.sh"
+SNIFF47_LOG="$TESTROOT/sniff47.log"
+: > "$SNIFF47_LOG"
+rm -f "$D47/state/page-seen"          # 讓 worker-died 重新變成待推事件
+sentinel47='SENTINEL-47-MUST-NOT-LEAK'
+printf '%s\n' "$sentinel47" | env AGENT_BRIDGE_DATA="$D47" PATH="$SHIM:$PATH" \
+  AGENT_BRIDGE_NOTIFY_CMD="$TESTROOT/sniffer47.sh" SNIFF47_LOG="$SNIFF47_LOG" \
+  "$BRIDGE" scan >/dev/null 2>&1
+assert "47(8) 前置：sniffer 真的被叫到了（有待推事件）" test -f "$SNIFF47_LOG"
+assert_fails "47(8)：自訂 notifier MUST NOT 讀得到呼叫端的 stdin" \
+  grep -qF "$sentinel47" "$SNIFF47_LOG"
+
+# (9) 不退出的自訂 notifier MUST 有界（同一個 blocker 的另一半）：整個指令
+# 必須在 NOTIFY_TIMEOUT（5s）附近收斂，不是永遠等下去
+cat > "$TESTROOT/hang47.sh" <<'HEOF'
+#!/usr/bin/env bash
+sleep 300
+HEOF
+chmod +x "$TESTROOT/hang47.sh"
+rm -f "$D47/state/page-seen"
+t47start="$(date +%s)"
+env AGENT_BRIDGE_DATA="$D47" PATH="$SHIM:$PATH" \
+  AGENT_BRIDGE_NOTIFY_CMD="$TESTROOT/hang47.sh" \
+  "$BRIDGE" scan >/dev/null 2>&1; rc47h=$?
+t47elapsed=$(( $(date +%s) - t47start ))
+assert "47(9)：卡死的 notifier MUST 被逾時殺掉（實測 ${t47elapsed}s）" \
+  test "$t47elapsed" -lt 30
+assert "47(9)：逾時的推播 MUST NOT 改變退出碼" test "$rc47h" -eq 0
+
 # (7) 推播管道全滅仍落盤、仍 exit 0（rubric v2 page 條 4）
 # **tmux 要是好的**：壞掉的 tmux 會讓掃描整輪不跑（沒有證據就不叫人），
 # 那樣測到的是「沒有事件」而不是「推不出去」。這裡三層各自失敗的方式是：

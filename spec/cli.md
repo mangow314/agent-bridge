@@ -535,23 +535,50 @@ Source: cmd_scan / ab_core::page::scan
 不得把整池 worker 判成死。task 是否掛在該 agent 身上，判準與 TUI 的歸屬軸
 同一條——收件人名相符**且** task `created_at` 嚴格晚於該 agent 的
 `registered_at`（同秒＝不可證＝不掛，同名 respawn 不承接上一代的歷史 task）。
+此判準與 TUI 的歸屬軸是**同一份實作**（`ab_core::page::task_belongs_to`；
+`ab_tui::model::attached` 轉呼叫），MUST NOT 各寫一份。
+
+**已知盲點 MUST 明列**：`list-panes` 永久非零（最後一個 tmux server／session
+已退出）與暫時性查詢失敗（逾時、權限、錯 socket）在目前的資料模型下無法
+區分，兩者都壓成「整輪不掃」。前者的事實可能正是「整池 pane 都死了」，那些
+事件於是**永遠**發不出去，不是「晚一輪」。要涵蓋這一格需要能證明 server 身分
+的 schema，屬另立設計裁定，不在本相位。
 Source: ab_core::page::scan / task_belongs_to
 
 ### CLI-SCAN-3 [tested: 47]
-每個**非唯讀**子指令進場時 MUST 順手掃一輪（沒有 daemon，事件只能由呼叫者
-發現）；`scan` 自身與 `ui` MUST 排除——前者否則計數恆為 0，後者否則
-dashboard 的啟動反過來取決於 page 層（§4 bounded-read：tmux 掛住時 TUI 仍
-MUST 畫得出磁碟 read model）。唯讀指令 MUST NOT 觸發（CLI-RO-1）。
+每個**非唯讀且已成功完成**的子指令 MUST 在其完成**之後**順手掃一輪（沒有
+daemon，事件只能由呼叫者發現）。時點 MUST 是 dispatch 之後而非之前：擺在
+前面會讓參數打錯／未知指令也推播、讓 `ready` 這條熱路徑先跑外部通知才寫
+ready（把 spawn 的等待推向逾時）、並讓 `fail`／`cancel` 先推一則本次指令
+正要解除的 `worker-died`。
+
+排除項：唯讀指令（MUST NOT 寫任何東西，CLI-RO-1，而掃描寫事件流）、非零
+退出的指令、`scan` 自身（否則其計數恆為 0）、`ui`（§4 bounded-read：tmux
+掛住時 TUI 仍 MUST 畫得出磁碟 read model，dashboard 的啟動不得取決於 page 層）。
 Source: main dispatch
 
 ### CLI-PAGE-1 [tested: 47]
 去重與落盤：每則事件有一個 event key（`failed:<task-id>`／
 `died:<agent>:<spawn-tag>:<task-id>`，後者帶 generation key，故同名 respawn
-是新事件、行程重啟不是）。同一 key MUST 恰落盤一次、恰推播一次。順序 MUST
-是**先落盤後推播**：推播管道全滅時事件 MUST 仍在
+是新事件、行程重啟不是）。
+
+保證的強度是 **durable record ＋ 至多嘗試推播一次**（at-most-once attempt），
+**不是 exactly-once**——正常路徑下同一 key 落盤一次、推播一次，但兩個 crash
+window MUST 被明列而非隱瞞：①事件流已 append、seen 未記時行程死亡 → 重啟後
+同一 key 會再落一筆；②seen 已記、推播尚未發出時行程死亡 → 該則實際推播 0 次
+（事件流裡仍在）。真正的 exactly-once 需要具 ack／idempotency key 的 outbox
+協定，而收件端是 `notify-send` 或使用者的任意腳本，該保證在本層無從建立。
+seen 先於推播寫入是刻意的：否則壞掉的 notifier 會讓同一則每次呼叫重推。
+
+順序 MUST 是**先落盤後推播**：推播管道全滅時事件 MUST 仍在
 `state/page-events.jsonl`，且呼叫端 MUST exit 0——推播是副作用，任何子指令的
 退出碼與 stdout 契約 MUST NOT 因它改變。
-Source: ab_core::page::emit
+
+event key MUST 撐得住 seen 檔的一行一 key 格式：含控制字元（含換行）的 key
+MUST 整則拒收（不落盤、不推播）。registry 的 `spawn_tag` 與 agent name 是
+worker 寫得到的不可信輸入，含換行的 tag 會讓 seen 比對永遠失準、把去重變成
+無限的通知源。
+Source: ab_core::page::emit / key_is_frameable
 
 ### CLI-PAGE-2 [tested: 47]
 推播管道分層：①`AGENT_BRIDGE_NOTIFY_CMD` 有設 → 以它為 **argv[0]**、後接
@@ -561,7 +588,20 @@ session（`WAYLAND_DISPLAY`／`DISPLAY`）**且非** SSH（`SSH_CONNECTION` 不�
 <client> -l`（`-l` 保證事件文字不被當 tmux format 展開）。SSH 下 MUST NOT
 走桌面通知：遠端的 `DISPLAY` 指的是遠端那台的螢幕，彈在沒有人的地方比不
 通知更糟。通知 MUST 帶 agent 名與 task id（rubric v2 page 層 human judgment）。
-Source: ab_core::page::SystemPager
+
+自訂命令 MUST 以三個 stdio 全接 null 的方式執行：`Command::status()` 預設
+繼承 stdin，而掃描跑在 CLI 路徑上——`send/reply/fail --message-file -` 的
+payload 會被自訂 notifier 讀走，指令仍成功但落盤內容已被截短。執行 MUST
+有界（內部固定 5 秒，逾時殺掉並視同失敗，**無解除逃生口**）：不退出的自訂
+命令會讓一個正在寫盤的原子指令永遠沒有終局。
+
+**SSH 判定是 heuristic，邊界 MUST 明列**：它讀的是「當前 CLI 行程的環境
+來源」，不是「此刻正在看畫面的那個 client」。本機建立的長壽 pane 被 SSH
+attach 時仍可能走本機 `notify-send`；反向殘留的 `SSH_CONNECTION` 會抑制桌面
+層。因 tmux 層一律逐 attached client 送，這是桌面層的誤投／漏投而非完全失聯。
+要精準到 viewer 需改成 client-aware 設計，MUST NOT 再堆 `SSH_TTY`／
+`SSH_CLIENT` 之類的猜測。
+Source: ab_core::page::SystemPager / SubprocessRunner
 
 ---
 
