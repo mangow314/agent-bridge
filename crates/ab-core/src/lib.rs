@@ -17,6 +17,7 @@ pub mod hook;
 pub mod json;
 pub mod lock;
 pub mod notify;
+pub mod page;
 pub mod paths;
 pub mod proc;
 pub mod registry;
