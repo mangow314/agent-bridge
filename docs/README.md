@@ -32,6 +32,7 @@
 | [rust/flow-spawn.md](rust/flow-spawn.md) | spawn 生命週期：cap／ready 探針／原子回滾／出身防護 |
 | [rust/flow-notify.md](rust/flow-notify.md) | 通知鏈：send → notify_or_defer → hook 的決策全圖 |
 | [rust/flow-ttl.md](rust/flow-ttl.md) | state 通道 TTL：單一寫者／owner gate／通知端新鮮度三視角 |
+| [lifecycle-safety.md](lifecycle-safety.md) | spawn／despawn／evict／gc 安全不變量的完整論證（反例、TOCTOU 取捨、審計記號設計理由）；結論式摘要在 README.zh-TW.md |
 | [testing-policy.md](testing-policy.md) | 測試執行政策：哪些情形跑全套、哪些跑分組 |
 
 ## 進行中
