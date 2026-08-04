@@ -145,7 +145,7 @@ claude-opus-4-6-thinking
 gpt-oss-120b-medium
 ```
 
-登入身分 `<帳號>`（Google AI Pro），未指定時的預設為
+量測時的登入身分為 Google AI Pro 方案；未指定時的預設為
 **Gemini 3.6 Flash (High)**。spawn 的 `--model <v>` 附加寫法（`spawn.rs:337`）
 可直接沿用，值照上表原字串。
 

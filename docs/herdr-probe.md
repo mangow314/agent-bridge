@@ -4,9 +4,8 @@
 21 MB，官方 `install.sh` 裝，無 sudo、無系統設定、無 telemetry）。
 比照 `docs/agy-probe.md`：只記實測到的事實與當下的判定，不記推論。
 
-量測動機：`.handoff/<交接檔>` 記載的驗證缺口
-——先前那輪 herdr 比較只看官網與文件，**沒有實裝試用**，而我們打算抄它的
-狀態 vocabulary。本檔補上一手證據。
+量測動機：先前那輪 herdr 比較只看官網與文件、**沒有實裝試用**，卻打算抄它的
+狀態 vocabulary——這個驗證缺口在當時的交接記錄裡被點名。本檔補上一手證據。
 
 跑法：`herdr --session probe` 起在一個拋棄式 tmux window，CLI 端以
 `HERDR_SESSION=probe herdr <noun> <verb>` 走該 session 的 socket

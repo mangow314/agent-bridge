@@ -222,6 +222,11 @@ hook_pid=1612290  ppid=1609575  starttime=56855455  bash
 1609575: /home/<user>/.nvm/.../@openai/codex-linux-x64/vendor/.../bin/codex --profile agent-worker
 ```
 
+（上列路徑是**本機 nvm 安裝**的實測值，非通用形狀。
+**實作註記（非本輪量測）**：runtime 身分判定不看目錄——`cmdline_is_runtime`
+（`crates/ab-core/src/proc.rs`）只比 argv[0]／argv[1] 的 basename。其他安裝
+方式的行程樹層數本輪未量測。）
+
 ## 為什麼與 claude 不同
 
 claude 是 tmux 直接 exec 的單一行程，pane_pid 就是 fork hook 的那個行程。

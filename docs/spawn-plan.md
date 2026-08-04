@@ -1,12 +1,15 @@
 # spawn 實作計畫（第三輪）
 
-狀態：**計畫定稿待審**（2026-07-22）。依據已過審的
+狀態（立案當時）：**計畫定稿待審**（2026-07-22）。依據已過審的
 `agent-spawn-proposal.md`；設計題拍板結果沿用提案傾向：就緒採自報到、
 pane 預設留用、v1 只支援 codex、安全面全採（cap／出身標記／審計）、
 失敗原子回滾。
 
-前置件：codex agent-worker profile —— **已落地並驗收**（chezmoi
-`45f689c`；驗收 task 20260722T035038Z-66f2，0 次人工核准）。
+**後續結果：已實作**（其後 runtime 擴充到 claude／agy）。本文保留計畫當時的
+形狀，落地行為以 `spec/` 與 `tests/run-tests.sh` 為準。
+
+前置件：codex agent-worker profile —— **已落地並驗收**（該 profile 由本機
+dotfiles 管理，不在本 repo；驗收 task 20260722T035038Z-66f2，0 次人工核准）。
 
 ## 範圍與非目標
 

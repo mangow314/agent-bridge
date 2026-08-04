@@ -1,8 +1,8 @@
 # 提案：codex worker 的核准放寬（agent-worker profile）
 
-狀態：**已落地、驗收通過**（2026-07-22）。chezmoi `45f689c`（走 topic
-branch + worktree 慣例併回）；live `~/.codex/agent-worker.config.toml`
-已 apply（600、re-diff 空）。驗收（task 20260722T035038Z-66f2，worker 以
+狀態：**已落地、驗收通過**（2026-07-22）。profile 檔本身由本機 dotfiles 管理
+（不在本 repo）：`~/.codex/agent-worker.config.toml`，權限 600。
+驗收（task 20260722T035038Z-66f2，worker 以
 `codex --profile agent-worker` 執行）：`start` 建鎖成功——證實 profile 疊加
 下基底 `writable_roots` 仍生效（原 `[unverified]` 點就此銷案）；含 3 個
 shell 指令的任務全程 **0 次人工核准**；reply 正常送達。
