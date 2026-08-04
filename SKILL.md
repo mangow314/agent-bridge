@@ -84,8 +84,20 @@ never crammed into `--message`.
   and fuzzy requirements that need back-and-forth clarification — there
   the round-trip cost of delegation exceeds the benefit.
 - Make the request self-contained: the other side cannot see your
-  conversation history. Include the working directory, relevant file
-  paths, and acceptance criteria.
+  conversation history. Minimum format, small tasks included — first
+  line: a one-sentence task statement (so the request is scannable at
+  `receive` time; keep it short); scope with working directory and
+  file paths, including what must NOT be touched; acceptance criteria
+  (machine-checkable preferred); constraints and authorization
+  boundaries (read-only vs edit, external side effects, and explicit
+  fan-out permission when a third layer is intended — without it the
+  worker must not fan out). Then the two fields that save the most
+  rounds yet are the easiest to omit:
+  - **Ruled-out directions, with reasons** — every relevant dead end
+    you walked but left out of the request, the worker will walk again.
+  - **Conclusions marked verified vs conjecture** — an unmarked guess
+    reads as fact, and the worker will build on top of it.
+  Full dispatch strategy: `share/orchestrator-brief.md`.
 - End the request with an authorization statement: "This task is
   authorized for direct execution; do not wait for sender confirmation;
   raise questions via reverse send (see below)." Otherwise a cautious
