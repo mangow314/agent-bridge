@@ -224,6 +224,11 @@ worker 會一律自己做完。這條要寫進 orchestrator-brief。
 
 ### 巢狀委派判準與主 session 不同
 
+> **狀態（已收）**：末句「這條寫進 worker-brief」**已落實**（`2c41e6e`
+> 「brief：把『context 是資產』寫進兩份守則」）——現行 `share/worker-brief.md`
+> 的〈Whether to delegate further down to subagents〉節寫的就是這條判準，
+> 並明說它與主 session 的門檻不是同一條。
+
 使用者全域的 context-discipline（>3 檔或 >2K tokens 就 dispatch）是為了保護
 **必須長期存活的主 context**。worker 繼承這套規則，但處境不同，且新設計讓它更
 微妙：
@@ -265,6 +270,12 @@ completed）當時整組空綠。修法是把狀態取樣移到 `wait` 之前。
 
 ## 已知風險
 
+> **狀態（已收）**：本節兩處「orchestrator-brief 要寫明」**都已落實**，現行
+> `share/orchestrator-brief.md` 各有對應章節——「追問越晚，可信度越低」在
+> 〈Follow-up credibility decays〉，「什麼任務值得走到第三層」在
+> 〈Which tasks deserve a third layer〉（後者還加上「非經 request 明確授權不
+> fan out」）。風險本身仍在，已落實的是**寫進 brief** 這個處置動作。
+
 - **保留 ≠ 上下文品質保留**：worker 閒置期間可能已被 auto-compact，
   「還記得」是遞減的。收尾筆記機制正是為此存在，但無法完全補償。
   orchestrator-brief 要寫明：追問越晚，可信度越低。
@@ -278,6 +289,10 @@ completed）當時整組空綠。修法是把狀態取樣移到 `wait` 之前。
   還是委派拿結論的——而這正好影響追問的可信度。追問前無從得知答案品質。
 
 ## 不做（本輪明確排除）
+
+> **狀態（部分已收）**：下列第一項「task 目錄 GC」**其後已實作**，不再是
+> backlog——`gc` 是正式子指令，條款見 `spec/cli.md` 的 CLI-GC-1／CLI-GC-2／
+> CLI-GC-3。另兩項維持排除。
 
 - task 目錄 GC（`idle` 的掃描成本問題）→ backlog
 - 自動分派策略編碼進 shell（策略留在 brief）
