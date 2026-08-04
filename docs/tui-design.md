@@ -379,7 +379,7 @@ baseline 仍是 7 步（CLI 沒有 blocker 軸這件事沒有改變）。
 
 ### P5 rubric v1：判定未通過（2026-08-02 實測，作廢留檔）
 
-12 worker／23 task fixture（`tests/p5-fixture.sh`，入庫 `99e47b1`）下使用者
+12 worker／23 task fixture（`tests/p5-fixture.sh`，入庫 `6ac2514`）下使用者
 實測：條 1 ✗（只答出 lineage 條數，未答成員、未察覺 standalone 段）、
 條 2 ✗（unattached 3 筆答成 0 筆）、條 3 ✗ 2/3（第三個異常誤答）。事後鑑識
 兩層根因：
@@ -541,8 +541,8 @@ P5.1 的三輪成果首次在真實終端目視（120x40／80x24／60x18 各一�
 P4.6 先行（P4.7 待其收斂後再批）／chrome 全英文／`L` peek 進 P4.7／
 P5 順延至 P4.7 後。全文：session scratchpad `ui-feedback-proposal.md`。
 
-**P4.6 收案（2026-08-02）**：四切片依序落地——a `4db5370`（ORIGINS 誠實化＋
-英文 chrome）／b `3cd37ef`（Enter matrix＋stable selection）／c `4a802b4`
+**P4.6 收案（2026-08-02）**：四切片依序落地——a `6d4834f`（ORIGINS 誠實化＋
+英文 chrome）／b `abe22e1`（Enter matrix＋stable selection）／c `07689b6`
 （TASKS 捲動＋freshness）／d（本次，pager markdown-lite）。切片 c 經 codex 獨立
 審查判 REFUTED，1 major＋5 minor 全數修正後才收：major 是「晚到的 tmux round
 以收信時間刷新 stamp，可把早已過期的快照重新標成新鮮」——修法為觀測時間跟著
@@ -571,8 +571,8 @@ C filter＋TASKS scope＋banner／D `L` 尾行預覽；gate (a)(b) 拆 A（資�
 與 B（render 面）兩段驗，gate (c) 於 B 建立新 fixture 後首跑、C/D 動鍵位
 後重跑。
 
-**P4.7 收案（2026-08-02）**：五片全數落地——A0 `26f7004`／A `6fe6f7b`／
-B1 `be4b202`／B2 `d606ed1`／C `209d01a`／D `1b7295e`。收案時 gate：
+**P4.7 收案（2026-08-02）**：五片全數落地——A0 `7acc7ed`／A `b15db4a`／
+B1 `5f632c3`／B2 `3c88c0a`／C `d7bed2c`／D `e111b53`。收案時 gate：
 cargo **274**（core 123＋tui 151）、`SRC_KIND=rust` 全套 **1120 PASS 0 FAIL**
 （含新分組 45）、`check-contract.sh` 4/4、`SRC_KIND=bash` 787 PASS 1 FAIL
 （22e，**環境既有紅**，stash 基準對照證實非本批）。gate 逐字覆核：
@@ -650,6 +650,6 @@ heartbeat：`updated_at` 只在狀態轉換時寫，task.rs:157；要標只能�
 解決 CC 內建 codex plugin／MCP 呼叫卡住無回應），有餘裕時往吸睛亮點調，
 不設硬性相位。
 
-量測載具 `tests/p5-fixture.sh` 入庫 `99e47b1`：40 條不變式（資料層＋畫面層），
+量測載具 `tests/p5-fixture.sh` 入庫 `6ac2514`：40 條不變式（資料層＋畫面層），
 codex 獨立審查 5 major 全修（ownership marker、shim 自指重入、down 失敗傳播、
 status 分布鎖死、墓碑逐字匹配）。
