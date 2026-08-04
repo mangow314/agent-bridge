@@ -60,6 +60,26 @@ Note: 兩欄 **MUST NOT 進入任何 auth／CAS 判斷**——despawn／evict �
 可寫，這兩欄是身分**線索**不是憑證。
 Source: cmd_spawn（lineage 區段）／ab_core::spawn::derive_lineage
 
+### STATE-AGENT-6 [tested: 16]
+**generation key 的文法**。寫進 registry 的 canonical `spawn_tag`／
+`lineage_root`／`parent_agent` 三欄，其值 MUST 逐字符合：
+
+```
+^AGENT_BRIDGE_SPAWN_TAG=ab-spawn-[A-Za-z0-9_-]+-[0-9]+-[0-9a-f]{12}$
+```
+
+即 `AGENT_BRIDGE_SPAWN_TAG=` 前綴 ＋ `ab-spawn-` ＋ 名稱段（至少一字元，
+字元集 `[A-Za-z0-9_-]`）＋ `-` ＋ 十進位數字段（至少一位）＋ `-` ＋ **12 位
+小寫**十六進位（大寫 MUST NOT 通過）。
+
+不符文法者在 lineage 推導中 MUST **視同缺席**——退回 parent 自身
+`spawn_tag`，MUST NOT 報錯、MUST NOT 另設分支或警告（fail-soft 方向與缺欄位
+一致）。
+Note: 本條規範的是**磁碟上那個字串的形狀**，不規定實作以 regex 或手寫掃描
+達成。本檔的 regex 原文是該文法的正本，實作端的副本由
+`ab_core::spawn::tests::gen_key_grammar_matches_the_spec` 對本檔逐字比對錨住。
+Source: ab_core::spawn::GEN_KEY_RE／is_generation_key
+
 ### STATE-AGENT-2 [tested: 20]
 出身判定 MUST 三態：spawn 出身／人工註冊／無法判定（JSON 損壞、非 object、
 讀不到）。「無法判定」MUST fail-closed：register 拒絕覆寫、despawn／evict

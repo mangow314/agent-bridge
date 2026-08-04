@@ -10,7 +10,9 @@ shell 測試曾單次吃掉 168 分鐘 wall-clock，是 commit 週期最大的�
 |---|---|---|
 | phase 內 iteration／commit | `cargo clippy --all-targets -- -D warnings`＋`cargo test`＋`TEST_GROUPS=<受影響分組> tests/run-tests.sh` | 受影響分組＝本 diff 動到的行為所屬分組＋新增分組；partial run 輸出會自帶 `⚠ PARTIAL RUN` 標記 |
 | 收案（phase 批收尾）／merge／cutover | 上述全部＋**全套** `tests/run-tests.sh`（不帶 `TEST_GROUPS`） | partial run 的輸出**不得作為收案／merge 證據**——收案宣稱必附全套數字 |
-| bash 正本對照（rollback 期） | `SRC_KIND=bash BRIDGE=$PWD/bin/agent-bridge.bash tests/run-tests.sh` | 只在動到 bash 凍結面或收案時跑 |
+
+（bash 正本退役後，「bash 對照」那一級隨之取消：套件只剩一個受測載具，
+`SRC_KIND` 旋鈕已移除。）
 
 ## TEST_GROUPS 機制
 

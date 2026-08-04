@@ -193,7 +193,6 @@ capture 查詢回 None——pane 可能還活著，MUST NOT 當成 pane 死亡�
 的實例即拆桶動機）；`send-keys-failed` 涵蓋 `send-keys` 這步
 的**所有**失敗——逾時、非零退出、TOCTOU 空窗內 pane 消失、子行程沒起來——
 實作只拿得到一個 bool，**MUST NOT** 命名成 `send-keys-timeout`。
-bash 正本自 M4 凍結、不實作本條款，SRC_KIND=bash 下相關斷言顯式 SKIP。
 Source: notify_or_defer_outcome / notify_pane_reason
 
 ### HOOK-NOTIFY-3 [tested: 39]

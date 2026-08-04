@@ -18,31 +18,19 @@ unset ${!AGENT_BRIDGE_@}
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 BRIDGE="${BRIDGE:-$ROOT/bin/agent-bridge}"
 # 源碼耦合檢查（§30 canary、§31i 寫入順序）抽取函式本體的對象。不跟著 $BRIDGE
-# 走——$BRIDGE 是黑箱受測體，這兩處要的是**源碼**。M4 cutover 後正本是 Rust，
-# 故預設 rust；`SRC_KIND=bash` 可切回 bash 正本（rollback 期與雙實作對照用）。
-# 顯式的 kind＋path 是 M3 codex 複核的建議形（source-kind／source-path）。
-# 光有 kind 還不夠：$BRIDGE（黑箱受測體）與 SRC_KIND（源碼抽取對象）若各指
-# 一套實作，兩邊各自全綠、整套照樣綠，等於沒驗到對應關係（獨立複核
-# 2026-07-31 實證）。故 kind 先驗 enum，再與載具實測結果交叉比對。
-SRC_KIND="${SRC_KIND:-rust}"
-case "$SRC_KIND" in
-  rust|bash) ;;
-  *) echo "SRC_KIND 需為 rust 或 bash：$SRC_KIND" >&2; exit 1 ;;
-esac
-SRC_BASH="$ROOT/bin/agent-bridge.bash"
+# 走——$BRIDGE 是黑箱受測體，這兩處要的是**源碼**。
 SRC_NOTIFY_RS="$ROOT/crates/ab-core/src/notify.rs"
 SRC_TASK_RS="$ROOT/crates/ab-core/src/task.rs"
-# 載具是哪套實作：Rust 認得 `__implemented-commands`（rc 0）、bash 正本當成
-# 未知指令（rc 1）——用既有介面判別，不為了自報身分再開一個。探針的 DATA
-# 指到不可建立的路徑，免得 bash 分支順手建到使用者真實的資料目錄
-if AGENT_BRIDGE_DATA=/dev/null/probe "$BRIDGE" __implemented-commands \
+# 載具身分驗證：Rust 正本認得 `__implemented-commands`（rc 0）——用既有介面
+# 判別，不為了自報身分再開一個。探針的 DATA 指到不可建立的路徑，免得誤建到
+# 使用者真實的資料目錄。
+# bash 正本退役後這道仍留著：$BRIDGE 可由呼叫者覆寫指到任何東西，沒有這道，
+# 「載具與源碼抽取對象各指一套」會整套綠得毫無意義（獨立複核 2026-07-31 實證
+# 的失效形），只是判準從雙向比對收斂成單向斷言。
+if ! AGENT_BRIDGE_DATA=/dev/null/probe "$BRIDGE" __implemented-commands \
     >/dev/null 2>&1; then
-  BRIDGE_KIND=rust
-else
-  BRIDGE_KIND=bash
-fi
-if [[ "$BRIDGE_KIND" != "$SRC_KIND" ]]; then
-  echo "SRC_KIND=$SRC_KIND 與 BRIDGE 不匹配（載具偵測為 $BRIDGE_KIND）：$BRIDGE" >&2
+  echo "BRIDGE 不是 Rust 正本（不認得 __implemented-commands）：$BRIDGE" >&2
+  echo "先建置：cargo build --release && cp -f target/release/ab bin/ab" >&2
   exit 1
 fi
 SOCK="agent-bridge-test"
@@ -135,14 +123,9 @@ evt_reason() {
   grep -qE "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9:]+Z notify-failed pane=[^[:space:]]+ cmd=[^[:space:]]+ reason=${r}\$" "$log"
 }
 
-# assert_reason <desc> <events.log> <reason>：bash 正本自 M4 凍結、不記 reason，
-# 故 SRC_KIND=bash 顯式 SKIP（不計 PASS／FAIL，bash 側總數不變）。
+# assert_reason <desc> <events.log> <reason>
 assert_reason() {
-  if [[ "$SRC_KIND" == bash ]]; then
-    printf 'SKIP: %s（bash 正本凍結，未實作 reason 欄位）\n' "$1"
-  else
-    assert "$1" evt_reason "$2" "$3"
-  fi
+  assert "$1" evt_reason "$2" "$3"
 }
 
 # ---- TEST_GROUPS 分組過濾（政策見 docs/testing-policy.md）----
@@ -236,8 +219,7 @@ EOF
 make_runtime_shim codex
 # 真 claude 也在 PATH 上，但 shim 排在最前面，測試不會叫到真的
 make_runtime_shim claude
-# agy 同理（真 agy 也可能在 PATH 上）。shim 無條件建立、只有分組 37 會用到：
-# bash 正本不支援 agy runtime，多這個檔對它是死碼而非行為差異
+# agy 同理（真 agy 也可能在 PATH 上）。shim 無條件建立、只有分組 37 會用到
 make_runtime_shim agy
 
 # spawn 出來的 pane 由 tmux server 啟動，PATH 繼承自 server 環境；
@@ -536,28 +518,23 @@ tmx kill-pane -t "$p_ok" 2>/dev/null || true
 # bug 的 coordinator，pane 上就有 `rg 'Requesting permission for:|Do you want to
 # proceed'` 的指令回顯，一行湊齊三組特徵；實測誤判 19/24≈79%，且 P4 之後同一
 # matcher 餵給 TUI 的 BLOCKER 軸，會變成常駐假 ⛔blocked。
-# bash 正本自 M4 凍結（仍是整屏無錨比對，會誤判），故 SRC_KIND=bash 顯式 SKIP。
-if [[ "$SRC_KIND" == bash ]]; then
-  printf 'SKIP: 8a③b matcher 下緣錨（bash 正本凍結，仍是整屏無錨比對）\n'
-else
-  D5j="$TESTROOT/d5j"
-  p_talk="$(tmx split-window -dP -F '#{pane_id}' -t it "$pane_cmd")"
-  ab "$D5j" register tata "$p_talk" 2>/dev/null
-  # 特徵行在上，其後 20 行正常內容把它推出下緣掃描區
-  tmx send-keys -t "$p_talk" \
-    "printf '%s\n' 'rg \"Requesting permission for:|Do you want to proceed?|esc to cancel|Esc to cancel\" notes.md' ; for i in \$(seq 1 20) ; do printf 'ordinary worker output line %s\n' \"\$i\" ; done ; touch $TESTROOT/talk-ready ; while IFS= read -r l ; do printf '%s\n' \"\$l\" >> $TESTROOT/talk-got.txt ; done" Enter
-  wait_for 10 test -f "$TESTROOT/talk-ready"
-  # 前置斷言：特徵字串真的還在可見一屏內（否則本組退化成 8a③ 的複本）
-  tmx capture-pane -pJ -t "$p_talk" > "$TESTROOT/talk-screen.txt"
-  assert "8a③b 前置：特徵字串確實在可見一屏（只是不在下緣）" \
-    grep -qF -- 'Requesting permission for:' "$TESTROOT/talk-screen.txt"
-  id5j="$(ab "$D5j" send tata --from alice --message hi 2>/dev/null)"
-  assert "8a③b 談論權限框的畫面：pane 收到通知文字（不再誤判）" \
-    wait_for 10 grep -q "$id5j" "$TESTROOT/talk-got.txt"
-  assert_fails "8a③b 談論權限框的畫面：events.log 不記 notify-failed" \
-    evt_grep "$D5j/tasks/$id5j/events.log" notify-failed
-  tmx kill-pane -t "$p_talk" 2>/dev/null || true
-fi
+D5j="$TESTROOT/d5j"
+p_talk="$(tmx split-window -dP -F '#{pane_id}' -t it "$pane_cmd")"
+ab "$D5j" register tata "$p_talk" 2>/dev/null
+# 特徵行在上，其後 20 行正常內容把它推出下緣掃描區
+tmx send-keys -t "$p_talk" \
+  "printf '%s\n' 'rg \"Requesting permission for:|Do you want to proceed?|esc to cancel|Esc to cancel\" notes.md' ; for i in \$(seq 1 20) ; do printf 'ordinary worker output line %s\n' \"\$i\" ; done ; touch $TESTROOT/talk-ready ; while IFS= read -r l ; do printf '%s\n' \"\$l\" >> $TESTROOT/talk-got.txt ; done" Enter
+wait_for 10 test -f "$TESTROOT/talk-ready"
+# 前置斷言：特徵字串真的還在可見一屏內（否則本組退化成 8a③ 的複本）
+tmx capture-pane -pJ -t "$p_talk" > "$TESTROOT/talk-screen.txt"
+assert "8a③b 前置：特徵字串確實在可見一屏（只是不在下緣）" \
+  grep -qF -- 'Requesting permission for:' "$TESTROOT/talk-screen.txt"
+id5j="$(ab "$D5j" send tata --from alice --message hi 2>/dev/null)"
+assert "8a③b 談論權限框的畫面：pane 收到通知文字（不再誤判）" \
+  wait_for 10 grep -q "$id5j" "$TESTROOT/talk-got.txt"
+assert_fails "8a③b 談論權限框的畫面：events.log 不記 notify-failed" \
+  evt_grep "$D5j/tasks/$id5j/events.log" notify-failed
+tmx kill-pane -t "$p_talk" 2>/dev/null || true
 
 # 8a④ B1 regression（有狀態 shim）：「capture-pane 失敗但 send-keys 可用」在真
 # tmux 幾乎構造不出來（pane 活著時 capture 不會失敗），shim 讓 capture 一律非零、
@@ -962,7 +939,7 @@ assert "併發 send：10 個 task 目錄皆存在且狀態合法" all_ids13_ok
 fi  # end grp 15
 # ---- 16. spawn：核心＋cap＋原子回滾（Phase 1） ----
 if grp 16; then
-# spec: CLI-SPAWN-1 CLI-SPAWN-2 CLI-SPAWN-3 CLI-SPAWN-4 ENV-SPAWN-1 ENV-HOOKS-1 ENV-PASS-1 ENV-TAG-1 HOOK-BIND-1 STATE-AGENT-1 STATE-AGENT-5
+# spec: CLI-SPAWN-1 CLI-SPAWN-2 CLI-SPAWN-3 CLI-SPAWN-4 ENV-SPAWN-1 ENV-HOOKS-1 ENV-PASS-1 ENV-TAG-1 HOOK-BIND-1 STATE-AGENT-1 STATE-AGENT-5 STATE-AGENT-6
 
 # 16a. 快樂路徑：假 codex 啟動期吃輸入 2 秒，首發探針必被吃，
 # ready 仍翻 true ＝ 探針重送機制生效（Phase 2 gate 一併覆蓋）
@@ -1215,7 +1192,7 @@ assert "Notification 對應裸指令 agent-bridge hook notification" \
 
 # 16a7. lineage 繼承（P4.7 切片 A；契約 STATE-AGENT-5）。兩欄的值是
 # **generation key＝canonical spawn_tag 全串**，不是名稱——名稱會重用，同名
-# respawn 是新的一代。兩 runtime 對等由 SRC_KIND 雙跑天然覆蓋。
+# respawn 是新的一代。
 #
 # 本段自己開一個資料目錄：lineage 要在乾淨的 registry 上驗「恰一匹配」，
 # $DSPAWN 裡殘留的 worker 會讓匹配數不可預期。
@@ -3100,13 +3077,8 @@ if [[ -n "$REAL_CLAUDE" ]] && CANARY_REAL="$(readlink -f "$REAL_CLAUDE" 2>/dev/n
   # 同時在函式內留一段含舊字串的註解，四個斷言仍全綠（獨立複核 2026-07-31）。
   # 剝註解把蒙混面壓到「函式內未使用的字面值／死分支」，那層由
   # notify.rs 的 matcher_uses_the_canary_feature_strings 單元測試鎖
-  if [[ "$SRC_KIND" == bash ]]; then
-    sed -n '/^screen_has_prompt() {/,/^}/p' "$SRC_BASH" \
-      | grep -v '^[[:space:]]*#' > "$TESTROOT/canary-fn"
-  else
-    sed -n '/^pub fn screen_has_prompt/,/^}/p' "$SRC_NOTIFY_RS" \
-      | grep -v '^[[:space:]]*//' > "$TESTROOT/canary-fn"
-  fi
+  sed -n '/^pub fn screen_has_prompt/,/^}/p' "$SRC_NOTIFY_RS" \
+    | grep -v '^[[:space:]]*//' > "$TESTROOT/canary-fn"
   assert "CC canary：screen_has_prompt 函式本體可抽出" test -s "$TESTROOT/canary-fn"
   for kw in 'Do you want to ' 'Esc to cancel' \
             'has written up a plan' 'Would you like to proceed'; do
@@ -3224,24 +3196,15 @@ assert "唯讀查詢不建資料目錄" test ! -d "$D31E"
 # 反向殘留的是「終態轉換可被重放」的 split-brain 方向）。源碼順序不變量，
 # 比照 §30 的函式本體抽取
 UMS_FN="$TESTROOT/ums-fn"
-# 抽取對象是源碼正本，理由同 §30 的 canary-fn（源碼耦合檢查，M4 已改綁 Rust）。
+# 抽取對象是源碼正本，理由同 §30 的 canary-fn（源碼耦合檢查）。
 # 註解行同樣先剝掉
-if [[ "$SRC_KIND" == bash ]]; then
-  sed -n '/^update_meta_status() {/,/^}/p' "$SRC_BASH" \
-    | grep -v '^[[:space:]]*#' > "$UMS_FN"
-  # shellcheck disable=SC2016  # $dir 是源碼字面值，刻意不展開
-  SL_PAT='atomic_write "$dir/status"'
-  # shellcheck disable=SC2016  # 同上
-  ML_PAT='atomic_write "$dir/metadata.json"'
-else
-  sed -n '/^pub fn update_meta_status/,/^}/p' "$SRC_TASK_RS" \
-    | grep -v '^[[:space:]]*//' > "$UMS_FN"
-  # 各鎖**完整的呼叫頭＋第一引數**，不是單抽路徑字面值：後者可被
-  # `let p = dir.join("status");` 這種 decoy 先命中，實際寫入順序反轉了斷言
-  # 照樣綠（獨立複核 2026-07-31 給的反例）
-  SL_PAT='atomic_write(&dir.join("status")'
-  ML_PAT='atomic_write(&meta_path'
-fi
+sed -n '/^pub fn update_meta_status/,/^}/p' "$SRC_TASK_RS" \
+  | grep -v '^[[:space:]]*//' > "$UMS_FN"
+# 各鎖**完整的呼叫頭＋第一引數**，不是單抽路徑字面值：後者可被
+# `let p = dir.join("status");` 這種 decoy 先命中，實際寫入順序反轉了斷言
+# 照樣綠（獨立複核 2026-07-31 給的反例）
+SL_PAT='atomic_write(&dir.join("status")'
+ML_PAT='atomic_write(&meta_path'
 assert "update_meta_status 函式本體可抽出" test -s "$UMS_FN"
 # 比對前把空白全部去掉：呼叫跨幾行是 rustfmt 的事，不該讓它決定斷言成敗
 UMS_FLAT="$(tr -d '[:space:]' < "$UMS_FN")"
@@ -3924,10 +3887,6 @@ if grp 35; then
 # 或使用者用 AGENT_BRIDGE_CLAUDE_HOOKS 指定 wrapper）一樣不符，當成冒名會把
 # 本尊永久擋死，連 TTL 自癒都到不了。故不符一律落回 M4 的 session_id＋TTL。
 # 設計依據與實測：docs/rust/m5-proposal.md。
-#
-# 這一組只對 Rust 正本執行：bash 正本凍結在 M4 的行為（rollback 基準），
-# 不再長新功能。SKIP 是顯式的，不靜默跳過。
-if [[ "$SRC_KIND" == rust ]]; then
 
 # hookcall 的 pipeline 右段由當前 shell fork，故受測 hook 行程的直接父行程
 # 就是這個 shell——$BASHPID 即「本尊」該有的 pid
@@ -4091,9 +4050,6 @@ assert "35f worker_starttime 與該 pid 當下的 starttime 相符" \
   bash -c "[ \"\$(bash -c 'raw=\$(</proc/$wid_pid/stat); raw=\${raw##*\") \"}; set -- \$raw; echo \${20}')\" = \"$(jq -r '.worker_starttime' "$D35F/agents/wid.json")\" ]"
 absp "$D35F" 5 despawn wid >/dev/null 2>&1
 
-else
-  printf 'SKIP: 35 行程身分閘門（SRC_KIND=bash：bash 正本凍結在 M4 行為，不含 M5）\n'
-fi
 
 fi  # end grp 35
 # ---- 36. codex launcher 形（HOOK-OWNER-5 自癒擴充）----
@@ -4109,9 +4065,6 @@ if grp 36; then
 # 直接 PPID，任何「祖先鏈走得到本尊」「鏈上沒夾別的 runtime」式的放寬都會
 # 把它確認成本尊（architecture §11.7）。中介一律用**真的行程**構造（argv 形
 # 狀由 script 名決定），不是 registry 捏的假資料。
-#
-# 與 35 同理只對 Rust 執行；bash 正本凍結、顯式 SKIP。
-if [[ "$SRC_KIND" == rust ]]; then
 
 # 假 runtime 中介：bash script，argv 為 ["/bin/bash", "…/rtbin36/<名>"]，依
 # STATE-AGENT-4 前兩項規則命中 <名>。hook 呼叫後接 exit 0——非最後命令，防
@@ -4267,9 +4220,6 @@ assert "36f 鏈中斷前置：中介確實完成了 hook 呼叫" test -e "$TESTR
 assert "36f 鏈中斷（worker 已死、中介被 reparent）：不得確認" \
   cmp -s "$D36F/state/ijf.json" "$TESTROOT/ijf-before.json"
 
-else
-  printf 'SKIP: 36 codex launcher 形（SRC_KIND=bash：bash 正本凍結在 M4 行為，不含 M5）\n'
-fi
 
 fi  # end grp 36
 # ---- 37. agy runtime（Antigravity CLI）----
@@ -4279,9 +4229,6 @@ if grp 37; then
 # 分隔的旗標值，位置參數原樣落為初始 prompt，故沿用同一條 worker_prompt_arg
 # 注入路徑；旗標姿態（skip-permissions＋sandbox）是使用者裁決，不是實作偏好，
 # 因此用白名單式 argv 斷言鎖住——與 16a2 同理，子字串比對擋不住偷偷追加的旗標。
-#
-# 與 35／36 同理只對 Rust 執行；bash 正本自 M4 凍結、不支援 agy，顯式 SKIP。
-if [[ "$SRC_KIND" == rust ]]; then
 
 # 37a 快樂路徑＋argv 白名單
 pane_wy="$(absp "$DSPAWN" 20 spawn wy1 --runtime agy 2>/dev/null)"; rc=$?
@@ -4401,9 +4348,6 @@ assert "37e events.log 記 notify-failed" \
   evt_grep "$D37S/tasks/$id37e/events.log" notify-failed
 tmx kill-window -t "$w_short" 2>/dev/null || true
 
-else
-  printf 'SKIP: 37 agy runtime（SRC_KIND=bash：bash 正本凍結在 M4，不支援 agy）\n'
-fi
 
 fi  # end grp 37
 # ---- 38. list --long 介入視圖 ----
@@ -4416,9 +4360,6 @@ if grp 38; then
 # 失效降級是**顯式字面值**且三態分明（活著／查了不在／沒得查）；③ 唯讀——判定
 # dead 不得順手清 registry。第 ② 條是這個功能唯一會騙人的地方：把 owner 已死
 # 顯示成一個空位置，比不顯示更糟。
-#
-# 與 35–37 同理只對 Rust 執行；bash 正本自 M4 凍結，顯式 SKIP。
-if [[ "$SRC_KIND" == rust ]]; then
 
 D38="$TESTROOT/d38"
 mkdir -p "$D38/agents"
@@ -4562,9 +4503,6 @@ tmx kill-session -t linkB 2>/dev/null || true
 assert_fails "38i list 未知參數應拒" ab "$D38" list --bogus
 assert_fails "38i list 多餘參數應拒" ab "$D38" list --long extra
 
-else
-  printf 'SKIP: 38 list --long（SRC_KIND=bash：bash 正本凍結在 M4）\n'
-fi
 
 fi  # end grp 38
 # ---- 39 copy-mode 送鍵防線（AB-COPYMODE-1）----
@@ -4578,9 +4516,6 @@ if grp 39; then
 # **不得**替人 `-X cancel`——人正在看的捲動位置是介入現場，清掉比不通知更糟；
 # ③ 送鍵子行程有逾時兜底（檢查與送鍵之間的 TOCTOU 空窗仍可能撞上 copy-mode，
 # 沒有逾時那個空窗就是永久鎖死）；④ mode 查不出來時 fail-closed。
-#
-# 與 35–38 同理只對 Rust 執行；bash 正本自 M4 凍結，顯式 SKIP。
-if [[ "$SRC_KIND" == rust ]]; then
 
 D39="$TESTROOT/d39"
 
@@ -4740,9 +4675,6 @@ assert "39e 查詢層逾時：events.log 記 notify-failed" \
 assert_reason "39e 查詢層逾時：notify-failed 標 reason=query-failed" \
   "$D39e/tasks/$id39e/events.log" query-failed
 
-else
-  printf 'SKIP: 39 copy-mode 送鍵防線（SRC_KIND=bash：bash 正本凍結在 M4）\n'
-fi
 
 fi  # end grp 39
 # ---- 40. TUI 第一縱切（ui dashboard） ----
@@ -4763,8 +4695,6 @@ if grp 40; then
 # （AGENT_BRIDGE_UI_POPUP=1 時 focus 成功即正常退出，ENV-UI-1）。
 # 畫面斷言一律 capture-pane 落檔後 grep 特徵字串，不做整畫面 byte 比對
 # （alternate screen 承諾不了 byte 級不變，終審已裁定）。
-# 與 35–39 同理只對 Rust 執行；bash 正本自 M4 凍結，顯式 SKIP。
-if [[ "$SRC_KIND" == rust ]]; then
 
 D40="$TESTROOT/d40"
 mkdir -p "$D40/agents" "$D40/tasks"
@@ -5028,9 +4958,6 @@ tmx detach-client -t "$CLIENT40" 2>/dev/null || true
 tmx kill-pane -t "$TUI40" 2>/dev/null || true
 tmx kill-window -t "$W40_WIN" 2>/dev/null || true
 
-else
-  printf 'SKIP: 40 TUI 第一縱切（SRC_KIND=bash：bash 正本凍結在 M4，不含 TUI）\n'
-fi
 
 fi  # end grp 40
 # ---- 41. TUI 三面板＋唯讀鍵（r／i／c） ----
@@ -5048,8 +4975,7 @@ if grp 41; then
 #       負責
 # 另含：Tab 兩欄循環、TASKS 欄含終態、終態列 `x` 被拒、`i` 摘要頁、
 # 退出後 window id／layout／geometry 不變與 termios 逐字還原（沿用 40 的
-# tui40_run／stty40_same 手法）。與 35–40 同理只對 Rust 執行。
-if [[ "$SRC_KIND" == rust ]]; then
+# tui40_run／stty40_same 手法）。
 
 D41="$TESTROOT/d41"
 mkdir -p "$D41/agents" "$D41/tasks"
@@ -5294,9 +5220,6 @@ assert "41i 退出後 window id／layout／geometry 不變" \
 tmx kill-pane -t "$TUI41" 2>/dev/null || true
 tmx kill-window -t "$W41_WIN" 2>/dev/null || true
 
-else
-  printf 'SKIP: 41 TUI 四面板＋唯讀鍵（SRC_KIND=bash：bash 正本凍結在 M4，不含 TUI）\n'
-fi
 
 fi  # end grp 41
 # ---- 42. evict 入口 CAS（CLI-EVICT-4） ----
@@ -5308,8 +5231,6 @@ if grp 42; then
 #       無通知、pane 未 kill、registry 未動、審計未新增
 #   (c) 送出後 → despawn 前換代 → 照舊拒收（既有 CLI-EVICT-3 行為，
 #       由分組 26 覆蓋；本組只確認新增的入口鎖沒有削弱它）
-# 與 35–41 同理只對 Rust 執行（bash 正本自 M4 凍結，不含 --expect-*）。
-if [[ "$SRC_KIND" == rust ]]; then
 
 D42="$TESTROOT/d42"
 
@@ -5437,9 +5358,6 @@ assert "42e 不帶 expect：收尾任務落地" test -d "$D42/tasks/$tid42b"
 assert "42e 不帶 expect：registry 已回收" test ! -f "$D42/agents/ev42b.json"
 tmx kill-pane -t "$pane42b" 2>/dev/null || true
 
-else
-  printf 'SKIP: 42 evict 入口 CAS（SRC_KIND=bash：bash 正本凍結在 M4，不含 --expect-*）\n'
-fi
 
 fi  # end grp 42
 # ---- 43. TUI evict 證據框（CAS） ----
@@ -5455,8 +5373,6 @@ if grp 43; then
 #   (d) 相符 → 走下沉的 core 編排：收尾任務落地後 registry 回收、pane 被 kill
 #   (e) evict 的 await 段（預設 300s）跑在**一次性 thread** 上：期間 UI 仍收得
 #       了鍵（? 開得了合法鍵頁），同一個 worker 再按 e 只提示「進行中」
-# 與 40–42 同理只對 Rust 執行（bash 正本自 M4 凍結，不含 TUI）。
-if [[ "$SRC_KIND" == rust ]]; then
 
 D43="$TESTROOT/d43"
 mkdir -p "$D43"
@@ -5616,9 +5532,6 @@ tmx kill-window -t "$TUI43N" 2>/dev/null || true
 tmx kill-pane -t "$TUI43" 2>/dev/null || true
 tmx kill-pane -t "$pane43b" 2>/dev/null || true
 
-else
-  printf 'SKIP: 43 TUI evict 證據框（SRC_KIND=bash：bash 正本凍結在 M4，不含 TUI）\n'
-fi
 
 fi  # end grp 43
 # ---- 44. P4 效率驗收（replay script 步數 gate） ----
@@ -5639,8 +5552,6 @@ if grp 44; then
 #
 # 前置：BLOCKER 軸（§4 v1 matcher 契約：硬編碼 prompt matcher ＋結構性
 # occlusion）——沒有它 TUI 定位不到 blocked prompt，正確率必然 2/3。
-# 與 40–43 同理只對 Rust 執行。
-if [[ "$SRC_KIND" == rust ]]; then
 
 D44="$TESTROOT/d44"
 P4OUT="$TESTROOT/p4out"
@@ -6130,9 +6041,6 @@ tmx kill-window -t "$W44A" 2>/dev/null || true
 tmx kill-window -t "$W44P" 2>/dev/null || true
 tmx kill-window -t "$W44B" 2>/dev/null || true
 
-else
-  printf 'SKIP: 44 P4 效率驗收（SRC_KIND=bash：bash 正本凍結在 M4，不含 TUI）\n'
-fi
 
 fi  # end grp 44
 # ---- 45. 尾行預覽的 capture-pane 語意（真 tmux；P4.7 切片 D） ----
@@ -6148,9 +6056,6 @@ if grp 45; then
 # **不進本組**：hang、非零退出、kill／收屍。真 tmux 做不出決定性的 hang，寫進來
 # 只會換到 flaky；那三項在 Rust 單元測試裡以可控的 fixture process 驗
 # （crates/ab-core/src/tmux.rs 的 `tail_from_child`）。
-#
-# 與 40–44 同理只對 Rust 執行（bash 正本不含 TUI）。
-if [[ "$SRC_KIND" == rust ]]; then
 
 TAIL45_N=20
 # **自己一個 window**：同一個 window 的 pane 數有上限（第 6 個 split 必炸，
@@ -6232,9 +6137,6 @@ assert "45：CJK／寬字元行原樣保留（同一行）" \
 
 tmx kill-window -t "$W45" 2>/dev/null || true
 
-else
-  printf 'SKIP: 45 尾行預覽 capture-pane 語意（SRC_KIND=bash：bash 正本凍結在 M4，不含 TUI）\n'
-fi
 
 fi  # end grp 45
 # ---- 46. await 的 blocker 探測（真 tmux；CLI-AWAIT-3／CLI-AWAIT-4） ----
@@ -6243,8 +6145,7 @@ if grp 46; then
 # 動機（session 審查 2026-08-03）：無人值守 worker 卡在權限確認框一小時、
 # await 只會等到 timeout——探測讓等待方在秒級知道。真 tmux 而非 shim：
 # matcher 吃的是 capture-pane 的實際回傳，假件只證明得了我方送出去的東西
-# （P4.7 教訓）。與 40–45 同理只對 Rust 執行（bash 正本凍結在 M4）。
-if [[ "$SRC_KIND" == rust ]]; then
+# （P4.7 教訓）。
 
 D46="$TESTROOT/d46"
 mkdir -p "$D46"
@@ -6326,9 +6227,6 @@ assert "46(5)：降級有 stderr 提示" grep -q '改純輪詢' "$TESTROOT/aw46d
 
 tmx kill-window -t "$W46" 2>/dev/null || true
 
-else
-  printf 'SKIP: 46 await blocker 探測（SRC_KIND=bash：bash 正本凍結在 M4，不含探測）\n'
-fi
 
 fi  # end grp 46
 # ---- 47. page 層：兩類事件的推播與去重（tui-design §1／§9 rubric v2） ----
@@ -6336,8 +6234,6 @@ if grp 47; then
 # 動機：page 層是「推到人面前、不用打開任何東西」那一層。單元測試已鎖住
 # 模型與 ladder（ab-core `page.rs`）；這裡鎖的是**真的走完整支 CLI** 之後
 # 的可觀察事實——事件流落了幾筆、自訂通知命令收到什麼、哪些子指令零推播。
-# 與 40–46 同理只對 Rust 執行（bash 正本凍結在 M4，page 層是 Rust 獨有）。
-if [[ "$SRC_KIND" == rust ]]; then
 
 D47="$TESTROOT/d47"
 mkdir -p "$D47"
@@ -6532,9 +6428,6 @@ assert "47(7)：推播全滅時事件仍落盤" test "$(ev47_count)" -gt "$befor
 
 tmx kill-window -t "$W47" 2>/dev/null || true
 
-else
-  printf 'SKIP: 47 page 層（SRC_KIND=bash：page 層是 Rust 獨有，bash 正本凍結在 M4）\n'
-fi
 
 fi  # end grp 47
 # ---- 總結 ----

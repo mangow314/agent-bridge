@@ -526,15 +526,15 @@ pub fn canonical_spawn_tag(bare: &str) -> String {
     format!("{}={bare}", config::ENV_SPAWN_TAG)
 }
 
-/// canonical generation key 的文法（**bash `GEN_KEY_RE` 的逐字副本**）。
+/// canonical generation key 的文法（**spec STATE-AGENT-6 的逐字副本**）。
 ///
 /// 這裡存的是 regex **原文**，實作是下面的手寫掃描；兩者的一致性由
-/// `is_generation_key` 的測試群（逐形狀正反例）錨住，與 bash 的一致性由
-/// `gen_key_grammar_matches_the_bash_runtime` 直接對檔案比對。
+/// `is_generation_key` 的測試群（逐形狀正反例）錨住，與文法正本的一致性由
+/// `gen_key_grammar_matches_the_spec` 直接對 `spec/state.md` 比對。
 pub const GEN_KEY_RE: &str =
     r"^AGENT_BRIDGE_SPAWN_TAG=ab-spawn-[A-Za-z0-9_-]+-[0-9]+-[0-9a-f]{12}$";
 
-/// canonical generation key 的**文法驗證**（bash `GEN_KEY_RE` 逐字同一條）：
+/// canonical generation key 的**文法驗證**（spec STATE-AGENT-6 逐字同一條）：
 /// `^AGENT_BRIDGE_SPAWN_TAG=ab-spawn-[A-Za-z0-9_-]+-[0-9]+-[0-9a-f]{12}$`
 ///
 /// 為什麼要驗：registry 是**worker 可寫面**（同 `PANE_RE`／`WINDOW_RE` 的
@@ -547,9 +547,9 @@ pub const GEN_KEY_RE: &str =
 /// fallback 路徑，不另設分支、不另發警告——fail-soft 方向與缺欄位一致）。
 ///
 /// 手寫掃描而不是 regex crate：依賴上限（§6）不為一條式子多開一個 crate。
-/// 代價是「兩 runtime 同一條文法」少了一個機器錨，故把 regex 原文留成
-/// `GEN_KEY_RE` 常數，並由 `gen_key_grammar_matches_the_bash_runtime`
-/// 對 `bin/agent-bridge.bash` 逐字比對。
+/// 代價是「實作與文法正本同一條」少了一個機器錨，故把 regex 原文留成
+/// `GEN_KEY_RE` 常數，並由 `gen_key_grammar_matches_the_spec`
+/// 對 `spec/state.md`（STATE-AGENT-6）逐字比對。
 pub fn is_generation_key(s: &str) -> bool {
     let Some(rest) = s.strip_prefix(&format!("{}=ab-spawn-", config::ENV_SPAWN_TAG)) else {
         return false;
@@ -2270,20 +2270,21 @@ mod tests {
         assert_eq!(derive_lineage(tag, &rows, &self_tag()).root, good);
     }
 
-    /// **F2 的雙 runtime 錨**：Rust 的手寫掃描與 bash 的 `GEN_KEY_RE`
-    /// MUST 是同一條文法。Rust 這邊沒有 regex 引擎（依賴上限），所以把原文
-    /// 留成常數，並在這裡對 `bin/agent-bridge.bash` **逐字**比對——兩邊哪一
-    /// 側先改，這條就紅。
+    /// **F2 的契約錨**：實作端的 `GEN_KEY_RE` 副本與文法正本
+    /// （`spec/state.md` STATE-AGENT-6）MUST 是同一條文法。Rust 這邊沒有
+    /// regex 引擎（依賴上限），所以把原文留成常數，並在這裡對 spec **逐字**
+    /// 比對——兩邊哪一側先改，這條就紅。
+    ///
+    /// M4 之前這條錨的是 `bin/agent-bridge.bash`（雙 runtime 對照）；bash 正本
+    /// 退役後改綁 spec，方向反而更正：實作對契約，不是實作對實作。
     #[test]
-    fn gen_key_grammar_matches_the_bash_runtime() {
-        let bash =
-            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../bin/agent-bridge.bash");
-        let src = std::fs::read_to_string(&bash)
-            .unwrap_or_else(|e| panic!("讀不到 {}：{e}", bash.display()));
-        let want = format!("GEN_KEY_RE='{GEN_KEY_RE}'");
+    fn gen_key_grammar_matches_the_spec() {
+        let spec = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../spec/state.md");
+        let src = std::fs::read_to_string(&spec)
+            .unwrap_or_else(|e| panic!("讀不到 {}：{e}", spec.display()));
         assert!(
-            src.contains(&want),
-            "bash 的 GEN_KEY_RE MUST 與 Rust 逐字相同；預期該行為：\n{want}"
+            src.contains(GEN_KEY_RE),
+            "spec/state.md（STATE-AGENT-6）的文法 MUST 與實作常數逐字相同；預期含該行：\n{GEN_KEY_RE}"
         );
     }
 

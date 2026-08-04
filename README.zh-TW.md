@@ -64,8 +64,7 @@ context 管理都要自己來。agent-bridge 編排的是你平常手上在用�
 三個組成，全部本機、無常駐程序：
 
 1. **薄 CLI**（`bin/agent-bridge`，exec shim 接到 Rust 執行檔 `bin/ab`）：
-   21 個子指令，唯一的進入點。原本的 bash 實作留在 `bin/agent-bridge.bash`，
-   兩邊過同一套測試。
+   23 個子指令，唯一的進入點。原本的 bash 實作已退役（見下）。
 2. **檔案系統 mailbox**（預設 `~/.local/share/agent-bridge/`，可用環境變數
    `AGENT_BRIDGE_DATA` 覆蓋）：
    - `agents/<name>.json`：agent 註冊表（`{name, pane_id, registered_at}`；
@@ -169,14 +168,14 @@ cargo build --release && cp -f target/release/ab bin/ab
 agent-bridge list   # 冒煙測試
 ```
 
-漏了重建的話，shim 會 **exit 127 並印出建置指令**，而不是靜默退回 bash
-正本——兩套實作靜默互換，會讓測試套件以為在驗 Rust、其實驗到 bash（假綠）。
-這個「大聲失敗」是刻意的。
+漏了重建的話，shim 會 **exit 127 並印出建置指令**，而不是靜默降級。這個
+「大聲失敗」是刻意的：入口沉默地做別的事，比直接壞掉更難查。
 
-bash 正本以 `bin/agent-bridge.bash` 留在樹上，**自 M4 起凍結**，只作 rollback
-與雙實作對照之用，且只有顯式執行那個路徑才會跑到。兩套實作的子指令差集恰是
-**`ui` 與 `scan` 兩支（Rust 獨有）**，其餘 21 支語意相同——這是設計上的分歧
-（page 層與看板都建立在 Rust 側的資料模型上），不是漂移。
+**bash 正本已退役**：`bin/agent-bridge.bash` 自 M4 起凍結為 rollback 基準，
+其後自樹上移除（git 歷史仍可取回）。隨之塌縮的還有測試套件的 `SRC_KIND`
+雙載具旋鈕與 13 組只對 Rust 執行的 SKIP 分支——套件現在只有一個受測載具。
+保留下來的是「載具身分必須實測」那道防線：`$BRIDGE` 可被呼叫者覆寫，指到
+不認得 `__implemented-commands` 的東西一律非零退出，不讓它默默驗錯對象。
 
 Claude Code 的委派協定 skill：把**整個 repo** symlink 成 skill 目錄
 （SKILL.md 以相對路徑引用 `share/` 的 briefs，必須跟它們同目錄才解析得到；

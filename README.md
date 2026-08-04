@@ -159,15 +159,15 @@ agent-bridge list   # smoke test
 ```
 
 If you skip the rebuild, the shim exits 127 and prints the build command
-rather than silently falling back to the bash implementation — two
-implementations swapping themselves in and out is how a test suite ends up
-believing it exercised Rust when it exercised bash.
+rather than silently degrading — an entry point that quietly does something
+else is harder to diagnose than one that simply breaks.
 
-The original bash implementation stays in the tree as
-`bin/agent-bridge.bash`, frozen since M4 and kept for rollback and
-side-by-side comparison. It is only reached by running that path explicitly.
-Two subcommands exist in the Rust binary only — `ui` and `scan`, both
-described below; everything else behaves identically across the two.
+The original bash implementation was frozen at M4 as a rollback baseline and
+has since been retired from the tree (it remains in git history). The test
+suite's dual-carrier `SRC_KIND` switch went with it; what stayed is the rule
+that the carrier's identity must be *measured* — `$BRIDGE` is caller-
+overridable, so anything that doesn't answer `__implemented-commands` fails
+loudly rather than silently verifying the wrong thing.
 
 Optional — load the delegation-protocol skill into Claude Code by symlinking
 the whole repo as the skill directory (SKILL.md references `share/` briefs by
@@ -211,8 +211,7 @@ a fake completion). Panes you opened yourself can join via
 ## How it works
 
 - **Thin CLI** (`bin/agent-bridge` — a shim onto the Rust binary `bin/ab`) —
-  the only entry point. The original bash implementation is kept alongside as
-  `bin/agent-bridge.bash`; both pass the same suite.
+  23 subcommands, the only entry point.
 - **Filesystem mailbox** (`~/.local/share/agent-bridge/`, override with
   `AGENT_BRIDGE_DATA`): task files with atomic, lock-protected state
   transitions (`queued → delivered → running → completed/failed/cancelled`).

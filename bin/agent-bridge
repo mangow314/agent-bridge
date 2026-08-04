@@ -10,21 +10,17 @@
 # /proc/self/exe 就是 bin/ab，祖父層＝repo 根，share/ 才找得到。
 # 從 target/release/ 直接跑會把 root 算成 target/——M3 的 .gate/ staging 正是
 # 為了繞開這件事，cutover 後那層可以退場。
-#
-# rollback：`git revert` 本 commit 即還原 bash 正本（bin/agent-bridge.bash
-# 是同一個檔的改名，內容未動）。
 set -euo pipefail
 
 SCRIPT_PATH="$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || printf '%s' "${BASH_SOURCE[0]}")"
 REPO_ROOT="$(dirname "$(dirname "$SCRIPT_PATH")")"
 AB="$REPO_ROOT/bin/ab"
 
-# 缺產物時大聲失敗，不靜默退回 bash 正本：兩套實作靜默互換會讓測試套件
-# 以為在驗 Rust、其實驗到 bash（假綠）。要跑 bash 版就顯式指路徑。
+# 缺產物時大聲失敗（exit 127＋建置提示），不靜默降級：入口沉默地做別的事，
+# 比直接壞掉更難查。
 if [[ ! -x "$AB" ]]; then
   printf 'agent-bridge: 找不到執行檔 %s\n' "$AB" >&2
   printf '  先建置：cargo build --release && cp -f target/release/ab bin/ab\n' >&2
-  printf '  要跑 bash 正本：直接執行 %s/bin/agent-bridge.bash\n' "$REPO_ROOT" >&2
   exit 127
 fi
 
