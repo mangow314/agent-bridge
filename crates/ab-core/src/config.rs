@@ -49,6 +49,8 @@ pub const ENV_TMUX_TIMEOUT: &str = "AGENT_BRIDGE_TMUX_TIMEOUT";
 /// Page 層推播的自訂命令（argv[0]，後接 title、body 兩個參數）。設了就取代
 /// 桌面通知那一層——SSH／無桌面環境的逃生口（ntfy、telegram…）。
 pub const ENV_NOTIFY_CMD: &str = "AGENT_BRIDGE_NOTIFY_CMD";
+/// here 落點 split 後套用的 tmux layout（`none`＝只 split 不重排）。
+pub const ENV_HERE_LAYOUT: &str = "AGENT_BRIDGE_HERE_LAYOUT";
 
 /// state TTL 的預設值（bash `${AGENT_BRIDGE_STATE_TTL:-1800}`）。
 pub const STATE_TTL_DEFAULT: i64 = 1800;
@@ -372,6 +374,52 @@ pub fn max_relay_depth() -> Result<i64> {
     depth_var(ENV_MAX_RELAY_DEPTH, 10, "需為非負整數（空值也不接受）")
 }
 
+/// here 落點的 layout（預設 `main-vertical`）。白名單驗證、壞值致命：
+/// spawn 端在建 pane 前呼叫（CLI-SPAWN-2 的 precheck 紀律），錯字不該
+/// 等 pane 落地後才被 tmux 拒絕。**空字串也是壞值**——不走 `read_env` 的
+/// `:-` 慣例，設了就必須是白名單值（codex plan 審查 2026-08-04 R4）。
+pub fn here_layout() -> Result<String> {
+    parse_here_layout(std::env::var_os(ENV_HERE_LAYOUT))
+}
+
+const HERE_LAYOUTS: [&str; 6] = [
+    "main-vertical",
+    "main-horizontal",
+    "tiled",
+    "even-vertical",
+    "even-horizontal",
+    "none",
+];
+
+/// 與讀取分開以便測試（same pattern as `classify`）。
+fn parse_here_layout(v: Option<std::ffi::OsString>) -> Result<String> {
+    let Some(os) = v else {
+        return Ok("main-vertical".to_string());
+    };
+    let Ok(s) = os.into_string() else {
+        return Err(Error::new(format!(
+            "{ENV_HERE_LAYOUT} 含非 UTF-8 內容，拒絕使用"
+        )));
+    };
+    if HERE_LAYOUTS.contains(&s.as_str()) {
+        Ok(s)
+    } else {
+        Err(Error::new(format!(
+            "{ENV_HERE_LAYOUT} 不是合法 layout（{}；空值也不接受）：{s}",
+            HERE_LAYOUTS.join("|")
+        )))
+    }
+}
+
+/// 「人工 session」判準的**唯一正本**：spawn 落點的 auto 規則與
+/// CLI-RELAY-4 盯守提醒都走這裡，兩路不得各自解讀（P4 審查 CONFIRMED 1）。
+/// 三態語意：unset 與空字串＝人工（`:-` 慣例——空值視同沒設）；非 UTF-8
+/// ＝視為 tag 在場（保守：寧可少印提醒、worker 不落人類 window，也不把
+/// 亂碼當人工）。tag 是 placement provenance hint，不是身分授權。
+pub fn caller_is_manual() -> bool {
+    matches!(read_env(ENV_SPAWN_TAG), EnvValue::Unset)
+}
+
 fn depth_var(name: &str, default: i64, complaint: &str) -> Result<i64> {
     let Some(os) = std::env::var_os(name) else {
         return Ok(default);
@@ -389,6 +437,28 @@ fn lossy(name: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// here layout 的值域：unset＝預設 main-vertical；白名單值原樣通過；
+    /// 空字串、白名單外、非 UTF-8 一律致命（fail-closed，不套 `:-` 慣例）。
+    #[test]
+    fn here_layout_value_domain() {
+        use std::ffi::OsString;
+        assert_eq!(parse_here_layout(None).unwrap(), "main-vertical");
+        for good in HERE_LAYOUTS {
+            assert_eq!(parse_here_layout(Some(OsString::from(good))).unwrap(), good);
+        }
+        for bad in ["", "sideways", "main-vertical ", "MAIN-VERTICAL"] {
+            assert!(
+                parse_here_layout(Some(OsString::from(bad))).is_err(),
+                "壞值應致命：{bad:?}"
+            );
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStringExt;
+            assert!(parse_here_layout(Some(OsString::from_vec(vec![0xff, 0xfe]))).is_err());
+        }
+    }
 
     /// ENV-TMUX-1 的值域：預設 5、`0`＝不設限、壞值退預設。
     ///

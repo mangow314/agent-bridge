@@ -45,10 +45,13 @@ const USAGE: &str = r#"用法：
                                                 逾時以 exit 124 退出（其他錯誤一律非 124，供呼叫端區分）
                                                 --on-blocker（預設 warn）：worker pane 卡權限框時警告；
                                                 return＝持續滿 --blocker-grace（預設 60s）以 exit 125 提前返回
-  agent-bridge spawn <name> --runtime <codex|claude|agy> [--model <model>] [--window]
+  agent-bridge spawn <name> --runtime <codex|claude|agy> [--model <model>] [--here|--window]
                                                 spawn 一個 worker pane 並註冊；stdout 只印 pane-id
                                                 （--model 不給＝該 CLI 的使用者預設模型）
-  agent-bridge relay <name> --runtime <codex|claude|agy> [--model <model>] --handoff <path> [--window] [--no-select] [--self-exit <my-name>]
+                                                落點：人工 session 預設 --here（切進當前 window、套
+                                                AGENT_BRIDGE_HERE_LAYOUT，預設 main-vertical）；
+                                                spawn 出身呼叫者預設 worker window；--window 開專屬視窗
+  agent-bridge relay <name> --runtime <codex|claude|agy> [--model <model>] --handoff <path> [--here|--window] [--no-select] [--self-exit <my-name>]
                                                 把主導權交給新 session（注入接手者守則＋交接檔）；stdout 只印 pane-id
   agent-bridge despawn <name>                   回收 spawn 出身的 worker（kill pane＋除名；人工註冊拒殺）
   agent-bridge ready <name>                     （worker）回報就緒；僅限 spawned agent
@@ -1003,13 +1006,14 @@ fn cmd_gc(paths: &Paths, args: &[String]) -> Result<()> {
 fn parse_spawn_args(args: &[String], relay: Option<spawn::Relay>) -> Result<spawn::SpawnRequest> {
     if args.is_empty() {
         return Err(Error::new(
-            "用法：agent-bridge spawn <name> --runtime <codex|claude|agy> [--model <model>] [--window]",
+            "用法：agent-bridge spawn <name> --runtime <codex|claude|agy> [--model <model>] [--here|--window]",
         ));
     }
     let name = args[0].clone();
     let mut runtime = String::new();
     let mut model = String::new();
     let mut use_window = false;
+    let mut here = false;
     let mut it = args[1..].iter();
     while let Some(a) = it.next() {
         match a.as_str() {
@@ -1031,14 +1035,19 @@ fn parse_spawn_args(args: &[String], relay: Option<spawn::Relay>) -> Result<spaw
                 }
             }
             "--window" => use_window = true,
+            "--here" => here = true,
             other => return Err(Error::new(format!("未知參數：{other}"))),
         }
+    }
+    if here && use_window {
+        return Err(Error::new("--here 與 --window 互斥"));
     }
     Ok(spawn::SpawnRequest {
         name,
         runtime,
         model,
         use_window,
+        here,
         relay,
     })
 }
@@ -1059,7 +1068,7 @@ fn cmd_spawn(paths: &Paths, args: &[String]) -> Result<()> {
 /// → 寫審計」，A 若殺自己的 pane，執行中的 process 會被 SIGHUP 帶走，永遠走不
 /// 到後兩步。
 fn cmd_relay(paths: &Paths, args: &[String]) -> Result<()> {
-    const USAGE_RELAY: &str = "用法：agent-bridge relay <name> --runtime <codex|claude|agy> [--model <model>] --handoff <path> [--window] [--no-select] [--self-exit <my-name>]";
+    const USAGE_RELAY: &str = "用法：agent-bridge relay <name> --runtime <codex|claude|agy> [--model <model>] --handoff <path> [--here|--window] [--no-select] [--self-exit <my-name>]";
     if args.is_empty() {
         return Err(Error::new(USAGE_RELAY));
     }
@@ -1069,6 +1078,7 @@ fn cmd_relay(paths: &Paths, args: &[String]) -> Result<()> {
     let mut handoff = String::new();
     let mut prev = String::new();
     let mut use_window = false;
+    let mut here = false;
     let mut no_select = false;
     let mut it = args[1..].iter();
     while let Some(a) = it.next() {
@@ -1099,6 +1109,7 @@ fn cmd_relay(paths: &Paths, args: &[String]) -> Result<()> {
                     .clone();
             }
             "--window" => use_window = true,
+            "--here" => here = true,
             "--no-select" => no_select = true,
             other => return Err(Error::new(format!("未知參數：{other}"))),
         }
@@ -1147,6 +1158,9 @@ fn cmd_relay(paths: &Paths, args: &[String]) -> Result<()> {
     if use_window {
         spawn_args.push("--window".into());
     }
+    if here {
+        spawn_args.push("--here".into());
+    }
     let req = parse_spawn_args(&spawn_args, Some(relay))?;
     let tmux = SubprocessTmux;
     let pane = spawn::spawn(paths, &tmux, &req)?;
@@ -1160,10 +1174,9 @@ fn cmd_relay(paths: &Paths, args: &[String]) -> Result<()> {
     // CLI-RELAY-4：手動起的 session（呼叫者環境無 spawn tag）是接力鏈上唯一
     // 會彈權限框的形狀，而那個框沒有任何機制偵測得到（tui-design §1 known
     // gap：偵測＝常駐輪詢，已裁定不做）。這一行提醒就是該 gap 的全部緩解。
-    if std::env::var(config::ENV_SPAWN_TAG)
-        .unwrap_or_default()
-        .is_empty()
-    {
+    // 判準與 spawn 落點的 auto 規則共用同一個 helper：三態語意（unset／空
+    // ＝人工；非 UTF-8＝視為在場）兩路必須一致（P4 審查 CONFIRMED 1）
+    if config::caller_is_manual() {
         eprintln!(
             "提醒：本 session 為手動起（非 spawn 出身）。手動 session 的權限框不會被任何機制偵測，鏈上若仍有手動 pane 請自行盯守（spawn 出身的接手者不受影響）。"
         );

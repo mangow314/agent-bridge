@@ -1,6 +1,6 @@
 # 環境變數契約
 
-全部 17 個 `AGENT_BRIDGE_*` 變數（總數由 `tests/check-contract.sh` 第 1 項的
+全部 18 個 `AGENT_BRIDGE_*` 變數（總數由 `tests/check-contract.sh` 第 1 項的
 集合 diff 守著，不是手工維護的宣稱）。通則：
 
 ### ENV-GEN-1 [untested]
@@ -89,12 +89,33 @@ Source: cmd_spawn / cmd_relay
 `AGENT_BRIDGE_READY_PROBE_INTERVAL`：ready 等待期間探針重送間隔秒數。預設 `2`。
 Source: cmd_spawn / cmd_relay
 
-### ENV-TAG-1 [tested: 16, 18b]
+### ENV-TAG-1 [tested: 16, 18b, 23, 32]
 `AGENT_BRIDGE_SPAWN_TAG`：worker 身分標籤，由 spawn 在 worker 行程環境設定，
 文法 MUST 為 `ab-spawn-<name>-<pid>-<12hex>`（`<name>` 符合 `[A-Za-z0-9_-]+`）。
 hook 端由它析出「我是誰」；despawn/evict 以它比對出身與世代。使用者手動
-設定此變數不構成身分授權（詳 hooks.md 的出身防護條款）。
-Source: cmd_spawn / hook_agent_name / cmd_despawn
+設定此變數不構成身分授權（詳 hooks.md 的出身防護條款）；spawn 落點解析
+（CLI-SPAWN-5）另把它當 placement provenance hint 用，同樣不是身分授權。
+
+「呼叫者是不是人工 session」這個判準是上述兩種用法之外的**第三種**讀法：
+spawn 的 auto 落點規則（CLI-SPAWN-5）與 CLI-RELAY-4 的盯守提醒 MUST 共用
+同一份判準（正本 `config::caller_is_manual`，兩處不得各自解讀——P4 codex
+複核 CONFIRMED 1）。三態語意：**未設定或空字串**＝人工（`:-` 慣例，空值
+視同沒設）；**非 UTF-8**＝視為 tag 在場（即非人工——保守方向：寧可少印
+一次提醒、worker 不落人類 window，也不把讀不出來的亂碼當人工）；其餘任何
+非空字串一律視為 tag 在場，這裡**不驗**上面那條 grammar（判準只問「有沒有
+設」，不是「設得對不對」）。
+Source: cmd_spawn / hook_agent_name / cmd_despawn / config::caller_is_manual
+
+### ENV-HERE-1 [tested: 32]
+`AGENT_BRIDGE_HERE_LAYOUT`：`--here`／auto here 落點 split 進呼叫者當前
+window 後套用的 tmux layout（CLI-SPAWN-5）。預設 `main-vertical`；合法值
+`main-vertical|main-horizontal|tiled|even-vertical|even-horizontal|none`
+（`none`＝只 split 不重排）。未設定＝取預設；**空字串與非 UTF-8 皆為致命
+壞值**——不套本檔多數變數的「壞值退預設」慣例（對照 ENV-TMUX-1），因為
+壞的落點版面比逾時更難事後補救。壞值 MUST 只在會實際走 here 落點的路徑上
+驗證並致 spawn 於建 pane 前終止：`--window`、auto 判定為 spawn 出身呼叫者、
+tmux 外呼叫都不解析此變數，無關的壞值不得封鎖這些逃生口。
+Source: config::here_layout / cmd_spawn
 
 ## TUI
 

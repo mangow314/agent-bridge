@@ -156,6 +156,9 @@ pub struct SpawnRequest {
     /// 空字串＝沿用 runtime CLI 的使用者預設模型。
     pub model: String,
     pub use_window: bool,
+    /// `--here`：顯式要求落在呼叫者當前 window。與 `use_window` 互斥；
+    /// 兩者皆 false 時走 auto 規則（docs/spawn-here-plan.md）。
+    pub here: bool,
     pub relay: Option<Relay>,
 }
 
@@ -439,6 +442,26 @@ pub fn spawn(paths: &Paths, tmux: &dyn TmuxClient, req: &SpawnRequest) -> Result
     let (ready_timeout, _) = config::ready_opts()?;
     let max = config::max_spawn()?;
 
+    // here 落點解析（prototype；設計正本 docs/spawn-here-plan.md）。
+    // 互斥與壞 layout 值都在建 pane 前拒絕（CLI-SPAWN-2 的 precheck 紀律）；
+    // auto＝人工 session（環境無 spawn tag）在 tmux 內就落在呼叫者 window，
+    // spawn 出身的呼叫者維持 worker window——第三層 fan-out 不該堆進人類視窗
+    if req.here && req.use_window {
+        return Err(Error::new("--here 與 --window 互斥"));
+    }
+    // 以 owner_win（here 分支真正需要的東西）為准：tmux 外或 window 不可
+    // 解析時，顯式 --here 也退回 current-window fallback（設計正本明文），
+    // use_here 因此必為 false——layout 驗證就不會擋到用不上它的路徑
+    let use_here =
+        !req.use_window && !owner_win.is_empty() && (req.here || config::caller_is_manual());
+    // layout 只在 here 路徑驗證：--window／spawn 出身／tmux 外根本不用它，
+    // 無關的壞值不該封鎖這些逃生口（codex plan 審查 2026-08-04 建議 1）
+    let here_layout = if use_here {
+        config::here_layout()?
+    } else {
+        String::new()
+    };
+
     // cap 檢查、建 pane、註冊全部包在 registry 鎖內，杜絕並行 spawn 繞過 cap；
     // 鎖內任一步失敗 → 回滾（kill 已建 pane＋刪 registry 檔）
     let guard = acquire_lock(paths, "agents-registry")?;
@@ -460,6 +483,8 @@ pub fn spawn(paths: &Paths, tmux: &dyn TmuxClient, req: &SpawnRequest) -> Result
             owner: &owner,
             owner_win: &owner_win,
             owner_winname: &owner_winname,
+            use_here,
+            here_layout: &here_layout,
             max,
         },
     );
@@ -675,6 +700,10 @@ struct SpawnLocked<'a> {
     owner: &'a str,
     owner_win: &'a str,
     owner_winname: &'a str,
+    /// 落點解析結果：true＝split 進呼叫者當前 window（`--here` 或 auto）。
+    use_here: bool,
+    /// here 落點 split 後套的 layout；`none`＝不重排。
+    here_layout: &'a str,
     max: i64,
 }
 
@@ -765,8 +794,9 @@ fn spawn_locked(
 
     // per-owner worker window：同 owner 先前的 worker window 還活著就沿用
     // （split 進去＋tiled 重排），否則新建一個緊鄰 orchestrator window 之後。
-    // 查表在 registry 鎖內：兩個並行 spawn 不會為同一 owner 各開一窗
-    let worker_win = if ctx.owner.is_empty() || req.use_window {
+    // 查表在 registry 鎖內：兩個並行 spawn 不會為同一 owner 各開一窗。
+    // here 落點不查表：呼叫者自己的 window 不是 bridge 管的 worker window
+    let worker_win = if ctx.owner.is_empty() || req.use_window || ctx.use_here {
         String::new()
     } else {
         find_worker_window(paths, tmux, ctx.owner)
@@ -779,6 +809,26 @@ fn spawn_locked(
         } else {
             new_window(tmux, &["-dP"], &tagged_cmd)
         }
+    } else if ctx.use_here && !ctx.owner_win.is_empty() {
+        // here 落點：split 進呼叫者自己的 window，「同任務同 window」。
+        // 不寫 @ab_owner——不建立沿用語意，reuse／confused-deputy 路徑不碰。
+        // layout 失敗不致命（pane 已落地、註冊照走），與 tiled 重排同級
+        let p = tmux
+            .exec(&[
+                "split-window",
+                "-dP",
+                "-t",
+                ctx.owner_win,
+                "-F",
+                "#{pane_id}",
+                &tagged_cmd,
+            ])
+            .and_then(|o| o.ok_stdout())
+            .ok_or_else(|| Error::new("tmux split-window 失敗"))?;
+        if ctx.here_layout != "none" {
+            let _ = tmux.exec(&["select-layout", "-t", ctx.owner_win, ctx.here_layout]);
+        }
+        Ok(p)
     } else if !worker_win.is_empty() {
         // 先取 pane 再重排：bash 的 `select-layout` 在 `|| die` 之後才執行
         // （:1299-1301），split 失敗時根本不會走到
@@ -839,7 +889,9 @@ fn spawn_locked(
     if !is_valid_window(&placed_win) {
         placed_win.clear();
     }
-    let reg_win = if !ctx.owner.is_empty() && !req.use_window {
+    // here 落點一併排除：placed_win 是呼叫者自己的 window，把 @ab_owner
+    // 印記寫上去等於把使用者的窗標成 bridge 的 worker window（信任根污染）
+    let reg_win = if !ctx.owner.is_empty() && !req.use_window && !ctx.use_here {
         placed_win
     } else {
         String::new()

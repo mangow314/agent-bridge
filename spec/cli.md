@@ -204,10 +204,11 @@ Source: cmd_await / task::await_task_watched
 ## `spawn`
 
 ### CLI-SPAWN-1 [tested: 16, 37]
-`spawn <name> --runtime <codex|claude|agy> [--model <model>] [--window]`：
+`spawn <name> --runtime <codex|claude|agy> [--model <model>] [--here|--window]`：
 建立 worker pane 並註冊。model 文法 `[A-Za-z0-9][A-Za-z0-9._-]{0,63}`、
-不支援的 runtime、同名已註冊（任一出身）——MUST 全部在建立 pane 之前拒絕。
-成功時 stdout 恰為 pane id 一行。
+不支援的 runtime、同名已註冊（任一出身）、`--here` 與 `--window` 同時給
+——MUST 全部在建立 pane 之前拒絕。落點細節見 CLI-SPAWN-5。成功時 stdout
+恰為 pane id 一行。
 
 Note（`agy` 的降級，量測正本 `docs/agy-probe.md`）：現行 agy（實測 1.1.9）
 沒有可供本專案掛載的 hooks 介面，故 agy worker **不會**有
@@ -244,13 +245,24 @@ registry 的 `spawn_tag` 欄。它是 despawn／回滾辨識 pane 出身的唯�
 Source: cmd_spawn
 
 ### CLI-SPAWN-5 [tested: 32]
-落點：tmux 內呼叫時 worker MUST 落在呼叫者（owner）的 worker window——同
-owner 既有 worker window 存活且其 tmux 視窗選項 `@ab_owner` 等於本次解析的
-owner 才得沿用（registry 內容不足以授權沿用，防 confused-deputy）；否則
-新建緊鄰 owner 視窗之後。`--window` MUST 開專屬視窗且不被後續 spawn 共用。
-tmux 外呼叫落當前視窗。新建 worker window 的 `@ab_owner` 印記寫入失敗
-MUST 回滾 spawn。
-Source: cmd_spawn / caller_owner
+落點：`spawn` 接受互斥的 `[--here|--window]`；兩者同時給出，或 here layout
+壞值（ENV-HERE-1），MUST 在建 pane 前拒絕。`--window` MUST 開專屬視窗且
+不被後續 spawn 共用。`--here`（有可解析 tmux 呼叫者時）與 auto 規則判定
+「呼叫者是人工 session」（`AGENT_BRIDGE_SPAWN_TAG` 未設定或空字串，三態
+語意見 ENV-TAG-1，與 CLI-RELAY-4 盯守提醒共用同一判準）落同一解：切進呼叫者（owner）當前 window，split 後依
+`AGENT_BRIDGE_HERE_LAYOUT` 重排（`none`＝只 split 不重排）；此落點 MUST NOT
+查或寫 worker-window reuse 的信任根（`@ab_owner`），registry 的
+`worker_window` 欄 MUST 留空。auto 規則判定「呼叫者是 spawn 出身」時維持
+既有 per-owner worker window 規則：同 owner 既有 worker window 存活且其
+tmux 視窗選項 `@ab_owner` 等於本次解析的 owner 才得沿用（registry 內容
+不足以授權沿用，防 confused-deputy）；否則新建緊鄰 owner 視窗之後。
+tmux 外呼叫（含顯式 `--here` 但無可解析呼叫者）落當前視窗——未指定 target
+的 current-window split fallback，不視為錯誤。新建 worker window 的
+`@ab_owner` 印記寫入失敗 MUST 回滾 spawn。
+Note：`AGENT_BRIDGE_SPAWN_TAG` 在此只是落點 provenance 的訊號、不是身分
+授權——誤判的後果止於版面 UX，人可用 `--here`／`--window` 顯式修正，不為
+此新增信任根。
+Source: cmd_spawn / caller_owner / config::here_layout
 
 ### CLI-SPAWN-6 [tested: 32]
 spawn／despawn／evict／disposable MUST 追加審計行至 `<data>/agents.log`，
@@ -268,12 +280,13 @@ Source: share/worker-brief.md / share/successor-brief.md（引用不搬家）
 
 ## `relay`
 
-### CLI-RELAY-1 [tested: 23]
-`relay <name> --runtime <r> [--model <m>] --handoff <path> [--window]
+### CLI-RELAY-1 [tested: 23, 32]
+`relay <name> --runtime <r> [--model <m>] --handoff <path> [--here|--window]
 [--no-select] [--self-exit <my-name>]`：以接手者 brief（ENV-BRIEF-2）spawn
 一個接棒 session。`--handoff` 必填，MUST 在建 pane 前驗證為可讀普通檔案且
-路徑不含單引號。除 brief 與焦點切換外，cap／tag／回滾／夭折偵測／registry
-不變量 MUST 與 spawn 完全一致（同一實作路徑，不得複製第二份）。
+路徑不含單引號。除 brief 與焦點切換外，cap／tag／回滾／夭折偵測／registry／
+落點解析（CLI-SPAWN-5，`--here` 同適用）不變量 MUST 與 spawn 完全一致
+（同一實作路徑，不得複製第二份）。
 Source: cmd_relay
 
 ### CLI-RELAY-2 [tested: 23]
@@ -282,20 +295,24 @@ Source: cmd_relay
 非 relay 的 spawn MUST NOT 下傳深度變數。
 Source: cmd_relay / cmd_spawn
 
-### CLI-RELAY-3 [tested: 23]
+### CLI-RELAY-3 [tested: 23, 32]
 `--self-exit <my-name>` MUST 以「接手者 ready 後執行 `despawn <my-name>`」
 寫入接手者 prompt，MUST NOT 由前一棒自殺（自殺會斷 despawn 的
 kill→確認→清 registry→審計順序）。預設把 tmux 焦點切至新 pane；
-`--no-select` 不切；焦點切換失敗 MUST NOT 影響 relay 成功。
+`--no-select` 不切；焦點切換失敗 MUST NOT 影響 relay 成功。`--no-select`
+的契約是「不改 active pane」，不是「畫面完全不變」——here 落點的 layout
+重排（CLI-SPAWN-5）可能改變版面。
 Source: cmd_relay / relay_prompt_arg
 
 ### CLI-RELAY-4 [tested: 23]
-呼叫者環境無 `AGENT_BRIDGE_SPAWN_TAG`（手動起的 session，多為接力鏈
-第一棒）時，relay 成功後 MUST 在 stderr 印**恰一行**盯守提醒；有該變數時
-MUST NOT 印。理由：手動 session 的權限框沒有任何機制偵測得到（spawn 出身
-的 worker 帶 skip-permission 設定不彈框；偵測＝常駐輪詢，已裁定不做——
-docs/tui-design.md §1 known gap），此行是該 gap 的唯一緩解。此行 MUST NOT
-改變 relay 的 exit code 與 stdout 契約。
+呼叫者環境判為人工 session（`AGENT_BRIDGE_SPAWN_TAG` 未設定或空字串——
+三態語意見 ENV-TAG-1，與 CLI-SPAWN-5 auto 規則共用同一判準，手動起的
+session 多為接力鏈第一棒）時，relay 成功後 MUST 在 stderr 印**恰一行**
+盯守提醒；判為 spawn 出身（該變數有非空值，含非 UTF-8）時 MUST NOT 印。
+理由：手動 session 的權限框沒有任何機制偵測得到（spawn 出身的 worker 帶
+skip-permission 設定不彈框；偵測＝常駐輪詢，已裁定不做——docs/tui-design.md
+§1 known gap），此行是該 gap 的唯一緩解。此行 MUST NOT 改變 relay 的
+exit code 與 stdout 契約。
 Source: cmd_relay
 
 ## `despawn`

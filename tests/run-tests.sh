@@ -3252,9 +3252,9 @@ assert "寫入階段失敗仍零殘留（EXIT trap 回滾）" \
 chmod 600 "$BAD31"
 
 fi  # end grp 31
-# ---- 32. spawn 落點：per-owner worker window＋owner/actor 審計（2026-07-25）----
+# ---- 32. spawn 落點：--here／auto／--window＋owner/actor 審計（2026-07-25，P3 2026-08-04）----
 if grp 32; then
-# spec: CLI-SPAWN-5 CLI-SPAWN-6
+# spec: CLI-SPAWN-5 CLI-SPAWN-6 ENV-HERE-1 CLI-RELAY-1 CLI-RELAY-3
 # 前面所有測例都在 tmux 外呼叫 spawn（TMUX 已 unset）→ 舊行為（目前視窗
 # split），上面已覆蓋。本節驗「orchestrator 本身在 pane 內」的新路徑：
 # worker 落進 owner 的 worker window（不交給 tmux 的 client 焦點解析）、
@@ -3262,6 +3262,17 @@ if grp 32; then
 # agents.log 尾欄記 actor、--window 專屬視窗不寫 worker_window。
 # 測試環境沒有 attached client，無從重現「落到使用者焦點視窗」的原始故障；
 # 能驗的是落點已被顯式錨定到 owner。
+#
+# P3（docs/spawn-here-plan.md）翻轉了 auto 預設：ORC_PANE 是人工呼叫者
+# （環境無 AGENT_BRIDGE_SPAWN_TAG），auto 現在解到 here，不再是
+# per-owner worker window。32a/32b/32e/32g/32i 驗的正是 worker-window 那條
+# 路徑（沿用／confused-deputy／印記回滾），故對這幾例的 spawn 呼叫端注入
+# AGENT_BRIDGE_SPAWN_TAG（模擬「spawn 出身呼叫者」），把它們留在原本要測的
+# 路徑上；--window 不適用（那是專屬視窗，不是 worker window）。32j 起是
+# P3 新增：人工呼叫者預設 here、顯式 --here、互斥、layout 值域、layout
+# 只在 here 路徑驗證、relay 共用同一套解析。
+FAKE_CALLER_TAG="ab-spawn-orc-99999-aaaaaaaaaaaa"  # 語法合 ENV-TAG-1 即可：
+# caller_is_manual 只看「有沒有設」，不驗文法；只是要讓 auto 判為非人工
 D32="$TESTROOT/d32"
 orc_cmd="$(printf 'env AGENT_BRIDGE_DATA=%q AGENT_BRIDGE_READY_TIMEOUT=1 AGENT_BRIDGE_READY_PROBE_INTERVAL=0.5 PATH=%q bash --norc --noprofile' \
   "$D32" "$SHIM:$PATH")"
@@ -3277,9 +3288,11 @@ fi
 # worker 會落在 sentinel 之後，index 斷言才抓得到 mutation
 SENT32="$(tmx new-window -dP -t orc: -n sentinel32 -F '#{window_id}')"
 
-# 32a. in-pane spawn：worker 進新開的 worker window，不與 orchestrator 同窗
+# 32a. in-pane spawn（spawn 出身呼叫者）：worker 進新開的 worker window，
+# 不與 orchestrator 同窗。注入 AGENT_BRIDGE_SPAWN_TAG：這也同時是「auto 對
+# spawn 出身呼叫者維持 worker-window 規則」的正面驗證（P3 auto 規則第 2 條）
 tmx send-keys -t "$ORC_PANE" \
-  "agent-bridge spawn w32a --runtime codex >$TESTROOT/w32a.out 2>/dev/null; echo rc=\$? >$TESTROOT/w32a.done" Enter
+  "AGENT_BRIDGE_SPAWN_TAG=$FAKE_CALLER_TAG agent-bridge spawn w32a --runtime codex >$TESTROOT/w32a.out 2>/dev/null; echo rc=\$? >$TESTROOT/w32a.done" Enter
 wait_for 20 test -f "$TESTROOT/w32a.done"
 W32A_PANE="$(cat "$TESTROOT/w32a.out" 2>/dev/null || true)"
 # 空 pane 變數不可餵給 display-message：-t '' 會解析到 current window，
@@ -3311,9 +3324,9 @@ assert "32a registry 記 worker_window" \
 assert "32a agents.log spawned 尾欄記 actor＝owner" \
   grep -qE "Z spawned w32a [^ ]+ codex orc:@[0-9]+\$" "$D32/agents.log"
 
-# 32b. 同 owner 第二次 spawn：沿用同一個 worker window
+# 32b. 同 owner 第二次 spawn（spawn 出身呼叫者）：沿用同一個 worker window
 tmx send-keys -t "$ORC_PANE" \
-  "agent-bridge spawn w32b --runtime codex >$TESTROOT/w32b.out 2>/dev/null; echo rc=\$? >$TESTROOT/w32b.done" Enter
+  "AGENT_BRIDGE_SPAWN_TAG=$FAKE_CALLER_TAG agent-bridge spawn w32b --runtime codex >$TESTROOT/w32b.out 2>/dev/null; echo rc=\$? >$TESTROOT/w32b.done" Enter
 wait_for 20 test -f "$TESTROOT/w32b.done"
 W32B_PANE="$(cat "$TESTROOT/w32b.out" 2>/dev/null || true)"
 W32B_WIN=""
@@ -3365,7 +3378,7 @@ jq -n --arg o "orc:$ORC_WIN" --arg w "$ORC_WIN" \
     model:"",spawned_at:"t",ready:false,spawn_tag:"x",owner:$o,worker_window:$w}' \
   > "$D32/agents/evil-b.json"
 tmx send-keys -t "$ORC_PANE" \
-  "AGENT_BRIDGE_MAX_SPAWN=8 agent-bridge spawn w32e --runtime codex >$TESTROOT/w32e.out 2>/dev/null; echo rc=\$? >$TESTROOT/w32e.done" Enter
+  "AGENT_BRIDGE_MAX_SPAWN=8 AGENT_BRIDGE_SPAWN_TAG=$FAKE_CALLER_TAG agent-bridge spawn w32e --runtime codex >$TESTROOT/w32e.out 2>/dev/null; echo rc=\$? >$TESTROOT/w32e.done" Enter
 wait_for 20 test -f "$TESTROOT/w32e.done"
 W32E_PANE="$(cat "$TESTROOT/w32e.out" 2>/dev/null || true)"
 W32E_WIN=""
@@ -3383,7 +3396,7 @@ jq -n --arg o "orc:$ORC_WIN" --arg w "$EVIL32_WIN" \
     model:"",spawned_at:"t",ready:false,spawn_tag:"x",owner:$o,worker_window:$w}' \
   > "$D32/agents/evil-c.json"
 tmx send-keys -t "$ORC_PANE" \
-  "AGENT_BRIDGE_MAX_SPAWN=8 agent-bridge spawn w32g --runtime codex >$TESTROOT/w32g.out 2>/dev/null; echo rc=\$? >$TESTROOT/w32g.done" Enter
+  "AGENT_BRIDGE_MAX_SPAWN=8 AGENT_BRIDGE_SPAWN_TAG=$FAKE_CALLER_TAG agent-bridge spawn w32g --runtime codex >$TESTROOT/w32g.out 2>/dev/null; echo rc=\$? >$TESTROOT/w32g.done" Enter
 wait_for 20 test -f "$TESTROOT/w32g.done"
 W32G_PANE="$(cat "$TESTROOT/w32g.out" 2>/dev/null || true)"
 W32G_WIN=""
@@ -3404,7 +3417,9 @@ assert "32h 污染欄位寫入審計前被摺疊" \
 # 32i. 新建窗的 @ab_owner 印記寫入失敗必須翻盤回滾（第三輪複核指出：
 # 靜默吞掉會做出 spawn 成功但永不可沿用的窗）。選擇性 shim：只讓帶
 # @ab_owner 的 tmux 呼叫失敗，其餘轉真 tmux；用新 owner（orc2 window）
-# 觸發「新建」分支——orc 的既有合法窗走的是沿用分支（重寫失敗容忍）
+# 觸發「新建」分支——orc 的既有合法窗走的是沿用分支（重寫失敗容忍）。
+# @ab_owner 印記只在 worker-window 路徑寫（here 落點不碰），故也注入
+# AGENT_BRIDGE_SPAWN_TAG 讓 orc2 走 worker-window 這條路徑
 STAMPFAIL="$TESTROOT/stampfail"
 mkdir -p "$STAMPFAIL"
 # shellcheck disable=SC2016  # $@ 是 shim 腳本的內容，要 literal 不展開
@@ -3416,7 +3431,7 @@ tmx send-keys -t "$ORC2_PANE" "$(printf 'touch %q' "$TESTROOT/orc2-ready")" Ente
 wait_for 10 test -f "$TESTROOT/orc2-ready"
 PANES_BEFORE_32I="$(pane_count)"
 tmx send-keys -t "$ORC2_PANE" \
-  "PATH=$STAMPFAIL:\$PATH AGENT_BRIDGE_MAX_SPAWN=16 agent-bridge spawn w32i --runtime codex >$TESTROOT/w32i.out 2>$TESTROOT/w32i.err; echo rc=\$? >$TESTROOT/w32i.done" Enter
+  "PATH=$STAMPFAIL:\$PATH AGENT_BRIDGE_MAX_SPAWN=16 AGENT_BRIDGE_SPAWN_TAG=$FAKE_CALLER_TAG agent-bridge spawn w32i --runtime codex >$TESTROOT/w32i.out 2>$TESTROOT/w32i.err; echo rc=\$? >$TESTROOT/w32i.done" Enter
 wait_for 20 test -f "$TESTROOT/w32i.done"
 assert "32i 印記寫入失敗：spawn 非零收場" \
   bash -c "grep -q 'rc=0' '$TESTROOT/w32i.done' && exit 1 || grep -q 'rc=' '$TESTROOT/w32i.done'"
@@ -3426,6 +3441,183 @@ assert "32i 回滾：registry 無 w32i" bash -c "! test -e '$D32/agents/w32i.jso
 W32I_SURVIVORS="$(tmx list-panes -a -F '#{pane_start_command}' 2>/dev/null | grep -c 'ab-spawn-w32i' || true)"
 assert "32i 回滾：無 w32i pane 殘留" test "$W32I_SURVIVORS" -eq 0
 assert "32i 回滾：pane 數回到 spawn 前" test "$(pane_count)" -eq "$PANES_BEFORE_32I"
+
+# ---- P3 新增：--here／auto 人工預設／layout 值域（docs/spawn-here-plan.md）----
+# 從這裡起累計的 spawned registry（32a/32b/32e/g 的真實 agent＋evil-a/b/c/d
+# 的注入 fixture）已逼近預設 cap（4），故凡是會真的落地 registry 的呼叫都
+# 帶寬鬆的 AGENT_BRIDGE_MAX_SPAWN 覆蓋——這裡要驗的是落點，不是 cap。
+
+# 32j. 人工呼叫者（ORC_PANE，環境無 tag）：auto 預設翻轉成 here，落自己
+# 當前 window；registry worker_window 留空；不建立 @ab_owner 信任根
+tmx send-keys -t "$ORC_PANE" \
+  "AGENT_BRIDGE_MAX_SPAWN=32 agent-bridge spawn w32j --runtime codex >$TESTROOT/w32j.out 2>/dev/null; echo rc=\$? >$TESTROOT/w32j.done" Enter
+wait_for 20 test -f "$TESTROOT/w32j.done"
+W32J_PANE="$(cat "$TESTROOT/w32j.out" 2>/dev/null || true)"
+W32J_WIN=""
+[[ -n "$W32J_PANE" ]] && W32J_WIN="$(tmx display-message -p -t "$W32J_PANE" '#{window_id}' 2>/dev/null || true)"
+assert "32j 人工呼叫者預設 here：worker pane 存活" pane_alive "$W32J_PANE"
+assert "32j 人工呼叫者預設 here：落呼叫者當前 window" \
+  test -n "$W32J_WIN" -a "$W32J_WIN" = "$ORC_WIN"
+assert "32j here：registry worker_window 留空" \
+  jq -e '.worker_window == ""' "$D32/agents/w32j.json"
+assert "32j here：registry owner 仍記錄（僅不記 worker_window）" \
+  jq -e --arg o "orc:$ORC_WIN" '.owner == $o' "$D32/agents/w32j.json"
+# @ab_owner 負斷言：`tmx` 是本檔的 shell function，套進 `bash -c` 的巢狀
+# subshell 看不到它——原寫法因此永遠印空字串、`test -z` 恆真，是空包斷言
+# （P4 codex 複核 CONFIRMED 2）。改在頂層直接呼叫 `tmx`（沿用 W32A_WIN 等
+# 既有慣例）；用不帶 -v 的 `show-options -w` 一次列出該 window 已設的選項
+# ——查得到但沒設＝exit 0＋空輸出，查不到（window 消失／socket 壞）＝
+# 非零退出，兩者分開斷言，「查詢本身失敗」不會被誤讀成「沒設」
+OPTS_32J="$(tmx show-options -w -t "$ORC_WIN" 2>"$TESTROOT/opts32j.err")"; RC_32J=$?
+assert "32j here：ORC_WIN 的 window options 查得到（非查詢失敗）" \
+  test "$RC_32J" -eq 0
+assert "32j here：@ab_owner 未寫在呼叫者 window（不建立 reuse 信任根）" \
+  bash -c '! grep -qE "^@ab_owner[[:space:]]" <<<"$1"' _ "$OPTS_32J"
+
+# 32k. 顯式 --here（有可解析呼叫者）：與 auto 同解
+tmx send-keys -t "$ORC_PANE" \
+  "AGENT_BRIDGE_MAX_SPAWN=32 agent-bridge spawn w32k --runtime codex --here >$TESTROOT/w32k.out 2>/dev/null; echo rc=\$? >$TESTROOT/w32k.done" Enter
+wait_for 20 test -f "$TESTROOT/w32k.done"
+W32K_PANE="$(cat "$TESTROOT/w32k.out" 2>/dev/null || true)"
+W32K_WIN=""
+[[ -n "$W32K_PANE" ]] && W32K_WIN="$(tmx display-message -p -t "$W32K_PANE" '#{window_id}' 2>/dev/null || true)"
+assert "32k 顯式 --here：落呼叫者當前 window" \
+  test -n "$W32K_WIN" -a "$W32K_WIN" = "$ORC_WIN"
+assert "32k 顯式 --here：registry worker_window 留空" \
+  jq -e '.worker_window == ""' "$D32/agents/w32k.json"
+OPTS_32K="$(tmx show-options -w -t "$ORC_WIN" 2>"$TESTROOT/opts32k.err")"; RC_32K=$?
+assert "32k 顯式 --here：ORC_WIN 的 window options 查得到（非查詢失敗）" \
+  test "$RC_32K" -eq 0
+assert "32k 顯式 --here：@ab_owner 未寫在呼叫者 window（不建立 reuse 信任根）" \
+  bash -c '! grep -qE "^@ab_owner[[:space:]]" <<<"$1"' _ "$OPTS_32K"
+
+# 32l. --here 與 --window 互斥：建 pane 前拒絕（純 argv 解析，不必經 tmux 呼叫者）
+before_32l="$(pane_count)"
+assert_fails "32l --here 與 --window 互斥：建 pane 前拒絕" \
+  env AGENT_BRIDGE_DATA="$D32" PATH="$SHIM:$PATH" "$BRIDGE" \
+  spawn w32l --runtime codex --here --window
+assert "32l 互斥拒絕：不建 pane" test "$(pane_count)" -eq "$before_32l"
+assert "32l 互斥拒絕：不留 registry" test ! -e "$D32/agents/w32l.json"
+
+# 32m. AGENT_BRIDGE_HERE_LAYOUT 值域：空字串／白名單外值 → 建 pane 前拒絕
+# （走 ORC_PANE 的 auto here 路徑，而非顯式 --here；tmux 外呼叫的 --here
+# 不解析這個變數，混進來會測錯路徑）
+PANES_BEFORE_32M="$(pane_count)"
+tmx send-keys -t "$ORC_PANE" \
+  "AGENT_BRIDGE_HERE_LAYOUT= AGENT_BRIDGE_MAX_SPAWN=32 agent-bridge spawn w32m1 --runtime codex >$TESTROOT/w32m1.out 2>$TESTROOT/w32m1.err; echo rc=\$? >$TESTROOT/w32m1.done" Enter
+wait_for 20 test -f "$TESTROOT/w32m1.done"
+assert "32m 空字串 layout：spawn 非零收場" \
+  bash -c "grep -q 'rc=0' '$TESTROOT/w32m1.done' && exit 1 || grep -q 'rc=' '$TESTROOT/w32m1.done'"
+assert "32m 空字串 layout：死因指出 AGENT_BRIDGE_HERE_LAYOUT" \
+  grep -q 'AGENT_BRIDGE_HERE_LAYOUT' "$TESTROOT/w32m1.err"
+assert "32m 空字串 layout：不留 registry" test ! -e "$D32/agents/w32m1.json"
+
+tmx send-keys -t "$ORC_PANE" \
+  "AGENT_BRIDGE_HERE_LAYOUT=bogus AGENT_BRIDGE_MAX_SPAWN=32 agent-bridge spawn w32m2 --runtime codex >$TESTROOT/w32m2.out 2>$TESTROOT/w32m2.err; echo rc=\$? >$TESTROOT/w32m2.done" Enter
+wait_for 20 test -f "$TESTROOT/w32m2.done"
+assert "32m 白名單外 layout：spawn 非零收場" \
+  bash -c "grep -q 'rc=0' '$TESTROOT/w32m2.done' && exit 1 || grep -q 'rc=' '$TESTROOT/w32m2.done'"
+assert "32m 白名單外 layout：死因指出 AGENT_BRIDGE_HERE_LAYOUT" \
+  grep -q 'AGENT_BRIDGE_HERE_LAYOUT' "$TESTROOT/w32m2.err"
+assert "32m 白名單外 layout：不留 registry" test ! -e "$D32/agents/w32m2.json"
+assert "32m 兩例壞 layout：pane 數回到 spawn 前（皆在建 pane 前拒絕）" \
+  test "$(pane_count)" -eq "$PANES_BEFORE_32M"
+
+# 32n. AGENT_BRIDGE_HERE_LAYOUT=none：只 split 不重排（以 shim 記錄
+# select-layout 呼叫，而非量測幾何——2 pane 幾何與預設 split 不可分辨，
+# 同 32b 註解引用的既有裁決）
+LAYOUTLOG="$TESTROOT/layout-calls.log"
+LSHIM="$TESTROOT/layoutshim"
+mkdir -p "$LSHIM"
+cat > "$LSHIM/tmux" <<EOF
+#!/usr/bin/env bash
+if [[ "\$1" == select-layout ]]; then printf '%s\n' "\$*" >> "$LAYOUTLOG"; fi
+unset TMUX
+exec $(printf '%q' "$REAL_TMUX") -L $(printf '%q' "$SOCK") -f /dev/null "\$@"
+EOF
+chmod +x "$LSHIM/tmux"
+rm -f "$LAYOUTLOG"
+tmx send-keys -t "$ORC_PANE" \
+  "PATH=$LSHIM:\$PATH AGENT_BRIDGE_MAX_SPAWN=32 agent-bridge spawn w32n1 --runtime codex >$TESTROOT/w32n1.out 2>/dev/null; echo rc=\$? >$TESTROOT/w32n1.done" Enter
+wait_for 20 test -f "$TESTROOT/w32n1.done"
+assert "32n 預設 layout（main-vertical）：確有呼叫 select-layout" \
+  grep -q 'select-layout .*main-vertical' "$LAYOUTLOG"
+rm -f "$LAYOUTLOG"
+tmx send-keys -t "$ORC_PANE" \
+  "PATH=$LSHIM:\$PATH AGENT_BRIDGE_HERE_LAYOUT=none AGENT_BRIDGE_MAX_SPAWN=32 agent-bridge spawn w32n2 --runtime codex >$TESTROOT/w32n2.out 2>/dev/null; echo rc=\$? >$TESTROOT/w32n2.done" Enter
+wait_for 20 test -f "$TESTROOT/w32n2.done"
+assert "32n HERE_LAYOUT=none：不呼叫 select-layout（不重排）" \
+  test ! -e "$LAYOUTLOG"
+
+# 32o. 壞 layout 值只在 here 路徑致命：tmux 內的 --window 與（auto 判定的）
+# spawn 出身呼叫者都用不到這個變數，不得被無關的壞值擋下。兩例都必須經
+# ORC_PANE（tmux 內、owner 可解析）執行——本檔全程 `unset TMUX`，若直接在
+# 頂層主 shell 呼叫 `$BRIDGE`，owner 恆為空，兩例會一起坍縮成「tmux 外」
+# 情境，測不到「tmux 內 --window」與「tmux 內 tag-present auto」這兩條
+# 路徑本身（P4 codex 複核 CONFIRMED 3）
+tmx send-keys -t "$ORC_PANE" \
+  "AGENT_BRIDGE_HERE_LAYOUT= AGENT_BRIDGE_MAX_SPAWN=32 agent-bridge spawn w32o1 --runtime codex --window >$TESTROOT/w32o1.out 2>$TESTROOT/w32o1.err; echo rc=\$? >$TESTROOT/w32o1.done" Enter
+wait_for 20 test -f "$TESTROOT/w32o1.done"
+assert "32o tmux 內 --window＋壞 layout：spawn 成功（exit 0，不解析 here layout）" \
+  grep -q 'rc=0' "$TESTROOT/w32o1.done"
+W32O1_PANE="$(cat "$TESTROOT/w32o1.out" 2>/dev/null || true)"
+assert "32o tmux 內 --window＋壞 layout：worker pane 存活" pane_alive "$W32O1_PANE"
+
+tmx send-keys -t "$ORC_PANE" \
+  "AGENT_BRIDGE_HERE_LAYOUT= AGENT_BRIDGE_MAX_SPAWN=32 AGENT_BRIDGE_SPAWN_TAG=$FAKE_CALLER_TAG agent-bridge spawn w32o2 --runtime codex >$TESTROOT/w32o2.out 2>$TESTROOT/w32o2.err; echo rc=\$? >$TESTROOT/w32o2.done" Enter
+wait_for 20 test -f "$TESTROOT/w32o2.done"
+assert "32o tmux 內 tag-present auto＋壞 layout：spawn 成功（exit 0，不解析 here layout）" \
+  grep -q 'rc=0' "$TESTROOT/w32o2.done"
+W32O2_PANE="$(cat "$TESTROOT/w32o2.out" 2>/dev/null || true)"
+assert "32o tmux 內 tag-present auto＋壞 layout：worker pane 存活" pane_alive "$W32O2_PANE"
+
+# 32p. relay 共用同一套落點解析（CLI-RELAY-1）：人工呼叫者預設 here，
+# 接棒 pane 落呼叫者當前 window
+RELAY_HANDOFF32="$TESTROOT/relay-handoff-32.md"
+printf '# handoff\n下一步：無。\n' > "$RELAY_HANDOFF32"
+tmx send-keys -t "$ORC_PANE" \
+  "AGENT_BRIDGE_MAX_SPAWN=32 agent-bridge relay wrelay32 --runtime codex --handoff $RELAY_HANDOFF32 --no-select >$TESTROOT/wrelay32.out 2>/dev/null; echo rc=\$? >$TESTROOT/wrelay32.done" Enter
+wait_for 20 test -f "$TESTROOT/wrelay32.done"
+WRELAY32_PANE="$(cat "$TESTROOT/wrelay32.out" 2>/dev/null || true)"
+WRELAY32_WIN=""
+[[ -n "$WRELAY32_PANE" ]] && WRELAY32_WIN="$(tmx display-message -p -t "$WRELAY32_PANE" '#{window_id}' 2>/dev/null || true)"
+assert "32p relay 人工呼叫者預設 here：接棒 pane 落呼叫者 window" \
+  test -n "$WRELAY32_WIN" -a "$WRELAY32_WIN" = "$ORC_WIN"
+assert "32p relay here：registry worker_window 留空" \
+  jq -e '.worker_window == ""' "$D32/agents/wrelay32.json"
+# CLI-RELAY-3：--no-select 的契約是「不改 active pane」（不是「畫面完全
+# 不變」——here 的 layout 重排可能動版面，這裡只鎖 active pane 不變）。
+# split-window 帶 -d 本就不搶焦點，--no-select 是「不額外再切一次」，
+# ORC_WIN 目前的 active pane 應仍是原本送指令進去的 ORC_PANE
+ORC_ACTIVE_AFTER_RELAY="$(tmx display-message -p -t "$ORC_WIN" '#{pane_id}' 2>/dev/null || true)"
+assert "32p relay --no-select：ORC_PANE 仍是 active pane（CLI-RELAY-3）" \
+  test "$ORC_ACTIVE_AFTER_RELAY" = "$ORC_PANE"
+
+# 32q. 顯式 --here 且 tmux 外（無可解析呼叫者）：退回 current-window split
+# fallback，不視為錯誤；壞 AGENT_BRIDGE_HERE_LAYOUT 用不到這條路徑，不得
+# 擋下它（CLI-SPAWN-5：「tmux 外呼叫（含顯式 --here 但無可解析呼叫者）落
+# 當前視窗……不視為錯誤」）。呼叫端不經 ORC_PANE、直接以 `ab`／`$BRIDGE`
+# 模式呼叫（套件全程 `unset TMUX`，同分組 1-31 與 32d 既有的 tmux 外模擬
+# 手法；`-u TMUX_PANE` 一併帶上只是雙重保險，不依賴呼叫端環境乾淨）
+BEFORE_32Q_PANES="$(pane_count)"
+BEFORE_32Q_WINS="$(tmx list-windows -a -F '#{window_id}' 2>/dev/null | wc -l)"
+pane_32q="$(env -u TMUX -u TMUX_PANE AGENT_BRIDGE_DATA="$D32" AGENT_BRIDGE_HERE_LAYOUT='' \
+  AGENT_BRIDGE_MAX_SPAWN=32 PATH="$SHIM:$PATH" \
+  "$BRIDGE" spawn w32q --runtime codex --here 2>"$TESTROOT/w32q.err")"; rc32q=$?
+assert "32q 顯式 --here＋tmux 外＋壞 layout：exit 0（退回 fallback，不是錯誤）" \
+  test "$rc32q" -eq 0
+assert "32q：stdout 是合法 pane id（%N）" \
+  bash -c "[[ '$pane_32q' =~ ^%[0-9]+\$ ]]"
+assert "32q：pane 落在套件的隔離 tmux socket 上" pane_alive "$pane_32q"
+assert "32q：agent 已註冊" test -e "$D32/agents/w32q.json"
+assert "32q：pane 數恰增加 1（split，不是新視窗）" \
+  test "$(pane_count)" -eq "$((BEFORE_32Q_PANES + 1))"
+assert "32q：window 數未變（fallback 是 split 進既有視窗）" \
+  test "$(tmx list-windows -a -F '#{window_id}' 2>/dev/null | wc -l)" -eq "$BEFORE_32Q_WINS"
+assert "32q：registry owner 留空（tmux 外呼叫沒有 owner 概念）" \
+  jq -e '.owner == ""' "$D32/agents/w32q.json"
+assert "32q：registry worker_window 留空" \
+  jq -e '.worker_window == ""' "$D32/agents/w32q.json"
 
 # 32f. 欄位安全不變量：agents.log 每行恰 6 個空白分隔欄（含 32h 的污染注入）
 assert "32f agents.log 每行恰 6 欄" \
