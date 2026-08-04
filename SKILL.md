@@ -61,6 +61,13 @@ agent-bridge read "$id"               # (sender) read the reply body (works for 
 agent-bridge disposable <name>        # (worker, spawned only) declare this round's context has no residual value
 agent-bridge gc [--older-than <days>] [--include-notes] [--apply]
                                       # clean old terminal-state tasks; dry-run by default, --apply to delete
+agent-bridge scan                     # page-layer sweep: notify a human about failed tasks and dead panes still
+                                      # holding live work; stdout = count of newly pushed events. Every non-read-only
+                                      # subcommand already sweeps on the way out, so call this only when driving it
+                                      # from a tmux hook / key binding / cron
+agent-bridge ui                       # alternate-screen dashboard for a human to watch the pool (q to leave).
+                                      # NEVER run this from an agent session: it takes over the terminal and blocks
+                                      # until someone presses q. Use list / list --long / idle for machine-readable views
 ```
 
 Multi-line content always goes through `--message-file -` (stdin heredoc),

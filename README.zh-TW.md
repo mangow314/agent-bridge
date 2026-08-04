@@ -154,6 +154,26 @@ command -v agent-bridge   # 應解析到 symlink
 `bin/agent-bridge` 是 exec shim，接到 `bin/ab`（建置產物，不進版控）。執行檔
 必須放在 `bin/` 底下：`share/` 的 briefs 預設路徑是從它的祖父層目錄反推的。
 
+### 升級既有的 clone（多裝置必讀）
+
+`bin/ab` 是建置產物、**不進版控**，所以只 `git pull` 會留下一個 exec 不到
+任何東西的入口。每次 pull 之後都要重建：
+
+```bash
+git pull
+cargo build --release && cp -f target/release/ab bin/ab
+agent-bridge list   # 冒煙測試
+```
+
+漏了重建的話，shim 會 **exit 127 並印出建置指令**，而不是靜默退回 bash
+正本——兩套實作靜默互換，會讓測試套件以為在驗 Rust、其實驗到 bash（假綠）。
+這個「大聲失敗」是刻意的。
+
+bash 正本以 `bin/agent-bridge.bash` 留在樹上，**自 M4 起凍結**，只作 rollback
+與雙實作對照之用，且只有顯式執行那個路徑才會跑到。兩套實作的子指令差集恰是
+**`ui` 與 `scan` 兩支（Rust 獨有）**，其餘 21 支語意相同——這是設計上的分歧
+（page 層與看板都建立在 Rust 側的資料模型上），不是漂移。
+
 Claude Code 的委派協定 skill：把**整個 repo** symlink 成 skill 目錄
 （SKILL.md 以相對路徑引用 `share/` 的 briefs，必須跟它們同目錄才解析得到；
 用 dotfiles 管理器管理這條 symlink 亦可，效果等價）：
@@ -195,6 +215,8 @@ agent-bridge evict <name> [--timeout <secs>] [--from <sender>]
                                               # 派收尾任務 → 等筆記落地 → despawn；stdout 只印收尾 task-id
 agent-bridge gc [--older-than <days>] [--apply] [--include-notes]
                                               # 清舊終態 task（預設 14 天）；預設只試算，--apply 才刪
+agent-bridge scan                             # （Rust 獨有）掃一輪 page 層事件並推播；stdout 只印新推的則數
+agent-bridge ui                               # （Rust 獨有）alternate-screen 看板；q 離開
 ```
 
 輸出契約（機器可解析）：
@@ -477,6 +499,54 @@ registry／審計）與 `spawn` 完全共用，不複製第二份安全不變量
 - **審計**：spawn/despawn 各追加一行到 `agents.log`（append-only）。
 - despawn 對已消失的 pane（如 tmux server 重啟過）仍會清 registry，不卡死。
 
+## ui／scan：看板與呼叫器（Rust 獨有）
+
+池子一大，「現在誰卡住了、哪一筆沒人接」就不是 `list` 的三欄看得出來的。
+這兩支分別回答兩個不同的問題：**我想看時看得到**（`ui`），與
+**我沒在看時它會來找我**（`scan`）。
+
+### `ui`：alternate-screen 看板
+
+```bash
+agent-bridge ui        # q 離開
+```
+
+WORKERS 依 **spawn lineage 分組**（不是依物理位置——relay 一次，物理位置就
+斷了，血緣不會），TASKS 列在飛的任務，DETAIL 給選取項的細節，含一條
+`root → … → parent → self` 的 breadcrumb。breadcrumb 只由 registry 的兩個
+欄位（`lineage_root`／`parent_agent`，值是 canonical generation key 而非
+名字）重建：中間代沒資料就省略號，有資料但 agent 已除名就留墓碑 `†`。
+`Enter` 跳到該 worker 的 pane，`x` 取消選取的 task。
+
+**讀盤為主、tmux 為側查**：畫面的正本是磁碟上的 read model，tmux 只用來補
+死活與權限框兩個軸，且是有界查詢（`AGENT_BRIDGE_TMUX_TIMEOUT`，預設 5 秒）。
+所以 tmux 卡住時退化的是那兩欄，不是整個畫面——看板的啟動不該取決於 tmux。
+
+### `scan`：把「需要人現在出手」送到人面前
+
+事件恰兩類，不打算擴充：**task 進了 `failed`**，以及 **pane 死了卻還掛著
+非終態 task**。每則事件先落盤到 `state/page-events.jsonl`，再推播：
+
+```
+AGENT_BRIDGE_NOTIFY_CMD  →  本機桌面 notify-send  →  tmux status line（逐 client）
+```
+
+- **`AGENT_BRIDGE_NOTIFY_CMD` 的值是 argv[0]**——一支可執行檔的路徑，後接
+  `<title> <body>` 兩個參數，**不是一段 shell 字串**（不會經過 shell，也就沒有
+  注入面）。這是 SSH／無桌面環境接通知的逃生口。
+- **SSH 下不打桌面通知**：有 `SSH_CONNECTION` 就跳過那一層——遠端的
+  `DISPLAY` 是一塊沒有人在看的螢幕。遠端只剩 status line，除非你自己設
+  `AGENT_BRIDGE_NOTIFY_CMD`。
+- **保證強度是 durable record ＋至多嘗試推播一次**，不是 exactly-once。
+  去重軸是帶世代的 event key（同名 respawn 是新事件，不會被上一代的紀錄吃掉）；
+  notifier 壞掉就此作罷而不是每次呼叫重推同一則洗版——事件在磁碟上，事後查得到。
+- **平常不必手動跑**：每個非唯讀且成功完成的子指令進場都會順手掃一輪。顯式的
+  `scan` 是留給想掛 tmux hook／鍵位／cron 的人——我們不主動去改你的 tmux 設定。
+- 通知的**標題**帶「誰、出了什麼事、人在哪」，**內文**首行是決策依據（失敗
+  原因本身，不是「進了 failed 終態」這種狀態字）、末行是 task id。這個形狀是
+  實測打出來的，不是設計者的偏好：受測者原本答得出「誰、出了什麼事」，卻卡在
+  「要不要切過去看」——通知從沒說過切去哪裡。
+
 ## disposable／idle／evict：pane 的去留由上下文殘值決定
 
 worker 做完一件事不代表它該死。它腦裡可能還留著沒寫進 response 的東西——查過
@@ -584,6 +654,16 @@ tests/run-tests.sh
 
 ## 已知限制
 
+- **看板的「歸屬可讀性」尚未通過理解驗收**（2026-08-04，PD1 第一輪 1/3）：
+  資料是對的（分組、breadcrumb、unattached 判定都有機器不變式守著），但
+  **人讀不讀得出來是另一回事**，而後者才是這個面板存在的理由。實測打出三個
+  缺口：(1) `[unattached]` 只列出連不上的 task，不說**為什麼**連不上——實際上
+  背後是三種完全不同的原因（同名 respawn 的歷史 task／收件人根本不在 registry／
+  註冊與建立同秒＝不可證），畫面把三者呈現得一模一樣；(2) 直系 parent 是二級
+  資訊（要選取該列再讀 DETAIL 的 breadcrumb），第一眼看不到，受測者於是把
+  「卡住的那一個」當成「派生它的那一個」；(3) 墓碑鏈缺兩代時畫面只讓人看見
+  一代（`†` 之外的中間代只有省略號）。三條都未修，詳見
+  `docs/tui-design.md` §9 的 PD1 節。page 層（通知）的同類驗收已於第三輪通過。
 - **agent 忙碌時通知會延後處理**：已接線 hook 的 claude worker 若 state 檔
   顯示新鮮的 `busy`，`notify_or_defer` 現在完全不送鍵，訊息留在 mailbox，
   改由對方自己的 Stop hook 在 turn 結束時查到並自行 `receive`（通知原生化
