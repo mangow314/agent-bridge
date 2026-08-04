@@ -21,7 +21,8 @@ dotfiles 管理，不在本 repo；驗收 task 20260722T035038Z-66f2，0 次人�
 ## 現況錨點（已核實）
 
 - registry：`$AGENTS_DIR/<name>.json`，欄位 `{name, pane_id,
-  registered_at}`，jq 產生＋`atomic_write` 寫入（`bin/agent-bridge:150-183`）。
+  registered_at}`，jq 產生＋`atomic_write` 寫入（已退役 bash 正本的
+  `cmd_register`／`atomic_write`，見 git history）。
 - 測試 harness：獨立 socket `tmux -L agent-bridge-test`、PATH shim 機制、
   `assert`/`assert_fails` helper（`tests/run-tests.sh`）。
 - 通知機制：send-keys 短指令進對方 REPL 輸入流（README「已知限制」：

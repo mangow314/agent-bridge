@@ -1,8 +1,7 @@
 # Rust 遷移架構設計（ab-core / ab / ab-tui）
 
-- 地位：**結構錨**。行為錨是 `spec/`（90 條款）＋`tests/run-tests.sh`（40 編號
-  分組）；本文件回答「Rust 側怎麼組織」，行為疑義一律回 spec 與 bash 正本
-  （`bin/agent-bridge`，M4 cutover 前不動）。
+- 地位：**結構錨**。行為錨是 `spec/`＋`tests/run-tests.sh`；本文件回答「Rust 側
+  怎麼組織」，行為疑義一律回 `spec/`（唯一契約正本），實作疑義回 Rust source。
 - 計畫正本：`~/.claude/plans/cheeky-waddling-meadow.md`（phases × gates）。
 - 判準：M1 實作若與本文件衝突，先改文件再改碼（文件是 review 對象，不是擺設）；
   模組命名與邊界變更須在 PR 說明列出對映表 diff。
@@ -17,30 +16,37 @@
 
 ## 2. ab-core 模組對映表（模組 ↔ spec 域 ↔ bash 函式群）
 
-| 模組 | 職責 | spec 域 | 對映 bash 函式（bin/agent-bridge） |
+> **狀態（bash 正本退役後）**：本節記的是遷移期的對映關係，右欄引用的是**已
+> 退役 bash 正本的函式名**（見 git history），不是現行實作的 symbol。原表留存
+> 供沿革查考。
+
+| 模組 | 職責 | spec 域 | 對映 bash 函式（`bin/agent-bridge.bash`，已退役） |
 |---|---|---|---|
-| `paths` | 資料目錄佈局（agents/ tasks/ state/ locks/）、`AGENT_BRIDGE_DATA` 解析 | state.md、env.md | `ensure_dirs`:148 |
+| `paths` | 資料目錄佈局（agents/ tasks/ state/ locks/）、`AGENT_BRIDGE_DATA` 解析 | state.md、env.md | `ensure_dirs` |
 | `config` | `AGENT_BRIDGE_*` 全部 env 的讀取與驗證；**變數名保留字面字串**（check-contract check 1 的 grep 面） | env.md 17 條 | 散落各處的 `${AGENT_BRIDGE_*:-}` 讀取點 |
-| `fsio` | `atomic_write`（tmp＋rename 同目錄）、payload byte 流原樣搬運 | state.md STATE-GEN-2 | `atomic_write`:172、`write_message`:276 |
-| `lock` | mkdir 鎖：佔用重試＋「非佔用即權限」die 分流；RAII guard 只是便利層，**語意不依賴 Drop**（SIGKILL 殘鎖行為＝bash 現況；stale 回收是 M5 行為變更，parity 期禁做） | state.md STATE-LOCK-* | `acquire_lock`:227、`release_lock`:217 |
-| `registry` | agent 註冊表 CRUD、pane 解析、owner/actor 審計欄位 | state.md STATE-AGENT-* | `cmd_register`:476 核心、`is_spawned`:153、`caller_owner`:884、`log_agent_event`:898 |
-| `task` | task 目錄結構、id 生成/驗證、狀態機轉換（queued→delivered→running→終態）、events.log、殘缺 task 目錄清理、**gc（終態 task 清理）** | state.md STATE-TASK-*、cli.md 轉換條款 | `write_message`:276、`log_event`:251、`update_meta_status`:261、`check_task_id`:420、`last_task_at`:457、`send_rollback`:202（清 metadata/status 未寫齊的殘缺 task 目錄，屬 task 寫入交易邊界；交易背景註解始於 :195）、`cmd_gc`:1683 |
-| `notify` | 送鍵通知：權限框雙掃、失敗語意（notify-failed 可復原）、`notify_or_defer` 的 TTL/state 新鮮度 gate | hooks.md HOOK-NOTIFY-*、env.md ENV-TTL-1/2、ENV-NOTIFY-1 | `notify_pane`:330、`screen_has_prompt`:318、`notify_or_defer`:371 |
-| `hook` | hook 三事件核心：身分解析、state 單一寫者、owner gate（session_id 所有權）、oldest-queued；**失敗一律就地吞掉（不上拋 `Result`）**，`run()` 回 `HookOutcome{Silent,Block}`；exit 0 與 panic 兜底在 `ab` dispatch 層（M2 修正，見 §4） | hooks.md 14 條、state.md STATE-CHAN-* | `hook_agent_name`:2010、`hook_write_state`:2035、`hook_owner_gate`:2069、`hook_oldest_queued`:2098、`cmd_hook`:2131 |
-| `spawn` | worker 生命週期：cap、pane 建立、brief 注入、ready 探針、原子回滾、出身防護（tag）、idle/disposable（**evict 的三段式編排在 `ab` CLI 層**，見 §9） | cli.md spawn 群、env.md ENV-SPAWN/READY/TAG | `cmd_spawn`:1063、`spawn_rollback`:940、`rb_kill_tagged`:928、`spawn_wait_ready`:1038、`worker_prompt_arg`:1007、`relay_prompt_arg`:1024、`cmd_despawn`:1476、`cmd_ready`:1594、`cmd_disposable`:1629、`cmd_idle`:1800、`disposable_effective`:444 |
+| `fsio` | `atomic_write`（tmp＋rename 同目錄）、payload byte 流原樣搬運 | state.md STATE-GEN-2 | `atomic_write`、`write_message` |
+| `lock` | mkdir 鎖：佔用重試＋「非佔用即權限」die 分流；RAII guard 只是便利層，**語意不依賴 Drop**（SIGKILL 殘鎖行為＝bash 現況；stale 回收是 M5 行為變更，parity 期禁做） | state.md STATE-LOCK-* | `acquire_lock`、`release_lock` |
+| `registry` | agent 註冊表 CRUD、pane 解析、owner/actor 審計欄位 | state.md STATE-AGENT-* | `cmd_register` 核心、`is_spawned`、`caller_owner`、`log_agent_event` |
+| `task` | task 目錄結構、id 生成/驗證、狀態機轉換（queued→delivered→running→終態）、events.log、殘缺 task 目錄清理、**gc（終態 task 清理）** | state.md STATE-TASK-*、cli.md 轉換條款 | `write_message`、`log_event`、`update_meta_status`、`check_task_id`、`last_task_at`、`send_rollback`（清 metadata/status 未寫齊的殘缺 task 目錄，屬 task 寫入交易邊界；交易背景寫在該函式前的註解）、`cmd_gc` |
+| `notify` | 送鍵通知：權限框雙掃、失敗語意（notify-failed 可復原）、`notify_or_defer` 的 TTL/state 新鮮度 gate | hooks.md HOOK-NOTIFY-*、env.md ENV-TTL-1/2、ENV-NOTIFY-1 | `notify_pane`、`screen_has_prompt`、`notify_or_defer` |
+| `hook` | hook 三事件核心：身分解析、state 單一寫者、owner gate（session_id 所有權）、oldest-queued；**失敗一律就地吞掉（不上拋 `Result`）**，`run()` 回 `HookOutcome{Silent,Block}`；exit 0 與 panic 兜底在 `ab` dispatch 層（M2 修正，見 §4） | hooks.md 14 條、state.md STATE-CHAN-* | `hook_agent_name`、`hook_write_state`、`hook_owner_gate`、`hook_oldest_queued`、`cmd_hook` |
+| `spawn` | worker 生命週期：cap、pane 建立、brief 注入、ready 探針、原子回滾、出身防護（tag）、idle/disposable（**evict 的三段式編排在 `ab` CLI 層**，見 §9） | cli.md spawn 群、env.md ENV-SPAWN/READY/TAG | `cmd_spawn`、`spawn_rollback`、`rb_kill_tagged`、`spawn_wait_ready`、`worker_prompt_arg`、`relay_prompt_arg`、`cmd_despawn`、`cmd_ready`、`cmd_disposable`、`cmd_idle`、`disposable_effective` |
 | `tmux` | `TmuxClient` trait＋`SubprocessTmux` 實作；**以裸名 `tmux` 經 PATH spawn**（測試 shim 攔截前提，tests/run-tests.sh:91-93）；argv 陣列傳參 | （載具，無獨立 spec 域） | `tmux` token 91 次（command-shaped 呼叫約 65；分佈於 notify/spawn/despawn/registry 各函式群） |
-| `time` | ISO 8601 UTC 時戳（`now_iso`）、epoch 換算、TTL 新鮮度；顯式 UTC、不受 locale/TZ | state.md ts 格式 | `now_iso`:144、TTL epoch 比對段 |
+| `time` | ISO 8601 UTC 時戳（`now_iso`）、epoch 換算、TTL 新鮮度；顯式 UTC、不受 locale/TZ | state.md ts 格式 | `now_iso`、TTL epoch 比對段 |
 
 覆蓋核對：bash 58 函式中，`cmd_*` 21 個屬 `ab` dispatch 面（邏輯下沉
 ab-core 對應模組）、`err/die/info/usage` 屬 `ab` 輸出層、其餘 helper 已列入
-上表對映欄。M1 實作時逐函式打勾，未列者（如 `rand_suffix`:146、
-`require_jq`:166——Rust 無此依賴、`validate_ready_opts`:988、
-`parse_message_opts`:664、`respond_task`:686）歸入所屬模組不另立。
+上表對映欄。M1 實作時逐函式打勾，未列者（如 `rand_suffix`、
+`require_jq`——Rust 無此依賴、`validate_ready_opts`、
+`parse_message_opts`、`respond_task`）歸入所屬模組不另立。
 
 ## 3. 核心型別與所有權
 
+> **狀態（bash 正本退役後）**：本節引用的是**已退役 bash 正本的函式名**（如
+> `check_task_id`，見 git history），不是現行實作的 symbol。
+
 - `AgentName`／`TaskId`：newtype over `String`，建構即驗證（對齊
-  `check_task_id`:420 與 register 的名稱規則）；驗證失敗訊息逐字對齊 bash die。
+  `check_task_id` 與 register 的名稱規則）；驗證失敗訊息逐字對齊 bash die。
 - `TaskState`：`enum {Queued, Delivered, Running, Completed, Failed, Cancelled}`
   ——合法轉換表寫成 `TaskState::can_transition(to)`，非法轉換回傳
   `Error::IllegalTransition`（訊息對齊 bash）。磁碟表現＝小寫字串
@@ -53,12 +59,17 @@ ab-core 對應模組）、`err/die/info/usage` 屬 `ab` 輸出層、其餘 helpe
 
 ## 4. 錯誤模型 → exit code
 
+> **狀態（bash 正本退役後）**：本節的 parity 論證引用的是**已退役 bash 正本的
+> 函式名**（見 git history），屬遷移期的決策脈絡；現行行為以 `spec/` 為準，
+> Rust 實作是唯一載具。
+
 - `ab-core` 全面 `Result<T, Error>`；`Error` 帶「使用者可見訊息」欄位，
   **訊息文字逐字對齊 bash die 的中文 stderr**（parity gate 驗這個）。
 - `ab` dispatch 層統一收斂：`Err` → stderr 印訊息 → exit code。
   - 一般指令：die 對應非 0（各條款明定值以 spec/cli.md 為準；CLI-GEN-1 教訓
     ——呼叫端只能依賴「非 0＝失敗、124＝逾時」，不得依賴「失敗必為 1」）。
-  - `hook` 子指令鐵律：**任何錯誤一律吞掉、exit 0**（bin/agent-bridge:2258-2261）。
+  - `hook` 子指令鐵律：**任何錯誤一律吞掉、exit 0**
+    （已退役 bash 正本的 `cmd_hook`，見 git history）。
     - M2 修正（原設計為「內部回 `Result`、dispatch 層吞」）：那個形狀表達不了
       bash 的實際語意。bash 是**逐步就地吞**——`hook_write_state` 寫失敗只讓
       state 停在舊值，後面的分支照跑；上拋成單一 `Err` 會把「這一步沒做成」
@@ -67,11 +78,15 @@ ab-core 對應模組）、`err/die/info/usage` 屬 `ab` 輸出層、其餘 helpe
     - dispatch 層兜底保留兩層：無條件 `ExitCode::from(0)`，外加 `catch_unwind`
       讓 panic 不會變成 101（panic 訊息照樣進 stderr，同 bash 出錯有輸出）。
   - 唯讀豁免：`status|await|idle|list|hook` 不建目錄；目錄缺失時以「找不到」
-    語意收場（bin/agent-bridge:2266-2268 的 parity）。
+    語意收場（對齊已退役 bash 正本 `main` 的 dispatch 分流，見 git history）。
 - `panic!` 視為 bug：release 建置 `panic = "abort"` 候選（M1 定案），嚴禁把
   panic 當錯誤路徑。
 
 ## 5. 子行程／signal 政策
+
+> **狀態（bash 正本退役後）**：本節與 §5.1 的 parity 論證屬遷移期脈絡，引用的
+> 是**已退役 bash 正本的函式名**（如 `cmd_hook`、`require_jq`，見 git history），
+> 不是現行實作的 symbol。現行行為以 `spec/` 為準，Rust 實作是唯一載具。
 
 - **SIGPIPE**：Rust 預設忽略（寫端得 `EPIPE` Err）；`ab` main 起手以
   `libc::signal(SIGPIPE, SIG_DFL)` 顯式恢復預設處置，行為對齊 bash「隨管線
@@ -95,9 +110,9 @@ ab-core 對應模組）、`err/die/info/usage` 屬 `ab` 輸出層、其餘 helpe
 
 兩項在 M2 codex 複核中被指出，判定為**不修**，理由記在這裡免得下一棒重開。
 
-- **不模擬「jq 不在 PATH 就 no-op」**。bash `cmd_hook`:2142 有
+- **不模擬「jq 不在 PATH 就 no-op」**。bash `cmd_hook` 有
   `command -v jq || exit 0`；Rust 沒有 jq 依賴，照抄等於讓一個無關工具的缺席
-  癱瘓自己的 hook。§2 覆蓋核對表早已把 `require_jq`:166 記為「Rust 無此依
+  癱瘓自己的 hook。§2 覆蓋核對表早已把 `require_jq` 記為「Rust 無此依
   賴」，本項沿用同一裁決。可觀察差異：PATH 無 jq ＋ 有 queued task 的 stop
   事件，bash 靜默 exit 0、Rust 照發 block JSON。
 - **state 檔的 `ts` 只認 canonical ISO**，不模擬 GNU `date -ud` 的寬鬆方言
@@ -115,13 +130,20 @@ ab-core 對應模組）、`err/die/info/usage` 屬 `ab` 輸出層、其餘 helpe
 
 ## 6. 鎖語意（parity 紅線）
 
+> **狀態（bash 正本退役後）**：本節的「bash 現況等價」論證屬遷移期脈絡；
+> 下方引用的是**已退役 bash 正本的函式名**（見 git history），現行錯誤訊息以
+> `spec/state.md` 與 Rust 實作為準。
+
 `lock::Guard` 釋放走顯式 `release()`＋`Drop` 雙保險，但正確性論證只允許引用
 顯式路徑：SIGKILL／abort 時 Drop 不執行，殘鎖=bash 現況等價（mkdir 鎖天生
 如此）。「非佔用即權限」的 die 分流（分組 8b）在 `acquire` 實作內逐字對齊
-bin/agent-bridge:227 起的錯誤訊息。stale-lock 偵測／回收＝行為變更，屬 M5
+已退役 bash 正本 `acquire_lock` 的錯誤訊息。stale-lock 偵測／回收＝行為變更，屬 M5
 提案範圍，parity 期不得混入。
 
 ## 7. 輸出 parity 策略（jq 對拍）
+
+> **狀態（bash 正本退役後）**：jq 對拍是遷移期的 gate 形狀，正本退役後不再
+> 有可產 fixture 的 bash 側；沿用下來的是既有 fixture 與下方三條裁決本身。
 
 - bash 以 jq 產生的 JSON（metadata.json、state/*.json、list 輸出）逐測例
   fixture 對拍：先用 bash 版產 fixture（`jq` 實際輸出存檔），Rust 序列化結果
@@ -138,7 +160,8 @@ bin/agent-bridge:227 起的錯誤訊息。stale-lock 偵測／回收＝行為變
 
 ## 8. 流程圖
 
-三張核心流程圖（畫的是 bash 現行為，Rust 實作照此 parity）：
+三張核心流程圖（繪製當時畫的是 bash 正本的行為，Rust 實作照此 parity；正本
+退役後這些圖描述的就是 Rust 的現行為）：
 
 1. send→notify_or_defer→hook 通知鏈 — `docs/rust/flow-notify.md`
 2. spawn 生命週期（cap／ready 探針／原子回滾／出身防護）— `docs/rust/flow-spawn.md`
@@ -146,9 +169,15 @@ bin/agent-bridge:227 起的錯誤訊息。stale-lock 偵測／回收＝行為變
 
 ## 9. M3（spawn 生命週期）的裁決與偏離
 
-### 9.1 執行檔擺放位置是 brief 解析的前提
+### 9.1 執行檔擺放位置是 brief 解析的前提（已結案：`.gate/` staging 退場）
 
-bash 以 `readlink -f "$BASH_SOURCE"` 反推 `REPO_ROOT`（:45-46），brief／hooks
+> **狀態（M4 cutover 後）**：下述 `.gate/ab` staging 已隨 cutover 退場，產物
+> 現擺 `bin/ab`（見 §10.1）；本節留存的是「祖父層＝repo 根」那條規則的由來。
+> 下方引用的是**已退役 bash 正本**頂層的 `SCRIPT_PATH`／`REPO_ROOT` 賦值
+> （見 git history）。
+
+bash 以 `readlink -f "$BASH_SOURCE"` 反推 `REPO_ROOT`（頂層 `SCRIPT_PATH`／
+`REPO_ROOT` 賦值），brief／hooks
 settings 的預設值都掛在它下面。Rust 用 `current_exe()`（Linux 讀
 `/proc/self/exe`，同樣解析完符號連結）套**同一條規則**：`REPO_ROOT ＝
 dirname(dirname(執行檔))`。
@@ -186,6 +215,11 @@ BRIDGE=$PWD/.gate/ab bash tests/run-tests.sh
 
 ### 9.4 測試 harness 的兩處改動（M3）
 
+> **狀態（bash 正本退役後）**：下述「M4 cutover 時一起改綁 Rust 源」**已經完成**，
+> `SRC_BASH` 隨正本一併移除，「在那之前」的過渡期已結束。現行的載具身分判準是
+> `tests/check-contract.sh`（源碼面固定抽 `crates/`）＋`tests/run-tests.sh:24-35`
+> 開頭那道 `__implemented-commands` 探針 gate。本節留存的是兩處改動的由來。
+
 parity gate 的前提是**測試對實作語言中立**。兩類斷言原本不是：
 
 1. **注入點掛在 `date(1)`**（§19c'、§21）：那只是 bash 實作恰好會 fork 的外部
@@ -202,18 +236,21 @@ parity gate 的前提是**測試對實作語言中立**。兩類斷言原本不�
 
 ### 9.5 codex 複核一輪的處置（2026-07-31）
 
+> **狀態（bash 正本退役後）**：下表「處置」欄引用的是**已退役 bash 正本的函式**
+> （`cmd_despawn`、`cmd_spawn`，見 git history），不是現行實作的 symbol。
+
 rubric 六條判定 REJECTED／CONFIRMED／REJECTED／REJECTED／CONFIRMED／CONFIRMED。
 兩個 blocker 與五個 should-fix 全數修復並重驗：
 
 | 項目 | 症狀 | 處置 |
 |---|---|---|
-| blocker：despawn 謊報成功 | `remove_file` 的錯誤被吞，仍寫審計＋印「已 despawn」 | 上拋（`NotFound` 視為成功）；bash `:1580` 的裸 `rm -f` 在 `set -e` 下同樣帶走整支 |
+| blocker：despawn 謊報成功 | `remove_file` 的錯誤被吞，仍寫審計＋印「已 despawn」 | 上拋（`NotFound` 視為成功）；bash `cmd_despawn` 的裸 `rm -f` 在 `set -e` 下同樣帶走整支 |
 | blocker：poll interval 非 UTF-8 | `env::var().unwrap_or_default()` 把它壓成「未設定」→退 1.0，evict 因此把 config 錯誤誤判成真逾時 | 改 `var_os`＋三態；非 UTF-8 走「值不合法」 |
 | `//` 的空字串語意 | `jq_raw_field` 把 `""` 併進 None，鏈式 fallback 會多掉一層（idle 對 `spawned_at: ""` 印秒數，bash 印 `-`） | 新增 `json::jq_alt`（逐字 `//`），idle／`read_field`／`disposable_effective` 改用它；`jq_raw_field` 維持 `// empty` 形狀給 M2 的 hook 欄位 |
 | `printf %q` 只吃 `&str` | proxy／PASS_ENV 值與 hooks 路徑先 lossy 再引號化，非 UTF-8 位元組變 U+FFFD | `shell_quote` 改收 `&[u8]`（`$'\NNN'` 產物是純 ASCII，故不必把啟動指令改成 bytes）；brief 路徑因為是**單引號字面值**無法跳脫，改 fail-closed 拒絕（相對 bash 的刻意偏離，方向是大聲失敗而非靜默注入錯誤守則） |
 | ready interval 可 panic | `Duration::from_secs_f64(inf)` 在「registry 已寫、回滾已解除」之後 panic | 改 `try_from_secs_f64`，不可表示時退 `Duration::MAX`（＝bash 把超大值交給 `sleep` 的同一終態） |
 | spawn tag 的熵可預測 | 沿用 `task::rand_suffix`，`/dev/urandom` 失敗時退回 pid⊕nanos——但 tag 是 despawn 的殺人依據 | 另立 `secure_hex12()`，讀不到熵直接 `Err`（bash 也是在建 pane 前死） |
-| split 失敗仍重排 | `select-layout` 在傳播錯誤前執行 | 先 `?` 取 pane 再 layout（對齊 `:1299-1301`） |
+| split 失敗仍重排 | `select-layout` 在傳播錯誤前執行 | 先 `?` 取 pane 再 layout（對齊 bash `cmd_spawn` 的 `select-layout` 段） |
 | evict stderr 非逐字 | 內層 `cmd_send` die／`cmd_await` 逾時行被吞 | 兩處先 `err_line` 內層訊息再印 evict 的中止／逾時行 |
 
 rubric 6（harness 改動正當性）codex 判 CONFIRMED，並建議 M4 讓
@@ -392,6 +429,11 @@ parity 的形狀因此從「兩邊同數字」變成「Rust 784／bash 756＋顯
 成單向斷言——`$BRIDGE` 仍可被呼叫者覆寫，指錯照樣要紅。
 
 ### 11.5 自檢
+
+> **狀態（bash 正本退役後）**：下表的 PASS／FAIL 是 **M5 當時的實測紀錄**，
+> 原樣留存為證據。分組結構在正本退役後已塌縮（`b6d9ab1`：`SRC_KIND` 旋鈕與
+> 13 組 SKIP 分支一併移除），故該組絕對數字**不再可重現、也不是現行基準**；
+> 現行收案數字依 `docs/testing-policy.md` 的規定，以最近一次全套實測為準。
 
 新斷言以 mutation 反證過，不是看著綠燈就收工：
 

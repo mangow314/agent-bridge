@@ -138,8 +138,9 @@ Phase 3 落地時與本文的差異（以實作為準）：
 
 ## 關鍵設計約束（先查清楚才敢動）
 
-- **單一全域鎖**：`LOCK_DIR` 是單值（`bin/agent-bridge:112`），`release_lock`
-  只釋放一把 → **無法同時持有 task 鎖與 registry 鎖**。故保留標記**不掛在
+- **單一全域鎖**：`LOCK_DIR` 是單值（已退役 bash 正本的頂層 `LOCK_DIR`，見 git
+  history），`release_lock` 只釋放一把 → **無法同時持有 task
+  鎖與 registry 鎖**。故保留標記**不掛在
   `reply` 上**（那需要兩把鎖），改走獨立命令 `disposable`。
 - **`spawn` 保持純粹，不自動驅逐**。不加 `--evict-if-full`：那會讓一條經過
   九輪複核的路徑長出「自動殺 pane」的能力。撞 cap 時由 orchestrator 明確發起
@@ -169,8 +170,8 @@ agent-bridge evict <name> [--timeout <secs>]
 
 ## worker 是完整 session，不是 subagent（本輪釐清）
 
-`spawn` 起的是 `claude --permission-mode auto`（`bin/agent-bridge:756`），沒有任何
-收窄工具的旗標，且**刻意不加** `--settings/--setting-sources`（註解 748-751）。
+`spawn` 起的是 `claude --permission-mode auto`，沒有任何收窄工具的旗標，且
+**刻意不加** `--settings/--setting-sources`（plan 當時的決策；其後實作已改）。
 所以每個 worker 是完整的 Claude Code session：完整工具集（含 Agent tool）、
 自己的 context window、使用者全域 CLAUDE.md 與 `rules/*.md` 全部生效。
 

@@ -213,7 +213,8 @@ Note（`agy` 的降級，量測正本 `docs/agy-probe.md`）：現行 agy（實�
 沒有可供本專案掛載的 hooks 介面，故 agy worker **不會**有
 `state/<name>.json`，通知端恆走 legacy 送鍵
 （HOOK-NOTIFY-1 的「未知」分支）。這是接受的 degradation 而非缺陷：
-send/receive/reply 的任務狀態機不倚賴 state 通道。bash 正本自 M4 凍結，
+send/receive/reply 的任務狀態機不倚賴 state 通道。退役前的 bash 正本凍結於
+M4、不含 agy；正本現已自樹移除。
 `agy` MUST 只存在於 Rust 實作。
 Source: cmd_spawn
 
@@ -522,8 +523,8 @@ Source: cmd_ui / ab_tui::run / ab_core::evict
 
 ### CLI-SCAN-1 [tested: 47]
 `scan`：掃一輪 page 層事件並推播（設計正本 `docs/tui-design.md` §1 的 page
-層）。**Rust 獨有**——bash 正本自 M4 凍結、不含 page 層，這是設計上的分歧
-而非漂移（比照 `notify` 的 agy 權限框那組）。不吃參數；stdout MUST 只印
+層）。**page 層只存在於 Rust 實作**（退役前的 bash 正本凍結於 M4、不含
+page 層；正本現已自樹移除）。不吃參數；stdout MUST 只印
 一個十進位整數＝這一輪**新**推的事件數（已推過的不計），說明走 stderr。
 事件恰兩類，不得擴充：`task-failed`（`fail` 的收斂點同步發）與
 `worker-died`（pane 不存在但掛著非終態 task）。

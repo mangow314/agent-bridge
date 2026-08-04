@@ -345,7 +345,8 @@ agent-bridge despawn worker-1                          # 任務收尾：kill pan
     以及下緣備援的 `Do you want to proceed?` ＋小寫 `esc to cancel` 成對。
     備援錨不是冗餘——worker 預設進共用 window 並 tiled 均分，pane 一多就矮到
     header 被捲出可見一屏，那時只有下緣還在（回歸鎖在分組 37e）。不補的話送鍵
-    的 Enter 會替 worker 按下預設的「1. Yes」。**bash 正本自 M4 凍結、不支援 agy**，本 runtime 只存在於 Rust
+    的 Enter 會替 worker 按下預設的「1. Yes」。**退役前的 bash 正本凍結於 M4、
+    不含 agy**；正本其後自樹上移除，本 runtime 只存在於 Rust
   - 新增 runtime 前必須實測該 CLI 的位置參數確實會被當第一則 user message 執行
     且執行完 session 常駐；只吃 stdin 或需要別的旗標的 CLI 要另外長出注入方式
 - **`--model` 指定 worker 的模型**（三個 runtime 都吃 `--model` 長旗標，codex／

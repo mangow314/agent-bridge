@@ -1198,8 +1198,8 @@ assert "Notification 對應裸指令 agent-bridge hook notification" \
 # $DSPAWN 裡殘留的 worker 會讓匹配數不可預期。
 DLIN="$TESTROOT/dlin"
 mkdir -p "$DLIN/agents" "$DLIN/locks" "$DLIN/tasks"   # 先建出資料目錄（list 唯讀不建）
-# canonical generation key 的文法（與 bin/agent-bridge 的 GEN_KEY_RE、
-# ab_core::spawn::is_generation_key **逐字同一條**）
+# canonical generation key 的文法（契約正本是 spec/state.md 的 STATE-AGENT-6，
+# 實作端 ab_core::spawn::GEN_KEY_RE／is_generation_key **逐字同一條**）
 LIN_KEY_RE='^AGENT_BRIDGE_SPAWN_TAG=ab-spawn-[A-Za-z0-9_-]+-[0-9]+-[0-9a-f]{12}$'
 
 # 16a7-1：繼承鏈 root→A→B。A 由「帶 root tag 的環境」spawn（模擬 root worker
