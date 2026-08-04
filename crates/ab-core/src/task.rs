@@ -1139,6 +1139,13 @@ mod tests {
         let tasks_dir = root.join("tasks-is-a-file");
         std::fs::write(&tasks_dir, b"not a directory").unwrap();
 
+        // 預期 cause：對**同一個形狀**（在普通檔案底下建子目錄）直接取一次
+        // `io::Error`，拿它的字串當比對基準。不硬編英文 "Not a directory"——
+        // 那串隨 libc／locale 變，硬編會在別的環境變成假紅。
+        let expected_cause = std::fs::create_dir(tasks_dir.join("cause-probe"))
+            .expect_err("在普通檔案底下建子目錄 MUST 失敗")
+            .to_string();
+
         let paths = Paths {
             data_dir: root.clone(),
             agents_dir: root.join("agents"),
@@ -1160,6 +1167,12 @@ mod tests {
         assert!(
             msg.contains("無法建立 task 目錄"),
             "訊息未指出是建 task 目錄失敗：{msg}"
+        );
+        // 底層 cause MUST 帶得出來：拿掉 production 那句 format 裡的「：{e}」，
+        // 這條就要紅。前兩條斷言都不管 cause，這條是它們的補集。
+        assert!(
+            msg.contains(&expected_cause),
+            "訊息未帶出底層 cause（預期含「{expected_cause}」）：{msg}"
         );
         let _ = std::fs::remove_dir_all(&root);
     }
