@@ -1,0 +1,15 @@
+# `agent-bridge ui` 的 TUI dashboard（設計正本 docs/tui-design.md）。
+# lib crate：由 `ab` 的 `ui` 子指令呼叫 ab_tui::run()——部署邊界是單一
+# binary（cp target/release/ab bin/ab），第二個 binary 會在部署時失蹤。
+# 依賴上限見 tui-design.md §6：ratatui＋crossterm＋ab-core，僅此三項。
+[package]
+name = "ab-tui"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+ab-core = { path = "../ab-core" }
+crossterm = "0.29.0"
+ratatui = "0.30.2"

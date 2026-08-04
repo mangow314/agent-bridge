@@ -21,15 +21,18 @@ mechanics. Read the section for the role you are playing.
 
 ```bash
 agent-bridge list                     # delegable agents (name<TAB>pane_id<TAB>ready column: -/starting/ready)
+agent-bridge list --long              # human-intervention view: header row + name/pane/ready/origin/where/owner/disposable/idle
+                                      # where+owner resolved live to <session>:<window>; dead / owner-dead / ? (not queryable) are distinct
+                                      # read-only: signals, not a "safe to delete" verdict — reclaiming stays despawn/evict
 agent-bridge register <name> <tmux-target>
                                       # manually register an existing pane as an agent (unregister to remove)
-agent-bridge spawn <name> --runtime <codex|claude> [--model <model>] [--window]
+agent-bridge spawn <name> --runtime <codex|claude|agy> [--model <model>] [--window]
                                       # open + register a worker pane; prints pane-id on stdout (no --model = that CLI's default)
                                       # placement: workers land in this orchestrator's own worker window (created
                                       # next to it, reused across spawns, tiled); owner granularity is the caller's
                                       # tmux window; --window = a fully separate window; outside tmux it falls
                                       # back to splitting the current window
-agent-bridge relay <name> --runtime <codex|claude> [--model <model>] --handoff <path> [--window] [--no-select] [--self-exit <my-name>]
+agent-bridge relay <name> --runtime <codex|claude|agy> [--model <model>] --handoff <path> [--window] [--no-select] [--self-exit <my-name>]
                                       # hand over: open a successor pane (injects successor brief + handoff file); not a worker
                                       # chain depth is capped (AGENT_BRIDGE_MAX_RELAY_DEPTH, default 10); hitting it means stop and get a human, not raise it yourself
 agent-bridge despawn <name>           # reclaim a bridge-spawned worker (manually registered agents are refused)
@@ -58,6 +61,13 @@ agent-bridge read "$id"               # (sender) read the reply body (works for 
 agent-bridge disposable <name>        # (worker, spawned only) declare this round's context has no residual value
 agent-bridge gc [--older-than <days>] [--include-notes] [--apply]
                                       # clean old terminal-state tasks; dry-run by default, --apply to delete
+agent-bridge scan                     # page-layer sweep: notify a human about failed tasks and dead panes still
+                                      # holding live work; stdout = count of newly pushed events. Every non-read-only
+                                      # subcommand already sweeps on the way out, so call this only when driving it
+                                      # from a tmux hook / key binding / cron
+agent-bridge ui                       # alternate-screen dashboard for a human to watch the pool (q to leave).
+                                      # NEVER run this from an agent session: it takes over the terminal and blocks
+                                      # until someone presses q. Use list / list --long / idle for machine-readable views
 ```
 
 Multi-line content always goes through `--message-file -` (stdin heredoc),

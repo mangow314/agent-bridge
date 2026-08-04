@@ -16,7 +16,35 @@ unset TMUX
 unset ${!AGENT_BRIDGE_@}
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-BRIDGE="$ROOT/bin/agent-bridge"
+BRIDGE="${BRIDGE:-$ROOT/bin/agent-bridge}"
+# 源碼耦合檢查（§30 canary、§31i 寫入順序）抽取函式本體的對象。不跟著 $BRIDGE
+# 走——$BRIDGE 是黑箱受測體，這兩處要的是**源碼**。M4 cutover 後正本是 Rust，
+# 故預設 rust；`SRC_KIND=bash` 可切回 bash 正本（rollback 期與雙實作對照用）。
+# 顯式的 kind＋path 是 M3 codex 複核的建議形（source-kind／source-path）。
+# 光有 kind 還不夠：$BRIDGE（黑箱受測體）與 SRC_KIND（源碼抽取對象）若各指
+# 一套實作，兩邊各自全綠、整套照樣綠，等於沒驗到對應關係（獨立複核
+# 2026-07-31 實證）。故 kind 先驗 enum，再與載具實測結果交叉比對。
+SRC_KIND="${SRC_KIND:-rust}"
+case "$SRC_KIND" in
+  rust|bash) ;;
+  *) echo "SRC_KIND 需為 rust 或 bash：$SRC_KIND" >&2; exit 1 ;;
+esac
+SRC_BASH="$ROOT/bin/agent-bridge.bash"
+SRC_NOTIFY_RS="$ROOT/crates/ab-core/src/notify.rs"
+SRC_TASK_RS="$ROOT/crates/ab-core/src/task.rs"
+# 載具是哪套實作：Rust 認得 `__implemented-commands`（rc 0）、bash 正本當成
+# 未知指令（rc 1）——用既有介面判別，不為了自報身分再開一個。探針的 DATA
+# 指到不可建立的路徑，免得 bash 分支順手建到使用者真實的資料目錄
+if AGENT_BRIDGE_DATA=/dev/null/probe "$BRIDGE" __implemented-commands \
+    >/dev/null 2>&1; then
+  BRIDGE_KIND=rust
+else
+  BRIDGE_KIND=bash
+fi
+if [[ "$BRIDGE_KIND" != "$SRC_KIND" ]]; then
+  echo "SRC_KIND=$SRC_KIND 與 BRIDGE 不匹配（載具偵測為 $BRIDGE_KIND）：$BRIDGE" >&2
+  exit 1
+fi
 SOCK="agent-bridge-test"
 
 if ! REAL_TMUX="$(command -v tmux)"; then
@@ -41,6 +69,18 @@ cleanup() {
   tmx kill-server 2>/dev/null || true
   "$REAL_TMUX" -L agent-bridge-test-b -f /dev/null kill-server 2>/dev/null || true
   "$REAL_TMUX" -L agent-bridge-test-c -f /dev/null kill-server 2>/dev/null || true
+  # 掃掉還指著 $TESTROOT 的行程再刪目錄。**`tmx kill-server` 掃不到它們**：
+  # 假 runtime 是背景 `&` 起的，父 subshell 一退就 reparent 到 init，從此與
+  # tmux socket 無關。2026-08-03 在使用者機器上撈到兩支這樣的孤兒——`rtbin36o`
+  # 的假 codex，各自活了 3.2 天、燒掉 36 分鐘 CPU，而它們的 TESTROOT 早被這
+  # 支 cleanup 刪光了（假件活得比 fixture 久）。
+  #
+  # 為什麼那兩支沒有照它自己的 500 圈上限退出，**沒有查明**——證據隨行程一起
+  # 消失了。所以這裡補的是**兜底**而不是根因修復：`$TESTROOT` 是 mktemp 出來
+  # 的唯一路徑，拿它當 pattern 不會誤傷別人的行程。
+  if [[ -n "${TESTROOT:-}" && "$TESTROOT" == */agent-bridge-tests.* ]]; then
+    pkill -f -- "$TESTROOT" 2>/dev/null || true
+  fi
   if [[ -n "${TESTROOT:-}" && -d "$TESTROOT" ]]; then
     rm -rf -- "$TESTROOT"
   fi
@@ -81,6 +121,75 @@ wait_for() {
 evt_grep() {
   local log="$1" ev="$2"
   grep -qE "Z ${ev}([[:space:]]|\$)" "$log"
+}
+
+# evt_reason <events.log> <reason>：notify-failed 行帶 reason=<v>（HOOK-NOTIFY-4）。
+# 四個關卡原本共用同一個 notify-failed，事後分不出誰擋的。
+#
+# 比對**整行**而非「行內某處有 reason=」：reason 的契約是 additive——append 在
+# `pane=`／`cmd=` 之後、既有欄位順序不動。鬆散比對下，把欄位重排成
+# `reason=… pane=… cmd=…` 照樣全綠，additive 那半條契約等於沒鎖。
+# shellcheck disable=SC2329  # 經 assert 的 "$@" 間接呼叫
+evt_reason() {
+  local log="$1" r="$2"
+  grep -qE "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9:]+Z notify-failed pane=[^[:space:]]+ cmd=[^[:space:]]+ reason=${r}\$" "$log"
+}
+
+# assert_reason <desc> <events.log> <reason>：bash 正本自 M4 凍結、不記 reason，
+# 故 SRC_KIND=bash 顯式 SKIP（不計 PASS／FAIL，bash 側總數不變）。
+assert_reason() {
+  if [[ "$SRC_KIND" == bash ]]; then
+    printf 'SKIP: %s（bash 正本凍結，未實作 reason 欄位）\n' "$1"
+  else
+    assert "$1" evt_reason "$2" "$3"
+  fi
+}
+
+# ---- TEST_GROUPS 分組過濾（政策見 docs/testing-policy.md）----
+# TEST_GROUPS=44,45 只跑指定分組；空＝全套。partial run 會在總結印警告，
+# 不得作為收案／merge 證據。GRP_NEEDS 是**靜態審計**出的跨組依賴
+# （變數＋函式；audit：scratchpad/audit_groups.py 形，2026-08-03），選中組
+# 自動拉入依賴組（傳遞閉包）。新分組若引用他組狀態，必須同步補這張表——
+# 漏補的失敗形態是「選中組轉紅」（fail-visible），不會假綠。
+declare -A GRP_NEEDS=(
+  [2]="1" [3]="1" [5]="4" [7]="6" [13]="4 6 7 11 12" [22]="19" [27]="22"
+  [29]="25 26" [34.5+]="34" [36]="35" [42]="26" [43]="26"
+  # codex 複核補（2026-08-03）：13 需 7（group 6 只 deliver、7 才 reply 成
+  # completed，缺 7 會無限等待）；17/18 需 16（manual-x 與 pane_w1 是 16 建的
+  # 語意 fixture，變數掃描抓不到 manual-x 這種字串依賴）
+  [17]="16" [18]="16"
+)
+GRP_KNOWN=" 1 2 3 4 5 6 7 8 8a 8b 9 10 11 12 13 14 15 16 17 18 18b 18c 19 20 20b 21 22 23 24 25 26 27 28 29 30 31 32 33 34 34.5+ 35 36 37 38 39 40 41 42 43 44 45 46 47 "
+GRP_SELECTED=""
+GRP_SKIPPED=0
+if [[ -n "${TEST_GROUPS:-}" ]]; then
+  _grp_queue="${TEST_GROUPS//,/ }"
+  for _g in $_grp_queue; do
+    if [[ "$GRP_KNOWN" != *" $_g "* ]]; then
+      printf 'TEST_GROUPS 含未知分組：%s（可用：%s）\n' "$_g" "$GRP_KNOWN" >&2
+      exit 1
+    fi
+  done
+  _grp_changed=1
+  while (( _grp_changed )); do
+    _grp_changed=0
+    for _g in $_grp_queue; do
+      for _d in ${GRP_NEEDS[$_g]:-}; do
+        if [[ " $_grp_queue " != *" $_d "* ]]; then
+          _grp_queue="$_d $_grp_queue"
+          _grp_changed=1
+        fi
+      done
+    done
+  done
+  GRP_SELECTED=" $_grp_queue "
+fi
+grp() {
+  if [[ -z "$GRP_SELECTED" ]] || [[ "$GRP_SELECTED" == *" $1 "* ]]; then
+    return 0
+  fi
+  GRP_SKIPPED=$(( GRP_SKIPPED + 1 ))
+  return 1
 }
 
 # ---- shim：讓 bridge 內部的 tmux 呼叫走測試 socket ----
@@ -127,6 +236,9 @@ EOF
 make_runtime_shim codex
 # 真 claude 也在 PATH 上，但 shim 排在最前面，測試不會叫到真的
 make_runtime_shim claude
+# agy 同理（真 agy 也可能在 PATH 上）。shim 無條件建立、只有分組 37 會用到：
+# bash 正本不支援 agy runtime，多這個檔對它是死碼而非行為差異
+make_runtime_shim agy
 
 # spawn 出來的 pane 由 tmux server 啟動，PATH 繼承自 server 環境；
 # 在 server 啟動前把 shim 排進 PATH，pane 才找得到假 codex 與 agent-bridge
@@ -197,6 +309,7 @@ if ! wait_for 10 test -f "$TESTROOT/ready-a" || ! wait_for 10 test -f "$TESTROOT
 fi
 
 # ---- 1. register / list（含同名覆蓋） ----
+if grp 1; then
 # spec: CLI-REGISTER-1 CLI-LIST-1 STATE-AGENT-1 STATE-AGENT-3 STATE-GEN-1 ENV-DATA-1
 D1="$TESTROOT/d1"
 ab "$D1" register alice "$PANE_A" 2>/dev/null
@@ -217,7 +330,9 @@ assert "register 失敗時不寫 agents 檔" \
 assert_fails "register：tmux 不可用時報錯" \
   ab_notmux "$D1" register carol "$PANE_A"
 
+fi  # end grp 1
 # ---- 2. send 錯誤路徑 ----
+if grp 2; then
 # spec: CLI-SEND-2 CLI-SEND-3 CLI-GEN-1 STATE-GEN-3
 out="$(ab "$D1" send nobody --from alice --message hi 2>/dev/null)"; rc=$?
 assert "send 未註冊 agent：非零退出" test "$rc" -ne 0
@@ -227,13 +342,17 @@ assert_fails "send 缺訊息參數報錯" ab "$D1" send alice --from bob
 assert_fails "send：--from 名稱不合法被拒" \
   ab "$D1" send alice --from "bad name" --message hi
 
+fi  # end grp 2
 # ---- 3. 未知 task 的 receive / status / read ----
+if grp 3; then
 # spec: CLI-GEN-1 CLI-GEN-3 CLI-RECEIVE-1 CLI-STATUS-1
 assert_fails "receive 未知 task 報錯" ab "$D1" receive 20990101T000000Z-dead
 assert_fails "status 未知 task 報錯"  ab "$D1" status  20990101T000000Z-dead
 assert_fails "read 未知 task 報錯"    ab "$D1" read    20990101T000000Z-dead
 
+fi  # end grp 3
 # ---- 4. send 快樂路徑 + read 於未 completed ----
+if grp 4; then
 # spec: CLI-SEND-1 CLI-GEN-2 CLI-RECEIVE-1 STATE-TASK-1 STATE-TASK-2 STATE-TASK-3
 # 註：pane 的 AGENT_BRIDGE_DATA 指向 DATA_IT，收到本組（D2）通知後其 receive 會
 # 找不到 task 而失敗，不影響 D2 的狀態——正好隔離出 queued 狀態供測試。
@@ -259,7 +378,9 @@ assert "read 於尚未 completed：非零退出" test "$rc" -ne 0
 assert "read 於尚未 completed：stderr 提示尚未回覆" \
   grep -q '尚未回覆' "$TESTROOT/d2-read.err"
 
+fi  # end grp 4
 # ---- 5. reply 非法轉換：queued 未 receive 直接 reply ----
+if grp 5; then
 # spec: CLI-REPLY-1 STATE-TASK-4
 ab "$D2" reply "$id2" --message "premature" >/dev/null 2>&1; rc=$?
 assert "reply 於 queued（未 receive）：非零退出" test "$rc" -ne 0
@@ -267,7 +388,9 @@ assert "reply 於 queued：狀態檔不變（仍 queued）" st_is "$D2" "$id2" q
 assert "reply 於 queued：不產生 response.md" \
   test ! -e "$D2/tasks/$id2/response.md"
 
+fi  # end grp 5
 # ---- 6. 特殊字元 byte-for-byte 保真（--message-file 與 stdin） ----
+if grp 6; then
 # spec: CLI-SEND-1
 D3="$TESTROOT/d3"
 ab "$D3" register bob "$PANE_B" 2>/dev/null
@@ -295,7 +418,9 @@ id3s="$(ab "$D3" send bob --from alice --message-file - < "$TRICKY" 2>/dev/null)
 ab "$D3" receive "$id3s" > "$TESTROOT/got3s.out" 2>/dev/null
 assert "send --message-file - （stdin）保真" diff -q "$TRICKY" "$TESTROOT/got3s.out"
 
+fi  # end grp 6
 # ---- 7. reply / read / 對 completed 重複 reply ----
+if grp 7; then
 # spec: CLI-REPLY-1 CLI-READ-1 STATE-TASK-4
 TRICKY2="$TESTROOT/tricky2.txt"
 # shellcheck disable=SC2016  # 刻意保留字面 $x/`y`，測試保真
@@ -315,7 +440,9 @@ assert "對 completed 重複 reply：非零退出" test "$rc" -ne 0
 assert "對 completed 重複 reply：狀態檔內容不變" \
   diff -q "$TESTROOT/status-before" "$D3/tasks/$id3/status"
 
+fi  # end grp 7
 # ---- 8. 通知失敗路徑（pane 已死） ----
+if grp 8; then
 # spec: CLI-SEND-3
 D5="$TESTROOT/d5"
 p3="$(tmx split-window -dP -F '#{pane_id}' -t it "$pane_cmd")"
@@ -330,7 +457,9 @@ assert "通知失敗：stderr 有含 task-id 的警告" \
 assert "通知失敗：events.log 記 notify-failed" \
   evt_grep "$D5/tasks/$id5/events.log" notify-failed
 
+fi  # end grp 8
 # ---- 8a. 盲點 1：worker 停在權限對話框時，通知的按鍵不得送進去 ----
+if grp 8a; then
 # spec: HOOK-NOTIFY-2 ENV-NOTIFY-1
 # notify_pane 送鍵前 capture-pane 掃 Claude Code 權限對話框特徵，掃到就降級。這裡
 # 直接鎖住核心不變量「攔截時一個按鍵都沒送進 pane」——而非只驗 return code：假 pane
@@ -361,6 +490,8 @@ assert "對話框偵測(Bash 框)：got 恰好只有哨兵一行（通知的文�
   bash -c 'test "$(wc -l < "$1")" -eq 1 && grep -Fxq "$2" "$1"' _ "$TESTROOT/ask1-got.txt" 'SENTINEL-ask1'
 assert "對話框偵測(Bash 框)：events.log 記 notify-failed" \
   evt_grep "$D5a/tasks/$id5a/events.log" notify-failed
+assert_reason "對話框偵測(Bash 框)：notify-failed 標 reason=prompt" \
+  "$D5a/tasks/$id5a/events.log" prompt
 assert "對話框偵測(Bash 框)：stderr 有含 task-id 的警告" \
   grep -q "$id5a" "$TESTROOT/d5a-send.err"
 tmx kill-pane -t "$p_ask" 2>/dev/null || true
@@ -400,6 +531,34 @@ assert_fails "非對話框畫面：通知未降級（events.log 不記 notify-fa
   evt_grep "$D5b/tasks/$id5b/events.log" notify-failed
 tmx kill-pane -t "$p_ok" 2>/dev/null || true
 
+# 8a③b matcher 位置有錨（2026-08-01 收窄）：畫面**上半部**出現特徵字串、下緣是
+# 正常內容時，MUST 照送。這是 production 形狀而非人造刁難——一個正在調查這個
+# bug 的 coordinator，pane 上就有 `rg 'Requesting permission for:|Do you want to
+# proceed'` 的指令回顯，一行湊齊三組特徵；實測誤判 19/24≈79%，且 P4 之後同一
+# matcher 餵給 TUI 的 BLOCKER 軸，會變成常駐假 ⛔blocked。
+# bash 正本自 M4 凍結（仍是整屏無錨比對，會誤判），故 SRC_KIND=bash 顯式 SKIP。
+if [[ "$SRC_KIND" == bash ]]; then
+  printf 'SKIP: 8a③b matcher 下緣錨（bash 正本凍結，仍是整屏無錨比對）\n'
+else
+  D5j="$TESTROOT/d5j"
+  p_talk="$(tmx split-window -dP -F '#{pane_id}' -t it "$pane_cmd")"
+  ab "$D5j" register tata "$p_talk" 2>/dev/null
+  # 特徵行在上，其後 20 行正常內容把它推出下緣掃描區
+  tmx send-keys -t "$p_talk" \
+    "printf '%s\n' 'rg \"Requesting permission for:|Do you want to proceed?|esc to cancel|Esc to cancel\" notes.md' ; for i in \$(seq 1 20) ; do printf 'ordinary worker output line %s\n' \"\$i\" ; done ; touch $TESTROOT/talk-ready ; while IFS= read -r l ; do printf '%s\n' \"\$l\" >> $TESTROOT/talk-got.txt ; done" Enter
+  wait_for 10 test -f "$TESTROOT/talk-ready"
+  # 前置斷言：特徵字串真的還在可見一屏內（否則本組退化成 8a③ 的複本）
+  tmx capture-pane -pJ -t "$p_talk" > "$TESTROOT/talk-screen.txt"
+  assert "8a③b 前置：特徵字串確實在可見一屏（只是不在下緣）" \
+    grep -qF -- 'Requesting permission for:' "$TESTROOT/talk-screen.txt"
+  id5j="$(ab "$D5j" send tata --from alice --message hi 2>/dev/null)"
+  assert "8a③b 談論權限框的畫面：pane 收到通知文字（不再誤判）" \
+    wait_for 10 grep -q "$id5j" "$TESTROOT/talk-got.txt"
+  assert_fails "8a③b 談論權限框的畫面：events.log 不記 notify-failed" \
+    evt_grep "$D5j/tasks/$id5j/events.log" notify-failed
+  tmx kill-pane -t "$p_talk" 2>/dev/null || true
+fi
+
 # 8a④ B1 regression（有狀態 shim）：「capture-pane 失敗但 send-keys 可用」在真
 # tmux 幾乎構造不出來（pane 活著時 capture 不會失敗），shim 讓 capture 一律非零、
 # send-keys 只記 argv 不透傳。鎖住 fail-closed 方向：查不到 pane 狀態必須整個放棄
@@ -434,6 +593,9 @@ assert "capture 失敗 fail-closed(B1)：send-keys 一次都沒被呼叫" \
   test ! -e "$TESTROOT/b1-sendkeys.log"
 assert "capture 失敗 fail-closed(B1)：events.log 記 notify-failed" \
   evt_grep "$D5d/tasks/$id5d/events.log" notify-failed
+# capture 讀不出來＝查詢層失敗（2026-08-03 拆桶）：pane 可能活著，不得記 pane-gone
+assert_reason "capture 失敗 fail-closed(B1)：notify-failed 標 reason=query-failed" \
+  "$D5d/tasks/$id5d/events.log" query-failed
 
 # 8a⑤ B3 regression（有狀態 shim）：第一次掃描時畫面乾淨、通知文字送出後的延遲
 # 期間 worker 才彈出權限框——真 tmux 難穩定構造這個時序，shim 用計數檔讓第一次
@@ -548,7 +710,9 @@ assert_fails "半特徵畫面(片段一)：通知未降級（events.log 不記 n
   evt_grep "$D5i/tasks/$id5i/events.log" notify-failed
 tmx kill-pane -t "$p_half1" 2>/dev/null || true
 
+fi  # end grp 8a
 # ---- 8b. 鎖失敗路徑：權限失敗 vs 真正鎖佔用 ----
+if grp 8b; then
 # spec: STATE-LOCK-1
 D6="$TESTROOT/d6"
 ab "$D6" register bob "$PANE_B" 2>/dev/null
@@ -566,7 +730,9 @@ rmdir "$D6/locks/$id6.lock"
 assert "鎖被佔用：重試後非零退出" test "$rc" -ne 0
 assert "鎖被佔用：報佔用中" grep -q '佔用中' "$TESTROOT/d6-lock.err"
 
+fi  # end grp 8b
 # ---- 9. unregister ----
+if grp 9; then
 # spec: CLI-UNREGISTER-1
 D7="$TESTROOT/d7"
 ab "$D7" register dave "$PANE_A" 2>/dev/null
@@ -579,7 +745,9 @@ assert_fails "unregister：不合法名稱被拒" ab "$D7" unregister "bad name"
 assert_fails "unregister 後 send 該 agent 報錯" \
   ab "$D7" send dave --from alice --message hi
 
+fi  # end grp 9
 # ---- 10. start：delivered → running ----
+if grp 10; then
 # spec: CLI-START-1
 D8="$TESTROOT/d8"
 ab "$D8" register bob "$PANE_B" 2>/dev/null
@@ -599,7 +767,9 @@ assert "receive 於 running：狀態仍 running" st_is "$D8" "$id8" running
 ab "$D8" reply "$id8" --message "done from running" 2>/dev/null
 assert "running 可 reply → completed" st_is "$D8" "$id8" completed
 
+fi  # end grp 10
 # ---- 11. fail：delivered/running → failed，read 可讀失敗原因 ----
+if grp 11; then
 # spec: CLI-FAIL-1
 D9="$TESTROOT/d9"
 ab "$D9" register bob "$PANE_B" 2>/dev/null
@@ -622,7 +792,9 @@ assert_fails "fail 後 reply 報錯（終態）" ab "$D9" reply "$id9" --message
 assert_fails "重複 fail 報錯（終態）" ab "$D9" fail "$id9" --message again
 assert "終態後狀態仍 failed" st_is "$D9" "$id9" failed
 
+fi  # end grp 11
 # ---- 12. cancel：queued/delivered/running → cancelled ----
+if grp 12; then
 # spec: CLI-CANCEL-1
 D10="$TESTROOT/d10"
 ab "$D10" register bob "$PANE_B" 2>/dev/null
@@ -663,7 +835,9 @@ assert "cancel 於 delivered：events.log 記 cancelled" \
 assert_fails "cancel 於 delivered 後 reply 報錯" \
   ab "$D10" reply "$idc4" --message late
 
+fi  # end grp 12
 # ---- 13. await：等待終態 ----
+if grp 13; then
 # spec: CLI-AWAIT-1 CLI-AWAIT-2 ENV-POLL-1
 assert "await 於 completed：立即印 completed" \
   test "$(ab "$D3" await "$id3" 2>/dev/null)" = completed
@@ -698,7 +872,9 @@ assert "背景 await：reply 後返回 exit 0" test "$rc" -eq 0
 assert "背景 await：印出 completed" \
   test "$(cat "$TESTROOT/await-bg.out")" = completed
 
+fi  # end grp 13
 # ---- 14. tmux 整合：完整 round-trip ----
+if grp 14; then
 # spec: CLI-SEND-1 CLI-RECEIVE-1 CLI-REPLY-1
 ab "$DATA_IT" register agent-a "$PANE_A" 2>/dev/null
 ab "$DATA_IT" register agent-b "$PANE_B" 2>/dev/null
@@ -716,7 +892,9 @@ assert "round-trip：reply 後狀態 completed" st_is "$DATA_IT" "$idIT" complet
 assert "round-trip：sender pane 收到並執行 read 通知" \
   wait_for 15 grep -q 'Z read$' "$DATA_IT/tasks/$idIT/events.log"
 
+fi  # end grp 14
 # ---- 15. 併發壓測：衝突轉換 + 大量平行 send ----
+if grp 15; then
 # spec: STATE-TASK-1
 
 # 15a. 同一 task 於 delivered 狀態並行射出 3 reply + 3 fail + 3 cancel：
@@ -781,8 +959,10 @@ all_ids13_ok() {
 }
 assert "併發 send：10 個 task 目錄皆存在且狀態合法" all_ids13_ok
 
+fi  # end grp 15
 # ---- 16. spawn：核心＋cap＋原子回滾（Phase 1） ----
-# spec: CLI-SPAWN-1 CLI-SPAWN-2 CLI-SPAWN-3 CLI-SPAWN-4 ENV-SPAWN-1 ENV-HOOKS-1 ENV-PASS-1 ENV-TAG-1 HOOK-BIND-1 STATE-AGENT-1
+if grp 16; then
+# spec: CLI-SPAWN-1 CLI-SPAWN-2 CLI-SPAWN-3 CLI-SPAWN-4 ENV-SPAWN-1 ENV-HOOKS-1 ENV-PASS-1 ENV-TAG-1 HOOK-BIND-1 STATE-AGENT-1 STATE-AGENT-5
 
 # 16a. 快樂路徑：假 codex 啟動期吃輸入 2 秒，首發探針必被吃，
 # ready 仍翻 true ＝ 探針重送機制生效（Phase 2 gate 一併覆蓋）
@@ -1033,6 +1213,163 @@ assert "Notification 對應裸指令 agent-bridge hook notification" \
   jq -e '.hooks.Notification[0].hooks[0].command == "agent-bridge hook notification" and .hooks.Notification[0].hooks[0].type == "command"' \
   "$HOOKS_JSON"
 
+# 16a7. lineage 繼承（P4.7 切片 A；契約 STATE-AGENT-5）。兩欄的值是
+# **generation key＝canonical spawn_tag 全串**，不是名稱——名稱會重用，同名
+# respawn 是新的一代。兩 runtime 對等由 SRC_KIND 雙跑天然覆蓋。
+#
+# 本段自己開一個資料目錄：lineage 要在乾淨的 registry 上驗「恰一匹配」，
+# $DSPAWN 裡殘留的 worker 會讓匹配數不可預期。
+DLIN="$TESTROOT/dlin"
+mkdir -p "$DLIN/agents" "$DLIN/locks" "$DLIN/tasks"   # 先建出資料目錄（list 唯讀不建）
+# canonical generation key 的文法（與 bin/agent-bridge 的 GEN_KEY_RE、
+# ab_core::spawn::is_generation_key **逐字同一條**）
+LIN_KEY_RE='^AGENT_BRIDGE_SPAWN_TAG=ab-spawn-[A-Za-z0-9_-]+-[0-9]+-[0-9a-f]{12}$'
+
+# 16a7-1：繼承鏈 root→A→B。A 由「帶 root tag 的環境」spawn（模擬 root worker
+# 自己在呼叫 spawn），B 再由 A 的 tag spawn——lineage_root MUST 一路傳下去，
+# 而 parent_agent 每一代都指向**直系** parent 的 tag
+pane_la="$(env AGENT_BRIDGE_DATA="$DLIN" AGENT_BRIDGE_READY_TIMEOUT=0 AGENT_BRIDGE_MAX_SPAWN=20 PATH="$SHIM:$PATH" \
+  "$BRIDGE" spawn lroot --runtime codex --window 2>/dev/null)"
+assert "lineage：root worker spawn 成功" pane_alive "$pane_la"
+lroot_tag="$(jq -r '.spawn_tag' "$DLIN/agents/lroot.json")"
+assert "lineage：無 tag spawn 的 lineage_root ＝自身 spawn_tag（自成根）" \
+  jq -e '.lineage_root == .spawn_tag' "$DLIN/agents/lroot.json"
+assert "lineage：自成根的 registry **沒有** parent_agent 這個 key" \
+  jq -e 'has("parent_agent") | not' "$DLIN/agents/lroot.json"
+assert "lineage：lineage_root 是 canonical generation key 形" \
+  bash -c "[[ \"\$(jq -r '.lineage_root' '$DLIN/agents/lroot.json')\" =~ $LIN_KEY_RE ]]"
+
+# A：呼叫者環境帶 root 的**裸值** tag（registry 存的是含前綴的形式，故要剝）
+lroot_bare="${lroot_tag#AGENT_BRIDGE_SPAWN_TAG=}"
+env AGENT_BRIDGE_DATA="$DLIN" AGENT_BRIDGE_READY_TIMEOUT=0 AGENT_BRIDGE_MAX_SPAWN=20 PATH="$SHIM:$PATH" \
+    AGENT_BRIDGE_SPAWN_TAG="$lroot_bare" \
+  "$BRIDGE" spawn lchildA --runtime codex --window >/dev/null 2>&1; rc=$?
+assert "lineage：帶 parent tag 的 spawn 成功" test "$rc" -eq 0
+assert "lineage：A 的 parent_agent ＝ parent 的 canonical spawn_tag（值是 tag 非名稱）" \
+  jq -e --arg t "$lroot_tag" '.parent_agent == $t' "$DLIN/agents/lchildA.json"
+assert "lineage：A 的 lineage_root 沿用 root 的 lineage_root" \
+  jq -e --arg r "$lroot_tag" '.lineage_root == $r' "$DLIN/agents/lchildA.json"
+assert "lineage：A 的兩欄都不是名稱（不得等於 agent 名）" \
+  jq -e '(.parent_agent != "lroot") and (.lineage_root != "lroot")' "$DLIN/agents/lchildA.json"
+
+# B：由 A 的 tag spawn——root 再傳一代，parent 換成 A
+la_tag="$(jq -r '.spawn_tag' "$DLIN/agents/lchildA.json")"
+env AGENT_BRIDGE_DATA="$DLIN" AGENT_BRIDGE_READY_TIMEOUT=0 AGENT_BRIDGE_MAX_SPAWN=20 PATH="$SHIM:$PATH" \
+    AGENT_BRIDGE_SPAWN_TAG="${la_tag#AGENT_BRIDGE_SPAWN_TAG=}" \
+  "$BRIDGE" spawn lchildB --runtime codex --window >/dev/null 2>&1; rc=$?
+assert "lineage：第三代 spawn 成功" test "$rc" -eq 0
+assert "lineage：B 的 lineage_root 仍是 root 的 key（跨兩代傳遞）" \
+  jq -e --arg r "$lroot_tag" '.lineage_root == $r' "$DLIN/agents/lchildB.json"
+assert "lineage：B 的 parent_agent 是 A 的 tag（直系，不是 root）" \
+  jq -e --arg a "$la_tag" --arg r "$lroot_tag" \
+  '.parent_agent == $a and .parent_agent != $r' "$DLIN/agents/lchildB.json"
+
+# 16a7-2：legacy parent（registry 無 lineage_root，永不 backfill）→ 子代退回
+# parent 自身的 spawn_tag 當根
+jq 'del(.lineage_root, .parent_agent)' "$DLIN/agents/lchildA.json" \
+  > "$TESTROOT/legacy.json" && mv "$TESTROOT/legacy.json" "$DLIN/agents/lchildA.json"
+assert "lineage（前提）：A 已被改成 legacy 形（無 lineage_root）" \
+  jq -e 'has("lineage_root") | not' "$DLIN/agents/lchildA.json"
+env AGENT_BRIDGE_DATA="$DLIN" AGENT_BRIDGE_READY_TIMEOUT=0 AGENT_BRIDGE_MAX_SPAWN=20 PATH="$SHIM:$PATH" \
+    AGENT_BRIDGE_SPAWN_TAG="${la_tag#AGENT_BRIDGE_SPAWN_TAG=}" \
+  "$BRIDGE" spawn llegacy --runtime codex --window >/dev/null 2>&1; rc=$?
+assert "lineage：legacy parent 下 spawn 仍成功" test "$rc" -eq 0
+assert "lineage：legacy parent → lineage_root 退回 parent 自身 spawn_tag" \
+  jq -e --arg a "$la_tag" '.lineage_root == $a and .parent_agent == $a' \
+  "$DLIN/agents/llegacy.json"
+
+# 16a7-3：malformed lineage_root（worker 可寫面被塞了非 generation key）→
+# **視同缺席**，退回 parent 自身 tag（不另設分支、不另發警告）
+jq --arg bad 'parent-name' '.lineage_root = $bad' "$DLIN/agents/lchildA.json" \
+  > "$TESTROOT/bad.json" && mv "$TESTROOT/bad.json" "$DLIN/agents/lchildA.json"
+env AGENT_BRIDGE_DATA="$DLIN" AGENT_BRIDGE_READY_TIMEOUT=0 AGENT_BRIDGE_MAX_SPAWN=20 PATH="$SHIM:$PATH" \
+    AGENT_BRIDGE_SPAWN_TAG="${la_tag#AGENT_BRIDGE_SPAWN_TAG=}" \
+  "$BRIDGE" spawn lbadroot --runtime codex --window >/dev/null 2>&1; rc=$?
+assert "lineage：malformed lineage_root 下 spawn 仍成功（fail-soft）" test "$rc" -eq 0
+assert "lineage：malformed lineage_root 視同缺席 → 退 parent 自身 tag" \
+  jq -e --arg a "$la_tag" '.lineage_root == $a' "$DLIN/agents/lbadroot.json"
+assert "lineage：子代寫入的 lineage_root 恆為合法 generation key" \
+  bash -c "[[ \"\$(jq -r '.lineage_root' '$DLIN/agents/lbadroot.json')\" =~ $LIN_KEY_RE ]]"
+# 非字串型別（number）同樣不得被字串化沿用
+jq '.lineage_root = 5' "$DLIN/agents/lchildA.json" \
+  > "$TESTROOT/num.json" && mv "$TESTROOT/num.json" "$DLIN/agents/lchildA.json"
+env AGENT_BRIDGE_DATA="$DLIN" AGENT_BRIDGE_READY_TIMEOUT=0 AGENT_BRIDGE_MAX_SPAWN=20 PATH="$SHIM:$PATH" \
+    AGENT_BRIDGE_SPAWN_TAG="${la_tag#AGENT_BRIDGE_SPAWN_TAG=}" \
+  "$BRIDGE" spawn lnumroot --runtime codex --window >/dev/null 2>&1
+assert "lineage：非字串 lineage_root（number）同樣退 parent 自身 tag" \
+  jq -e --arg a "$la_tag" '.lineage_root == $a' "$DLIN/agents/lnumroot.json"
+
+# 16a7-4：duplicate tag（兩筆 registry 有相同 spawn_tag）→ ambiguous：
+# 自成根＋stderr 警告，**MUST NOT 依目錄序任選**
+DDUP="$TESTROOT/ddup"
+mkdir -p "$DDUP/agents" "$DDUP/locks" "$DDUP/tasks"
+dup_tag='AGENT_BRIDGE_SPAWN_TAG=ab-spawn-dupparent-4242-0123456789ab'
+for n in dupa dupb; do
+  jq -n --arg n "$n" --arg t "$dup_tag" --arg r "$dup_tag" \
+    '{name: $n, pane_id: "%999", registered_at: "2026-08-02T00:00:00Z", spawned: true,
+      runtime: "codex", model: "", spawned_at: "2026-08-02T00:00:00Z", ready: true,
+      spawn_tag: $t, owner: "", worker_window: "", lineage_root: $r}' \
+    > "$DDUP/agents/$n.json"
+done
+env AGENT_BRIDGE_DATA="$DDUP" AGENT_BRIDGE_READY_TIMEOUT=0 AGENT_BRIDGE_MAX_SPAWN=20 PATH="$SHIM:$PATH" \
+    AGENT_BRIDGE_SPAWN_TAG="${dup_tag#AGENT_BRIDGE_SPAWN_TAG=}" \
+  "$BRIDGE" spawn ldup --runtime codex --window >/dev/null 2>"$TESTROOT/ldup.err"; rc=$?
+assert "lineage：duplicate tag 下 spawn 仍成功（ambiguous 不擋 spawn）" test "$rc" -eq 0
+assert "lineage：duplicate tag → 自成根（lineage_root ＝自身 spawn_tag）" \
+  jq -e '.lineage_root == .spawn_tag' "$DDUP/agents/ldup.json"
+assert "lineage：duplicate tag → parent_agent 缺席（不任選任何一筆）" \
+  jq -e 'has("parent_agent") | not' "$DDUP/agents/ldup.json"
+assert "lineage：duplicate tag → stderr 有可見警告" \
+  grep -q '無法唯一判定' "$TESTROOT/ldup.err"
+
+# 16a7-5：fail-soft 迴歸（F1）——stderr 關閉（2>&-）時，ambiguous 這條會印
+# 警告的路徑 MUST 仍然 spawn 成功。裸 `err` 在 set -e 下遇 EPIPE 會中止整支，
+# 而此時 pane 已建好，EXIT trap 會回滾一個其實成功的 spawn
+env AGENT_BRIDGE_DATA="$DDUP" AGENT_BRIDGE_READY_TIMEOUT=0 AGENT_BRIDGE_MAX_SPAWN=20 PATH="$SHIM:$PATH" \
+    AGENT_BRIDGE_SPAWN_TAG="${dup_tag#AGENT_BRIDGE_SPAWN_TAG=}" \
+  "$BRIDGE" spawn ldupq --runtime codex --window >/dev/null 2>&-; rc=$?
+assert "lineage：stderr 關閉下 ambiguous 路徑仍 spawn 成功（fail-soft）" test "$rc" -eq 0
+assert "lineage：stderr 關閉下 registry 照樣落地" test -e "$DDUP/agents/ldupq.json"
+
+# 16a7-6：reserved PASS_ENV（B4）——白名單指名 AGENT_BRIDGE_SPAWN_TAG 時
+# MUST 剔除：spawn 成功、有警告，且 pane 啟動指令**只有一個** tag assignment
+# （多出來的那個排在後面會覆蓋前者，子代於是頂著呼叫者的 tag 開起來）
+pane_lres="$(env AGENT_BRIDGE_DATA="$DLIN" AGENT_BRIDGE_READY_TIMEOUT=0 AGENT_BRIDGE_MAX_SPAWN=20 PATH="$SHIM:$PATH" \
+    AGENT_BRIDGE_PASS_ENV='AGENT_BRIDGE_SPAWN_TAG,AGENT_BRIDGE_RELAY_DEPTH,PE_OK' \
+    AGENT_BRIDGE_SPAWN_TAG="$lroot_bare" AGENT_BRIDGE_RELAY_DEPTH=3 PE_OK=keepme \
+  "$BRIDGE" spawn lres --runtime codex --window 2>"$TESTROOT/lres.err")"; rc=$?
+assert "PASS_ENV reserved：spawn 仍成功（靜默剔除，不是 fail-closed）" test "$rc" -eq 0
+assert "PASS_ENV reserved：stderr 有剔除警告" \
+  grep -q '保留變數' "$TESTROOT/lres.err"
+lres_cmd="$(tmx display -pt "$pane_lres" '#{pane_start_command}')"
+assert "PASS_ENV reserved：pane 啟動指令只有一個 AGENT_BRIDGE_SPAWN_TAG= assignment" \
+  bash -c "c=${lres_cmd@Q}; n=\$(grep -o 'AGENT_BRIDGE_SPAWN_TAG=' <<<\"\$c\" | wc -l); (( n == 1 ))"
+assert "PASS_ENV reserved：RELAY_DEPTH 沒被白名單帶進啟動指令" \
+  bash -c "c=${lres_cmd@Q}; [[ \"\$c\" != *AGENT_BRIDGE_RELAY_DEPTH=* ]]"
+assert "PASS_ENV reserved：非保留變數照舊穿透（證明不是整份白名單被丟掉）" \
+  bash -c "c=${lres_cmd@Q}; [[ \"\$c\" == *' PE_OK=keepme '* ]]"
+assert "PASS_ENV reserved：子代 lineage 仍認得出真正的 parent（tag 沒被蓋掉）" \
+  jq -e --arg t "$lroot_tag" '.parent_agent == $t' "$DLIN/agents/lres.json"
+# fail-soft 迴歸（F1 的另一半）：stderr 關閉下剔除路徑一樣不得帶走 spawn
+env AGENT_BRIDGE_DATA="$DLIN" AGENT_BRIDGE_READY_TIMEOUT=0 AGENT_BRIDGE_MAX_SPAWN=20 PATH="$SHIM:$PATH" \
+    AGENT_BRIDGE_PASS_ENV='AGENT_BRIDGE_SPAWN_TAG' \
+  "$BRIDGE" spawn lresq --runtime codex --window >/dev/null 2>&-; rc=$?
+assert "PASS_ENV reserved：stderr 關閉下剔除路徑仍 spawn 成功（fail-soft）" test "$rc" -eq 0
+
+# 16a7-7：register（人工註冊）MUST NOT 寫這兩欄
+ab "$DLIN" register lmanual "$PANE_A" >/dev/null 2>&1
+assert "lineage：register 不寫 lineage_root／parent_agent" \
+  jq -e '(has("lineage_root") | not) and (has("parent_agent") | not)' \
+  "$DLIN/agents/lmanual.json"
+
+# 收尾：本段開的 worker 全部回收（避免佔用後續測例的 pane／cap）
+for n in lroot lchildA lchildB llegacy lbadroot lnumroot lres lresq; do
+  ab "$DLIN" despawn "$n" >/dev/null 2>&1 || true
+done
+for n in ldup ldupq; do
+  ab "$DDUP" despawn "$n" >/dev/null 2>&1 || true
+done
+
 # 16b. 參數與名稱衝突拒絕
 assert_fails "spawn 已註冊（spawned）名稱被拒" absp "$DSPAWN" 0 spawn w1 --runtime codex
 ab "$DSPAWN" register manual-x "$PANE_A" 2>/dev/null
@@ -1119,7 +1456,9 @@ assert "spawn --window：與既有 pane 不同 window" bash -c \
      \"\$($REAL_TMUX -L $SOCK display -pt '$PANE_A' '#{window_id}')\" ]]"
 ab "$DSPAWN" despawn ww >/dev/null 2>&1
 
+fi  # end grp 16
 # ---- 17. ready／探針（Phase 2） ----
+if grp 17; then
 # spec: CLI-READY-1 ENV-READY-1 ENV-READY-2
 pane_w5="$(absp "$DSPAWN" 0 spawn w5 --runtime codex 2>/dev/null)"
 assert "READY_TIMEOUT=0：spawn 立即返回、ready 仍 false" \
@@ -1148,7 +1487,9 @@ assert "就緒逾時：stderr 印未回報就緒警告" grep -q '未回報就緒
 assert "就緒逾時：pane 留用供診斷" pane_alive "$pane_w6"
 assert "就緒逾時：registry 仍在、ready false" jq -e '.ready == false' "$DSPAWN/agents/w6.json"
 
+fi  # end grp 17
 # ---- 18. despawn＋出身防護（Phase 3） ----
+if grp 18; then
 # spec: CLI-DESPAWN-1
 assert_fails "despawn 人工 agent 被拒" ab "$DSPAWN" despawn manual-x
 assert "despawn 被拒：registry 檔仍在" test -f "$DSPAWN/agents/manual-x.json"
@@ -1172,7 +1513,9 @@ assert "死 pane despawn：registry 已清" test ! -e "$DSPAWN/agents/w7.json"
 assert "死 pane despawn：agents.log 記下這次回收（未宣告 disposable → unsaved）" \
   grep -qE "Z despawned-unsaved w7 " "$DSPAWN/agents.log"
 
+fi  # end grp 18
 # ---- 18b. despawn 的出身證據＝pane 啟動指令的 tag（codex 第三輪 FAIL 1） ----
+if grp 18b; then
 # spec: CLI-DESPAWN-2 ENV-TAG-1
 # pane id 會被 tmux 重用（不同 server／server 重啟後計數器歸零），registry 也
 # 可能被有資料目錄寫入權的 worker 偽造。只憑 pane_id 相符就殺，會殺到人工 pane。
@@ -1293,7 +1636,9 @@ assert "server 中途替換：stderr 說明無法關閉 pane" \
 "$REAL_TMUX" -L "$SOCKB" -f /dev/null kill-server 2>/dev/null || true
 tmx kill-pane -t "$pane_s" 2>/dev/null
 
+fi  # end grp 18b
 # ---- 18c. despawn 不得把 tmux 失敗當成「pane 已消失」（codex 第三輪 FAIL 2） ----
+if grp 18c; then
 # spec: CLI-DESPAWN-3
 DDSP="$TESTROOT/ddsp"
 pane_k="$(absp "$DDSP" 0 spawn kx --runtime codex 2>/dev/null)"
@@ -1336,7 +1681,9 @@ ab "$DSPAWN" despawn w6 >/dev/null 2>&1
 assert "spawn/despawn 全程後 locks 無殘留" \
   test -z "$(ls -A "$DSPAWN/locks" 2>/dev/null)"
 
+fi  # end grp 18c
 # ---- 19. codex 複核回歸：出身防護的 TOCTOU 與回滾漏洞 ----
+if grp 19; then
 # spec: CLI-SPAWN-2 CLI-DESPAWN-2 STATE-TASK-5
 
 # 19a. provenance race（codex FAIL 1）：出身檢查若在鎖外，despawn 可能先驗過
@@ -1469,21 +1816,30 @@ assert "審計寫入失敗：pane 被回收（pane 數不變）" \
 assert "審計寫入失敗：不留 registry" test ! -e "$DTRAP/agents/audit-x.json"
 
 # 19c'. 回滾刪不掉 registry 時不得靜默（codex 第二輪 FAIL 2）：
-# date shim 在 registry 已寫入後把 agents/ 轉唯讀 → 審計失敗觸發回滾，
-# 但 rm 也失敗。殘留 registry 會繼續佔 cap，必須明講而非吞掉。
+# agents.log 是目錄 → 審計失敗觸發回滾；回滾先殺 pane（if-shell）再刪
+# registry，shim 就趁 if-shell 那一刻把 agents/ 轉唯讀，讓後續的 rm 必然失敗。
+# 殘留 registry 會繼續佔 cap，必須明講而非吞掉。
+# 注入點掛在 tmux 而非 date（M3 改）：date 只是 bash 實作恰好會呼叫的外部
+# 指令，Rust 實作內建時戳、不 fork date，掛在那裡的話這個場景根本不會發生
+# ——測到的是「實作有沒有用 date」而不是「回滾會不會靜默」。if-shell 是兩邊
+# 都必經的回滾步驟，換過去之後這條斷言對兩個實作都成立。
 DRES="$TESTROOT/dres"
 mkdir -p "$DRES/agents" "$DRES/agents.log" "$DRES/locks" "$DRES/tasks"
 RESSHIM="$TESTROOT/resshim"
 mkdir -p "$RESSHIM"
-cat > "$RESSHIM/date" <<EOF
+cat > "$RESSHIM/tmux" <<EOF
 #!/usr/bin/env bash
-# registry 一旦落地就鎖住父目錄，讓後續回滾的 rm 必然失敗
-if [[ -f "$DRES/agents/res-x.json" ]]; then chmod 0555 "$DRES/agents"; fi
-exec /usr/bin/date "\$@"
+unset TMUX
+# 回滾的第一步是 if-shell（原子驗 tag 才殺）；此時 registry 已落地，
+# 鎖住父目錄讓緊接著的 rm 必然失敗
+if [[ "\$1" == "if-shell" ]]; then chmod 0555 "$DRES/agents"; fi
+exec $(printf '%q' "$REAL_TMUX") -L $(printf '%q' "$SOCK") -f /dev/null "\$@"
 EOF
-chmod +x "$RESSHIM/date"
+chmod +x "$RESSHIM/tmux"
+ln -s "$BRIDGE" "$RESSHIM/agent-bridge"
+ln -s "$SHIM/codex" "$RESSHIM/codex"
 before_res="$(pane_count)"
-env AGENT_BRIDGE_DATA="$DRES" AGENT_BRIDGE_READY_TIMEOUT=0 PATH="$RESSHIM:$SHIM:$PATH" \
+env AGENT_BRIDGE_DATA="$DRES" AGENT_BRIDGE_READY_TIMEOUT=0 PATH="$RESSHIM:$PATH" \
   "$BRIDGE" spawn res-x --runtime codex >/dev/null 2>"$TESTROOT/res.err"; rc=$?
 chmod 0755 "$DRES/agents"
 assert "回滾刪不掉 registry：非零退出" test "$rc" -ne 0
@@ -1638,7 +1994,9 @@ assert "目錄型 registry 路徑：不建 pane" test "$(pane_count)" -eq "$befo
 assert "目錄型 registry 路徑：無殘鎖" \
   test ! -d "$DDIR/locks/agents-registry.lock"
 
+fi  # end grp 19
 # ---- 20. 損壞 registry 的出身判斷必須 fail-closed（codex 第七輪 FAIL 1） ----
+if grp 20; then
 # spec: STATE-AGENT-2 CLI-SPAWN-3
 # `jq -e '.spawned == true'` 會把「條件 false」與「JSON 壞掉」壓成同一個非零，
 # 於是損壞的 registry 被當成人工註冊：可被 register 覆寫、被 unregister 除名
@@ -1672,7 +2030,9 @@ assert "registry 是字面 null：pane 未受影響" pane_alive "$pane_bad"
 rm -f "$DBAD/agents/bad1.json"
 tmx kill-pane -t "$pane_bad" 2>/dev/null
 
+fi  # end grp 20
 # ---- 20b. readiness 參數在建 pane 前就要驗（codex 第八輪 FAIL） ----
+if grp 20b; then
 # spec: CLI-SPAWN-2 ENV-READY-1 ENV-READY-2
 # 非法值若留到 spawn_wait_ready 才 die，pane 與 registry 都已落地、回滾也已
 # 解除，呼叫端只看到非零退出，卻多了一個佔 cap 的 worker
@@ -1700,7 +2060,9 @@ assert "stdout 已關閉：spawn 仍 exit 0（worker 已建立不該報失敗）
 assert "stdout 已關閉：registry 確實寫入" test -f "$DSO/agents/so.json"
 ab "$DSO" despawn so >/dev/null 2>&1 || true
 
+fi  # end grp 20b
 # ---- 21. 解鎖失敗不得靜默（codex 第七輪 FAIL 3） ----
+if grp 21; then
 # spec: STATE-LOCK-2
 # 鎖目錄被塞進檔案時 rmdir 會 Directory not empty，吞掉的話鎖就永久殘留、
 # 而且沒有任何人知道
@@ -1708,23 +2070,30 @@ DLK="$TESTROOT/dlk"
 mkdir -p "$DLK/agents" "$DLK/locks" "$DLK/tasks"
 LKSHIM="$TESTROOT/lkshim"
 mkdir -p "$LKSHIM"
-cat > "$LKSHIM/date" <<EOF
+# 注入點掛在 tmux 而非 date（M3 改，理由同 §19c'）：建 pane 的那些 tmux 呼叫
+# 全在 registry 鎖內，兩個實作都必經；date 則只有 bash 實作會 fork
+cat > "$LKSHIM/tmux" <<EOF
 #!/usr/bin/env bash
-# spawn 取得 registry 鎖後才會呼叫 date（寫 registered_at）；趁機把鎖目錄弄成非空
+unset TMUX
+# spawn 取得 registry 鎖之後才會建 pane；趁這時把鎖目錄弄成非空
 if [[ -d "$DLK/locks/agents-registry.lock" ]]; then
   : > "$DLK/locks/agents-registry.lock/squatter"
 fi
-exec /usr/bin/date "\$@"
+exec $(printf '%q' "$REAL_TMUX") -L $(printf '%q' "$SOCK") -f /dev/null "\$@"
 EOF
-chmod +x "$LKSHIM/date"
-env AGENT_BRIDGE_DATA="$DLK" AGENT_BRIDGE_READY_TIMEOUT=0 PATH="$LKSHIM:$SHIM:$PATH" \
+chmod +x "$LKSHIM/tmux"
+ln -s "$BRIDGE" "$LKSHIM/agent-bridge"
+ln -s "$SHIM/codex" "$LKSHIM/codex"
+env AGENT_BRIDGE_DATA="$DLK" AGENT_BRIDGE_READY_TIMEOUT=0 PATH="$LKSHIM:$PATH" \
   "$BRIDGE" spawn lk --runtime codex >/dev/null 2>"$TESTROOT/lk.err" || true
 assert "解鎖失敗：stderr 明確警告而非靜默" \
   grep -q '無法釋放鎖目錄' "$TESTROOT/lk.err"
 rm -rf "$DLK/locks/agents-registry.lock"
 ab "$DLK" despawn lk >/dev/null 2>&1 || true
 
+fi  # end grp 21
 # ---- 22. worker brief 注入（真 codex 實測 gate 失敗的成因） ----
+if grp 22; then
 # spec: ENV-BRIEF-1 CLI-SPAWN-7
 # spawn 出來的 runtime 是零脈絡 session：不注入守則的話，它不知道 pane 裡
 # 收到的 `agent-bridge ready <name>` 是要執行的命令，會當成對話回覆而永遠
@@ -1832,8 +2201,10 @@ for kw in 'agent-bridge receive' 'agent-bridge reply' 'agent-bridge fail' \
   assert "brief 正本含必要元素：$kw" grep -q -- "$kw" "$REPO_BRIEF"
 done
 
+fi  # end grp 22
 # ---- 23. relay：交棒給接手者 ----
-# spec: CLI-RELAY-1 CLI-RELAY-2 CLI-RELAY-3 ENV-DEPTH-1 ENV-DEPTH-2 ENV-BRIEF-2
+if grp 23; then
+# spec: CLI-RELAY-1 CLI-RELAY-2 CLI-RELAY-3 CLI-RELAY-4 ENV-DEPTH-1 ENV-DEPTH-2 ENV-BRIEF-2
 # relay 與 spawn 共用整條 pane 生命週期（cap／tag／回滾／夭折偵測／registry），
 # 差別只有注入哪份 brief、切不切焦點、以及要不要請接手者回收前一棒。
 # 故這裡只測那三處差異＋交接檔路徑的防線，不重測 spawn 已覆蓋的部分。
@@ -2090,7 +2461,35 @@ for rdn in rd1 rd2 rd5 rd12; do
   assert "23h 收尾：despawn $rdn（pane 還回共享池）" ab "$DDEPTH" despawn "$rdn"
 done
 
+# 23i. CLI-RELAY-4：手動呼叫者（無 spawn tag）→ stderr 恰一行盯守提醒；
+# spawn 出身（有 tag）→ 不印。手動 session 的權限框無從偵測（tui-design §1
+# known gap），這行是唯一緩解，兩個方向都要釘死才不會（a）靜默消失或
+# （b）對 spawn 出身的接手者洗版。env -u／顯式設值缺一不可：套件本身可能
+# 由任一種身分執行（人工終端無 tag、spawn 出身的協調者有 tag），不控變數
+# 這兩條會隨執行者身分假綠
+RHERR="$TESTROOT/relay-hint-manual.err"
+env -u AGENT_BRIDGE_SPAWN_TAG AGENT_BRIDGE_DATA="$DRELAY" AGENT_BRIDGE_READY_TIMEOUT=0 \
+  PATH="$SHIM:$PATH" \
+  "$BRIDGE" relay rh1 --runtime codex --handoff "$HANDOFF" --no-select \
+  >/dev/null 2>"$RHERR"; rc=$?
+assert "手動呼叫者 relay：exit 0（提醒不影響成功契約）" test "$rc" -eq 0
+assert "手動呼叫者：stderr 有盯守提醒" grep -q '手動起' "$RHERR"
+assert "提醒恰一行（不得洗版）" \
+  bash -c "test \"\$(grep -c '手動起' '$RHERR')\" -eq 1"
+RHERR2="$TESTROOT/relay-hint-spawned.err"
+env AGENT_BRIDGE_SPAWN_TAG='ab-spawn-rhx-1-0123456789ab' \
+  AGENT_BRIDGE_DATA="$DRELAY" AGENT_BRIDGE_READY_TIMEOUT=0 PATH="$SHIM:$PATH" \
+  "$BRIDGE" relay rh2 --runtime codex --handoff "$HANDOFF" --no-select \
+  >/dev/null 2>"$RHERR2"; rc=$?
+assert "spawn 出身呼叫者 relay：exit 0" test "$rc" -eq 0
+assert_fails "spawn 出身呼叫者：不印提醒" grep -q '手動起' "$RHERR2"
+for rhn in rh1 rh2; do
+  assert "23i 收尾：despawn $rhn（pane 還回共享池）" ab "$DRELAY" despawn "$rhn"
+done
+
+fi  # end grp 23
 # ---- 24. disposable：worker 自報脈絡無殘值（orchestrator Phase 1） ----
+if grp 24; then
 # spec: CLI-DISPOSABLE-1
 # 語意刻意是單向宣告而非雙向旗標：預設保留，沒宣告過的一律視為仍有殘值。
 # 失效方向因此是「多留一個佔 cap」而不是「把還有用的脈絡殺掉」
@@ -2137,7 +2536,9 @@ assert_fails "disposable：registry 是合法 JSON 但非 object → 拒絕（�
 assert "disposable：非 object registry 被拒後內容未被覆寫" \
   test "$(tr -d '[:space:]' < "$DDISP/agents/dp1.json")" = null
 
+fi  # end grp 24
 # ---- 25. idle：worker 池回收決策視圖（orchestrator Phase 2） ----
+if grp 25; then
 # spec: CLI-IDLE-1 CLI-IDLE-2
 DIDLE="$TESTROOT/didle"
 
@@ -2238,7 +2639,9 @@ assert "idle：不取鎖——執行後 locks/ 為空" \
   test -z "$(ls -A "$DIDLE/locks")"
 assert_fails "idle：多給參數被拒" ab "$DIDLE" idle extra
 
+fi  # end grp 25
 # ---- 26. evict：驅逐前強制落地筆記（orchestrator Phase 3） ----
+if grp 26; then
 # spec: CLI-EVICT-1 CLI-EVICT-2 CLI-EVICT-3
 # 三步 send → await → despawn。核心不變量：**pane 沒被收掉之前，筆記一定先
 # 落地**；唯一的例外是逾時，而逾時必須在審計線上看得出來（否則「筆記沒落地」
@@ -2427,7 +2830,9 @@ assert "evict：出身不明被拒時不送收尾任務" test "$(task_count "$DE
 assert "evict：出身不明被拒時 registry 未被清掉（留給人工處理）" \
   test -e "$DEV/agents/ev4.json"
 
+fi  # end grp 26
 # ---- 27. brief 正本的策略不變量（Phase 4）----
+if grp 27; then
 # spec: CLI-SPAWN-7
 # 兩份 brief 是策略層的正本，機制對它們一無所知，所以只有這裡守得住：
 # 條款被刪或被改回舊語意時要在測試就紅，而不是等某個 worker 真的把自己
@@ -2459,7 +2864,9 @@ for kw in 'agent-bridge idle' 'agent-bridge evict' 'evicted-timeout' \
   assert "orchestrator brief 含必要元素：$kw" grep -q -- "$kw" "$REPO_OBRIEF"
 done
 
+fi  # end grp 27
 # ---- 28. gc：清舊 task，但三道保留線都不能破 ----
+if grp 28; then
 # spec: CLI-GC-1 CLI-GC-2 CLI-GC-3 STATE-TASK-5
 # tasks/ 只增不減不只是磁碟問題：idle 的回收決策直接掃這個目錄，資料越髒決策
 # 越不可信（名稱重用那個 bug 的根因就是這裡）。但這是唯一會刪東西的命令，
@@ -2559,7 +2966,9 @@ tid_pl="$(ab "$DGP" send plain-a --from alice --message "一般任務" 2>/dev/nu
 assert "gc：一般 send 不帶 pinned（否則 gc 等於失效）" \
   test "$(jq -r '.pinned // false' "$DGP/tasks/$tid_pl/metadata.json")" = false
 
+fi  # end grp 28
 # ---- 29. 第二輪獨立複核的修補（2026-07-23）----
+if grp 29; then
 # spec: CLI-GC-3 CLI-EVICT-3
 DR2="$TESTROOT/drev2"
 mkdir -p "$DR2"/{agents,tasks,locks}
@@ -2661,7 +3070,9 @@ ab "$DR3" gc --older-than 0 --apply >/dev/null 2>&1
 assert "I5：不是 send 生成的目錄名不刪（唯一會 rm 的路徑要保守）" \
   test -d "$DR3/tasks/foo"
 
+fi  # end grp 29
 # ---- 30. CC 權限框特徵 canary：安裝中的 claude 仍含防線依賴的字串 ----
+if grp 30; then
 # spec: HOOK-NOTIFY-2
 # screen_has_prompt 的特徵是對 Claude Code UI 文案的字串比對（bin 內註明以
 # 2.1.218 可執行檔 strings 佐證）。CC 改版改文案時，防線靜默退回 fail-open
@@ -2682,18 +3093,33 @@ if [[ -n "$REAL_CLAUDE" ]] && CANARY_REAL="$(readlink -f "$REAL_CLAUDE" 2>/dev/n
   # 出現，搜整檔會讓「函式改了 matcher、註解留著舊字串」照樣誤綠
   # （獨立複核 2026-07-24 指出）。函式被改名或抽不出來時檔案為空，
   # 後續 grep 全紅——失效方向是誤報而非漏報
-  sed -n '/^screen_has_prompt() {/,/^}/p' "$BRIDGE" > "$TESTROOT/canary-fn"
+  # 抽取對象是**源碼正本**而非 $BRIDGE（M3 改、M4 改綁 Rust）：這是源碼耦合
+  # 檢查，與 check-contract 1–2 同一類，不是黑箱行為斷言。$BRIDGE 是編譯後的
+  # 執行檔，sed 抽不出函式本體，硬綁它只會退化成「換實作就全紅」。
+  # 抽出後**剝掉註解行**再比對：光 grep -F 的話，把 matcher 換成新字串、
+  # 同時在函式內留一段含舊字串的註解，四個斷言仍全綠（獨立複核 2026-07-31）。
+  # 剝註解把蒙混面壓到「函式內未使用的字面值／死分支」，那層由
+  # notify.rs 的 matcher_uses_the_canary_feature_strings 單元測試鎖
+  if [[ "$SRC_KIND" == bash ]]; then
+    sed -n '/^screen_has_prompt() {/,/^}/p' "$SRC_BASH" \
+      | grep -v '^[[:space:]]*#' > "$TESTROOT/canary-fn"
+  else
+    sed -n '/^pub fn screen_has_prompt/,/^}/p' "$SRC_NOTIFY_RS" \
+      | grep -v '^[[:space:]]*//' > "$TESTROOT/canary-fn"
+  fi
   assert "CC canary：screen_has_prompt 函式本體可抽出" test -s "$TESTROOT/canary-fn"
   for kw in 'Do you want to ' 'Esc to cancel' \
             'has written up a plan' 'Would you like to proceed'; do
-    assert "CC canary：特徵「$kw」與 bin 的 screen_has_prompt 一致" \
+    assert "CC canary：特徵「$kw」與正本 screen_has_prompt 一致" \
       grep -qF -- "$kw" "$TESTROOT/canary-fn"
   done
 else
   printf 'SKIP: CC canary（無可檢查的 claude 執行檔——PATH 找不到、readlink 失敗或非一般檔案；特徵漂移檢查未執行）\n'
 fi
 
+fi  # end grp 30
 # ---- 31. 第三輪獨立複核的修補（2026-07-24）----
+if grp 31; then
 # spec: CLI-STATUS-1 CLI-READ-1 CLI-AWAIT-2 CLI-DESPAWN-3 CLI-EVICT-2 CLI-RO-1 ENV-POLL-1 CLI-GEN-3 CLI-SEND-3 STATE-TASK-4 STATE-TASK-5
 # 複核輪抓出的缺口，各自鎖一個回歸；編號對應複核報告的 finding
 
@@ -2798,14 +3224,31 @@ assert "唯讀查詢不建資料目錄" test ! -d "$D31E"
 # 反向殘留的是「終態轉換可被重放」的 split-brain 方向）。源碼順序不變量，
 # 比照 §30 的函式本體抽取
 UMS_FN="$TESTROOT/ums-fn"
-sed -n '/^update_meta_status() {/,/^}/p' "$BRIDGE" > "$UMS_FN"
+# 抽取對象是源碼正本，理由同 §30 的 canary-fn（源碼耦合檢查，M4 已改綁 Rust）。
+# 註解行同樣先剝掉
+if [[ "$SRC_KIND" == bash ]]; then
+  sed -n '/^update_meta_status() {/,/^}/p' "$SRC_BASH" \
+    | grep -v '^[[:space:]]*#' > "$UMS_FN"
+  # shellcheck disable=SC2016  # $dir 是源碼字面值，刻意不展開
+  SL_PAT='atomic_write "$dir/status"'
+  # shellcheck disable=SC2016  # 同上
+  ML_PAT='atomic_write "$dir/metadata.json"'
+else
+  sed -n '/^pub fn update_meta_status/,/^}/p' "$SRC_TASK_RS" \
+    | grep -v '^[[:space:]]*//' > "$UMS_FN"
+  # 各鎖**完整的呼叫頭＋第一引數**，不是單抽路徑字面值：後者可被
+  # `let p = dir.join("status");` 這種 decoy 先命中，實際寫入順序反轉了斷言
+  # 照樣綠（獨立複核 2026-07-31 給的反例）
+  SL_PAT='atomic_write(&dir.join("status")'
+  ML_PAT='atomic_write(&meta_path'
+fi
 assert "update_meta_status 函式本體可抽出" test -s "$UMS_FN"
-# shellcheck disable=SC2016  # $dir 是源碼字面值，刻意不展開
-sl="$(grep -n 'atomic_write "$dir/status"' "$UMS_FN" | cut -d: -f1 | head -1)"
-# shellcheck disable=SC2016  # 同上
-ml="$(grep -n 'atomic_write "$dir/metadata.json"' "$UMS_FN" | cut -d: -f1 | head -1)"
+# 比對前把空白全部去掉：呼叫跨幾行是 rustfmt 的事，不該讓它決定斷言成敗
+UMS_FLAT="$(tr -d '[:space:]' < "$UMS_FN")"
+sl="$(awk -v s="$UMS_FLAT" -v p="${SL_PAT// /}" 'BEGIN{print index(s,p)}')"
+ml="$(awk -v s="$UMS_FLAT" -v p="${ML_PAT// /}" 'BEGIN{print index(s,p)}')"
 assert "先寫 status 再寫 metadata（split-brain 方向鎖定）" \
-  test -n "$sl" -a -n "$ml" -a "$sl" -lt "$ml"
+  test "$sl" -gt 0 -a "$ml" -gt 0 -a "$sl" -lt "$ml"
 
 # 31j. F1 第二輪：await 迴圈內 status 消失＝操作性失敗。evict 以 `||` 呼叫端
 # 包住 cmd_await，該語境抑制 errexit——修補前裸讀取失敗被靜靜輪詢到期限、
@@ -2845,7 +3288,9 @@ assert "寫入階段失敗仍零殘留（EXIT trap 回滾）" \
   test -z "$(ls -A "$D31C/tasks" 2>/dev/null)"
 chmod 600 "$BAD31"
 
+fi  # end grp 31
 # ---- 32. spawn 落點：per-owner worker window＋owner/actor 審計（2026-07-25）----
+if grp 32; then
 # spec: CLI-SPAWN-5 CLI-SPAWN-6
 # 前面所有測例都在 tmux 外呼叫 spawn（TMUX 已 unset）→ 舊行為（目前視窗
 # split），上面已覆蓋。本節驗「orchestrator 本身在 pane 內」的新路徑：
@@ -3023,7 +3468,9 @@ assert "32i 回滾：pane 數回到 spawn 前" test "$(pane_count)" -eq "$PANES_
 assert "32f agents.log 每行恰 6 欄" \
   bash -c "! grep -qEv '^[^ ]+ [^ ]+ [^ ]+ [^ ]+ [^ ]+ [^ ]+\$' '$D32/agents.log'"
 
+fi  # end grp 32
 # ---- 33. 通知原生化 Phase 1：hook 子命令＋notify_or_defer（declarative-juggling-lark）----
+if grp 33; then
 # spec: CLI-HOOK-1 HOOK-ID-1 HOOK-ID-2 HOOK-EVT-1 HOOK-EVT-2 HOOK-EVT-3 HOOK-EVT-4 HOOK-NOTIFY-1 STATE-CHAN-1 STATE-CHAN-2 STATE-CHAN-3 ENV-TTL-1
 
 # 33.1 hook stop：有 queued task → block JSON＋state busy/last_delivered
@@ -3204,8 +3651,10 @@ assert "33.11b cancel 通知 to busy→deferred：events.log 記 notify-deferred
   evt_grep "$D33l/tasks/$id33l/events.log" notify-deferred
 tmx kill-pane -t "$p33l" 2>/dev/null || true
 
+fi  # end grp 33
 # ---- 34. 獨立複核 blocker 修補（2026-07-28）----
-# spec: HOOK-ID-3 HOOK-EVT-3 HOOK-NOTIFY-1 ENV-TTL-1
+if grp 34; then
+# spec: HOOK-ID-3 HOOK-EVT-3 HOOK-NOTIFY-1 ENV-TTL-1 ENV-TTL-2
 
 # 34.1a B1 反例：tasks/ 目錄名含 shell metacharacter，混在合法 queued task
 # 之間 → hook stop 的 reason 只能含合法 id，惡意目錄名片段不得出現
@@ -3305,7 +3754,20 @@ assert "34.4 TTL=0：events.log 記 notified" \
   evt_grep "$D34e/tasks/$id34e/events.log" notified
 tmx kill-pane -t "$p34e" 2>/dev/null || true
 
+# 34.4b ENV-TTL-2：通知端 STATE_TTL 壞值（非 0–9 位純數字）MUST die，
+# 不得靜默採預設——hook 端壞值退預設是 ENV-TTL-3（34.5+），方向相反勿混。
+# die 發生在 notify_or_defer 開頭、任何送鍵之前，PANE_A 不會收到雜訊
+D34g="$TESTROOT/d34g"
+ab "$D34g" register pia "$PANE_A" 2>/dev/null
+env AGENT_BRIDGE_STATE_TTL=bad AGENT_BRIDGE_DATA="$D34g" PATH="$SHIM:$PATH" \
+  "$BRIDGE" send pia --from alice --message hi >/dev/null 2>"$TESTROOT/h34g.err"; rc=$?
+assert "34.4b ENV-TTL-2：send 於 TTL 壞值以錯誤終止" test "$rc" -ne 0
+assert "34.4b ENV-TTL-2：錯誤訊息指向 STATE_TTL（排除其他死因）" \
+  grep -q "AGENT_BRIDGE_STATE_TTL" "$TESTROOT/h34g.err"
+
+fi  # end grp 34
 # ---- 34.5+ 巢狀 runtime 冒名缺陷（owner/session_id 所有權閘門）----
+if grp 34.5+; then
 # spec: HOOK-OWNER-1 HOOK-OWNER-2 HOOK-OWNER-3 HOOK-OWNER-4 HOOK-EVT-4 ENV-TTL-3 STATE-CHAN-2
 # 缺陷紀錄：docs/codex-hooks-probe.md「巢狀 runtime 會汙染 parent 的 state」。
 # SPAWN_TAG 被子行程繼承，僅靠 tag 分不出本尊與巢狀 session；閘門以 hook
@@ -3449,7 +3911,2637 @@ assert "34.13 缺 sid：exit 0" test "$rc" -eq 0
 assert "34.13 缺 sid：無 stdout（不 block）" test ! -s "$TESTROOT/h34m.out"
 assert "34.13 缺 sid：不產生 state 檔" bash -c "! test -e '$D34m/state/wes.json'"
 
+fi  # end grp 34.5+
+# ---- 35. 行程身分閘門（M5 窗 1）----
+if grp 35; then
+# spec: HOOK-OWNER-5 STATE-AGENT-4
+# registry 帶得動 worker 的 (pid, starttime) 時，閘門比對 hook 行程的**直接**
+# 父行程：確認得出是本尊就放行、不看 session_id／ts。這關掉的是「parent
+# /clear 換新 session_id 後被自己的閘門擋住、要等 TTL 才自癒」那個窗——行程
+# 沒變＝身分沒變。
+#
+# **只有相符是結論**。PPID 不符不代表冒名——合法中介（runtime fork 新主行程、
+# 或使用者用 AGENT_BRIDGE_CLAUDE_HOOKS 指定 wrapper）一樣不符，當成冒名會把
+# 本尊永久擋死，連 TTL 自癒都到不了。故不符一律落回 M4 的 session_id＋TTL。
+# 設計依據與實測：docs/rust/m5-proposal.md。
+#
+# 這一組只對 Rust 正本執行：bash 正本凍結在 M4 的行為（rollback 基準），
+# 不再長新功能。SKIP 是顯式的，不靜默跳過。
+if [[ "$SRC_KIND" == rust ]]; then
+
+# hookcall 的 pipeline 右段由當前 shell fork，故受測 hook 行程的直接父行程
+# 就是這個 shell——$BASHPID 即「本尊」該有的 pid
+ME_PID="$BASHPID"
+
+# /proc/<pid>/stat 第 22 欄。comm（第 2 欄）可含空白與右括號，故從最後一個
+# ") " 之後才開始數；切完 $1 是第 3 欄，第 22 欄因此是 ${20}
+proc_starttime() {
+  local raw
+  raw="$(<"/proc/$1/stat")" || return 1
+  raw="${raw##*') '}"
+  # shellcheck disable=SC2086  # 刻意分詞：stat 欄位以空白分隔
+  set -- $raw
+  printf '%s\n' "${20}"
+}
+
+# 寫一份只含身分兩欄的 registry（其餘欄位與本組無關；閘門只讀這兩欄）
+write_ident_reg() {
+  local dir="$1" name="$2" pid="$3" start="$4"
+  mkdir -p "$dir/agents"
+  jq -n --arg p "$pid" --arg s "$start" \
+    '{name: "x", pane_id: "%1", worker_pid: $p, worker_starttime: $s}' \
+    > "$dir/agents/$name.json"
+}
+
+# 異主且新鮮的 state：沒有行程身分時這一定是「擋」，是本組所有對照的基準
+seed_fresh_foreign_state() {
+  local dir="$1" name="$2"
+  mkdir -p "$dir/state"
+  jq -n --arg t "$(now_iso_test)" \
+    '{state: "busy", ts: $t, last_delivered: "", owner: "sP"}' \
+    > "$dir/state/$name.json"
+}
+
+ME_START="$(proc_starttime "$ME_PID")"
+assert "35 前置：取得本 shell 的 starttime" test -n "$ME_START"
+
+# 35a 本尊：PPID 與 starttime 都對上 → 放行，且無視異主的 session_id
+D35A="$TESTROOT/d35a"
+seed_fresh_foreign_state "$D35A" ida
+write_ident_reg "$D35A" ida "$ME_PID" "$ME_START"
+hookcall "$D35A" "ab-spawn-ida-1-aaaaaaaaaaaa" prompt-submit '{"session_id":"sNEW"}' \
+  >/dev/null 2>&1
+assert "35a 本尊：異主 sid 仍放行（state 被寫入）" \
+  state_field_is "$D35A/state/ida.json" state busy
+assert "35a 本尊：owner 換成本次 session_id" \
+  state_field_is "$D35A/state/ida.json" owner sNEW
+
+# 35b PPID 不符（pid 指向一個活著、但不是本 hook 父行程的行程）→ 落回時間窗。
+# state 新鮮且異主，落回後照樣擋——擋的是時間窗，不是身分。
+# 用 tmux server 當那個「別人」：它一定活著且必然不是測試 shell 的子行程
+OTHER_PID="$(tmux -L "$SOCK" display -p '#{pid}' 2>/dev/null || echo 1)"
+OTHER_START="$(proc_starttime "$OTHER_PID")"
+D35B="$TESTROOT/d35b"
+seed_fresh_foreign_state "$D35B" idb
+write_ident_reg "$D35B" idb "$OTHER_PID" "$OTHER_START"
+cp "$D35B/state/idb.json" "$TESTROOT/idb-before.json"
+hookcall "$D35B" "ab-spawn-idb-1-aaaaaaaaaaaa" prompt-submit '{"session_id":"sC"}' \
+  > "$TESTROOT/h35b.out" 2>/dev/null; rc=$?
+assert "35b PPID 不符：exit 0" test "$rc" -eq 0
+assert "35b PPID 不符：無 stdout" test ! -s "$TESTROOT/h35b.out"
+assert "35b PPID 不符＋state 新鮮：仍擋（state 檔逐位元不變）" \
+  cmp -s "$D35B/state/idb.json" "$TESTROOT/idb-before.json"
+
+# 35c **失效方向**：PPID 不符只是「確認不了」，不是「確認為冒名」。落回時間窗
+# 後，ts 過期就該能接管。這是本組最該紅的一條——少了它，把不符當成確定冒名的
+# 退化版本（本尊經合法中介呼叫時被永久擋死）會全綠通過
+D35C="$TESTROOT/d35c"
+mkdir -p "$D35C/state"
+jq -n '{state: "busy", ts: "2020-01-01T00:00:00Z", last_delivered: "", owner: "sP"}' \
+  > "$D35C/state/idc.json"
+write_ident_reg "$D35C" idc "$OTHER_PID" "$OTHER_START"
+hookcall "$D35C" "ab-spawn-idc-1-aaaaaaaaaaaa" prompt-submit '{"session_id":"sC"}' \
+  >/dev/null 2>&1
+assert "35c PPID 不符＋ts 過期：落回時間窗，可接管" \
+  state_field_is "$D35C/state/idc.json" owner sC
+
+# 35d 記錄過期（pid 還在但 starttime 對不上＝pid 被重用）→ 落回時間窗。
+# 落回之後 ts 過期，於是可接管——證明「無法裁決」與「裁決為冒名」不同路
+D35D="$TESTROOT/d35d"
+mkdir -p "$D35D/state"
+jq -n '{state: "busy", ts: "2020-01-01T00:00:00Z", last_delivered: "", owner: "sP"}' \
+  > "$D35D/state/idd.json"
+write_ident_reg "$D35D" idd "$ME_PID" 999999999999
+hookcall "$D35D" "ab-spawn-idd-1-aaaaaaaaaaaa" prompt-submit '{"session_id":"sTAKE"}' \
+  >/dev/null 2>&1
+assert "35d 記錄過期：落回時間窗，過期 state 可接管" \
+  state_field_is "$D35D/state/idd.json" owner sTAKE
+
+# 35e 欄位不全 → 落回。三種形狀各驗一次（缺一欄、兩欄皆空、無 registry）
+i=0
+for reg_doc in '{"worker_pid":"'"$ME_PID"'"}' '{"worker_pid":"","worker_starttime":""}' ''; do
+  i=$((i + 1))
+  DE="$TESTROOT/d35e$i"
+  mkdir -p "$DE/state"
+  jq -n '{state: "busy", ts: "2020-01-01T00:00:00Z", last_delivered: "", owner: "sP"}' \
+    > "$DE/state/ide.json"
+  if [[ -n "$reg_doc" ]]; then
+    mkdir -p "$DE/agents"
+    printf '%s\n' "$reg_doc" > "$DE/agents/ide.json"
+  fi
+  hookcall "$DE" "ab-spawn-ide-1-aaaaaaaaaaaa" prompt-submit '{"session_id":"sFB"}' \
+    >/dev/null 2>&1
+  assert "35e-$i 身分欄不全：落回時間窗（過期可接管）" \
+    state_field_is "$DE/state/ide.json" owner sFB
+done
+
+# 35g 合法中介：registry 記的 pid 是本尊（本 shell）且它還活著，但 hook 經一層
+# 合法 wrapper 呼叫，於是直接 PPID 是那層 wrapper。這是本輪修復的行為錨——
+# 把不符當成確定的冒名，本尊會被永久擋死，連 TTL 都救不回來。
+#
+# `; exit 0` 是必要的：bash -c 對「唯一且最後一個」命令會直接 exec 取代自己，
+# 那樣就沒有中介行程了。兩條斷言合起來才成立——第一條證明中介真的存在（PPID
+# 確實不符，否則會被當本尊放行），第二條證明不符只是落回而非擋死
+hookcall_via_wrapper() {
+  local data="$1" tag="$2" json="$3"
+  printf '%s' "$json" | bash --norc --noprofile -c \
+    'env AGENT_BRIDGE_DATA="$1" AGENT_BRIDGE_SPAWN_TAG="$2" PATH="$3" "$4" hook prompt-submit
+     exit 0' _ "$data" "$tag" "$SHIM:$PATH" "$BRIDGE"
+}
+
+D35G="$TESTROOT/d35g"
+seed_fresh_foreign_state "$D35G" idg
+write_ident_reg "$D35G" idg "$ME_PID" "$ME_START"
+cp "$D35G/state/idg.json" "$TESTROOT/idg-before.json"
+hookcall_via_wrapper "$D35G" "ab-spawn-idg-1-aaaaaaaaaaaa" '{"session_id":"sMID"}' \
+  >/dev/null 2>&1
+assert "35g 合法中介：PPID 確實不符（state 新鮮異主，故擋）" \
+  cmp -s "$D35G/state/idg.json" "$TESTROOT/idg-before.json"
+
+D35G2="$TESTROOT/d35g2"
+mkdir -p "$D35G2/state"
+jq -n '{state: "busy", ts: "2020-01-01T00:00:00Z", last_delivered: "", owner: "sP"}' \
+  > "$D35G2/state/idg.json"
+write_ident_reg "$D35G2" idg "$ME_PID" "$ME_START"
+hookcall_via_wrapper "$D35G2" "ab-spawn-idg-1-aaaaaaaaaaaa" '{"session_id":"sMID"}' \
+  >/dev/null 2>&1
+assert "35g 合法中介＋ts 過期：不得永久擋死本尊（可接管）" \
+  state_field_is "$D35G2/state/idg.json" owner sMID
+
+# 35f STATE-AGENT-4：spawn 真的把身分兩欄寫進 registry，且 worker_pid 指向的
+# 行程確實是本次 runtime。少了這條，上面幾條驗的都只是自己捏的 registry，
+# 「spawn 會不會寫」完全沒被鎖住
+D35F="$TESTROOT/d35f"
+pane_35f="$(absp "$D35F" 20 spawn wid --runtime codex 2>/dev/null)"
+assert "35f spawn 寫入 worker_pid（純數字）" \
+  jq -e '.worker_pid | test("^[0-9]+$")' "$D35F/agents/wid.json"
+assert "35f spawn 寫入 worker_starttime（純數字）" \
+  jq -e '.worker_starttime | test("^[0-9]+$")' "$D35F/agents/wid.json"
+# 記到的必須是這個 pane 的行程，而且是同一次行程生命。
+# **刻意不在這裡事後比對 argv**：runtime stub 收工前會 `exec bash` 換掉自己的
+# argv（pid 不變、starttime 不變）——這正好示範了為什麼持續判別要綁 starttime
+# 而不是綁 argv。argv 只在 spawn 當下用來確認「pane_pid 是 runtime 不是中介
+# shell」，那一層由 spawn::tests::worker_identity_requires_runtime_attestation
+# 守——它錨在 caller 上，把 resolve_worker_identity 裡的 attestation 拿掉會紅
+# （只驗 helper 的單元測試擋不住那個退化，codex 複核 2026-07-31 §4）
+wid_pid="$(jq -r '.worker_pid' "$D35F/agents/wid.json")"
+assert "35f worker_pid 等於 tmux 回報的 pane_pid" \
+  test "$wid_pid" = "$(tmx display -pt "$pane_35f" '#{pane_pid}')"
+assert "35f worker_starttime 與該 pid 當下的 starttime 相符" \
+  bash -c "[ \"\$(bash -c 'raw=\$(</proc/$wid_pid/stat); raw=\${raw##*\") \"}; set -- \$raw; echo \${20}')\" = \"$(jq -r '.worker_starttime' "$D35F/agents/wid.json")\" ]"
+absp "$D35F" 5 despawn wid >/dev/null 2>&1
+
+else
+  printf 'SKIP: 35 行程身分閘門（SRC_KIND=bash：bash 正本凍結在 M4 行為，不含 M5）\n'
+fi
+
+fi  # end grp 35
+# ---- 36. codex launcher 形（HOOK-OWNER-5 自癒擴充）----
+if grp 36; then
+# spec: HOOK-OWNER-5
+# codex 是 node launcher：pane_pid fork 原生執行檔、原生執行檔才 fork hook，
+# 直接形永遠對不上。擴充：registry `runtime=codex` 時另試 launcher 形——hook
+# 的直接 PPID 命中 codex argv 形、且其父行程即 worker_pid，恰好一層。
+#
+# **本組的主要斷言是「巢狀不被誤放行」，不是「codex 本尊會綠」**：誤放行＝
+# 立即奪權（不經 TTL），是身分閘門唯一比 M4 更糟的失效方向。實測巢狀鏈
+# （m5-proposal §1）是 hook → 巢狀 claude → bash → 本尊——巢狀正是 hook 的
+# 直接 PPID，任何「祖先鏈走得到本尊」「鏈上沒夾別的 runtime」式的放寬都會
+# 把它確認成本尊（architecture §11.7）。中介一律用**真的行程**構造（argv 形
+# 狀由 script 名決定），不是 registry 捏的假資料。
+#
+# 與 35 同理只對 Rust 執行；bash 正本凍結、顯式 SKIP。
+if [[ "$SRC_KIND" == rust ]]; then
+
+# 假 runtime 中介：bash script，argv 為 ["/bin/bash", "…/rtbin36/<名>"]，依
+# STATE-AGENT-4 前兩項規則命中 <名>。hook 呼叫後接 exit 0——非最後命令，防
+# bash 把唯一命令 exec 合併掉（那樣中介行程就不存在了，同 35g）
+RTBIN36="$TESTROOT/rtbin36"
+mkdir -p "$RTBIN36"
+for rt36 in codex claude; do
+  # shellcheck disable=SC2016  # 寫的是字面 script 內容，展開發生在中介行程裡
+  printf '%s\n' '#!/bin/bash' '"$AB_BRIDGE" hook prompt-submit' 'exit 0' \
+    > "$RTBIN36/$rt36"
+  chmod +x "$RTBIN36/$rt36"
+done
+
+# 經一層假 runtime 中介呼叫 hook。pipeline 右段由本 shell fork 後 exec，故
+# 中介的父行程是本 shell（$ME_PID）——正是 launcher 形的「worker fork 中介、
+# 中介 fork hook」形狀
+hookcall_via_rt36() {
+  local rt="$1" data="$2" tag="$3" json="$4"
+  printf '%s' "$json" | env AGENT_BRIDGE_DATA="$data" AGENT_BRIDGE_SPAWN_TAG="$tag" \
+    PATH="$SHIM:$PATH" AB_BRIDGE="$BRIDGE" "$RTBIN36/$rt"
+}
+
+# registry 含 runtime 欄的身分三欄版
+write_ident_reg_rt36() {
+  local dir="$1" name="$2" pid="$3" start="$4" rt="$5"
+  mkdir -p "$dir/agents"
+  jq -n --arg p "$pid" --arg s "$start" --arg r "$rt" \
+    '{name: "x", pane_id: "%1", worker_pid: $p, worker_starttime: $s, runtime: $r}' \
+    > "$dir/agents/$name.json"
+}
+
+# 36a launcher 形本尊：runtime=codex、中介命中 codex 形、中介的父行程＝記錄
+# 的 worker_pid → 放行，無視異主的新鮮 state（即時自癒）
+D36A="$TESTROOT/d36a"
+seed_fresh_foreign_state "$D36A" ija
+write_ident_reg_rt36 "$D36A" ija "$ME_PID" "$ME_START" codex
+hookcall_via_rt36 codex "$D36A" "ab-spawn-ija-1-aaaaaaaaaaaa" '{"session_id":"sNEW"}' \
+  >/dev/null 2>&1
+assert "36a codex launcher 形本尊：異主 sid 仍放行（state 被寫入）" \
+  state_field_is "$D36A/state/ija.json" state busy
+assert "36a codex launcher 形本尊：owner 換成本次 session_id" \
+  state_field_is "$D36A/state/ija.json" owner sNEW
+
+# 36b 直接形對 codex 照樣成立：launcher 形是「另試」，不是取代
+D36B="$TESTROOT/d36b"
+seed_fresh_foreign_state "$D36B" ijb
+write_ident_reg_rt36 "$D36B" ijb "$ME_PID" "$ME_START" codex
+hookcall "$D36B" "ab-spawn-ijb-1-aaaaaaaaaaaa" prompt-submit '{"session_id":"sNEW"}' \
+  >/dev/null 2>&1
+assert "36b codex 直接形本尊：照樣放行" \
+  state_field_is "$D36B/state/ijb.json" owner sNEW
+
+# 36c **巢狀反例（本組最重要）**：claude worker 下掛一層真的 claude 形狀行程
+# （hook → 巢狀 claude → 本尊），launcher 形 MUST NOT 對 claude 啟用。放寬成
+# 「攀鏈到本尊即確認」或「按記錄的 runtime 名認中介」的退化版本，這條會紅
+D36C="$TESTROOT/d36c"
+seed_fresh_foreign_state "$D36C" ijc
+write_ident_reg_rt36 "$D36C" ijc "$ME_PID" "$ME_START" claude
+cp "$D36C/state/ijc.json" "$TESTROOT/ijc-before.json"
+hookcall_via_rt36 claude "$D36C" "ab-spawn-ijc-1-aaaaaaaaaaaa" '{"session_id":"sNEST"}' \
+  > "$TESTROOT/h36c.out" 2>/dev/null; rc=$?
+assert "36c claude 巢狀：exit 0" test "$rc" -eq 0
+assert "36c claude 巢狀：無 stdout" test ! -s "$TESTROOT/h36c.out"
+assert "36c claude 巢狀：不得確認（state 逐位元不變）" \
+  cmp -s "$D36C/state/ijc.json" "$TESTROOT/ijc-before.json"
+
+# 36c2 同構但 ts 過期：落回的是時間窗，不是「確認為冒名」——過期仍可接管
+D36C2="$TESTROOT/d36c2"
+mkdir -p "$D36C2/state"
+jq -n '{state: "busy", ts: "2020-01-01T00:00:00Z", last_delivered: "", owner: "sP"}' \
+  > "$D36C2/state/ijc.json"
+write_ident_reg_rt36 "$D36C2" ijc "$ME_PID" "$ME_START" claude
+hookcall_via_rt36 claude "$D36C2" "ab-spawn-ijc-1-aaaaaaaaaaaa" '{"session_id":"sMID"}' \
+  >/dev/null 2>&1
+assert "36c2 claude 巢狀＋ts 過期：落回時間窗，可接管" \
+  state_field_is "$D36C2/state/ijc.json" owner sMID
+
+# 36d 鏈更長（巢狀 codex 的形狀）：中介命中 codex 形，但其父行程是多出來的
+# bash 夾層而非 worker_pid——「恰好一層」的上界。巢狀 codex 的真實鏈至少長
+# 這樣（hook → 原生 → launcher → shell → …），一律落回
+D36D="$TESTROOT/d36d"
+seed_fresh_foreign_state "$D36D" ijd
+write_ident_reg_rt36 "$D36D" ijd "$ME_PID" "$ME_START" codex
+cp "$D36D/state/ijd.json" "$TESTROOT/ijd-before.json"
+# shellcheck disable=SC2016  # '"$1"' 由夾層 bash 展開，正是要多出來的那層
+printf '%s' '{"session_id":"sDEEP"}' | env AGENT_BRIDGE_DATA="$D36D" \
+  AGENT_BRIDGE_SPAWN_TAG="ab-spawn-ijd-1-aaaaaaaaaaaa" PATH="$SHIM:$PATH" \
+  AB_BRIDGE="$BRIDGE" bash --norc --noprofile -c '"$1"; exit 0' _ "$RTBIN36/codex" \
+  >/dev/null 2>&1
+assert "36d 鏈更長（codex 中介隔著 bash 夾層）：不得確認" \
+  cmp -s "$D36D/state/ijd.json" "$TESTROOT/ijd-before.json"
+
+# 36e 中介不命中本 runtime 形：codex worker 下的 claude 形中介（巢狀 claude
+# 掛在 codex worker 裡）→ 落回
+D36E="$TESTROOT/d36e"
+seed_fresh_foreign_state "$D36E" ije
+write_ident_reg_rt36 "$D36E" ije "$ME_PID" "$ME_START" codex
+cp "$D36E/state/ije.json" "$TESTROOT/ije-before.json"
+hookcall_via_rt36 claude "$D36E" "ab-spawn-ije-1-aaaaaaaaaaaa" '{"session_id":"sX"}' \
+  >/dev/null 2>&1
+assert "36e codex worker 下的 claude 形中介：不得確認" \
+  cmp -s "$D36E/state/ije.json" "$TESTROOT/ije-before.json"
+
+# 36g 白名單交叉反例：claude worker 下掛一個**codex 形**的中介、其父又正好
+# 是 worker_pid——launcher 形的結構全對，但 runtime=claude 不在白名單 → MUST
+# 落回。這條架的是「runtime 白名單開關」本身：只刪 runtime guard 而保留
+# 硬編碼 codex attest 的退化，36c 照不出來（claude 形中介 attest 不中），
+# 唯獨這條會紅（codex 跨廠複核 2026-07-31 major 1）
+D36G="$TESTROOT/d36g"
+seed_fresh_foreign_state "$D36G" ijg
+write_ident_reg_rt36 "$D36G" ijg "$ME_PID" "$ME_START" claude
+cp "$D36G/state/ijg.json" "$TESTROOT/ijg-before.json"
+hookcall_via_rt36 codex "$D36G" "ab-spawn-ijg-1-aaaaaaaaaaaa" '{"session_id":"sXRT"}' \
+  >/dev/null 2>&1
+assert "36g claude worker 下的 codex 形中介（結構全對）：白名單不含 claude，不得確認" \
+  cmp -s "$D36G/state/ijg.json" "$TESTROOT/ijg-before.json"
+
+# 36f 鏈中斷：中介活著、但記錄的 worker（中介之父）已死——hook 執行時中介已
+# 被 reparent，攀不回 worker_pid。用真的行程死亡構造，不靠推論：subshell 寫完
+# registry（記自己為 worker）、背景起 codex 形中介後立即退出；中介等 subshell
+# 死透才跑 hook，完成後落 done 標記
+D36F="$TESTROOT/d36f"
+seed_fresh_foreign_state "$D36F" ijf
+cp "$D36F/state/ijf.json" "$TESTROOT/ijf-before.json"
+printf '%s' '{"session_id":"sORPH"}' > "$TESTROOT/ijf.json"
+# 中介必須命中 codex 形（argv[0]=bash、argv[1] basename=codex），讓「上游已
+# 死」成為唯一的落回原因——與 36e 的 attest 不命中路徑分開
+RTBIN36O="$TESTROOT/rtbin36o"
+mkdir -p "$RTBIN36O"
+# 等 reparent 不能用 `kill -0 舊父`：父行程死後可能殘留 zombie（視 reaper
+# 而定），kill -0 對 zombie 照樣成功。改輪詢**自己的 ppid 是否已不是舊父**
+# ——reparent 正是「上游已死」的直接可觀察形狀。有界輪詢，逾時放棄（無 done
+# 標記，前置斷言會紅）
+# shellcheck disable=SC2016  # 寫的是字面 script 內容，展開發生在中介行程裡
+printf '%s\n' '#!/bin/bash' \
+  'n=0' \
+  'while raw=$(</proc/self/stat); raw=${raw##*") "}; set -- $raw; [[ "$2" == "$AB_DEAD_PPID" ]]; do' \
+  '  sleep 0.02; n=$((n+1)); [[ $n -gt 500 ]] && exit 1' \
+  'done' \
+  '"$AB_BRIDGE" hook prompt-submit < "$AB_JSON_FILE"' \
+  ': > "$AB_DONE_FILE"' 'exit 0' > "$RTBIN36O/codex"
+chmod +x "$RTBIN36O/codex"
+(
+  write_ident_reg_rt36 "$D36F" ijf "$BASHPID" "$(proc_starttime "$BASHPID")" codex
+  env AGENT_BRIDGE_DATA="$D36F" AGENT_BRIDGE_SPAWN_TAG="ab-spawn-ijf-1-aaaaaaaaaaaa" \
+    PATH="$SHIM:$PATH" AB_BRIDGE="$BRIDGE" AB_DEAD_PPID="$BASHPID" \
+    AB_JSON_FILE="$TESTROOT/ijf.json" AB_DONE_FILE="$TESTROOT/ijf.done" \
+    bash "$RTBIN36O/codex" >/dev/null 2>&1 &
+)
+# 等中介跑完 hook（有界輪詢，不靠猜時序）
+for _ in $(seq 1 200); do [[ -e "$TESTROOT/ijf.done" ]] && break; sleep 0.05; done
+assert "36f 鏈中斷前置：中介確實完成了 hook 呼叫" test -e "$TESTROOT/ijf.done"
+assert "36f 鏈中斷（worker 已死、中介被 reparent）：不得確認" \
+  cmp -s "$D36F/state/ijf.json" "$TESTROOT/ijf-before.json"
+
+else
+  printf 'SKIP: 36 codex launcher 形（SRC_KIND=bash：bash 正本凍結在 M4 行為，不含 M5）\n'
+fi
+
+fi  # end grp 36
+# ---- 37. agy runtime（Antigravity CLI）----
+if grp 37; then
+# spec: CLI-SPAWN-1 HOOK-NOTIFY-2
+# 第三個 runtime。量測正本 docs/agy-probe.md：`--prompt-interactive` 吃空白
+# 分隔的旗標值，位置參數原樣落為初始 prompt，故沿用同一條 worker_prompt_arg
+# 注入路徑；旗標姿態（skip-permissions＋sandbox）是使用者裁決，不是實作偏好，
+# 因此用白名單式 argv 斷言鎖住——與 16a2 同理，子字串比對擋不住偷偷追加的旗標。
+#
+# 與 35／36 同理只對 Rust 執行；bash 正本自 M4 凍結、不支援 agy，顯式 SKIP。
+if [[ "$SRC_KIND" == rust ]]; then
+
+# 37a 快樂路徑＋argv 白名單
+pane_wy="$(absp "$DSPAWN" 20 spawn wy1 --runtime agy 2>/dev/null)"; rc=$?
+assert "37a spawn --runtime agy：exit 0" test "$rc" -eq 0
+assert "37a spawn stdout 只印 pane-id（%N）一行" \
+  bash -c "[[ '$pane_wy' =~ ^%[0-9]+\$ ]]"
+assert "37a agy registry：runtime 欄為 agy" \
+  jq -e '.runtime == "agy"' "$DSPAWN/agents/wy1.json"
+assert "37a agy 一樣注入 worker brief（走同一條 worker_prompt_arg）" \
+  grep -q -- 'The above is your worker brief' "$TESTROOT/agy-args.txt"
+# 白名單：argv 必須「恰好」是 --dangerously-skip-permissions / --sandbox /
+# --prompt-interactive / <prompt> 四個。少一個旗標＝姿態被悄悄放寬（例如
+# 掉了 --sandbox），多一個＝有人往 worker 啟動旗標塞東西，兩個方向都該紅
+assert "37a agy argv 恰好四個參數（追加或遺漏任何旗標都該紅）" \
+  bash -c "mapfile -d '' -t A < '$TESTROOT/agy-argv.txt'; (( \${#A[@]} == 4 ))"
+assert "37a agy argv 前三個恰為裁決的旗標、第四個是 prompt 非旗標" \
+  bash -c "mapfile -d '' -t A < '$TESTROOT/agy-argv.txt'; [[ \${A[0]} == '--dangerously-skip-permissions' && \${A[1]} == '--sandbox' && \${A[2]} == '--prompt-interactive' && \${A[3]} != -* ]]"
+# 否定式斷言先證明「有東西可否定」（16a2 的空綠教訓）：-p 會讓 pane 跑完即退
+assert "37a agy 不帶 -p/--print（headless 會讓 pane 跑完即退）" \
+  bash -c "[[ -s '$TESTROOT/agy-args.txt' ]] && ! grep -qE -- '(^| )(-p|--print)( |\$)' '$TESTROOT/agy-args.txt'"
+assert "37a agy 探針重送生效：ready == true" \
+  jq -e '.ready == true' "$DSPAWN/agents/wy1.json"
+assert "37a agents.log 記 spawned wy1 … agy" \
+  grep -qE "Z spawned wy1 ${pane_wy} agy -\$" "$DSPAWN/agents.log"
+
+# 37b --model 下放。**順序是語意，不是排版**：`--prompt-interactive` 不是布林
+# 開關而是吃下一個 token 當值的 string flag（實測 `agy --prompt-interactive
+# --not-a-real-flag --help` rc=0，未知旗標被吞成值而非報錯）。它必須是最後一個
+# 旗標，否則 `--model` 會被吃成 initial prompt、模型旗標失效、真 prompt 錯位。
+# shim 只記 argv 不解析 agy 旗標，所以錯序照樣「綠」——這條斷言鎖的就是那個
+# shim 看不見的語意（跨廠複核 2026-07-31 抓出實作錯序，本斷言曾一度鎖住錯形）
+absp "$DSPAWN" 20 spawn wy2 --runtime agy --model gemini-3.6-flash-high >/dev/null 2>&1; rc=$?
+assert "37b spawn --runtime agy --model：exit 0" test "$rc" -eq 0
+assert "37b agy argv 恰好六個參數（37a 的四個 ＋ --model <m>）" \
+  bash -c "mapfile -d '' -t A < '$TESTROOT/agy-argv.txt'; (( \${#A[@]} == 6 ))"
+assert "37b agy argv 完整序列：--model 在 --prompt-interactive **之前**、prompt 緊接其後且在最後" \
+  bash -c "mapfile -d '' -t A < '$TESTROOT/agy-argv.txt'; [[ \${A[0]} == '--dangerously-skip-permissions' && \${A[1]} == '--sandbox' && \${A[2]} == '--model' && \${A[3]} == 'gemini-3.6-flash-high' && \${A[4]} == '--prompt-interactive' && \${A[5]} != -* ]]"
+assert "37b agy worker 可正常 despawn" ab "$DSPAWN" despawn wy2
+assert "37a agy worker 可正常 despawn" ab "$DSPAWN" despawn wy1
+
+# 37c agy 無 hooks → 不寫 state → 通知端一律走 legacy 送鍵（CLI-SPAWN-1 的
+# Note）。鎖的是「缺 state 檔時通知照樣送達 agy worker」——降級鏈本身在分組
+# 33/34 已鎖，這裡確認 agy 這個 runtime 落在該鏈的「未知」分支而非別處
+D37="$TESTROOT/d37"
+p_agy="$(tmx split-window -dP -F '#{pane_id}' -t it "$pane_cmd")"
+ab "$D37" register wy3 "$p_agy" 2>/dev/null
+tmx send-keys -t "$p_agy" \
+  "touch $TESTROOT/agy37c-ready ; while IFS= read -r l ; do printf '%s\n' \"\$l\" >> $TESTROOT/agy37c-got.txt ; done" Enter
+wait_for 10 test -f "$TESTROOT/agy37c-ready"
+id37c="$(ab "$D37" send wy3 --from alice --message hi 2>/dev/null)"
+assert "37c 本組佈景確認：該 agent 無 state 檔（真機無 hooks 的事實見 probe）" \
+  test ! -e "$D37/state/wy3.json"
+assert "37c 無 state → legacy 送鍵照樣送達（got 收到含 task-id 的 receive 行）" \
+  wait_for 10 grep -q "$id37c" "$TESTROOT/agy37c-got.txt"
+tmx kill-pane -t "$p_agy" 2>/dev/null || true
+
+# 37d AGY-PROMPT-1：agy 權限框的送鍵防線。agy 的框 footer 是**小寫**
+# `esc to cancel`，claude 的兩組特徵一個都不命中；不補的話送鍵的 Enter 會落在
+# 預設選項 `1. Yes`，替一個正等人類決策的 worker 按下批准。錨是 agy 獨有的
+# `Requesting permission for:`（不放寬 esc 大小寫的理由見 notify.rs 註解）。
+# 畫面文字逐字抄自實測（docs/agy-probe.md）。攔截判準沿用 8a 的哨兵法：
+# 先證明記錄機制活著，再斷言 got 恰好只有哨兵一行——只驗「不含 task-id」擋不住
+# 「只送了一個 Enter」這種 regression，而那個 Enter 正是會誤批的東西
+#
+# pane 開在**自己的視窗**而非 split 進 `it`：跑全套時 `it` 已累積多個 pane，
+# 每個只剩幾列高，六行框加上折行的指令列會超過可見高度，特徵被捲出「一屏」
+# 之外——`screen_has_prompt` 依契約只看一屏可見文字，那是測試佈景的假紅，
+# 不是防線失效（單跑分組 37 全綠、全套紅，實測 2026-07-31）。
+D37P="$TESTROOT/d37p"
+p_agyask="$(tmx new-window -dP -F '#{pane_id}' "$pane_cmd")"
+ab "$D37P" register wy4 "$p_agyask" 2>/dev/null
+tmx send-keys -t "$p_agyask" \
+  "printf '%s\n' 'Requesting permission for:' '   ./bin/agent-bridge receive t1' 'Do you want to proceed?' '> 1. Yes' '  4. No' 'esc to cancel' ; touch $TESTROOT/agyask-ready ; while IFS= read -r l ; do printf '%s\n' \"\$l\" >> $TESTROOT/agyask-got.txt ; done" Enter
+wait_for 10 test -f "$TESTROOT/agyask-ready"
+id37d="$(ab "$D37P" send wy4 --from alice --message hi 2>/dev/null)"; rc=$?
+tmx send-keys -t "$p_agyask" 'SENTINEL-agy' Enter
+assert "37d agy 框偵測：send 仍 exit 0" test "$rc" -eq 0
+assert "37d agy 框偵測：記錄機制活著（哨兵行有進 got）" \
+  wait_for 10 grep -q 'SENTINEL-agy' "$TESTROOT/agyask-got.txt"
+# shellcheck disable=SC2016  # $1/$2 由內層 bash 展開，刻意單引號
+assert "37d agy 權限框在場時一個按鍵都沒送進去（否則 Enter 替 worker 按下 1. Yes）" \
+  bash -c 'test "$(wc -l < "$1")" -eq 1 && grep -Fxq "$2" "$1"' _ "$TESTROOT/agyask-got.txt" 'SENTINEL-agy'
+assert "37d agy 框偵測：events.log 記 notify-failed" \
+  evt_grep "$D37P/tasks/$id37d/events.log" notify-failed
+tmx kill-window -t "$p_agyask" 2>/dev/null || true
+
+# 37e **矮 pane（production 形狀）**：worker 預設進共用 window 並 tiled 均分，
+# pane 一多就矮到框的 header 捲出可見一屏——掃描只看一屏（capture-pane -pJ，
+# 不取 scrollback），那時 `Requesting permission for:` 已不在畫面。37d 用獨立
+# 視窗驗完整框，這條驗只剩下緣的情形：header 不可見、選項與小寫 footer 仍在。
+# 單靠 header 錨的版本在這裡必紅（跨廠複核 2026-07-31 的 blocker）
+D37S="$TESTROOT/d37s"
+w_short="$(tmx new-window -dP -F '#{window_id}' "$pane_cmd")"
+p_short="$(tmx list-panes -t "$w_short" -F '#{pane_id}')"
+# 把視窗壓到 6 列：框只放得下下緣（問句＋兩個選項＋footer），header 進 scrollback
+tmx resize-window -t "$w_short" -x 200 -y 6 2>/dev/null || true
+tmx send-keys -t "$p_short" \
+  "printf '%s\n' 'Requesting permission for:' '   ./bin/agent-bridge receive t1' 'Do you want to proceed?' '> 1. Yes' '  4. No' 'esc to cancel' ; touch $TESTROOT/agyshort-ready ; while IFS= read -r l ; do printf '%s\n' \"\$l\" >> $TESTROOT/agyshort-got.txt ; done" Enter
+wait_for 10 test -f "$TESTROOT/agyshort-ready"
+# 前置斷言：確認這一屏真的看不到 header——否則本組退化成 37d 的複本、什麼都沒鎖。
+# 先把可見一屏擷取到檔案再斷言：`tmx` 是本殼的 function，`bash -c` 子殼裡不存在，
+# 直接寫進 assert 的子殼會讓否定式前置**假綠**（找不到指令 → 無輸出 → ! 成立）
+tmx capture-pane -pJ -t "$p_short" > "$TESTROOT/agyshort-screen.txt"
+assert "37e 前置：矮 pane 的可見一屏已看不到 header 錨" \
+  bash -c "! grep -qF 'Requesting permission for:' '$TESTROOT/agyshort-screen.txt'"
+assert "37e 前置：下緣特徵仍在可見一屏" \
+  grep -qF 'esc to cancel' "$TESTROOT/agyshort-screen.txt"
+ab "$D37S" register wy5 "$p_short" 2>/dev/null
+id37e="$(ab "$D37S" send wy5 --from alice --message hi 2>/dev/null)"
+tmx send-keys -t "$p_short" 'SENTINEL-short' Enter
+assert "37e 矮 pane 記錄機制活著（哨兵行有進 got）" \
+  wait_for 10 grep -q 'SENTINEL-short' "$TESTROOT/agyshort-got.txt"
+# shellcheck disable=SC2016  # $1/$2 由內層 bash 展開，刻意單引號
+assert "37e header 捲出一屏時仍 MUST NOT 送鍵（下緣備援錨接住）" \
+  bash -c 'test "$(wc -l < "$1")" -eq 1 && grep -Fxq "$2" "$1"' _ "$TESTROOT/agyshort-got.txt" 'SENTINEL-short'
+assert "37e events.log 記 notify-failed" \
+  evt_grep "$D37S/tasks/$id37e/events.log" notify-failed
+tmx kill-window -t "$w_short" 2>/dev/null || true
+
+else
+  printf 'SKIP: 37 agy runtime（SRC_KIND=bash：bash 正本凍結在 M4，不支援 agy）\n'
+fi
+
+fi  # end grp 37
+# ---- 38. list --long 介入視圖 ----
+if grp 38; then
+# spec: CLI-LIST-1 CLI-LIST-2
+# 使用者痛點：`list` 只給 name/pane/ready，人要介入時看不出「pane 在哪、誰派的、
+# 哪個能刪」。資料本來就在 registry，只是沒有指令一次講完。
+#
+# 本組鎖三件事：① 裸 `list` 一個位元組都沒變（既有腳本的介面）；② --long 的
+# 失效降級是**顯式字面值**且三態分明（活著／查了不在／沒得查）；③ 唯讀——判定
+# dead 不得順手清 registry。第 ② 條是這個功能唯一會騙人的地方：把 owner 已死
+# 顯示成一個空位置，比不顯示更糟。
+#
+# 與 35–37 同理只對 Rust 執行；bash 正本自 M4 凍結，顯式 SKIP。
+if [[ "$SRC_KIND" == rust ]]; then
+
+D38="$TESTROOT/d38"
+mkdir -p "$D38/agents"
+# 38a 裸 list 不因 --long 的加入而改變：與改動前的三欄形逐字比對
+p38="$(tmx split-window -dP -F '#{pane_id}' -t it "$pane_cmd")"
+ab "$D38" register w38 "$p38" >/dev/null 2>&1
+ab "$D38" list > "$TESTROOT/l38-bare.txt" 2>/dev/null
+# 精確比對整份輸出而非 grep 一條期望列：grep 擋不住「多一列／多一欄／插入
+# 其他文字」，那些照樣是裸介面的行為變更（跨廠複核 2026-07-31 指出的假綠）
+printf 'w38\t%s\t-\n' "$p38" > "$TESTROOT/l38-bare-want.txt"
+assert "38a 裸 list 輸出與期望逐位元組相同（不只是含某一列）" \
+  cmp -s "$TESTROOT/l38-bare-want.txt" "$TESTROOT/l38-bare.txt"
+
+# 38b --long：標頭在第一行、欄數恰八
+ab "$D38" list --long > "$TESTROOT/l38-long.txt" 2>/dev/null
+assert "38b --long 首行為欄名標頭" \
+  bash -c "head -1 '$TESTROOT/l38-long.txt' | grep -qFx 'NAME	PANE	READY	ORIGIN	WHERE	OWNER	DISPOSABLE	IDLE'"
+assert "38b --long 每列恰八個 TAB 分隔欄" \
+  bash -c "awk -F'\t' 'NF != 8 { bad = 1 } END { exit bad }' '$TESTROOT/l38-long.txt'"
+ab "$D38" list -l > "$TESTROOT/l38-short.txt" 2>/dev/null
+# 比 IDLE 以外的七欄：IDLE 是牆鐘秒數，兩次呼叫本來就可能差一秒——
+# 拿它比對會做出一條會隨機紅的斷言（flake 比漏測更糟）
+cut -f1-7 "$TESTROOT/l38-long.txt" > "$TESTROOT/l38-long7.txt"
+cut -f1-7 "$TESTROOT/l38-short.txt" > "$TESTROOT/l38-short7.txt"
+assert "38b -l 是 --long 的別名（除 IDLE 秒數外輸出相同）" \
+  cmp -s "$TESTROOT/l38-long7.txt" "$TESTROOT/l38-short7.txt"
+
+# 38c 人工註冊：origin=manual、owner 欄為 `-`（沒有 owner 概念，不是死了）
+row38c="$(grep '^w38	' "$TESTROOT/l38-long.txt")"
+assert "38c 人工註冊 origin 為 manual" \
+  bash -c "printf '%s' '$row38c' | awk -F'\t' '\$4 == \"manual\" { exit 0 } { exit 1 }'"
+assert "38c 人工註冊 owner 為 -（無 owner 概念，非 owner-dead）" \
+  bash -c "printf '%s' '$row38c' | awk -F'\t' '\$6 == \"-\" { exit 0 } { exit 1 }'"
+assert "38c 活著的 pane 位置解析為 <session>:<window>，非裸 %%id" \
+  bash -c "printf '%s' '$row38c' | awk -F'\t' '\$5 ~ /^[^:]+:[0-9]+\$/ { exit 0 } { exit 1 }'"
+
+# 38d pane 已死 → `dead`；且**唯讀**：registry 不得被順手清掉
+tmx kill-pane -t "$p38" 2>/dev/null || true
+# kill-pane 是同步的（tmux 回來時 pane 已不在 list-panes），不需等待
+ab "$D38" list --long > "$TESTROOT/l38-dead.txt" 2>/dev/null
+assert "38d pane 已死 → WHERE 欄為 dead" \
+  bash -c "grep '^w38	' '$TESTROOT/l38-dead.txt' | awk -F'\t' '\$5 == \"dead\" { exit 0 } { exit 1 }'"
+assert "38d 唯讀：判定 dead 不得清掉 registry 檔" test -f "$D38/agents/w38.json"
+
+# 38e owner window 已死 → `owner-dead`。tmux 對不存在的 window id 會靜靜回
+# `:` 且 exit 0（實測 3.7b），所以這條同時是「別用 exit code 判存在性」的回歸
+D38E="$TESTROOT/d38e"
+mkdir -p "$D38E/agents"
+jq -n --arg p "$(tmx list-panes -t it -F '#{pane_id}' | head -1)" \
+  '{name:"w38e", pane_id:$p, spawned:true, ready:true, owner:"nosuch:@99999", runtime:"claude"}' \
+  > "$D38E/agents/w38e.json"
+ab "$D38E" list --long > "$TESTROOT/l38-owner.txt" 2>/dev/null
+assert "38e owner window 不存在 → OWNER 欄為 owner-dead（不是空位置）" \
+  bash -c "grep '^w38e	' '$TESTROOT/l38-owner.txt' | awk -F'\t' '\$6 == \"owner-dead\" { exit 0 } { exit 1 }'"
+
+# 38f tmux 不可用 → `?`（未知），**不得**標成 dead：那會讓整池看似該回收
+env AGENT_BRIDGE_DATA="$D38E" PATH="$FAILSHIM:$PATH" "$BRIDGE" list --long \
+  > "$TESTROOT/l38-notmux.txt" 2>/dev/null
+assert "38f tmux 不可用 → WHERE 為 ?（未知，不是 dead）" \
+  bash -c "grep '^w38e	' '$TESTROOT/l38-notmux.txt' | awk -F'\t' '\$5 == \"?\" { exit 0 } { exit 1 }'"
+assert "38f tmux 不可用 → OWNER 為 ?（未知，不是 owner-dead）" \
+  bash -c "grep '^w38e	' '$TESTROOT/l38-notmux.txt' | awk -F'\t' '\$6 == \"?\" { exit 0 } { exit 1 }'"
+
+# 38g 損壞的 registry 不得終止整份報表：該列以 ? 呈現後繼續（它照樣佔著 cap）
+printf 'not json at all\n' > "$D38E/agents/w38bad.json"
+ab "$D38E" list --long > "$TESTROOT/l38-bad.txt" 2>/dev/null; rc=$?
+assert "38g 損壞 registry：exit 仍 0" test "$rc" -eq 0
+assert "38g 損壞 registry：整列七個狀態欄全為 ?、idle 為 -（不是只看兩欄）" \
+  bash -c "grep '^w38bad	' '$TESTROOT/l38-bad.txt' | grep -qFx \"\$(printf 'w38bad\t?\t?\t?\t?\t?\t?\t-')\""
+assert "38g 損壞 registry：其餘列照常輸出（沒有一壞全倒）" \
+  grep -q '^w38e	' "$TESTROOT/l38-bad.txt"
+
+# 38h 值域：「不得暗示可以安全刪除」是設計原則，不可機器判定全稱句——
+# 用黑名單 regex 掃字面值是形式主義（RECLAIMABLE／SAFE／其他語言全繞得過，
+# 跨廠複核 2026-07-31 指出）。可機器守的是**精確標頭＋各欄允許值域**：
+# 任何新欄位或新狀態字都必須先改這裡，那才是真正的閘門
+assert "38h 標頭逐字固定（新增欄位必須先改契約）" \
+  bash -c "head -1 '$TESTROOT/l38-long.txt' | grep -qFx 'NAME	PANE	READY	ORIGIN	WHERE	OWNER	DISPOSABLE	IDLE'"
+assert "38h READY 值域 ready|starting|-|?" \
+  bash -c "tail -n +2 '$TESTROOT/l38-long.txt' | awk -F'\t' '\$3 !~ /^(ready|starting|-|\\?)\$/ { bad=1 } END { exit bad }'"
+assert "38h ORIGIN 值域 spawned|manual|?" \
+  bash -c "tail -n +2 '$TESTROOT/l38-long.txt' | awk -F'\t' '\$4 !~ /^(spawned|manual|\\?)\$/ { bad=1 } END { exit bad }'"
+assert "38h DISPOSABLE 值域 yes|expired|-|?" \
+  bash -c "tail -n +2 '$TESTROOT/l38-long.txt' | awk -F'\t' '\$7 !~ /^(yes|expired|-|\\?)\$/ { bad=1 } END { exit bad }'"
+assert "38h IDLE 值域 非負整數|-" \
+  bash -c "tail -n +2 '$TESTROOT/l38-long.txt' | awk -F'\t' '\$8 !~ /^([0-9]+|-)\$/ { bad=1 } END { exit bad }'"
+
+# 38j registry 的 id 形狀壞掉 → invalid，**不是** dead：後者會讓人以為
+# 「東西曾經在、現在沒了」，前者才是實情（資料損壞）
+D38J="$TESTROOT/d38j"
+mkdir -p "$D38J/agents"
+jq -n '{name:"w38j", pane_id:"@garbage", spawned:true, ready:true, owner:"s:@nope", runtime:"claude"}' \
+  > "$D38J/agents/w38j.json"
+ab "$D38J" list --long > "$TESTROOT/l38-invalid.txt" 2>/dev/null
+assert "38j pane_id 形狀不合法 → WHERE 為 invalid（非 dead）" \
+  bash -c "grep '^w38j	' '$TESTROOT/l38-invalid.txt' | awk -F'\t' '\$5 == \"invalid\" { exit 0 } { exit 1 }'"
+assert "38j owner 的 @id 形狀不合法 → OWNER 為 invalid（非 owner-dead）" \
+  bash -c "grep '^w38j	' '$TESTROOT/l38-invalid.txt' | awk -F'\t' '\$6 == \"invalid\" { exit 0 } { exit 1 }'"
+
+# 38k 欄值含 TAB／換行：合法 JSON string 塞一個 TAB 就能把一列變九欄，
+# 破壞「一 agent 一行、恰八欄」的承諾
+D38K="$TESTROOT/d38k"
+mkdir -p "$D38K/agents"
+jq -n '{name:"w38k\tINJECTED\tCOLS", pane_id:"%1", spawned:false}' > "$D38K/agents/w38k.json"
+ab "$D38K" list --long > "$TESTROOT/l38-tab.txt" 2>/dev/null
+assert "38k 欄值含 TAB 時每列仍恰八欄" \
+  bash -c "awk -F'\t' 'NF != 8 { bad = 1 } END { exit bad }' '$TESTROOT/l38-tab.txt'"
+assert "38k 註冊名裡的 TAB 被代換掉（不得原樣輸出）" \
+  bash -c "! printf '%s' \"\$(tail -n +2 '$TESTROOT/l38-tab.txt')\" | grep -q 'w38k	INJECTED'"
+
+# 38l linked window：tmux 的 window 可同時掛在多個 session，`-a` 列表因此
+# 同 id 出現多次。取最後一筆＝隨列序給答案，而使用者問的正是「跟哪個主
+# session 關聯」（跨廠複核 2026-07-31 的 major；用 HashMap 覆寫的版本這裡必紅）
+D38L="$TESTROOT/d38l"
+mkdir -p "$D38L/agents"
+tmx new-session -d -s linkA -x 200 -y 100 "$pane_cmd"
+w38l="$(tmx list-windows -t linkA -F '#{window_id}' | head -1)"
+p38l="$(tmx list-panes -t "$w38l" -F '#{pane_id}' | head -1)"
+tmx new-session -d -s linkB -x 200 -y 100 "$pane_cmd"
+tmx link-window -s "$w38l" -t linkB: 2>"$TESTROOT/l38-link.err"
+assert "38l 前置：link-window 成功（錯誤不得被吞）" \
+  bash -c "test ! -s '$TESTROOT/l38-link.err'"
+# 先把清單落檔再斷言：`tmx` 是本殼的 function，`bash -c` 子殼裡不存在，
+# 直接寫進 assert 會讓前置永遠紅（同 37e 的教訓）
+tmx list-panes -a -F '#{pane_id}' > "$TESTROOT/l38-panes.txt"
+assert "38l 前置：同一 window 確實掛在兩個 session" \
+  bash -c "test \"\$(grep -cx -- '$p38l' '$TESTROOT/l38-panes.txt')\" -eq 2"
+# owner 記的是 linkB → 消歧義後 OWNER 應恰為 linkB 那一筆
+jq -n --arg p "$p38l" --arg w "$w38l" \
+  '{name:"w38l", pane_id:$p, spawned:true, ready:true, owner:("linkB:" + $w), runtime:"claude"}' \
+  > "$D38L/agents/w38l.json"
+ab "$D38L" list --long > "$TESTROOT/l38-linked.txt" 2>/dev/null
+assert "38l WHERE 列出全部 live 位置（逗號分隔，不任選一個）" \
+  bash -c "grep '^w38l	' '$TESTROOT/l38-linked.txt' | awk -F'\t' '\$5 ~ /^linkA:[0-9]+,linkB:[0-9]+\$/ { exit 0 } { exit 1 }'"
+assert "38l OWNER 以 registry 的 session 標籤消歧義（恰為 linkB 那一筆）" \
+  bash -c "grep '^w38l	' '$TESTROOT/l38-linked.txt' | awk -F'\t' '\$6 ~ /^linkB:[0-9]+\$/ { exit 0 } { exit 1 }'"
+tmx kill-session -t linkA 2>/dev/null || true
+tmx kill-session -t linkB 2>/dev/null || true
+
+# 38i 參數面：未知參數要拒，不得靜默當成裸 list
+assert_fails "38i list 未知參數應拒" ab "$D38" list --bogus
+assert_fails "38i list 多餘參數應拒" ab "$D38" list --long extra
+
+else
+  printf 'SKIP: 38 list --long（SRC_KIND=bash：bash 正本凍結在 M4）\n'
+fi
+
+fi  # end grp 38
+# ---- 39 copy-mode 送鍵防線（AB-COPYMODE-1）----
+if grp 39; then
+#
+# 人一捲動 worker pane 就會進 tmux copy-mode——那正是「人為介入」情境本身。
+# 實測：pane 在 copy-mode 時 `tmux send-keys -t <pane> 'agent-bridge receive
+# <id>'` **永不返回**，於是 orchestrator 的整條 send 被鎖死，且沒有逾時能救。
+#
+# 本組鎖四件事：① copy-mode 中一個按鍵都不送、降級成 notify-failed；②
+# **不得**替人 `-X cancel`——人正在看的捲動位置是介入現場，清掉比不通知更糟；
+# ③ 送鍵子行程有逾時兜底（檢查與送鍵之間的 TOCTOU 空窗仍可能撞上 copy-mode，
+# 沒有逾時那個空窗就是永久鎖死）；④ mode 查不出來時 fail-closed。
+#
+# 與 35–38 同理只對 Rust 執行；bash 正本自 M4 凍結，顯式 SKIP。
+if [[ "$SRC_KIND" == rust ]]; then
+
+D39="$TESTROOT/d39"
+
+# 39a／39b 真 copy-mode。用一個**全透傳**的 shim（行為與正常 SHIM 相同，只多
+# 記一筆 send-keys 呼叫）：光看「shell 沒收到字」證不了 gate 存在——拿掉 gate
+# 只留逾時，send-keys 照樣被呼叫、照樣卡死逾時、shell 照樣沒收到字、mode 照樣
+# 沒被取消，四條斷言全綠（跨廠複核 2026-07-31 finding 3 的假綠）。marker 檔把
+# 「有沒有真的呼叫下去」直接變成可觀察量。
+KEYSHIM="$TESTROOT/keyshim"
+mkdir -p "$KEYSHIM"
+cat > "$KEYSHIM/tmux" <<EOF
+#!/usr/bin/env bash
+unset TMUX
+if [[ "\$1" == "send-keys" ]]; then
+  { printf '%s ' "\$@"; printf '\n'; } >> $(printf '%q' "$TESTROOT/a39-sendkeys.log")
+fi
+exec $(printf '%q' "$REAL_TMUX") -L $(printf '%q' "$SOCK") -f /dev/null "\$@"
+EOF
+chmod +x "$KEYSHIM/tmux"
+
+p39="$(tmx split-window -dP -F '#{pane_id}' -t it "$pane_cmd")"
+ab "$D39" register cm39 "$p39" >/dev/null 2>&1
+tmx send-keys -t "$p39" \
+  "printf '%s\n' 'normal worker output' ; touch $TESTROOT/cm-ready ; while IFS= read -r l ; do printf '%s\n' \"\$l\" >> $TESTROOT/cm-got.txt ; done" Enter
+wait_for 10 test -f "$TESTROOT/cm-ready"
+tmx copy-mode -t "$p39"
+# 前置條件：pane 真的進了 mode。不驗這條，39a 可能是在「根本沒進 copy-mode」
+# 的畫面上假綠通過
+tmx display -pt "$p39" '#{pane_in_mode}' > "$TESTROOT/cm-mode-pre.txt" 2>/dev/null
+assert "39a 前置：pane 確實進入 copy-mode" \
+  grep -Fxq 1 "$TESTROOT/cm-mode-pre.txt"
+# 逾時值壓到 2 秒：防線若破了，這裡是套件唯一會撞到卡死的地方，不該讓它等滿
+# 預設窗。整個呼叫再包一層 timeout，鎖住「有限時間內返回」本身
+id39="$(env AGENT_BRIDGE_DATA="$D39" AGENT_BRIDGE_TMUX_TIMEOUT=2 PATH="$KEYSHIM:$PATH" \
+  timeout 30 "$BRIDGE" send cm39 --from alice --message hi 2>/dev/null)"
+assert "39a copy-mode：send 仍在有限時間內返回並產生任務 id" \
+  test -n "$id39"
+assert "39a copy-mode：send-keys 根本沒被呼叫（是 gate 擋下，不是逾時擋下）" \
+  test ! -f "$TESTROOT/a39-sendkeys.log"
+assert "39a copy-mode：events.log 記 notify-failed（降級而非靜默成功）" \
+  evt_grep "$D39/tasks/$id39/events.log" notify-failed
+assert_reason "39a copy-mode：notify-failed 標 reason=copy-mode" \
+  "$D39/tasks/$id39/events.log" copy-mode
+# 39b 先驗現場沒被清掉，再由測試自己離開 mode
+tmx display -pt "$p39" '#{pane_in_mode}' > "$TESTROOT/cm-mode-post.txt" 2>/dev/null
+assert "39b 不得替人 cancel：pane 仍停在 copy-mode（捲動現場保住）" \
+  grep -Fxq 1 "$TESTROOT/cm-mode-post.txt"
+tmx send-keys -X -t "$p39" cancel 2>/dev/null || true
+# 哨兵法驗「一個按鍵都沒送」：離開 mode 後補一行哨兵，got 應恰好只有哨兵
+tmx send-keys -t "$p39" 'SENTINEL-cm' Enter
+assert "39a copy-mode：記錄機制活著（哨兵行有進 got）" \
+  wait_for 10 grep -q 'SENTINEL-cm' "$TESTROOT/cm-got.txt"
+# shellcheck disable=SC2016  # 單引號故意：$1/$2 由內層 bash 展開
+assert "39a copy-mode：got 恰好只有哨兵一行（通知文字一個按鍵都沒送達）" \
+  bash -c 'test "$(wc -l < "$1")" -eq 1 && grep -Fxq "$2" "$1"' _ "$TESTROOT/cm-got.txt" 'SENTINEL-cm'
+tmx kill-pane -t "$p39" 2>/dev/null || true
+
+# 39c 逾時兜底：send-keys 永不返回時，指令 MUST NOT 被無限鎖死。
+# 真 copy-mode 的卡死不是每個 tmux 版本／mode-keys 設定都構造得出來，改用
+# shim 直接注入「send-keys 掛住」這個終態——鎖的是逾時機制本身。
+# `exec sleep` 而非 `sleep`：被殺的必須是 sleep 本人，否則 shim 死了、孫行程
+# 還在背景睡滿 300 秒。
+D39c="$TESTROOT/d39c"
+HANGSHIM="$TESTROOT/hangshim"
+mkdir -p "$HANGSHIM"
+cat > "$HANGSHIM/tmux" <<EOF
+#!/usr/bin/env bash
+unset TMUX
+if [[ "\$1" == "send-keys" ]]; then
+  touch $(printf '%q' "$TESTROOT/c39-hang-hit")
+  exec sleep 300
+fi
+exec $(printf '%q' "$REAL_TMUX") -L $(printf '%q' "$SOCK") -f /dev/null "\$@"
+EOF
+chmod +x "$HANGSHIM/tmux"
+env AGENT_BRIDGE_DATA="$D39c" PATH="$HANGSHIM:$PATH" "$BRIDGE" \
+  register hang39 "$PANE_B" >/dev/null 2>&1
+id39c="$(env AGENT_BRIDGE_DATA="$D39c" AGENT_BRIDGE_TMUX_TIMEOUT=2 PATH="$HANGSHIM:$PATH" \
+  timeout 30 "$BRIDGE" send hang39 --from alice --message hi 2>/dev/null)"
+assert "39c 逾時兜底：send-keys 卡死時指令仍在有限時間內返回" \
+  test -n "$id39c"
+# marker 排除「PATH 沒生效、其實走了正常路徑」的偽陰性
+assert "39c 逾時兜底：shim 的 send-keys 確實被呼叫到" \
+  test -f "$TESTROOT/c39-hang-hit"
+assert "39c 逾時兜底：events.log 記 notify-failed" \
+  evt_grep "$D39c/tasks/$id39c/events.log" notify-failed
+# 這是唯一走得到 send-keys-failed 桶的真實佈景（前兩道關卡都過、卡在送鍵本身）
+assert_reason "39c 逾時兜底：notify-failed 標 reason=send-keys-failed" \
+  "$D39c/tasks/$id39c/events.log" send-keys-failed
+
+# 39d mode 查不出來 → fail-closed。只讓 `#{pane_in_mode}` 查詢失敗，其餘子命令
+# 照常透傳：無法確認 pane 狀態時放行送鍵，等於整條防線被略過。
+D39d="$TESTROOT/d39d"
+MODESHIM="$TESTROOT/modeshim"
+mkdir -p "$MODESHIM"
+cat > "$MODESHIM/tmux" <<EOF
+#!/usr/bin/env bash
+unset TMUX
+for a in "\$@"; do
+  if [[ "\$a" == '#{pane_in_mode}' ]]; then
+    touch $(printf '%q' "$TESTROOT/d39-mode-hit")
+    echo "display failed (test stub)" >&2; exit 1
+  fi
+done
+if [[ "\$1" == "send-keys" ]]; then
+  { printf '%s ' "\$@"; printf '\n'; } >> $(printf '%q' "$TESTROOT/d39-sendkeys.log")
+  exit 0
+fi
+exec $(printf '%q' "$REAL_TMUX") -L $(printf '%q' "$SOCK") -f /dev/null "\$@"
+EOF
+chmod +x "$MODESHIM/tmux"
+env AGENT_BRIDGE_DATA="$D39d" PATH="$MODESHIM:$PATH" "$BRIDGE" \
+  register mode39 "$PANE_B" >/dev/null 2>&1
+id39d="$(env AGENT_BRIDGE_DATA="$D39d" PATH="$MODESHIM:$PATH" \
+  timeout 30 "$BRIDGE" send mode39 --from alice --message hi 2>/dev/null)"
+assert "39d fail-closed：mode 查詢確實被 shim 攔截" \
+  test -f "$TESTROOT/d39-mode-hit"
+assert "39d fail-closed：mode 查不出來時一個按鍵都不送" \
+  test ! -f "$TESTROOT/d39-sendkeys.log"
+assert "39d fail-closed：events.log 記 notify-failed" \
+  evt_grep "$D39d/tasks/$id39d/events.log" notify-failed
+# mode 查不出來＝查詢層失敗（2026-08-03 拆桶）：pane 可能活著，不得記 pane-gone
+assert_reason "39d fail-closed：notify-failed 標 reason=query-failed" \
+  "$D39d/tasks/$id39d/events.log" query-failed
+
+# 39e 逾時上限涵蓋整條通知路徑，不只 send-keys：notify_pane 在送鍵之前還會跑
+# list-panes／display／capture-pane 三種查詢，任何一個卡住，send 照樣無限等待
+# ——只擋 send-keys 等於上限形同不存在（跨廠複核 2026-07-31 finding 1）。
+# 這裡讓 mode 查詢永不返回：它排在 send-keys 之前，逾時若沒套到查詢層就會鎖死。
+D39e="$TESTROOT/d39e"
+MODEHANGSHIM="$TESTROOT/modehangshim"
+mkdir -p "$MODEHANGSHIM"
+cat > "$MODEHANGSHIM/tmux" <<EOF
+#!/usr/bin/env bash
+unset TMUX
+for a in "\$@"; do
+  if [[ "\$a" == '#{pane_in_mode}' ]]; then
+    touch $(printf '%q' "$TESTROOT/e39-modehang-hit")
+    exec sleep 300
+  fi
+done
+exec $(printf '%q' "$REAL_TMUX") -L $(printf '%q' "$SOCK") -f /dev/null "\$@"
+EOF
+chmod +x "$MODEHANGSHIM/tmux"
+env AGENT_BRIDGE_DATA="$D39e" PATH="$MODEHANGSHIM:$PATH" "$BRIDGE" \
+  register modehang39 "$PANE_B" >/dev/null 2>&1
+id39e="$(env AGENT_BRIDGE_DATA="$D39e" AGENT_BRIDGE_TMUX_TIMEOUT=2 PATH="$MODEHANGSHIM:$PATH" \
+  timeout 30 "$BRIDGE" send modehang39 --from alice --message hi 2>/dev/null)"
+assert "39e 查詢層逾時：mode 查詢卡死時指令仍在有限時間內返回" \
+  test -n "$id39e"
+assert "39e 查詢層逾時：shim 的 mode 查詢確實被呼叫到" \
+  test -f "$TESTROOT/e39-modehang-hit"
+assert "39e 查詢層逾時：events.log 記 notify-failed" \
+  evt_grep "$D39e/tasks/$id39e/events.log" notify-failed
+# mode 查詢卡到逾時＝查詢層失敗，落 query-failed 桶（不是 send-keys-failed
+# ——那時根本還沒走到送鍵；也不是 pane-gone——pane 分明活著，2026-08-03 拆桶）
+assert_reason "39e 查詢層逾時：notify-failed 標 reason=query-failed" \
+  "$D39e/tasks/$id39e/events.log" query-failed
+
+else
+  printf 'SKIP: 39 copy-mode 送鍵防線（SRC_KIND=bash：bash 正本凍結在 M4）\n'
+fi
+
+fi  # end grp 39
+# ---- 40. TUI 第一縱切（ui dashboard） ----
+if grp 40; then
+# spec: CLI-UI-1 CLI-CANCEL-1
+# 設計正本 docs/tui-design.md §8／§9 P1 的三個 gate，全部腳本化：
+#   (a) 導航到指定 task 列，x＋確認 → task 檔狀態轉 cancelled（且確認框逐字
+#       顯示等價 CLI 原文；通知事件落地；別的 task 不受波及）
+#   (b) 退出後 window id／layout string／geometry 不變、**termios 逐字還原**
+#       （同一條 shell 命令內 `stty -g` 前後比對——bash/readline 重畫 prompt
+#       時會自行重設 termios，隔著 prompt 比對驗不到 raw mode 有沒有留下）；
+#       正常退出（q）／panic／非 panic 的 Err 三條路徑各一次
+#   (c) Enter 後**真 client**（control-mode attached client）的
+#       `session:window.pane` 等於目標——不是 detached session 的 active
+#       window：後者在 switch/select 全壞掉時照樣綠
+# 另含消費端防線：無界 tmux（hanging shim＋TMUX_TIMEOUT=0）下 UI 仍畫得出來、
+# 收得了鍵（§4 bounded-read 硬條款的 UI 側），以及 popup 啟動器協定
+# （AGENT_BRIDGE_UI_POPUP=1 時 focus 成功即正常退出，ENV-UI-1）。
+# 畫面斷言一律 capture-pane 落檔後 grep 特徵字串，不做整畫面 byte 比對
+# （alternate screen 承諾不了 byte 級不變，終審已裁定）。
+# 與 35–39 同理只對 Rust 執行；bash 正本自 M4 凍結，顯式 SKIP。
+if [[ "$SRC_KIND" == rust ]]; then
+
+D40="$TESTROOT/d40"
+mkdir -p "$D40/agents" "$D40/tasks"
+
+# fixture：2 owner／3 worker／2 task（P1 用小 fixture；P4 的大 fixture 不在本階段）
+# live worker 放在獨立 window：Enter focus 的跨 window 案例
+W40_WIN="$(tmx new-window -dP -F '#{window_id}' -t it "$pane_cmd")"
+P40A="$(tmx list-panes -t "$W40_WIN" -F '#{pane_id}')"
+# dead worker：開了就殺（驗 dead 標示不毒死畫面；也是 P1 之後異常軸的地基）
+P40B="$(tmx split-window -dP -F '#{pane_id}' -t it "$pane_cmd")"
+tmx kill-pane -t "$P40B"
+# TUI 跑在自己 window 的 bash 裡（不是直接當 window command）：退出後 pane
+# 仍在，才驗得了「退出還原、terminal 可用」
+TUI40="$(tmx new-window -dP -F '#{pane_id}' -t it "$pane_cmd")"
+# current origin＝TUI 自己所在的 window（§2「以 current origin 為根」）
+OWN40="$(tmx display -p -t "$TUI40" '#{session_name}:#{window_id}')"
+SESS40="${OWN40%%:*}"
+# P4.6 題 1：origin 標籤顯示的是 window **名稱**（P4.7 切片 B1 起在 DETAIL
+# 上）。給它一個固定名字，斷言才有可預期的字面（預設名是啟動命令，會隨
+# $pane_cmd 漂移）
+WIN40NAME=ab40
+tmx rename-window -t "$TUI40" "$WIN40NAME"
+# 第二個 origin：window id 取一個**確定不存在**的值——origin 標籤顯示的是
+# `session:window-name`，只有已消失的 window 才會原樣留著 `@id` 並標 `(gone)`，
+# 這一列的字面才在 tmux 活著／掛住兩種情況下都可預期。
+# P4.7 切片 B1：它同時是「WORKERS 欄不再過濾 origin」的證據（tuiwother 掛在
+# 這個 origin 底下，卻與 tuiw1／tuiw2 同列於一張畫面）
+OWN40X="aaa:@94001"
+printf '{"name":"tuiw1","pane_id":"%s","registered_at":"2026-07-31T00:00:00Z","spawned":true,"ready":true,"runtime":"codex","spawn_tag":"t40-1","owner":"%s"}\n' \
+  "$P40A" "$OWN40" > "$D40/agents/tuiw1.json"
+printf '{"name":"tuiw2","pane_id":"%s","registered_at":"2026-07-31T00:00:00Z","spawned":true,"ready":true,"runtime":"claude","spawn_tag":"t40-2","owner":"%s"}\n' \
+  "$P40B" "$OWN40" > "$D40/agents/tuiw2.json"
+printf '{"name":"tuiwother","pane_id":"%%940","registered_at":"2026-07-31T00:00:00Z","spawned":true,"ready":true,"runtime":"codex","spawn_tag":"t40-3","owner":"%s"}\n' \
+  "$OWN40X" > "$D40/agents/tuiwother.json"
+# 兩個 queued task 都派給 tuiw1（手工鋪完整形狀：metadata＋status＋request，
+# 不經 send——不觸發通知，狀態確定停在 queued）
+T40A="20260731T000001Z-40aa"
+T40B="20260731T000002Z-40bb"
+for _t40 in "$T40A" "$T40B"; do
+  mkdir -p "$D40/tasks/$_t40"
+  printf 'queued\n' > "$D40/tasks/$_t40/status"
+  printf 'p1 fixture task\n' > "$D40/tasks/$_t40/request.md"
+  printf '{"version":1,"task_id":"%s","from":"alice","to":"tuiw1","created_at":"2026-07-31T00:00:01Z","updated_at":"2026-07-31T00:00:01Z","working_directory":"/tmp","status":"queued"}\n' \
+    "$_t40" > "$D40/tasks/$_t40/metadata.json"
+done
+
+tmx send-keys -t "$TUI40" \
+  "$(printf 'echo AB40-MAIN-SCREEN; touch %q' "$TESTROOT/tui40-ready")" Enter
+wait_for 10 test -f "$TESTROOT/tui40-ready"
+
+# gate (c) 要的是**真 client**：整套測試的 tmux server 全程 detached，
+# `display -t it:` 只讀得到 session 的 active window——switch-client／
+# select-pane 全壞掉它照樣綠。這裡起一個 control-mode client（不需要 pty、
+# 不改動 window 尺寸與 layout，已實測），之後一律以 `display -c <client>`
+# 觀測「使用者實際在哪」。fd 9 常開著 fifo，client 才不會在下一條命令就掉。
+CC40="$TESTROOT/tui40-cc.fifo"
+mkfifo "$CC40"
+( tmx -C attach -t it < "$CC40" > "$TESTROOT/tui40-cc.log" 2>&1 & )
+exec 9<>"$CC40"
+# shellcheck disable=SC2329  # 經 wait_for 間接呼叫
+cc40_up() { [[ -n "$(tmx list-clients -F '#{client_name}' 2>/dev/null)" ]]; }
+assert "40 前置：control-mode client 已 attach（gate (c) 的觀測點）" \
+  wait_for 10 cc40_up
+CLIENT40="$(tmx list-clients -F '#{client_name}' 2>/dev/null | head -1)"
+
+# fixture 齊備後快照 tmux 世界（gate (b) 的比對基準）：window id＋layout
+# string（內含 geometry 與 pane id）
+tmx list-windows -F '#{window_id} #{window_layout}' > "$TESTROOT/tui40-before.txt"
+
+# tui40_run <tag> [env 指派…]：在 TUI40 的 shell 裡跑一次 `ui`，並以**同一條
+# shell 命令**把 `stty -g` 夾在前後——中間不回 prompt，bash/readline 沒有機會
+# 代為重設 termios，raw mode 有沒有還原才驗得準（審查 F5）。
+tui40_run() {
+  local tag="$1"; shift
+  tmx send-keys -t "$TUI40" "$(printf 'stty -g > %q; env %s AGENT_BRIDGE_DATA=%q %q ui; stty -g > %q' \
+    "$TESTROOT/stty-$tag-before" "$*" "$D40" "$BRIDGE" "$TESTROOT/stty-$tag-after")" Enter
+}
+# shellcheck disable=SC2329  # 經 assert 的 "$@" 間接呼叫
+stty40_same() { diff -q "$TESTROOT/stty-$1-before" "$TESTROOT/stty-$1-after"; }
+
+# tmx 是本檔的 shell function，bash -c 子殼裡不存在：一律先擷取到檔案再斷言
+cap40() { tmx capture-pane -p -t "$TUI40" > "$TESTROOT/tui40-cap.txt" 2>/dev/null; }
+# shellcheck disable=SC2329  # 經 assert/wait_for 的 "$@" 間接呼叫
+ui_shows() { cap40 && grep -qF "$1" "$TESTROOT/tui40-cap.txt"; }
+# shellcheck disable=SC2329  # 經 assert/wait_for 的 "$@" 間接呼叫
+ui_lacks() { cap40 && ! grep -qF "$1" "$TESTROOT/tui40-cap.txt"; }
+# 真 client 當下所在的 session:window.pane（不是 session 的 active window）
+# shellcheck disable=SC2329  # 經 wait_for 間接呼叫
+focus40_is() {
+  [[ "$(tmx display -p -c "$CLIENT40" '#{session_name}:#{window_id}.#{pane_id}' 2>/dev/null)" \
+     == "it:$W40_WIN.$P40A" ]]
+}
+
+tui40_run q
+# 40a 讀模型→畫面：owner／兩 worker／兩 task 列（權威狀態字）都在
+assert "40a UI 起畫面：worker 列 tuiw1 可見" wait_for 10 ui_shows "tuiw1"
+assert "40a UI：dead worker tuiw2 亦在列（不毒死畫面）" ui_shows "tuiw2"
+# P4.6 題 1（P4.7 切片 B1 起改由 DETAIL 承載）：origin 標籤顯示
+# `session:window-name`（不是 `session:@id`）。ORIGINS 面板退場後，origin 從
+# 「一條軸」降級成 DETAIL 的證據行，投影的是**當前選中 worker** 的 owner。
+# **要等**：origin 標籤的誠實化吃的是 liveness 那一輪（2s 節流、走背景
+# worker），磁碟 read model 先到、window 索引後到——不等就是在驗第一幀的
+# unknown 降級態
+assert "40a DETAIL：current origin 以 session:window-name 顯示（非 @id）" \
+  wait_for 10 ui_shows "$SESS40:$WIN40NAME"
+assert "40a DETAIL：origin 不以 window id 冒充名字（誠實標籤，題 1）" ui_lacks "$OWN40"
+# P4.7 切片 B1：WORKERS 欄的唯一軸是 lineage 分組。這批 fixture 的 spawn_tag
+# 都不是 canonical generation key（legacy），故全部落在 `(standalone)` 段
+assert "40a WORKERS：lineage 分組標頭可見（唯一軸，legacy → standalone）" \
+  ui_shows "(standalone)"
+# P4.7 切片 B1：ORIGINS 退場＝**沒有 scope 過濾**，WORKERS 欄就是全 registry。
+# 舊斷言在這裡驗的是相反的事（「首頁根＝current owner，所以看不到 tuiwother」）
+# ——那條前提已經沒有了，改驗它的新形狀：跨 origin 的 worker MUST 也在列上
+assert "40a WORKERS 欄不再過濾 origin（跨 origin 的 tuiwother 亦在列）" \
+  wait_for 10 ui_shows "tuiwother"
+# 已消失 window 的 `(gone)` 標記同樣改由 DETAIL 承載：把選取移到 tuiwother
+# （列序：tuiw1／T40A／T40B／tuiw2／tuiwother），驗完用 Home 移回第 0 列
+# ——40d／40e 的前提是選取停在 tuiw1
+tmx send-keys -t "$TUI40" j
+tmx send-keys -t "$TUI40" j
+tmx send-keys -t "$TUI40" j
+tmx send-keys -t "$TUI40" j
+assert "40a DETAIL：已消失 window 的 origin 標 (gone)、且不猜舊名" \
+  wait_for 10 ui_shows "$OWN40X (gone)"
+tmx send-keys -t "$TUI40" Home
+assert "40a Home 移回第 0 列（tuiw1 的 DETAIL 回來了）" \
+  wait_for 10 ui_shows "name   : tuiw1"
+assert "40a UI：task 列帶 immutable id（$T40A）" ui_shows "$T40A"
+assert "40a UI：第二個 task 列亦可見" ui_shows "$T40B"
+assert "40a UI：task status 顯示權威字 queued" ui_shows "queued"
+# alternate screen 進場：主畫面的哨兵行此刻不可見
+cap40
+assert "40a alternate screen：主畫面內容已被覆蓋" \
+  bash -c '! grep -qF AB40-MAIN-SCREEN "$1"' _ "$TESTROOT/tui40-cap.txt"
+
+# 40b ?＝當前選中項的合法鍵；任意鍵關閉
+tmx send-keys -t "$TUI40" '?'
+assert "40b ? 顯示當前選中項合法鍵（chrome 全英文，題 9）" \
+  wait_for 10 ui_shows "keys (current selection)"
+tmx send-keys -t "$TUI40" k
+
+# 40c x 的合法目標只有 task 列：worker 列上按 x 無效並提示
+tmx send-keys -t "$TUI40" x
+assert "40c worker 列按 x：提示無效、不開確認框" \
+  wait_for 10 ui_shows "x only acts on task rows"
+
+# 40d gate (c)：Enter focus 跨 window。前置：真 client 不在目標 window 上
+tmx display -p -c "$CLIENT40" '#{window_id}' > "$TESTROOT/tui40-curwin.txt"
+assert "40d 前置：client 不在目標 window（跨 window 案例成立）" \
+  bash -c '! grep -qFx "$1" "$2"' _ "$W40_WIN" "$TESTROOT/tui40-curwin.txt"
+tmx send-keys -t "$TUI40" Enter
+assert "40d Enter focus：真 client 的 session:window.pane 等於目標" \
+  wait_for 10 focus40_is
+# focus 走背景 worker（審查 F1）：結果經 channel 回到 footer，且**UI 沒退出**
+# ——非 popup 模式 focus 後繼續跑（與 40j 的 popup 協定成對）
+assert "40d focus 結果回到 footer（背景 worker → channel）" \
+  wait_for 10 ui_shows "focused 'tuiw1'"
+
+# 40e gate (a)：導航到第一個 task 列，x → 確認框顯示等價 CLI 原文 → y 執行
+tmx send-keys -t "$TUI40" j
+tmx send-keys -t "$TUI40" x
+assert "40e 確認框逐字顯示等價 CLI：agent-bridge cancel <task-id>" \
+  wait_for 10 ui_shows "agent-bridge cancel $T40A"
+tmx send-keys -t "$TUI40" y
+assert "40e 確認後 task 檔狀態轉 cancelled" wait_for 10 st_is "$D40" "$T40A" cancelled
+assert "40e events.log 記 cancelled 事件" evt_grep "$D40/tasks/$T40A/events.log" cancelled
+# CLI-UI-1 要求「與 cancel 相同的轉換**與通知**」：少了通知呼叫，狀態照樣轉
+# cancelled，只有通知事件會消失——故必須另立斷言（審查 F6）
+# 通知在轉態**之後**、且送鍵之間隔 NOTIFY_DELAY，故要等（狀態轉好不代表
+# 通知已落地）
+assert "40e 通知語意與 CLI 一致（notified／notify-deferred／notify-failed 之一）" \
+  wait_for 10 evt_grep "$D40/tasks/$T40A/events.log" '(notified|notify-deferred|notify-failed)'
+assert "40e cancel 結果回到 footer（背景 worker → channel，不印 stderr）" \
+  wait_for 10 ui_shows "cancelled task $T40A"
+assert "40e 另一個 task 不受波及（仍 queued）" st_is "$D40" "$T40B" queued
+
+# 40f gate (b) 正常退出：q 後回主畫面、termios 逐字還原、tmux 世界不變
+tmx send-keys -t "$TUI40" q
+assert "40f q 退出：離開 alternate screen（主畫面哨兵行回來）" \
+  wait_for 10 ui_shows "AB40-MAIN-SCREEN"
+assert "40f q 退出：termios 逐字還原（同一條命令內 stty -g 前後比對）" \
+  wait_for 10 stty40_same q
+tmx send-keys -t "$TUI40" \
+  "$(printf 'touch %q' "$TESTROOT/tui40-after-q")" Enter
+assert "40f q 退出後 terminal 可用（shell 收得到指令）" \
+  wait_for 10 test -f "$TESTROOT/tui40-after-q"
+tmx list-windows -F '#{window_id} #{window_layout}' > "$TESTROOT/tui40-after.txt"
+assert "40f window id／layout／geometry 不變" \
+  diff -q "$TESTROOT/tui40-before.txt" "$TESTROOT/tui40-after.txt"
+
+# 40g gate (b) 錯誤退出之一：panic 注入（AB_TUI_SELFTEST_PANIC——測試 harness
+# 的注入點，非 AGENT_BRIDGE_* 設定面）。panic hook 先還原 terminal 再印訊息，
+# 所以 panic 訊息必須出現在**主畫面**上
+tui40_run panic AB_TUI_SELFTEST_PANIC=1
+assert "40g panic 退出：訊息印在主畫面（alt screen 已離開＝hook 有跑）" \
+  wait_for 10 ui_shows "AB_TUI_SELFTEST_PANIC"
+assert "40g panic 退出：termios 逐字還原" wait_for 10 stty40_same panic
+tmx send-keys -t "$TUI40" \
+  "$(printf 'touch %q' "$TESTROOT/tui40-after-panic")" Enter
+assert "40g panic 退出後 terminal 可用（raw mode 已還原）" \
+  wait_for 10 test -f "$TESTROOT/tui40-after-panic"
+tmx list-windows -F '#{window_id} #{window_layout}' > "$TESTROOT/tui40-after2.txt"
+assert "40g panic 退出後 window id／layout／geometry 仍不變" \
+  diff -q "$TESTROOT/tui40-before.txt" "$TESTROOT/tui40-after2.txt"
+
+# 40h gate (b) 錯誤退出之二：**非 panic 的 Err**（AB_TUI_SELFTEST_ERR）。
+# draw／event::poll／event::read 都以 Err 返回，那條路徑不經 panic hook；
+# 只驗 panic 擋不住未來有人在 cleanup 之前提早 return（審查 F10）。
+tui40_run err AB_TUI_SELFTEST_ERR=1
+assert "40h Err 退出：錯誤訊息印在主畫面（已離開 alt screen）" \
+  wait_for 10 ui_shows "AB_TUI_SELFTEST_ERR"
+assert "40h Err 退出：termios 逐字還原" wait_for 10 stty40_same err
+tmx list-windows -F '#{window_id} #{window_layout}' > "$TESTROOT/tui40-after3.txt"
+assert "40h Err 退出後 window id／layout／geometry 仍不變" \
+  diff -q "$TESTROOT/tui40-before.txt" "$TESTROOT/tui40-after3.txt"
+
+# 40i §4 bounded-read 硬條款的 UI 側：tmux 整個掛住（hanging shim）＋
+# AGENT_BRIDGE_TMUX_TIMEOUT=0（不設限）。tmux 全部在背景 worker 上跑，
+# 所以 UI 仍須畫得出磁碟 read model、仍須收得了鍵、仍須 q 得掉（審查 F1）。
+HANG40="$TESTROOT/hangshim40"
+mkdir -p "$HANG40"
+printf '#!/usr/bin/env bash\nsleep 30\n' > "$HANG40/tmux"
+chmod +x "$HANG40/tmux"
+tui40_run hang "AGENT_BRIDGE_TMUX_TIMEOUT=0 PATH=$(printf '%q' "$HANG40:$PATH")"
+# tmux 掛住時 window 索引整層 unknown：origin 標籤 MUST 退回原樣的
+# `session:@id` 並標 `(unknown)`，且 **MUST NOT** 標成 `(gone)`
+# （查不到 ≠ 不在，§5 三態）。
+# P4.7 切片 B1：舊斷言用 ORIGINS 欄的第二列（$OWN40X）當降級證據；那一欄沒了，
+# 改用 DETAIL 的 origin 行（選取停在第 0 列＝tuiw1，其 owner 即 $OWN40）
+assert "40i 無界 tmux 下 UI 照樣畫得出磁碟 read model" \
+  wait_for 10 ui_shows "tuiw1"
+assert "40i 無界 tmux 下 liveness 降級為 unknown（不凍結、照畫）" \
+  wait_for 10 ui_shows "$OWN40 (unknown)"
+assert "40i 無界 tmux 下 unknown MUST NOT 被寫成 gone" ui_lacks "(gone)"
+tmx send-keys -t "$TUI40" '?'
+assert "40i 無界 tmux 下鍵盤仍活（? 開得了合法鍵頁）" \
+  wait_for 10 ui_shows "keys (current selection)"
+tmx send-keys -t "$TUI40" k
+tmx send-keys -t "$TUI40" q
+# 退出證據用檔案不用畫面：畫面只有可見區，連跑多輪後哨兵行會捲出去
+assert "40i 無界 tmux 下 q 退得掉（UI thread 沒被 tmux 卡住）" \
+  wait_for 10 test -f "$TESTROOT/stty-hang-after"
+assert "40i 無界 tmux 退出後 termios 仍逐字還原" wait_for 10 stty40_same hang
+
+# 40j 啟動器協定（ENV-UI-1）：AGENT_BRIDGE_UI_POPUP=1 時 focus 成功即正常
+# 退出（`display-popup -E` 的行程結束＝關 popup，人落在目標 pane）。
+# 前置：先把 client 帶離目標 window，否則「有沒有 focus」分不出來。
+tmx select-window -t "$TUI40"
+tui40_run popup AGENT_BRIDGE_UI_POPUP=1
+assert "40j popup 模式：UI 起得來" wait_for 10 ui_shows "tuiw1"
+tmx send-keys -t "$TUI40" Enter
+assert "40j popup 模式：focus 成功後直接正常退出" \
+  wait_for 10 test -f "$TESTROOT/stty-popup-after"
+assert "40j popup 退出後真 client 落在目標 pane" wait_for 10 focus40_is
+assert "40j popup 退出：termios 逐字還原" wait_for 10 stty40_same popup
+
+# 收場：先放掉 control-mode client（fd 9 一關，attach 就結束），再殺本組開的
+# window（P40B 已死）
+exec 9>&-
+tmx detach-client -t "$CLIENT40" 2>/dev/null || true
+tmx kill-pane -t "$TUI40" 2>/dev/null || true
+tmx kill-window -t "$W40_WIN" 2>/dev/null || true
+
+else
+  printf 'SKIP: 40 TUI 第一縱切（SRC_KIND=bash：bash 正本凍結在 M4，不含 TUI）\n'
+fi
+
+fi  # end grp 40
+# ---- 41. TUI 三面板＋唯讀鍵（r／i／c） ----
+if grp 41; then
+# spec: CLI-UI-1 CLI-READ-1
+# 設計正本 docs/tui-design.md §2 版面（P4.7 切片 B1 起：ORIGINS 退場，
+# WORKERS／TASKS／DETAIL 三面板，可聚焦的只有前兩個）與 §9 P2 的兩個 gate：
+#   (a) `c` 後 `tmux show-buffer` 的內容含 immutable 證據與唯讀命令原文，且
+#       **不含任何 mutation 子指令字串**（action 層另以假 Clipboard 斷言組裝，
+#       見 `ab_tui::action::tests::copy_payload_is_read_only_evidence_for_every_selection`）
+#   (b) `r` 的畫面側：`agent-bridge read <id>` 的 stdout 落檔，TUI 按 `r` 後
+#       capture-pane 落檔，斷言 response 的特徵行出現在畫面上。**render 層
+#       只做特徵字串比對**——alternate screen 承諾不了 byte 級不變（終審已
+#       裁定）；byte 級由 `ab_core::task::tests::read_response_returns_verbatim_bytes_and_logs_read_event`
+#       負責
+# 另含：Tab 兩欄循環、TASKS 欄含終態、終態列 `x` 被拒、`i` 摘要頁、
+# 退出後 window id／layout／geometry 不變與 termios 逐字還原（沿用 40 的
+# tui40_run／stty40_same 手法）。與 35–40 同理只對 Rust 執行。
+if [[ "$SRC_KIND" == rust ]]; then
+
+D41="$TESTROOT/d41"
+mkdir -p "$D41/agents" "$D41/tasks"
+
+# fixture：1 owner／1 live worker／2 task（1 completed＋1 queued——`r` 讀得動
+# 的只有終態任務，這正是 TASKS 欄存在的理由）
+W41_WIN="$(tmx new-window -dP -F '#{window_id}' -t it "$pane_cmd")"
+P41A="$(tmx list-panes -t "$W41_WIN" -F '#{pane_id}')"
+TUI41="$(tmx new-window -dP -F '#{pane_id}' -t it "$pane_cmd")"
+OWN41="$(tmx display -p -t "$TUI41" '#{session_name}:#{window_id}')"
+SESS41="${OWN41%%:*}"
+# P4.6 題 1：origin 標籤顯示 window 名稱（P4.7 切片 B1 起在 DETAIL 上），
+# 給它固定名字才驗得準
+WIN41NAME=ab41
+tmx rename-window -t "$TUI41" "$WIN41NAME"
+printf '{"name":"tuiw41","pane_id":"%s","registered_at":"2026-07-31T04:41:00Z","spawned":true,"ready":true,"runtime":"codex","spawn_tag":"t41-gen1","owner":"%s"}\n' \
+  "$P41A" "$OWN41" > "$D41/agents/tuiw41.json"
+
+# 反序（新的在上）：completed 的 id 刻意比 queued 新，TASKS 欄第一列即可讀
+T41DONE="20260731T004142Z-41dd"
+# 後綴 MUST 是 hex：`is_generated_task_dirname` 只認 [0-9a-f]，非 hex 的目錄
+# 一律被當成「不是本工具生成的」而跳過，read model 裡根本不會出現
+T41Q="20260731T004141Z-41cc"
+mkdir -p "$D41/tasks/$T41DONE" "$D41/tasks/$T41Q"
+printf 'completed\n' > "$D41/tasks/$T41DONE/status"
+printf 'p2 fixture task\n' > "$D41/tasks/$T41DONE/request.md"
+printf 'AB41-RESPONSE-LINE 回覆全文的特徵行\n第二行\n' > "$D41/tasks/$T41DONE/response.md"
+printf '{"version":1,"task_id":"%s","from":"alice","to":"tuiw41","created_at":"2026-07-31T04:41:42Z","updated_at":"2026-07-31T04:41:42Z","working_directory":"/tmp","status":"completed"}\n' \
+  "$T41DONE" > "$D41/tasks/$T41DONE/metadata.json"
+printf 'queued\n' > "$D41/tasks/$T41Q/status"
+printf 'p2 fixture task\n' > "$D41/tasks/$T41Q/request.md"
+printf '{"version":1,"task_id":"%s","from":"alice","to":"tuiw41","created_at":"2026-07-31T04:41:41Z","updated_at":"2026-07-31T04:41:41Z","working_directory":"/tmp","status":"queued"}\n' \
+  "$T41Q" > "$D41/tasks/$T41Q/metadata.json"
+
+# gate (b) 的比對來源：CLI 側的 stdout 先落檔（同時證明下沉 ab-core 之後
+# CLI 行為不變，CLI-READ-1）
+ab "$D41" read "$T41DONE" \
+  > "$TESTROOT/t41-cli-read.out" 2> "$TESTROOT/t41-cli-read.err" || true
+assert "41 CLI read stdout 恰為 response 內容（下沉 ab-core 後行為不變）" \
+  diff -q "$D41/tasks/$T41DONE/response.md" "$TESTROOT/t41-cli-read.out"
+assert "41 CLI read 標頭走 stderr（task-id/from/to）" \
+  grep -q "^task-id: $T41DONE\$" "$TESTROOT/t41-cli-read.err"
+
+# 下沉 ab-core 後最容易漂掉的是**呈現順序**：舊行為是「先印三行標頭到 stderr，
+# 再串流 payload」，兩者都在 task 鎖內。若改成外殼拿到完整 outcome 才印，
+# response.md 缺檔時就一行標頭都不印——可觀察的行為改變（跨廠審查 major #1）
+T41NOR="20260731T004143Z-41ee"
+mkdir -p "$D41/tasks/$T41NOR"
+printf 'completed\n' > "$D41/tasks/$T41NOR/status"
+printf '{"version":1,"task_id":"%s","from":"alice","to":"tuiw41","created_at":"2026-07-31T04:41:43Z","updated_at":"2026-07-31T04:41:43Z","working_directory":"/tmp","status":"completed"}\n' \
+  "$T41NOR" > "$D41/tasks/$T41NOR/metadata.json"
+ab "$D41" read "$T41NOR" \
+  > "$TESTROOT/t41-nores.out" 2> "$TESTROOT/t41-nores.err" && rc41=0 || rc41=$?
+assert "41 response.md 缺檔：read 以非零收場" test "$rc41" -ne 0
+assert "41 response.md 缺檔：三行標頭仍先印出（順序不因下沉而改變）" \
+  grep -q "^to: tuiw41\$" "$TESTROOT/t41-nores.err"
+assert "41 response.md 缺檔：stdout 為空（payload 一個位元組都不該出）" \
+  test ! -s "$TESTROOT/t41-nores.out"
+rm -r "$D41/tasks/$T41NOR"
+
+tmx send-keys -t "$TUI41" \
+  "$(printf 'echo AB41-MAIN-SCREEN; touch %q' "$TESTROOT/tui41-ready")" Enter
+wait_for 10 test -f "$TESTROOT/tui41-ready"
+tmx list-windows -F '#{window_id} #{window_layout}' > "$TESTROOT/tui41-before.txt"
+
+# 沿用 40 的手法：同一條 shell 命令內把 stty -g 夾在前後（中間不回 prompt）
+tui41_run() {
+  local tag="$1"; shift
+  tmx send-keys -t "$TUI41" "$(printf 'stty -g > %q; env %s AGENT_BRIDGE_DATA=%q %q ui; stty -g > %q' \
+    "$TESTROOT/stty41-$tag-before" "$*" "$D41" "$BRIDGE" "$TESTROOT/stty41-$tag-after")" Enter
+}
+# shellcheck disable=SC2329  # 經 assert 的 "$@" 間接呼叫
+stty41_same() { diff -q "$TESTROOT/stty41-$1-before" "$TESTROOT/stty41-$1-after"; }
+# tmx 是本檔的 shell function，bash -c 子殼裡不存在：一律先擷取到檔案再斷言
+cap41() { tmx capture-pane -p -t "$TUI41" > "$TESTROOT/tui41-cap.txt" 2>/dev/null; }
+# shellcheck disable=SC2329  # 經 assert/wait_for 的 "$@" 間接呼叫
+ui41_shows() { cap41 && grep -qF "$1" "$TESTROOT/tui41-cap.txt"; }
+# shellcheck disable=SC2329  # 經 assert/wait_for 的 "$@" 間接呼叫
+ui41_lacks() { cap41 && ! grep -qF "$1" "$TESTROOT/tui41-cap.txt"; }
+# 面板聚焦只以文字 marker（`▶`）觀測：capture-pane 吃不到 style
+# shellcheck disable=SC2329  # 經 assert/wait_for 的 "$@" 間接呼叫
+ui41_matches() { cap41 && grep -qE "$1" "$TESTROOT/tui41-cap.txt"; }
+# `r` 是否真的又記了一筆 read 事件（CLI 側已記過一筆，故門檻是 2）
+# shellcheck disable=SC2329  # 經 assert/wait_for 的 "$@" 間接呼叫
+read_ev41_twice() {
+  (( $(grep -cE 'Z read([[:space:]]|$)' "$D41/tasks/$T41DONE/events.log" 2>/dev/null) >= 2 ))
+}
+
+tui41_run q
+# 41a 四面板都畫得出來
+assert "41a 三面板：WORKERS 欄可見" wait_for 10 ui41_shows "WORKERS"
+assert "41a 三面板：TASKS 欄可見" ui41_shows "TASKS"
+assert "41a 三面板：DETAIL 欄可見" ui41_shows "DETAIL"
+# P4.7 切片 B1：ORIGINS 欄退場，WORKERS 的唯一軸是 lineage 分組。舊斷言
+# （「ORIGINS 欄可見」）的前提消失，換成新軸自己的證據——這批 fixture 的
+# spawn_tag 不是 canonical generation key（legacy），故落在 `(standalone)` 段
+assert "41a WORKERS：lineage 分組標頭可見（唯一軸）" ui41_shows "(standalone)"
+assert "41a ORIGINS 欄已退場（面板名不得再出現在畫面上）" ui41_lacks "ORIGINS"
+# TASKS 欄含終態（in-flight 之外的那一筆），且顯示權威狀態字
+assert "41a TASKS 欄含終態任務（$T41DONE completed）" ui41_shows "$T41DONE"
+assert "41a TASKS 欄 status 為權威字 completed" ui41_shows "completed"
+assert "41a TASKS 欄亦含 queued 任務" ui41_shows "$T41Q"
+# DETAIL 隨聚焦面板的選中項（起始＝WORKERS 的 worker 列）
+assert "41a DETAIL 顯示選中 worker 的欄位" ui41_shows "name   : tuiw41"
+assert "41a DETAIL evidence 區列唯讀等價 CLI 原文" ui41_shows "\$ agent-bridge list --long"
+assert "41a footer 補上 r／i／c 鍵位提示（英文 chrome）" ui41_shows "c copy evidence"
+# 題 3：worker DETAIL 把 origin window 與 agent 自己的死活拆成兩列
+assert "41a DETAIL 有 origin 列（window 名稱＋@id＋三態）" \
+  ui41_shows "origin : $SESS41:$WIN41NAME ("
+assert "41a DETAIL 的 agent 死活是另一列" ui41_shows "state  : live"
+
+# 41b `i`：worker 摘要頁（registry 額外欄位＋三態 liveness）
+tmx send-keys -t "$TUI41" i
+assert "41b i 摘要頁顯示 spawn_tag（世代）" wait_for 10 ui41_shows "spawn_tag    : t41-gen1"
+assert "41b i 摘要頁顯示 registered_at" ui41_shows "registered_at: 2026-07-31T04:41:00Z"
+assert "41b i 摘要頁顯示 liveness（三態，此處 live）" ui41_shows "liveness     : live"
+assert "41b i 摘要頁的 evidence 區唯讀" ui41_shows "agent-bridge list --long"
+tmx send-keys -t "$TUI41" Escape
+assert "41b 任意鍵關閉摘要頁（摘要內容從畫面消失）" wait_for 10 ui41_lacks "spawn_tag"
+assert "41b 關閉後仍在 dashboard" ui41_shows "DETAIL"
+
+# 41c Tab 兩欄循環：WORKERS → TASKS → WORKERS（DETAIL 不可聚焦）
+assert "41c 起始聚焦 WORKERS（選中 marker 落在 worker 列）" \
+  ui41_matches "▶ ▸ tuiw41"
+tmx send-keys -t "$TUI41" Tab
+assert "41c Tab → TASKS（選中 marker 落在終態任務列）" \
+  wait_for 10 ui41_matches "▶ . $T41DONE"
+assert "41c TASKS 聚焦後 DETAIL 換成該 task 的細節" ui41_shows "task-id: $T41DONE"
+assert "41c DETAIL evidence 區為唯讀 read 命令原文" ui41_shows "\$ agent-bridge read $T41DONE"
+
+# 41d gate (a)：`c` 複製證據 → tmux buffer 讀回
+tmx send-keys -t "$TUI41" c
+assert "41d c 的結果回到 footer" \
+  wait_for 10 ui41_shows "evidence copied to the tmux buffer"
+tmx show-buffer > "$TESTROOT/t41-buffer.txt" 2>/dev/null
+assert "41d gate (a)：buffer 含 immutable task id" \
+  grep -qF "task-id: $T41DONE" "$TESTROOT/t41-buffer.txt"
+assert "41d gate (a)：buffer 含 agent-bridge read <id>" \
+  grep -qF "agent-bridge read $T41DONE" "$TESTROOT/t41-buffer.txt"
+assert "41d gate (a)：buffer 含 agent-bridge status <id>" \
+  grep -qF "agent-bridge status $T41DONE" "$TESTROOT/t41-buffer.txt"
+assert "41d gate (a)：buffer 含 pane id（介入用證據）" \
+  grep -qF "pane: $P41A" "$TESTROOT/t41-buffer.txt"
+for _m41 in cancel evict despawn send spawn relay unregister register kill gc; do
+  assert_fails "41d gate (a)：buffer MUST NOT 含 mutation 子指令 '$_m41'" \
+    grep -qF "$_m41" "$TESTROOT/t41-buffer.txt"
+done
+
+# 41e 終態任務按 x：提示無效、不開確認框、狀態不動
+tmx send-keys -t "$TUI41" x
+assert "41e 終態列按 x 被拒（提示含 terminal）" \
+  wait_for 10 ui41_shows "is already terminal"
+assert "41e 終態列按 x 不開確認框（無等價 CLI 原文）" \
+  bash -c '! grep -qF "Confirm to run the equivalent CLI" "$1"' _ "$TESTROOT/tui41-cap.txt"
+assert "41e 終態任務狀態未被動過" st_is "$D41" "$T41DONE" completed
+
+# 41f gate (b) 的畫面側：`r` 讀全文
+tmx send-keys -t "$TUI41" r
+assert "41f gate (b)：r 的 overlay 顯示 response 特徵行" \
+  wait_for 10 ui41_shows "AB41-RESPONSE-LINE"
+assert "41f gate (b)：overlay 標頭三欄同 CLI stderr（task-id/from/to）" \
+  ui41_shows "task-id: $T41DONE"
+assert "41f gate (b)：特徵行與 CLI stdout 同一份內容" \
+  grep -qF "AB41-RESPONSE-LINE" "$TESTROOT/t41-cli-read.out"
+# `r` 走的是與 CLI 同一份實作（同樣記 read 事件，CLI-READ-1）。門檻必須是
+# **第 2 筆**：同一 fixture 前面已由 CLI read 記過一筆，只驗「至少一筆」的話
+# TUI 完全沒記事件也會綠（跨廠審查 minor #4）
+assert "41f r 記 read 事件（與 CLI read 同一份實作）" \
+  wait_for 10 read_ev41_twice
+tmx send-keys -t "$TUI41" Escape
+assert "41f Esc 關閉 overlay（回到 dashboard）" wait_for 10 ui41_shows "DETAIL"
+
+# 41g 未回覆的任務按 r：逐字沿用 core 的拒絕訊息，不開 overlay
+tmx send-keys -t "$TUI41" j
+tmx send-keys -t "$TUI41" r
+assert "41g queued 任務按 r：footer 顯示 core 的拒絕訊息" \
+  wait_for 10 ui41_shows "尚未回覆"
+assert "41g 被拒時不開 overlay（dashboard 仍在）" ui41_shows "DETAIL"
+
+# 41h Tab 循環走完一圈。P4.7 切片 B1：ORIGINS 退場後只剩兩欄，
+# TASKS → WORKERS → TASKS → WORKERS——舊斷言的中間那一站沒有了，
+# 但「循環走得完、且回得到起點」這條 invariant 原封不動
+tmx send-keys -t "$TUI41" Tab
+assert "41h Tab → WORKERS（兩欄循環的下一站）" \
+  wait_for 10 ui41_matches "▶ ▸ tuiw41"
+tmx send-keys -t "$TUI41" Tab
+# 41g 把 TASKS 的選取移到第 1 列（queued），Tab 回來時 selection 不得被重置
+assert "41h Tab → TASKS（選取仍停在 41g 移到的那一列）" \
+  wait_for 10 ui41_matches "▶ ⚙ $T41Q"
+tmx send-keys -t "$TUI41" Tab
+assert "41h Tab → WORKERS（循環回到起點）" wait_for 10 ui41_matches "▶ ▸ tuiw41"
+
+# 41j Enter matrix（P4.6 切片 B）：**WORKERS 的內嵌 task 列 Enter＝read**，
+# 不再 focus 所屬 worker。WORKERS 欄只列 in-flight，這裡唯一的內嵌任務是
+# queued 的 $T41Q——讀不動，於是同一條斷言同時證明兩件事：走的是 read 那條
+# 路，且拒絕由 core 權威回答（不造旁路）。
+#
+# 先按 x 在 footer 種一個哨兵訊息：41g 早就讓「尚未回覆」留在 footer 上了，
+# 不換掉的話 Enter 什麼都不做也會綠
+tmx send-keys -t "$TUI41" x
+assert "41j 前置：footer 上是哨兵訊息（x 對 worker 列無效）" \
+  wait_for 10 ui41_shows "x only acts on task rows"
+tmx send-keys -t "$TUI41" j
+tmx send-keys -t "$TUI41" Enter
+assert "41j WORKERS task 列 Enter＝read（core 的拒絕訊息逐字進 footer）" \
+  wait_for 10 ui41_shows "尚未回覆"
+assert "41j Enter 確實動了（哨兵訊息已被換掉）" ui41_lacks "x only acts on task rows"
+assert "41j task 列的 Enter MUST NOT focus 它的 worker" ui41_lacks "focused 'tuiw41'"
+assert "41j 被拒時不開 overlay（dashboard 仍在）" ui41_shows "DETAIL"
+
+# 41k 反向循環（BTab）＋選取移回 worker 列。
+# 舊斷言驗的是「ORIGINS 列 Enter → 焦點切 WORKERS 並選該 scope 第一個 worker」
+# ——那一格隨面板退場（Enter matrix 從四格變三格）。留下來的兩條 invariant
+# 換載體：(1) BTab 是 Tab 的反向；(2) 選取真的移得回 worker 列（41l 的前提）。
+# 此刻選取停在 WORKERS 的內嵌 task 列（41j 按過 j），所以 `▶ ▸ tuiw41` 是真的
+# 被移回來的，不是本來就在那裡
+tmx send-keys -t "$TUI41" BTab
+# 兩欄的 task 列字面刻意分得開：TASKS 欄是 `▶ <status glyph> <id>`，
+# WORKERS 的內嵌 task 列是 `▶ └ <id>`——marker 落在哪一欄才驗得準
+assert "41k BTab → TASKS（反向循環）" \
+  wait_for 10 ui41_matches "▶ ⚙ $T41Q"
+tmx send-keys -t "$TUI41" BTab
+assert "41k BTab → WORKERS（反向走完一圈；選取仍停在內嵌 task 列）" \
+  wait_for 10 ui41_matches "▶ └ $T41Q"
+tmx send-keys -t "$TUI41" k
+assert "41k k → 選取移回 worker 列" wait_for 10 ui41_matches "▶ ▸ tuiw41"
+
+# 41l contextual footer（P4.6 切片 B）：第一段只列當前列有效的鍵、第二段全域
+assert "41l footer 第一段隨選中列（worker 列＝focus pane）" ui41_shows "Enter focus pane"
+assert "41l worker 列上 MUST NOT 列出 x（它只對 task 列有效）" ui41_lacks "x cancel"
+assert "41l footer 第二段是全域鍵" ui41_shows "? keys"
+
+# 41i 退出：termios 逐字還原、tmux 世界不變
+tmx send-keys -t "$TUI41" q
+assert "41i q 退出：離開 alternate screen（主畫面哨兵行回來）" \
+  wait_for 10 ui41_shows "AB41-MAIN-SCREEN"
+assert "41i q 退出：termios 逐字還原" wait_for 10 stty41_same q
+tmx list-windows -F '#{window_id} #{window_layout}' > "$TESTROOT/tui41-after.txt"
+assert "41i 退出後 window id／layout／geometry 不變" \
+  diff -q "$TESTROOT/tui41-before.txt" "$TESTROOT/tui41-after.txt"
+
+tmx kill-pane -t "$TUI41" 2>/dev/null || true
+tmx kill-window -t "$W41_WIN" 2>/dev/null || true
+
+else
+  printf 'SKIP: 41 TUI 四面板＋唯讀鍵（SRC_KIND=bash：bash 正本凍結在 M4，不含 TUI）\n'
+fi
+
+fi  # end grp 41
+# ---- 42. evict 入口 CAS（CLI-EVICT-4） ----
+if grp 42; then
+# spec: CLI-EVICT-4 CLI-EVICT-3
+# 設計正本 docs/tui-design.md §5／§9 P3 的三則 gate：
+#   (a) expect 相符 → evict 成功
+#   (b) **invocation 前已換代** → selection stale 非 0 退出，且不建 task、
+#       無通知、pane 未 kill、registry 未動、審計未新增
+#   (c) 送出後 → despawn 前換代 → 照舊拒收（既有 CLI-EVICT-3 行為，
+#       由分組 26 覆蓋；本組只確認新增的入口鎖沒有削弱它）
+# 與 35–41 同理只對 Rust 執行（bash 正本自 M4 凍結，不含 --expect-*）。
+if [[ "$SRC_KIND" == rust ]]; then
+
+D42="$TESTROOT/d42"
+
+# agents.log 的行數（證明「被拒時審計未新增」）
+# shellcheck disable=SC2329  # 經 assert 的 "$@" 間接呼叫
+audit_lines42() { wc -l < "$D42/agents.log" 2>/dev/null || printf '0'; }
+
+pane42="$(absp "$D42" 0 spawn ev42 --runtime codex 2>/dev/null)"
+GEN42="$(jq -r '.spawn_tag' "$D42/agents/ev42.json")"
+assert "42 前置：spawn_tag 讀得到（世代綁定的前提）" test -n "$GEN42"
+
+# 42a 參數面（additive）：值不得為空、缺參數被拒；被拒時不留孤兒任務
+before42="$(task_count "$D42")"
+before_audit42="$(audit_lines42)"
+assert_fails "42a --expect-pane 缺參數被拒" ab "$D42" evict ev42 --expect-pane
+assert_fails "42a --expect-generation 缺參數被拒" ab "$D42" evict ev42 --expect-generation
+assert_fails "42a --expect-pane 空值被拒" ab "$D42" evict ev42 --expect-pane ""
+assert "42a 參數被拒時不留孤兒收尾任務" test "$(task_count "$D42")" -eq "$before42"
+
+# 42b gate (b)：**invocation 前已換代**。以舊值呼叫 → selection stale，
+# 且此刻 MUST 一個副作用都沒有
+cp "$D42/agents/ev42.json" "$TESTROOT/ev42-before.json"
+jq --arg t "$GEN42-NEXT" '.spawn_tag = $t' "$TESTROOT/ev42-before.json" \
+  > "$D42/agents/ev42.json"
+cp "$D42/agents/ev42.json" "$TESTROOT/ev42-snapshot.json"
+before42="$(task_count "$D42")"
+before_audit42="$(audit_lines42)"
+ab "$D42" evict ev42 --expect-generation "$GEN42" \
+  > "$TESTROOT/ev42-stale.out" 2> "$TESTROOT/ev42-stale.err" && rc42=0 || rc42=$?
+assert "42b 世代不符：非 0 退出" test "$rc42" -ne 0
+assert "42b 世代不符：訊息含 selection stale" \
+  grep -qF "selection stale" "$TESTROOT/ev42-stale.err"
+assert "42b 世代不符：**不建 task**（tasks/ 數量不變）" \
+  test "$(task_count "$D42")" -eq "$before42"
+assert "42b 世代不符：pane 未被 kill" pane_alive "$pane42"
+assert "42b 世代不符：registry 未被動（逐字元不變）" \
+  diff -q "$TESTROOT/ev42-snapshot.json" "$D42/agents/ev42.json"
+assert "42b 世代不符：審計未新增" test "$(audit_lines42)" -eq "$before_audit42"
+assert "42b 世代不符：stdout 空（沒有 task-id 可印）" test ! -s "$TESTROOT/ev42-stale.out"
+
+# 42c pane 不符走同一條防線（只帶 --expect-pane）
+before42="$(task_count "$D42")"
+ab "$D42" evict ev42 --expect-pane "%999999" \
+  > /dev/null 2> "$TESTROOT/ev42-pane.err" && rc42=0 || rc42=$?
+assert "42c pane 不符：非 0 退出" test "$rc42" -ne 0
+assert "42c pane 不符：訊息含 selection stale" \
+  grep -qF "selection stale" "$TESTROOT/ev42-pane.err"
+assert "42c pane 不符：不建 task" test "$(task_count "$D42")" -eq "$before42"
+assert "42c pane 不符：pane 未被 kill" pane_alive "$pane42"
+
+# 42f 起始狀態 MUST 是**有效**的：42b 留下的 stale registry 若不還原，evict
+# 一進門就被擋，那又退回成「呼叫前就 stale」的形狀，殺不到 mutant
+cp "$TESTROOT/ev42-before.json" "$D42/agents/ev42.json"
+
+# 42f 鎖邊界（本組唯一能殺 mutant 的一條）：42b／42c 只證明「stale 會被擋」，
+# 但那在「先比對、後取鎖」的錯誤實作下**照樣綠**——registry 在呼叫前就已經
+# 是 stale 了。這裡改成讓換代發生在 evict **已經開始、正卡在鎖上**的時候：
+#   佔住 agents-registry 鎖 → 背景啟動帶舊 expect 的 evict（卡住）
+#   → 換代 → 放鎖 → evict 取得鎖後 MUST 重讀並判 stale
+# 「先比對後取鎖」的實作會在卡住之前就讀到舊值、比對通過，於是建出 task。
+mkdir -p "$D42/locks"
+LOCK42="$D42/locks/agents-registry.lock"
+mkdir "$LOCK42"
+before42="$(task_count "$D42")"
+# --timeout 1：正確實作會在 await 之前就 stale 掉，根本走不到那裡；帶上它是
+# 為了讓**錯誤實作**快速失敗而不是掛在預設 300s 的 await 上（實測 mutant 會）
+( ab "$D42" evict ev42 --expect-generation "$GEN42" --timeout 1 \
+    > "$TESTROOT/ev42-race.out" 2> "$TESTROOT/ev42-race.err"; \
+  printf '%s' "$?" > "$TESTROOT/ev42-race.rc" ) &
+race42_pid=$!
+sleep 0.6
+# evict 此刻 MUST 還沒建任何 task（它卡在鎖上，還沒讀 registry）
+assert "42f evict 卡在鎖上時尚未建任何 task" \
+  test "$(task_count "$D42")" -eq "$before42"
+jq --arg t "$GEN42-RACE" '.spawn_tag = $t' "$TESTROOT/ev42-before.json" \
+  > "$D42/agents/ev42.json"
+rmdir "$LOCK42"
+wait "$race42_pid" 2>/dev/null || true
+assert "42f 取得鎖後重讀 registry：判 selection stale" \
+  grep -qF "selection stale" "$TESTROOT/ev42-race.err"
+assert "42f 鎖競爭下非 0 退出" test "$(<"$TESTROOT/ev42-race.rc")" -ne 0
+assert "42f 鎖競爭下不建 task（比對若在取鎖前做，這裡會多一個）" \
+  test "$(task_count "$D42")" -eq "$before42"
+
+# 42g 「不通知」是 spec 明文（CLI-EVICT-4），pane_alive 證不到它——用計數
+# shim 直接數：selection stale 路徑 MUST 一次 send-keys 都沒有
+SHIM42="$TESTROOT/shim42"
+mkdir -p "$SHIM42"
+printf '#!/usr/bin/env bash\nprintf "%%s\\n" "$*" >> %q\nexec %q "$@"\n' \
+  "$TESTROOT/tmux-calls42.txt" "$(command -v tmux)" > "$SHIM42/tmux"
+chmod +x "$SHIM42/tmux"
+: > "$TESTROOT/tmux-calls42.txt"
+before42="$(task_count "$D42")"
+PATH="$SHIM42:$PATH" ab "$D42" evict ev42 --expect-generation "$GEN42" \
+  > /dev/null 2>&1 || true
+assert "42g selection stale：一次 send-keys 都沒有（＝沒通知任何人）" \
+  bash -c '! grep -q "send-keys" "$1"' _ "$TESTROOT/tmux-calls42.txt"
+assert "42g selection stale：仍未建 task" test "$(task_count "$D42")" -eq "$before42"
+
+# 換代模擬到此為止：registry 的 tag 已與 pane 的 pane_start_command 分家，
+# 留著會讓 42d 的 despawn 走 stale 路徑（那是 CLI-EVICT-3 的既有防線，不是
+# 本組要測的東西）。還原成真值，42d 才驗得到「相符 → 真的回收」
+cp "$TESTROOT/ev42-before.json" "$D42/agents/ev42.json"
+
+# 42d gate (a)：expect 相符（兩項都帶且都對）→ 走完整流程並成功回收
+bg_reply "$D42" ev42 "收尾筆記：CAS 相符路徑"
+tid42="$(ab "$D42" evict ev42 --from alice \
+  --expect-pane "$pane42" --expect-generation "$GEN42" \
+  2> "$TESTROOT/ev42-ok.err")" && rc42=0 || rc42=$?
+assert "42d expect 相符：exit 0" test "$rc42" -eq 0
+assert "42d expect 相符：stdout 是真的收尾 task-id" test -d "$D42/tasks/$tid42"
+assert "42d expect 相符：收尾任務派給被驅逐者" \
+  test "$(jq -r '.to' "$D42/tasks/$tid42/metadata.json")" = ev42
+assert "42d expect 相符：registry 已回收" test ! -f "$D42/agents/ev42.json"
+assert "42d expect 相符：審計記了 evicted*" \
+  grep -qE 'evicted' "$D42/agents.log"
+
+# 42e 不帶 expect 參數＝行為與現行完全相同（additive 的核心承諾）
+pane42b="$(absp "$D42" 0 spawn ev42b --runtime codex 2>/dev/null)"
+bg_reply "$D42" ev42b "收尾筆記：不帶 expect 的既有路徑"
+tid42b="$(ab "$D42" evict ev42b --from alice 2> "$TESTROOT/ev42b.err")" \
+  && rc42=0 || rc42=$?
+assert "42e 不帶 expect：exit 0（既有行為不變）" test "$rc42" -eq 0
+assert "42e 不帶 expect：收尾任務落地" test -d "$D42/tasks/$tid42b"
+assert "42e 不帶 expect：registry 已回收" test ! -f "$D42/agents/ev42b.json"
+tmx kill-pane -t "$pane42b" 2>/dev/null || true
+
+else
+  printf 'SKIP: 42 evict 入口 CAS（SRC_KIND=bash：bash 正本凍結在 M4，不含 --expect-*）\n'
+fi
+
+fi  # end grp 42
+# ---- 43. TUI evict 證據框（CAS） ----
+if grp 43; then
+# spec: CLI-UI-1 CLI-EVICT-4 CLI-EVICT-3
+# 設計正本 docs/tui-design.md §3／§5 的 `e`：
+#   (a) worker 列按 e → 證據框措辭是「派收尾任務後回收」（P4.6 題 9 英文化後
+#       即 `wrap-up task, then reclaim`）、逐字顯示等價 CLI 原文（含兩個
+#       --expect-*），且畫面上不得出現任何「安全刪除」語彙（中英兩套都擋）
+#   (b) n／Esc 放棄 → 一個副作用都沒有
+#   (c) 開框後換代 → y 確認時**重讀 registry**判 selection stale：不建 task、
+#       pane 未 kill（TUI 側的 compare-and-act，與分組 42 的 CLI 側成對）
+#   (d) 相符 → 走下沉的 core 編排：收尾任務落地後 registry 回收、pane 被 kill
+#   (e) evict 的 await 段（預設 300s）跑在**一次性 thread** 上：期間 UI 仍收得
+#       了鍵（? 開得了合法鍵頁），同一個 worker 再按 e 只提示「進行中」
+# 與 40–42 同理只對 Rust 執行（bash 正本自 M4 凍結，不含 TUI）。
+if [[ "$SRC_KIND" == rust ]]; then
+
+D43="$TESTROOT/d43"
+mkdir -p "$D43"
+
+# 真 spawn：pane 的 start command 帶 spawn_tag，despawn 才認得出這一代
+# （手寫 registry 會讓 tag 與 pane 分家，evict 一律走 stale 路徑）
+# --window：本組跑在 40–42 之後，owner window 已被前面的分組塞滿 pane，
+# 共用視窗的 split-window 會失敗（實測）。專屬 window 讓 fixture 與前面的
+# 分組脫鉤
+pane43="$(absp "$D43" 0 spawn ev43 --runtime codex --window 2>/dev/null)"
+pane43b="$(absp "$D43" 0 spawn ev43b --runtime codex --window 2>/dev/null)"
+GEN43="$(jq -r '.spawn_tag' "$D43/agents/ev43.json")"
+GEN43B="$(jq -r '.spawn_tag' "$D43/agents/ev43b.json")"
+assert "43 前置：兩個 worker 都 spawn 成功" \
+  test -n "$pane43" -a -n "$pane43b" -a -f "$D43/agents/ev43b.json"
+assert "43 前置：spawn_tag 讀得到（證據框要顯示它）" test -n "$GEN43"
+
+TUI43="$(tmx new-window -dP -F '#{pane_id}' -t it "$pane_cmd")"
+OWN43="$(tmx display -p -t "$TUI43" '#{session_name}:#{window_id}')"
+# spawn 記的 owner 是測試腳本所在的位置，不是 TUI 的；改掛到 TUI 所在 owner，
+# 首頁（以 current owner 為根）才看得到這兩個 worker。其餘欄位一律不動
+for _w43 in ev43 ev43b; do
+  jq --arg o "$OWN43" '.owner = $o' "$D43/agents/$_w43.json" \
+    > "$TESTROOT/$_w43.owner.json"
+  mv "$TESTROOT/$_w43.owner.json" "$D43/agents/$_w43.json"
+done
+cp "$D43/agents/ev43.json" "$TESTROOT/ev43-before.json"
+
+tmx send-keys -t "$TUI43" \
+  "$(printf 'echo AB43-MAIN-SCREEN; touch %q' "$TESTROOT/tui43-ready")" Enter
+wait_for 10 test -f "$TESTROOT/tui43-ready"
+
+cap43() { tmx capture-pane -p -t "$TUI43" > "$TESTROOT/tui43-cap.txt" 2>/dev/null; }
+# shellcheck disable=SC2329  # 經 assert/wait_for 的 "$@" 間接呼叫
+ui43_shows() { cap43 && grep -qF -- "$1" "$TESTROOT/tui43-cap.txt"; }
+# shellcheck disable=SC2329  # 經 assert 的 "$@" 間接呼叫
+ui43_lacks() { cap43 && ! grep -qF -- "$1" "$TESTROOT/tui43-cap.txt"; }
+# shellcheck disable=SC2329  # 經 wait_for 間接呼叫
+pane_gone43() { ! pane_alive "$1"; }
+
+tmx send-keys -t "$TUI43" \
+  "$(printf 'env AGENT_BRIDGE_DATA=%q %q ui' "$D43" "$BRIDGE")" Enter
+assert "43 UI 起得來（WORKERS 欄看得到 ev43）" wait_for 10 ui43_shows "ev43"
+
+# 43a 證據框：措辭＋等價 CLI 原文（§2 薄殼原則／§5 顯示紀律）
+before43="$(task_count "$D43")"
+tmx send-keys -t "$TUI43" e
+assert "43a e 開證據框：措辭是「派收尾任務後回收」（英文 chrome）" \
+  wait_for 10 ui43_shows "wrap-up task, then reclaim"
+assert "43a 證據框逐字顯示等價 CLI（含兩個 --expect-*）" \
+  ui43_shows "agent-bridge evict ev43 --expect-pane $pane43 --expect-generation $GEN43"
+assert "43a 證據框 MUST NOT 出現「安全刪除」語彙" ui43_lacks "安全刪除"
+assert "43a 證據框 MUST NOT 出現英文的「安全刪除」語彙" ui43_lacks "safe to delete"
+assert "43a 開框本身沒有副作用（未建 task）" \
+  test "$(task_count "$D43")" -eq "$before43"
+
+# 43b n 放棄：不建 task、registry 不動
+tmx send-keys -t "$TUI43" n
+assert "43b n 放棄 evict（footer 明說）" wait_for 10 ui43_shows "evict aborted"
+assert "43b 放棄後未建任何 task" test "$(task_count "$D43")" -eq "$before43"
+assert "43b 放棄後 pane 仍在" pane_alive "$pane43"
+
+# 43c gate (c)：開框之後換代 → y 確認時重讀 registry → selection stale。
+# 「沿用輪詢快照」的實作在這裡會照樣派出收尾任務（多一個 task）
+tmx send-keys -t "$TUI43" e
+assert "43c 前置：證據框已開（顯示當時世代 $GEN43）" \
+  wait_for 10 ui43_shows "--expect-generation $GEN43"
+jq --arg t "$GEN43-NEXT" '.spawn_tag = $t' "$TESTROOT/ev43-before.json" \
+  > "$TESTROOT/ev43-next.json"
+mv "$TESTROOT/ev43-next.json" "$D43/agents/ev43.json"
+before43="$(task_count "$D43")"
+# 「無副作用」要驗得到位（codex 複核 minor #6）：換代之後、按 y 之前先取
+# registry 與審計的基準——之後的 diff 才問得到「evict 有沒有動過它」
+cp "$D43/agents/ev43.json" "$TESTROOT/ev43-stale-snapshot.json"
+audit_before43="$(wc -l < "$D43/agents.log" 2>/dev/null || printf '0')"
+tmx send-keys -t "$TUI43" y
+assert "43c 確認當下重讀 registry：判 selection stale" \
+  wait_for 10 ui43_shows "selection stale"
+assert "43c selection stale：不建 task" test "$(task_count "$D43")" -eq "$before43"
+assert "43c selection stale：pane 未被 kill" pane_alive "$pane43"
+assert "43c selection stale：registry 逐 byte 未被動" \
+  diff -q "$TESTROOT/ev43-stale-snapshot.json" "$D43/agents/ev43.json"
+assert "43c selection stale：審計未新增" \
+  test "$(wc -l < "$D43/agents.log" 2>/dev/null || printf '0')" -eq "$audit_before43"
+# 換代模擬到此為止：tag 與 pane 的 start command 已分家，留著會讓 43d 的
+# despawn 走 stale 路徑（那是 CLI-EVICT-3 的既有防線，不是本組要測的東西）
+cp "$TESTROOT/ev43-before.json" "$D43/agents/ev43.json"
+
+# 43d gate (d)：相符 → 走下沉到 ab-core 的完整編排（send → await → despawn）
+bg_reply "$D43" ev43 "收尾筆記：TUI 證據框路徑"
+tmx send-keys -t "$TUI43" e
+assert "43d 前置：證據框重開（世代已還原）" \
+  wait_for 10 ui43_shows "--expect-generation $GEN43"
+tmx send-keys -t "$TUI43" y
+assert "43d 確認後 registry 被回收（evict 完成）" \
+  wait_for 30 test ! -f "$D43/agents/ev43.json"
+assert "43d 確認後 pane 已被 kill" wait_for 10 pane_gone43 "$pane43"
+assert "43d 審計記了 evicted*" grep -qE 'evicted' "$D43/agents.log"
+assert "43d 終局回到 footer（背景一次性 thread → channel）" \
+  wait_for 10 ui43_shows "evicted 'ev43'"
+
+# 43e gate (e)：evict 的 await 段跑在一次性 thread 上（常駐 worker 那條同時
+# 負責 liveness 輪詢，搭上去等於整整五分鐘不再刷新）。ev43b 沒有人回覆，
+# 編排會停在 await；此時 UI MUST 仍收得了鍵
+tmx send-keys -t "$TUI43" e
+assert "43e ev43b 的證據框開得起來" wait_for 10 ui43_shows "agent-bridge evict ev43b"
+tmx send-keys -t "$TUI43" y
+assert "43e 收尾任務已派出、進入等待（footer 看得到）" \
+  wait_for 15 ui43_shows "等待筆記落地"
+tmx send-keys -t "$TUI43" '?'
+assert "43e await 期間 UI 仍收得了鍵（? 開得了合法鍵頁）" \
+  wait_for 10 ui43_shows "keys (current selection)"
+tmx send-keys -t "$TUI43" k   # 任意鍵關閉合法鍵頁
+tmx send-keys -t "$TUI43" e
+assert "43e in-flight 閘：同一個 worker 再按 e 只提示進行中" \
+  wait_for 10 ui43_shows "already in progress"
+
+tmx send-keys -t "$TUI43" q
+assert "43e q 退出（UI thread 沒被 evict 的 await 卡住）" \
+  wait_for 10 ui43_shows "AB43-MAIN-SCREEN"
+
+# 43f 窄畫面（100 欄）：evict 的等價 CLI 原文約 112 字元，截斷會把尾端的
+# generation 吃掉——而那正是人判斷「要不要按 y」的依據（codex 複核 minor #5）。
+# 200 欄的 TUI43 抓不到這條，所以另開一個 manual-size 的窄 window 再驗一次。
+TUI43N="$(tmx new-window -dP -F '#{window_id}' -t it "$pane_cmd")"
+tmx set-option -w -t "$TUI43N" window-size manual
+tmx resize-window -t "$TUI43N" -x 100 -y 40
+P43N="$(tmx list-panes -t "$TUI43N" -F '#{pane_id}' | head -1)"
+# shellcheck disable=SC2329  # 經 assert/wait_for 的 "$@" 間接呼叫
+ui43n_shows() {
+  tmx capture-pane -p -t "$P43N" > "$TESTROOT/tui43n-cap.txt" 2>/dev/null \
+    && grep -qF -- "$1" "$TESTROOT/tui43n-cap.txt"
+}
+# 證據框裡的 generation 出現在**兩處**：短的「世代 :」欄，以及長的等價 CLI
+# 原文那一行。截斷時只有前者活得下來——所以「≥2 行命中」才是「命令原文沒被
+# 截掉尾巴」的判準（只驗 ≥1 的話，把 wrap 拿掉照樣綠，實測過）
+# shellcheck disable=SC2329  # 經 assert/wait_for 的 "$@" 間接呼叫
+ui43n_tag_twice() {
+  tmx capture-pane -p -t "$P43N" > "$TESTROOT/tui43n-cap.txt" 2>/dev/null \
+    && [[ "$(grep -c -F -- "$1" "$TESTROOT/tui43n-cap.txt")" -ge 2 ]]
+}
+assert "43f 前置：窄 window 真的是 100 欄" \
+  bash -c '[[ "$1" == 100 ]]' _ "$(tmx display -p -t "$TUI43N" '#{window_width}')"
+tmx send-keys -t "$P43N" \
+  "$(printf 'env AGENT_BRIDGE_DATA=%q %q ui' "$D43" "$BRIDGE")" Enter
+assert "43f 窄畫面下 UI 起得來" wait_for 10 ui43n_shows "ev43b"
+tmx send-keys -t "$P43N" e
+assert "43f 窄畫面下證據框措辭仍在" \
+  wait_for 10 ui43n_shows "wrap-up task, then reclaim"
+assert "43f 窄畫面下 generation 欄可見" ui43n_shows "$GEN43B"
+assert "43f 窄畫面下等價 CLI 的 generation 未被截掉（換行保留整條命令）" \
+  wait_for 10 ui43n_tag_twice "$GEN43B"
+tmx send-keys -t "$P43N" n
+tmx send-keys -t "$P43N" q
+tmx kill-window -t "$TUI43N" 2>/dev/null || true
+
+tmx kill-pane -t "$TUI43" 2>/dev/null || true
+tmx kill-pane -t "$pane43b" 2>/dev/null || true
+
+else
+  printf 'SKIP: 43 TUI evict 證據框（SRC_KIND=bash：bash 正本凍結在 M4，不含 TUI）\n'
+fi
+
+fi  # end grp 43
+# ---- 44. P4 效率驗收（replay script 步數 gate） ----
+if grp 44; then
+# spec: CLI-UI-1 CLI-LIST-2
+# 設計正本 docs/tui-design.md §9 P4：固定 fixture（3 owner／12 worker／
+# 20 task／3 異常）＋兩份固定 replay script（baseline：list --long＋合法唯讀
+# 命令序列；TUI：key 序列）＋明確成功 marker（三個異常 id 均被輸出／複製）。
+# Gate：TUI 步數 ≤ baseline 的 50%，正確率 100%。
+#
+# 計數規則＝script 內的按鍵／命令步數，**從 script 檔機械導出**
+# （tests/replay/p4-baseline.cmds／p4-tui.keys，非註解非空行＝一步）——
+# 手寫死數字會在 script 改動時悄悄失準。
+#
+# 附註（設計原文）：replay script 是 fixture 的一部分（固定初始 selection 與
+# 異常排序位置），量的是「固定操作序列下的步數差」，不宣稱量到任意操作者的
+# 自由行為。
+#
+# 前置：BLOCKER 軸（§4 v1 matcher 契約：硬編碼 prompt matcher ＋結構性
+# occlusion）——沒有它 TUI 定位不到 blocked prompt，正確率必然 2/3。
+# 與 40–43 同理只對 Rust 執行。
+if [[ "$SRC_KIND" == rust ]]; then
+
+D44="$TESTROOT/d44"
+P4OUT="$TESTROOT/p4out"
+mkdir -p "$D44/agents" "$D44/tasks" "$P4OUT"
+# baseline script 用的 CLI 載具（唯讀命令；PATH 走 shim 讓 tmux 指到測試 socket）
+# shellcheck disable=SC2329  # 經 replay script 的 eval 間接呼叫
+ab_p4() { env AGENT_BRIDGE_DATA="$D44" PATH="$SHIM:$PATH" "$BRIDGE" "$@"; }
+
+# owner A＝TUI 自己所在的 window。P4.7 切片 B1：首頁 selection 不再看 owner
+# （ORIGINS 退場，WORKERS 是全 registry、依 lineage 分組），它固定落在列序
+# 第 0 列——這裡讓 owner A 就是 TUI 的 window，只是為了讓 DETAIL 的 origin
+# 字面可預期。**TUI 獨佔這個 window**：worker 的 pane 另開一個 window 擺
+# ——owner 記的是「誰派出這個 worker」，pane 在哪是另一回事（`list --long` 的
+# OWNER 與 WHERE 本來就是兩欄）。擠在同一個 window 會把 TUI 壓成十來行高，
+# 量到的就變成捲動成本而不是定位成本。
+W44A="$(tmx new-window -dP -F '#{window_id}' -t it "$pane_cmd")"
+TUI44="$(tmx list-panes -t "$W44A" -F '#{pane_id}' | head -1)"
+OWN44A="$(tmx display -p -t "$TUI44" '#{session_name}:#{window_id}')"
+# P4.6 題 1：origin 標籤顯示的是 window **名稱**（P4.7 切片 B1 起在 DETAIL 上）。
+# owner A／B 的 window 都活著，標籤裡的假 session 名（`zzb:`）在顯示時會被
+# **當下查到的**真 session 名取代——所以兩者要靠 window 名字才分得開
+W44ANAME=p4a
+tmx rename-window -t "$W44A" "$W44ANAME"
+# owner A 的 6 個 worker pane（p4w01..p4w06）
+W44P="$(tmx new-window -dP -F '#{window_id}' -t it "$pane_cmd")"
+P4P01="$(tmx list-panes -t "$W44P" -F '#{pane_id}' | head -1)"
+for _i in 2 3 4 5 6; do
+  eval "P4P0$_i=\"\$(tmx split-window -dP -F '#{pane_id}' -t \"\$W44P\" \"\$pane_cmd\")\""
+done
+# split-window 每次對半切 active pane：不重排的話最後一個 pane 只剩 2-3 行，
+# capture-pane 抓不到完整的權限框畫面（實測踩過）
+tmx select-layout -t "$W44P" even-vertical
+
+# owner B／C 的標籤用**受控的 session 名**＋真實 window id：owner 欄的死活
+# 只看 `@winid`（`owner_liveness`／`list --long` 都是）。
+# P4.7 切片 B1：ORIGINS 欄退場後 session 名不再決定任何排序（WORKERS 依
+# lineage 分組、組內依 registry 檔名序），受控的 session 名只剩一個用途——
+# 讓 DETAIL 的 origin 字面在三個 owner 之間分得開。
+W44B="$(tmx new-window -dP -F '#{window_id}' -t it "$pane_cmd")"
+W44BNAME=p4b
+tmx rename-window -t "$W44B" "$W44BNAME"
+P4P07="$(tmx list-panes -t "$W44B" -F '#{pane_id}' | head -1)"
+P4P08="$(tmx split-window -dP -F '#{pane_id}' -t "$W44B" "$pane_cmd")"
+P4P10="$(tmx split-window -dP -F '#{pane_id}' -t "$W44B" "$pane_cmd")"
+P4P11="$(tmx split-window -dP -F '#{pane_id}' -t "$W44B" "$pane_cmd")"
+# p4w12 的 pane（B2 修正輪 H4）：**它必須活著**。異常 3／3 是「origin window
+# 已消失」，pane 若也不在，這一列同時是第二個 orphan——三個異常會變成四個
+# 事實，而 oracle 只鎖三個，多出來的那一個是靜默的。pane 借住在 owner B 的
+# window 裡：owner 記的是「誰派出它」，pane 在哪是另一回事
+P4P12="$(tmx split-window -dP -F '#{pane_id}' -t "$W44B" "$pane_cmd")"
+tmx select-layout -t "$W44B" even-vertical
+OWN44B="zzb:$W44B"
+# owner C：建完就 kill——它的 window id 於是不存在。異常本體是**底下那個
+# worker**（p4w12）而不是這個 window：P4.7 B5 起 owner 不是歸屬軸，它降成
+# DETAIL 的 origin 證據列（舊記法「dead owner」＝現在的「origin window 已消失」）
+W44C="$(tmx new-window -dP -F '#{window_id}' -t it "$pane_cmd")"
+tmx kill-window -t "$W44C" 2>/dev/null || true
+OWN44C="zzc:$W44C"
+
+# ---- lineage 拓撲（P4.7 切片 B2 補完 C1）----
+# gate (c) 的「scope 軸改 lineage」要求量測發生在**新軸的真實形狀**上：12 列
+# 全 legacy 時整個 registry 退化成一個 standalone 段，量到的是舊世界的殘影。
+# 三條 lineage，照原三 owner 的分佈改編（owner 分佈與異常語意逐條保留）：
+#
+#   L1（根在場＝p4w01）      p4w01 ─┬─ p4w02  p4w03  p4w04  p4w05
+#                                   └─ p4w05 ─ p4w06   ← 異常 2／3 blocked
+#   L2（根在場＝p4w07）      p4w07 ─┬─ p4w08 ─ p4w09   ← 異常 1／3 orphaned
+#                                   └─ p4w10  p4w11
+#   L3（根**缺席**＝p4z9）   p4z9† ─ p4z8†（中間代亦缺席）─ p4w12
+#                                                       ← 異常 3／3 origin 消失
+#
+# L3 是這一輪特意加的：根與中間代都不在 registry，於是畫面上真的有一個墓碑
+# 組標頭（`lineage p4z9† (c3c3)`）與一條墓碑 breadcrumb——P4.7 的核心賣點應該
+# 在效率量測的那張畫面上在場，而不是只活在單元測試裡。
+#
+# 組序（`group_by_lineage` 依 generation key 字典序、standalone 恆在最後）：
+# `p4w01…` < `p4w07…` < `p4z9…`（`w` < `z`），所以 L3 在最後、p4w12 是列序
+# 最後一列——replay 的 `End` 因此仍然一步就把選取送到它身上。
+p4tag() { printf 'AGENT_BRIDGE_SPAWN_TAG=ab-spawn-%s-%s-%s' "$1" "$2" "$3"; }
+P4T01="$(p4tag p4w01 101 a1a1a1a1a1a1)"
+P4T02="$(p4tag p4w02 102 a2a2a2a2a2a2)"
+P4T03="$(p4tag p4w03 103 a3a3a3a3a3a3)"
+P4T04="$(p4tag p4w04 104 a4a4a4a4a4a4)"
+P4T05="$(p4tag p4w05 105 a5a5a5a5a5a5)"
+P4T06="$(p4tag p4w06 106 a6a6a6a6a6a6)"
+P4T07="$(p4tag p4w07 107 b7b7b7b7b7b7)"
+P4T08="$(p4tag p4w08 108 b8b8b8b8b8b8)"
+P4T09="$(p4tag p4w09 109 b9b9b9b9b9b9)"
+P4T10="$(p4tag p4w10 110 0a0a0a0a0a0a)"
+P4T11="$(p4tag p4w11 111 0b0b0b0b0b0b)"
+P4T12="$(p4tag p4w12 112 0c0c0c0c0c0c)"
+# L1／L2 的根就是 p4w01／p4w07 自己；L3 的根與中間代**不建 registry 列**
+P4L1="$P4T01"
+P4L2="$P4T07"
+P4L3="$(p4tag p4z9 119 c3c3c3c3c3c3)"
+P4L3MID="$(p4tag p4z8 118 d4d4d4d4d4d4)"
+
+# registry：12 個 worker／3 個 owner／3 條 lineage。名字一律 p4wNN（**中性
+# 命名**：名字不洩漏誰是異常，異常的字典序位置因此不是為了好看而挑的）
+w44() { # w44 <name> <pane> <owner> <spawn_tag> <lineage_root> [parent_agent]
+  # 根（自成根）的形狀是 `lineage_root` 在、`parent_agent` **欄位缺席**
+  # ——寫成空字串是另一種形狀（invalid），不得混用
+  local _lin="\"lineage_root\":\"$5\""
+  [[ -n "${6:-}" ]] && _lin="$_lin,\"parent_agent\":\"$6\""
+  printf '{"name":"%s","pane_id":"%s","registered_at":"2026-07-31T00:00:00Z","spawned":true,"ready":true,"runtime":"codex","spawn_tag":"%s","owner":"%s",%s}\n' \
+    "$1" "$2" "$4" "$3" "$_lin" > "$D44/agents/$1.json"
+}
+w44 p4w01 "$P4P01" "$OWN44A" "$P4T01" "$P4L1"
+w44 p4w02 "$P4P02" "$OWN44A" "$P4T02" "$P4L1" "$P4T01"
+w44 p4w03 "$P4P03" "$OWN44A" "$P4T03" "$P4L1" "$P4T01"
+w44 p4w04 "$P4P04" "$OWN44A" "$P4T04" "$P4L1" "$P4T01"
+w44 p4w05 "$P4P05" "$OWN44A" "$P4T05" "$P4L1" "$P4T01"
+# 異常 2／3：blocked prompt（pane 活著，畫面是權限框）——掃描序中的第 6 個。
+# 它掛在 p4w05 底下（第三代）：breadcrumb 於是有一條走得完的三節鏈
+w44 p4w06 "$P4P06" "$OWN44A" "$P4T06" "$P4L1" "$P4T05"
+w44 p4w07 "$P4P07" "$OWN44B" "$P4T07" "$P4L2"
+w44 p4w08 "$P4P08" "$OWN44B" "$P4T08" "$P4L2" "$P4T07"
+# 異常 1／3：orphaned worker（registry 有、pane 不在，owner 仍活著）
+w44 p4w09 "%94409" "$OWN44B" "$P4T09" "$P4L2" "$P4T08"
+w44 p4w10 "$P4P10" "$OWN44B" "$P4T10" "$P4L2" "$P4T07"
+w44 p4w11 "$P4P11" "$OWN44B" "$P4T11" "$P4L2" "$P4T07"
+# 異常 3／3：origin window 已消失的 worker（spawn 當下那個 window 已被 kill；
+# 舊稱「dead owner 底下的 worker」——軸換成 lineage 之後，異常說的是這一列）。
+# 它同時是墓碑鏈的末端：root（p4z9）與 parent（p4z8）都不在 registry
+w44 p4w12 "$P4P12" "$OWN44C" "$P4T12" "$P4L3" "$P4L3MID"
+
+# 20 個 task（目錄名後綴必須是 hex，task.rs:378 會拒非 hex）。12 個 in-flight
+# ＋8 個終態：WORKERS 欄因此有 task 列（導航噪音），TASKS 欄有東西可讀
+_i=0
+for _spec in \
+  "p4w01 queued" "p4w01 running" "p4w02 delivered" "p4w03 running" \
+  "p4w04 queued" "p4w05 running" "p4w06 running" "p4w07 queued" \
+  "p4w08 delivered" "p4w09 running" "p4w10 queued" "p4w11 running" \
+  "p4w01 completed" "p4w02 completed" "p4w03 failed" "p4w04 completed" \
+  "p4w05 cancelled" "p4w06 completed" "p4w07 completed" "p4w12 completed"; do
+  set -- $_spec
+  _to="$1"; _st="$2"
+  _tid="$(printf '20260731T0000%02dZ-44%02x' "$_i" "$((160 + _i))")"
+  mkdir -p "$D44/tasks/$_tid"
+  printf '%s\n' "$_st" > "$D44/tasks/$_tid/status"
+  printf 'p4 fixture task\n' > "$D44/tasks/$_tid/request.md"
+  printf 'p4 fixture response\n' > "$D44/tasks/$_tid/response.md"
+  printf '{"version":1,"task_id":"%s","from":"alice","to":"%s","created_at":"2026-07-31T00:00:01Z","updated_at":"2026-07-31T00:00:01Z","working_directory":"/tmp","status":"%s"}\n' \
+    "$_tid" "$_to" "$_st" > "$D44/tasks/$_tid/metadata.json"
+  _i=$((_i + 1))
+done
+# fixture 的形狀是整組的前提，要驗到**每一個維度**：只數 worker 與 task 的話，
+# 「把 12 個 worker 全塞進 2 個 owner」這種 mutation 照樣全綠，而 owner 數正是
+# TUI 步數的來源（codex 複核 major #2）。owner 集合逐字比對＋各 owner 的 worker
+# 分布，全部從 registry JSON 機械萃取
+assert "44 前置：worker 與 task 數（12／20）" \
+  bash -c '[[ "$(ls "$1"/agents | wc -l)" == 12 && "$(ls "$1"/tasks | wc -l)" == 20 ]]' _ "$D44"
+jq -r '.owner' "$D44"/agents/*.json | sort -u > "$P4OUT/owners.actual"
+printf '%s\n' "$OWN44A" "$OWN44B" "$OWN44C" | sort > "$P4OUT/owners.expect"
+assert "44 前置：owner 集合恰為 3 個、逐字相符（防兩-owner mutation）" \
+  diff -q "$P4OUT/owners.expect" "$P4OUT/owners.actual"
+# shellcheck disable=SC2329  # 經 assert 的 "$@" 間接呼叫
+p4_owner_count() { jq -r --arg o "$2" 'select(.owner==$o) | .name' "$1"/agents/*.json | wc -l; }
+while read -r _own _want; do
+  [[ -z "$_own" ]] && continue
+  assert "44 前置：owner $_own 底下恰 $_want 個 worker" \
+    test "$(p4_owner_count "$D44" "$_own")" -eq "$_want"
+done <<EOF
+$OWN44A 6
+$OWN44B 5
+$OWN44C 1
+EOF
+# lineage 面同理逐字比對（P4.7 切片 B2 補完 C1）。三條防線各擋一種靜默退化：
+#   (a) 12 個 spawn_tag 全是 canonical generation key——寫成舊的 `t44-xxx` 會
+#       讓整份 registry 判成 legacy、退回一個 standalone 段，而畫面看起來只是
+#       「少了組標頭」，步數照樣量得出來
+#   (b) lineage 集合恰 3 條、分佈 6／5／1
+#   (c) L3 的根與中間代 MUST NOT 在 registry——墓碑組標頭與墓碑 breadcrumb 的
+#       唯一來源就是它們的缺席
+P4GENKEY='^AGENT_BRIDGE_SPAWN_TAG=ab-spawn-[A-Za-z0-9_-]+-[0-9]+-[0-9a-f]{12}$'
+# shellcheck disable=SC2329  # 經 assert 的 "$@" 間接呼叫
+p4_bad_tags() { jq -r '.spawn_tag' "$1"/agents/*.json | grep -cvE "$P4GENKEY" || true; }
+assert "44 前置：12 列的 spawn_tag 全是 canonical generation key" \
+  test "$(p4_bad_tags "$D44")" -eq 0
+jq -r '.lineage_root' "$D44"/agents/*.json | sort -u > "$P4OUT/lineages.actual"
+printf '%s\n' "$P4L1" "$P4L2" "$P4L3" | sort > "$P4OUT/lineages.expect"
+assert "44 前置：lineage 集合恰為 3 條、逐字相符（防「全 legacy」退化）" \
+  diff -q "$P4OUT/lineages.expect" "$P4OUT/lineages.actual"
+# shellcheck disable=SC2329  # 經 assert 的 "$@" 間接呼叫
+p4_lineage_count() { jq -r --arg l "$2" 'select(.lineage_root==$l) | .name' "$1"/agents/*.json | wc -l; }
+while read -r _lin _want; do
+  [[ -z "$_lin" ]] && continue
+  assert "44 前置：lineage ${_lin##*ab-spawn-} 底下恰 $_want 個 worker" \
+    test "$(p4_lineage_count "$D44" "$_lin")" -eq "$_want"
+done <<EOF
+$P4L1 6
+$P4L2 5
+$P4L3 1
+EOF
+# H4：p4w12 的 pane MUST 活著。它是「origin window 已消失」那一個異常的唯一
+# 標的；pane 若也不在，它同時變成第二個 orphan（畫面上多一個 ✗dead），而
+# 標記面的 oracle 只鎖兩筆——多出來的事實會靜默通過
+assert "44 前置：p4w12 的 pane 存活（擋 fixture 回退成雙異常）" pane_alive "$P4P12"
+assert_fails "44 前置：p4w09 的 pane 不存在（orphan 異常的來源）" pane_alive "%94409"
+jq -r '.spawn_tag' "$D44"/agents/*.json | sort > "$P4OUT/tags.actual"
+assert "44 前置：L3 的根與中間代不在 registry（墓碑組標頭／breadcrumb 的來源）" \
+  bash -c '! grep -qxF "$2" "$1" && ! grep -qxF "$3" "$1"' _ \
+  "$P4OUT/tags.actual" "$P4L3" "$P4L3MID"
+
+# blocked prompt 的畫面：用**真的長得像權限框**的內容（notify::screen_has_prompt
+# 的第一組錨：`Do you want to …` ＋ `Esc to cancel`），不依賴 matcher 的誤判面
+tmx send-keys -t "$P4P06" \
+  "clear; printf 'Do you want to make this edit?\\n 1. Yes\\n 2. No, keep going\\n\\nEsc to cancel\\n'" Enter
+# 其餘 pane 保持乾淨的 shell 畫面（baseline 掃描要掃得到「不是它」）
+# shellcheck disable=SC2329  # 經 wait_for 間接呼叫
+p4_blocked_ready() {
+  tmx capture-pane -p -t "$P4P06" > "$TESTROOT/p4w06-probe.txt" 2>/dev/null \
+    && grep -qF "Esc to cancel" "$TESTROOT/p4w06-probe.txt"
+}
+assert "44 前置：blocked prompt 的畫面已就緒（異常 2／3 的來源）" \
+  wait_for 15 p4_blocked_ready
+
+
+# ---- 步數：宣告值與執行值必須是**兩個獨立證據** ----
+# 只比「行數 vs 行數」是同一個 predicate 自我比較：`true; true; true` 一行三
+# 命令會被記成 1 步，步數就被灌水了（codex 複核 major #1，附反例）。兩道防線：
+#   (a) **格式收窄**：每一步必須是單一命令——拒絕 `;`／`|`／`&`／命令替換／
+#       續行。不合形狀的行直接記成 bad，不執行。
+#   (b) **執行計數只在該步成功後才 +1**（baseline 看 rc、TUI 看 send-keys 的
+#       rc），與行數導出的宣告值來自完全不同的來源。
+p4_steps() { grep -cvE '^[[:space:]]*(#|$)' "$1"; }
+# 單一命令的形狀（變數展開允許，命令替換與命令分隔一律拒絕）
+p4_cmd_shape_ok() {
+  case "$1" in
+    *';'* | *'|'* | *'&'* | *'$('* | *'`'* | *'\') return 1 ;;
+  esac
+  return 0
+}
+# TUI 按鍵的 allowlist（tmux 鍵名；一行一鍵，不接受任何組合寫法）
+p4_key_ok() {
+  case "$1" in
+    Tab | BTab | Enter | Escape | Up | Down | Home | End | [a-z] | '?') return 0 ;;
+    *) return 1 ;;
+  esac
+}
+BASE_CMDS="$(dirname "${BASH_SOURCE[0]}")/replay/p4-baseline.cmds"
+TUI_KEYS="$(dirname "${BASH_SOURCE[0]}")/replay/p4-tui.keys"
+STEPS_BASE="$(p4_steps "$BASE_CMDS")"
+STEPS_TUI="$(p4_steps "$TUI_KEYS")"
+
+# ---- baseline replay ----
+_n=0
+_nbad=0
+while IFS= read -r _line; do
+  [[ "$_line" =~ ^[[:space:]]*(#|$) ]] && continue
+  if ! p4_cmd_shape_ok "$_line"; then
+    _nbad=$((_nbad + 1))
+    continue
+  fi
+  if eval "$_line" 2>/dev/null; then
+    _n=$((_n + 1))
+  else
+    _nbad=$((_nbad + 1))
+  fi
+done < "$BASE_CMDS"
+assert "44 baseline：每一步都是單一命令且執行成功（bad=$_nbad）" test "$_nbad" -eq 0
+assert "44 baseline：成功執行的步數＝script 導出的步數（$_n vs $STEPS_BASE）" \
+  test "$_n" -eq "$STEPS_BASE"
+
+# baseline 的答案（全部從步驟輸出機械萃取）：
+#   dead owner  → list --long 的 OWNER 欄為 owner-dead
+#   orphaned    → WHERE 欄為 dead 但 OWNER 不是 owner-dead（owner 還活著）
+#   blocked     → 哪一個 <worker>.screen 命中權限框特徵（檔名即答案）
+B44_DEAD="$(awk -F'\t' 'NR>1 && $6=="owner-dead" {print $1}' "$P4OUT/list-long.txt")"
+B44_ORPH="$(awk -F'\t' 'NR>1 && $5=="dead" && $6!="owner-dead" {print $1}' "$P4OUT/list-long.txt")"
+B44_BLOCK=""
+for _f in "$P4OUT"/*.screen; do
+  if grep -qF "Do you want to " "$_f" && grep -qF "Esc to cancel" "$_f"; then
+    B44_BLOCK="$(basename "$_f" .screen)"
+  fi
+done
+printf '%s\n' "$B44_DEAD" "$B44_ORPH" "$B44_BLOCK" | sort > "$P4OUT/baseline.answer"
+assert "44 baseline：三個異常 id 全對（正確率 100%）" \
+  bash -c 'printf "p4w06\np4w09\np4w12\n" | diff -q - "$1"' _ "$P4OUT/baseline.answer"
+
+# ---- TUI replay ----
+tmx send-keys -t "$TUI44" \
+  "$(printf 'echo AB44-MAIN-SCREEN; touch %q' "$TESTROOT/tui44-ready")" Enter
+wait_for 10 test -f "$TESTROOT/tui44-ready"
+tmx send-keys -t "$TUI44" \
+  "$(printf 'env AGENT_BRIDGE_DATA=%q %q ui' "$D44" "$BRIDGE")" Enter
+cap44() { tmx capture-pane -p -t "$TUI44" > "$P4OUT/tui-step$1.cap" 2>/dev/null; }
+# shellcheck disable=SC2329  # 經 wait_for 間接呼叫
+ui44_ready() { cap44 boot && grep -qF "p4w01" "$P4OUT/tui-stepboot.cap" 2>/dev/null; }
+# shellcheck disable=SC2329  # 經 wait_for 間接呼叫
+ui44_blocker_ready() { cap44 boot && grep -qF "blocked" "$P4OUT/tui-stepboot.cap"; }
+assert "44 TUI：UI 起得來" wait_for 10 ui44_ready
+# BLOCKER 軸的第一輪查詢（tmux capture-pane ×N，走背景 worker）要跑完才算
+# 「首頁畫面」——步 0 的兩個異常之一就靠它
+assert "44 TUI：BLOCKER 軸第一輪查詢已落地（步 0 的前提）" \
+  wait_for 15 ui44_blocker_ready
+cap44 0
+
+_k=0
+_kbad=0
+while IFS= read -r _key; do
+  [[ "$_key" =~ ^[[:space:]]*(#|$) ]] && continue
+  if ! p4_key_ok "$_key"; then
+    _kbad=$((_kbad + 1))
+    continue
+  fi
+  if tmx send-keys -t "$TUI44" "$_key" 2>/dev/null; then
+    _k=$((_k + 1))
+  else
+    _kbad=$((_kbad + 1))
+  fi
+  sleep 0.6
+  cap44 "$_k"
+done < "$TUI_KEYS"
+assert "44 TUI：每一步都是合法單鍵且送達成功（bad=$_kbad）" test "$_kbad" -eq 0
+assert "44 TUI：成功送出的按鍵數＝script 導出的步數（$_k vs $STEPS_TUI）" \
+  test "$_k" -eq "$STEPS_TUI"
+
+# ---- TUI 的成功 marker：canonical answer，逐幀綁定 ----
+# 只做 substring 命中不夠：`p4w12` 與「它的 owner 已死」必須來自**同一幀**
+# （不同幀分開 grep 等於允許兩個互不相干的畫面湊出一個結論），而且不能只驗
+# 「有命中」——多餘的誤標也必須讓斷言紅（codex 複核 major #3）。
+#
+# P4.7 切片 B1 的改動：ORIGINS 欄退場後，畫面上**不存在**「每一列各自的
+# origin」這種東西——origin 降級成 DETAIL 的證據行，只投影當前選中列。舊的
+# 三元組 `<worker>\t<mark>\t<origin>` 因此無法照搬（把選中列的 origin 貼到
+# 每一列上，就是在編造事實）。拆成兩份、各自逐幀綁定：
+#   (1) 標記面 `<worker>\t<mark>`：worker 列自己說得出口的事實（blocked／
+#       ✗dead／copy-mode）。逐幀抽、跨幀取聯集。
+#   (2) 出身面 `<selected worker>\t<origin>`：**同一幀**裡的選取標記與 DETAIL
+#       的 origin 行綁在一起——「origin window 已消失」這條事實只有這裡說得出口。
+p4_frame_marks() {
+  local f="$1" line name mark
+  # 邊框字元**兩種都要當終止符**：focus 的面板畫的是粗框 `┃`，只擋 `│` 的話
+  # 這一段會一路吃到 DETAIL 欄——而 DETAIL 正好會投影出 `blocked`／`copy-mode`
+  # 字樣，於是憑空長出一個假標記
+  while IFS= read -r line; do
+    name="$(printf '%s' "$line" | grep -oE 'p4w[0-9]{2}' | head -1)"
+    [[ -z "$name" ]] && continue
+    mark=none
+    case "$line" in
+      *blocked*) mark=blocked ;;
+      *'✗dead'*) mark=dead ;;
+      *copy-mode*) mark=occluded ;;
+    esac
+    printf '%s\t%s\n' "$name" "$mark"
+  done < <(grep -oE '▸ p4w[0-9]{2}[^│┃]*' "$f")
+}
+p4_frame_origin() {
+  local f="$1" name origin
+  # 選取標記 `▶` 只畫在**聚焦面板**的選中列上（見 `view::sel_prefix`），
+  # 所以這一列就是 DETAIL 此刻投影的那一個 worker
+  name="$(grep -oE '▶ ▸ p4w[0-9]{2}' "$f" | head -1 | grep -oE 'p4w[0-9]{2}')"
+  [[ -z "$name" ]] && return 0
+  origin="$(grep -oE 'origin : [^│┃]*' "$f" | head -1 \
+    | sed -e 's/^origin : //' -e 's/[[:space:]]*$//')"
+  [[ -z "$origin" ]] && return 0
+  printf '%s\t%s\n' "$name" "$origin"
+}
+
+# parser regression（不碰 TUI、純驗 parser，故不計入 P4 步數）：
+#   (a) worker 列的擷取 MUST 終止在 **WORKERS 面板自己的右框**，不論它是細框
+#       還是粗框（聚焦時是 `┃`）——版面一旦變動，舊規則就會把隔壁欄的
+#       `blocked`／`copy-mode` 算進來，而那是靜默的假事實。
+#   (b) 出身面只認**同一幀**裡的選取列＋DETAIL 的 origin 行。
+P4PARSE="$P4OUT/parser-regression.cap"
+printf '  ▸ p4w77  codex  %%1  ready   ┃ blocker: blocked\n' > "$P4PARSE"
+p4_frame_marks "$P4PARSE" > "$P4OUT/parser-regression.out"
+printf 'p4w77\tnone\n' > "$P4OUT/parser-regression.expect"
+assert "44 parser：worker 列擷取終止於自己的右框（粗框亦然），不吃隔壁欄" \
+  diff -q "$P4OUT/parser-regression.expect" "$P4OUT/parser-regression.out"
+P4PARSE2="$P4OUT/parser-regression2.cap"
+printf '▶ ▸ p4w77  codex  %%1  ready   ┃ origin : zzq:@9 (gone)  │\n' > "$P4PARSE2"
+p4_frame_origin "$P4PARSE2" > "$P4OUT/parser-regression2.out"
+printf 'p4w77\tzzq:@9 (gone)\n' > "$P4OUT/parser-regression2.expect"
+assert "44 parser：出身面綁的是同一幀的選取列＋DETAIL 的 origin 行" \
+  diff -q "$P4OUT/parser-regression2.expect" "$P4OUT/parser-regression2.out"
+
+: > "$P4OUT/tui.marks"
+: > "$P4OUT/tui.origins"
+for _f in "$P4OUT"/tui-step[0-9]*.cap; do
+  p4_frame_marks "$_f" >> "$P4OUT/tui.marks"
+  p4_frame_origin "$_f" >> "$P4OUT/tui.origins"
+done
+# 標記面：異常＝worker 自己帶標記。其餘（正常 worker）一律不得出現在答案裡
+# ——誤標會多一行，漏標會少一行，兩邊都紅。
+#
+# B2 修正輪 H4：p4w12 的 pane 現在**活著**，所以標記面只剩兩筆。三個異常沒有
+# 變少——第三個（origin window 已消失）本來就不是列標記說得出口的事，它在
+# 出身面。舊 fixture 讓 p4w12 的 pane 也不存在，等於偷偷多了一個 orphan：
+# 畫面上四個事實、oracle 只鎖三個，多出來的那一個永遠不會紅。
+awk -F'\t' '$2 != "none"' "$P4OUT/tui.marks" | sort -u > "$P4OUT/tui.answer"
+printf '%s\t%s\n' \
+  p4w06 blocked \
+  p4w09 dead | sort > "$P4OUT/tui.expect"
+printf '  [P4] TUI canonical answer（標記面）：\n'
+sed 's/^/    /' "$P4OUT/tui.answer"
+assert "44 TUI：標記面兩個異常逐幀綁定、無多餘命中（第三個在出身面）" \
+  diff -q "$P4OUT/tui.expect" "$P4OUT/tui.answer"
+# 出身面：整輪 replay 中**恰好一筆** `(gone)` 綁定，且它是 p4w12。
+# 誠實說清楚它證明了什麼：
+#   證明了：p4w12 的 origin window 已消失（DETAIL 逐字說出 `(gone)`）；
+#   **沒有**證明 p4w09 的 origin 還活著——replay 沒有把選取移到 p4w09 上。
+#   那半條負向證據由下面的 44h 診斷段補（在步數之外，不影響量測）。
+# 「恰一筆」鎖的是「MUST NOT 有第二個 worker 被標成 origin 已消失」。
+# （「worker 的 pane 死了」與「它的 origin window 沒了」是兩個獨立的軸；
+# 前者在標記面，後者在出身面。）
+grep -F '(gone)' "$P4OUT/tui.origins" | sort -u > "$P4OUT/tui.gone"
+printf '%s\t%s (gone)\n' p4w12 "$OWN44C" > "$P4OUT/tui.gone.expect"
+printf '  [P4] TUI canonical answer（出身面）：\n'
+sed 's/^/    /' "$P4OUT/tui.gone"
+assert "44 TUI：origin window 已消失的證據與 worker 名來自同一幀、且僅此一筆" \
+  diff -q "$P4OUT/tui.gone.expect" "$P4OUT/tui.gone"
+
+# lineage 面（P4.7 切片 B2 補完 C1）：量測畫面上 MUST 真的有新軸的形狀，
+# 否則 gate (c) 量到的是「舊世界跑在新版面上」。兩條各鎖一半：
+#   (a) 組標頭：根缺席的那一條畫成墓碑（`†`＋世代短碼），不冒用任何在場者的名字
+#   (b) breadcrumb：p4w12 的 DETAIL 逐字畫出 `root† → … → parent†`
+#       （needle 只取前 34 欄——DETAIL 只有 43 欄內寬，整條 breadcrumb 會換行，
+#        needle 取到換行點之後就會永遠對不上）
+# 兩條都吃**既有的 capture**，不送任何按鍵，故不進步數。
+assert "44 TUI：根缺席的 lineage 組標頭是墓碑（新軸的形狀在量測畫面上在場）" \
+  grep -qF "lineage p4z9† (c3c3) (1)" "$P4OUT/tui-step0.cap"
+assert "44 TUI：p4w12 的 DETAIL breadcrumb 是墓碑鏈（root† → … → parent†）" \
+  bash -c 'grep -qhF "$2" "$1"/tui-step[0-9]*.cap' _ "$P4OUT" \
+  "lineage: p4z9† (c3c3) → … → p4z8†"
+
+# 44h：p4w09 的 origin 負向證據（B2 修正輪 H5）。
+# **不是新分組**（標題刻意不用 `# ---- NN` 的形狀，同 44g）：它是分組 44 的
+# 診斷段，check-contract 的分組抽取不該把它當成一個要在 traceability 掛號的
+# 新編號。
+# **不屬 P4 的步數量測**：按鍵在 replay script 之外，步數斷言此時已完成。
+# 為什麼要這一段：出身面的「恰一筆 gone」只證明「沒有第二個 worker 被標成
+# origin 消失」，不證明 p4w09 的 origin 還活著——replay 從沒把選取移到它身上，
+# 那是**未觀測**不是已否證。這裡把選取移過去，讓那半條負向證據真的被觀測到。
+# 選取此刻在最後一列（replay 的 End），p4w09 在它上面 6 列（列序：p4w12／
+# p4w11 的 task／p4w11／p4w10 的 task／p4w10／p4w09 的 task／p4w09）。
+# 捕捉檔另存成 tui-diag.cap：tui-step[0-9]*.cap 的聯集已經算完，這一幀不得
+# 混進去（它會多一筆 origin 綁定，把「恰一筆」的語意變成另一件事）。
+for _ in 1 2 3 4 5 6; do
+  tmx send-keys -t "$TUI44" k
+  sleep 0.3
+done
+# shellcheck disable=SC2329  # 經 wait_for 間接呼叫
+ui44_on_p4w09() {
+  tmx capture-pane -p -t "$TUI44" > "$P4OUT/tui-diag.cap" 2>/dev/null \
+    && grep -qE '▶ ▸ p4w09' "$P4OUT/tui-diag.cap"
+}
+assert "44h 前置：選取移到 p4w09（診斷段的前提）" wait_for 10 ui44_on_p4w09
+p4_frame_origin "$P4OUT/tui-diag.cap" > "$P4OUT/diag.origins"
+assert "44h：綁定的確實是 p4w09" grep -qF 'p4w09' "$P4OUT/diag.origins"
+assert "44h：p4w09 的 origin MUST NOT 是 (gone)（orphan ≠ origin 消失，兩軸獨立）" \
+  bash -c '! grep -qF "(gone)" "$1"' _ "$P4OUT/diag.origins"
+
+# 44g：BLOCKER 軸的 occluded 分支（§4 v1 契約的第二項，結構性 `pane_in_mode`）。
+# **不屬 P4 的步數量測**（按鍵在 replay script 之外，步數斷言此時已完成）：
+# 這是上一輪自己標記的覆蓋缺口——occlusion 先前只有單元測試，沒有畫面驗證。
+# 手法沿用分組 39（真 copy-mode，不是模擬）。
+# replay 的最後一步（End）把選取移到最後一列，WORKERS 欄跟著捲下去；
+# p4w01 在第 0 列，先用 Home 捲回頂端才看得到它
+# （P4.7 切片 B1 之前這裡按的是兩次 k——那是把 ORIGINS 欄移回 origin A）
+tmx send-keys -t "$TUI44" Home
+tmx copy-mode -t "$P4P01"
+tmx display -pt "$P4P01" '#{pane_in_mode}' > "$TESTROOT/p44-mode.txt" 2>/dev/null
+assert "44g 前置：pane 確實進入 copy-mode（不驗這條可能在沒進 mode 的畫面上假綠）" \
+  grep -Fxq 1 "$TESTROOT/p44-mode.txt"
+# shellcheck disable=SC2329  # 經 wait_for 間接呼叫
+ui44_occluded() {
+  tmx capture-pane -p -t "$TUI44" > "$P4OUT/tui-occl.cap" 2>/dev/null \
+    && grep -qE 'p4w01.*copy-mode' "$P4OUT/tui-occl.cap"
+}
+assert "44g BLOCKER 軸 occluded：copy-mode 的 worker 在畫面上標 copy-mode" \
+  wait_for 15 ui44_occluded
+# copy-mode 是「人正在看」，不是「worker 被框住」——兩者 MUST NOT 混為一談
+assert "44g occluded MUST NOT 被寫成 blocked" \
+  bash -c '! grep -qE "p4w01.*blocked" "$1"' _ "$P4OUT/tui-occl.cap"
+tmx send-keys -t "$P4P01" -X cancel 2>/dev/null || true
+
+# ---- gate ----
+printf '  [P4] baseline 步數＝%s、TUI 步數＝%s（比值 %s%%；gate ≤50%%）\n' \
+  "$STEPS_BASE" "$STEPS_TUI" "$((STEPS_TUI * 100 / STEPS_BASE))"
+assert "44 gate：TUI 步數 ≤ baseline 的 50%（$STEPS_TUI vs $STEPS_BASE）" \
+  test "$((STEPS_TUI * 2))" -le "$STEPS_BASE"
+
+tmx send-keys -t "$TUI44" q
+tmx kill-window -t "$W44A" 2>/dev/null || true
+tmx kill-window -t "$W44P" 2>/dev/null || true
+tmx kill-window -t "$W44B" 2>/dev/null || true
+
+else
+  printf 'SKIP: 44 P4 效率驗收（SRC_KIND=bash：bash 正本凍結在 M4，不含 TUI）\n'
+fi
+
+fi  # end grp 44
+# ---- 45. 尾行預覽的 capture-pane 語意（真 tmux；P4.7 切片 D） ----
+if grp 45; then
+# spec: CLI-UI-1
+# 設計正本 docs/tui-design.md §9 P4.7 切片 D（`L` 尾行預覽）。
+#
+# 為什麼非要真 tmux 不可：切片 D 的第一版把 `-S -<n>` 當成「總共只取 n 行」，
+# 而 argv 單元測試照樣全綠——**假件證明不了外部工具的回傳語意**，這一片踩到的
+# 正是這個坑（跨廠複核 M1，真 tmux 實測 80x24 的 pane 印 500 行後回 224 行）。
+# 本組鎖的就是「tmux 那一側到底回什麼」。
+#
+# **不進本組**：hang、非零退出、kill／收屍。真 tmux 做不出決定性的 hang，寫進來
+# 只會換到 flaky；那三項在 Rust 單元測試裡以可控的 fixture process 驗
+# （crates/ab-core/src/tmux.rs 的 `tail_from_child`）。
+#
+# 與 40–44 同理只對 Rust 執行（bash 正本不含 TUI）。
+if [[ "$SRC_KIND" == rust ]]; then
+
+TAIL45_N=20
+# **自己一個 window**：同一個 window 的 pane 數有上限（第 6 個 split 必炸，
+# 16a7 的教訓），而且本組要固定 geometry，與別人共用會被對方的 layout 改掉
+W45="$(tmx new-window -dP -F '#{window_id}' -t it "$pane_cmd")"
+P45="$(tmx list-panes -t "$W45" -F '#{pane_id}' | head -1)"
+# 固定 geometry：行數的上界是「n 行 history ＋ pane 高度」，高度浮動的話這一組
+# 的上界斷言就沒有意義。`window-size manual` 讓 window 不再跟著 client 縮放
+tmx set-option -t "$W45" window-size manual 2>/dev/null || true
+tmx resize-window -t "$W45" -x 80 -y 24 2>/dev/null || true
+PH45="$(tmx display -p -t "$P45" '#{pane_height}' 2>/dev/null)"
+PW45="$(tmx display -p -t "$P45" '#{pane_width}' 2>/dev/null)"
+# 讀回來的值才是分母（resize 沒生效時上界斷言仍然有意義，只是換一個數字）
+assert "45 前置：pane geometry 讀得出來（$PW45 x $PH45；上界斷言的分母）" \
+  bash -c 'test -n "$1" && test -n "$2" && test "$1" -gt 0 && test "$2" -gt 0' \
+  _ "$PH45" "$PW45"
+
+# fixture 內容：把它寫成腳本再叫 pane 跑，比把整串塞進 send-keys 可控
+cat > "$TESTROOT/feed45.sh" <<'EOF'
+# 300 行編號行：尾端在、開頭不在，才證明取到的是**尾端**
+for i in $(seq 1 300); do printf 'L%03d\n' "$i"; done
+# 超長軟折行：一行遠寬於 80 欄，tmux 顯示時折成數列；`-J` MUST 把它接回一行
+printf 'SOFTSTART%sSOFTEND\n' "$(printf 'x%.0s' $(seq 1 222))"
+# 硬換行：兩行各自獨立，MUST NOT 被 `-J` 併起來（-J 併的是「軟折」不是「換行」）
+printf 'HARDA\n'
+printf 'HARDB\n'
+# CJK／寬字元：一個字佔兩欄，行寬計算與折行判定靠它才驗得到
+printf 'CJK寬字元測試中文尾行 CJKEND\n'
+printf 'TAILMARK\n'
+EOF
+tmx send-keys -t "$P45" \
+  "$(printf 'bash %q; touch %q' "$TESTROOT/feed45.sh" "$TESTROOT/fed45")" Enter
+assert "45 前置：fixture 內容已印進 pane" wait_for 20 test -f "$TESTROOT/fed45"
+
+# 送出去的 argv MUST 與 Rust 那一側是同一組（`tail_args`）。兩邊各寫一份就會漂，
+# 而漂掉的症狀正是本組要擋的那種：這裡驗真 tmux 的語意、程式卻送別的參數
+sed -n '/pub fn tail_args/,/^}/p' "$ROOT/crates/ab-core/src/tmux.rs" > "$TESTROOT/tailargs45.txt"
+assert "45：Rust 的 tail_args 仍是 capture-pane -p -J -t <pane> -S -<n>" \
+  bash -c '
+    f="$1"
+    grep -qF "\"capture-pane\"" "$f" \
+      && grep -qF "\"-p\"" "$f" \
+      && grep -qF "\"-J\"" "$f" \
+      && grep -qF "\"-t\"" "$f" \
+      && grep -qF "\"-S\"" "$f" \
+      && grep -qF -- "-{history_lines}" "$f"' _ "$TESTROOT/tailargs45.txt"
+
+# 與 Rust 送的同一組參數（history 行數縮小成 20，只是為了讓 fixture 跑得快）
+tmx capture-pane -p -J -t "$P45" -S -"$TAIL45_N" > "$TESTROOT/tail45.cap" 2>/dev/null
+RC45=$?
+assert "45：capture-pane 正常退出（exit 0）" test "$RC45" -eq 0
+LINES45="$(wc -l < "$TESTROOT/tail45.cap")"
+
+# (1) 取到的是**尾端**：最後印的在、最先印的不在
+assert "45：取到的是尾端（TAILMARK 在）" grep -qF 'TAILMARK' "$TESTROOT/tail45.cap"
+assert "45：取到的是尾端（第 1 行 L001 不在）" \
+  bash -c '! grep -qF "L001" "$1"' _ "$TESTROOT/tail45.cap"
+
+# (2) 行數有界，但**不是**「恰好 n 行」——這一條把 M1 揭露的真實語意釘在測試裡：
+#     `-S -<n>` ＝ n 行 history ＋整個可見區，所以行數落在 (n, n + 高度 + 小量]
+assert "45：行數有界（$LINES45 ≤ $TAIL45_N + $PH45 + 2）" \
+  bash -c 'test "$1" -le "$(( $2 + $3 + 2 ))"' _ "$LINES45" "$TAIL45_N" "$PH45"
+assert "45：-S -n 不是「總共 n 行」（實得 $LINES45 > $TAIL45_N；含整個可見區）" \
+  test "$LINES45" -gt "$TAIL45_N"
+
+# (3) `-J`：軟折行被接回**一行**（首尾兩個標記出現在同一行，且只有一行）
+assert "45：-J 把超長軟折行併成一條（首尾標記同一行、恰一行）" \
+  bash -c 'test "$(grep -c "SOFTSTART.*SOFTEND" "$1")" -eq 1' _ "$TESTROOT/tail45.cap"
+
+# (4) 硬換行 MUST NOT 被併：兩個標記各自成行
+assert "45：硬換行不被 -J 併掉（HARDA／HARDB 不同行）" \
+  bash -c '! grep -q "HARDA.*HARDB" "$1"' _ "$TESTROOT/tail45.cap"
+assert "45：硬換行兩行都在" \
+  bash -c 'grep -q "^HARDA" "$1" && grep -q "^HARDB" "$1"' _ "$TESTROOT/tail45.cap"
+
+# (5) CJK／寬字元原樣保留在同一行（寬字元的欄寬換算沒有把它切斷）
+assert "45：CJK／寬字元行原樣保留（同一行）" \
+  grep -qF 'CJK寬字元測試中文尾行 CJKEND' "$TESTROOT/tail45.cap"
+
+tmx kill-window -t "$W45" 2>/dev/null || true
+
+else
+  printf 'SKIP: 45 尾行預覽 capture-pane 語意（SRC_KIND=bash：bash 正本凍結在 M4，不含 TUI）\n'
+fi
+
+fi  # end grp 45
+# ---- 46. await 的 blocker 探測（真 tmux；CLI-AWAIT-3／CLI-AWAIT-4） ----
+if grp 46; then
+# spec: CLI-AWAIT-3 CLI-AWAIT-4
+# 動機（session 審查 2026-08-03）：無人值守 worker 卡在權限確認框一小時、
+# await 只會等到 timeout——探測讓等待方在秒級知道。真 tmux 而非 shim：
+# matcher 吃的是 capture-pane 的實際回傳，假件只證明得了我方送出去的東西
+# （P4.7 教訓）。與 40–45 同理只對 Rust 執行（bash 正本凍結在 M4）。
+if [[ "$SRC_KIND" == rust ]]; then
+
+D46="$TESTROOT/d46"
+mkdir -p "$D46"
+
+# 自己一個 window（分組 45 同理：pane 數上限＋不被別人的 layout 影響）
+W46="$(tmx new-window -dP -F '#{window_id}' -t it "$pane_cmd")"
+P46P="$(tmx list-panes -t "$W46" -F '#{pane_id}' | head -1)"          # 權限框 pane
+P46C="$(tmx split-window -dP -F '#{pane_id}' -t "$W46" "$pane_cmd")"  # 乾淨 pane
+P46M="$(tmx split-window -dP -F '#{pane_id}' -t "$W46" "$pane_cmd")"  # copy-mode pane
+
+# 權限框 fixture：畫面下緣擺 CC 權限對話框的特徵組（與分組 30 canary 同源；
+# 命中 screen_has_prompt 的組 1：Do you want to + Esc to cancel）
+cat > "$TESTROOT/feed46.sh" <<'FEOF'
+printf 'some prior output\n'
+printf 'Requesting permission for: Bash command\n'
+printf ' Do you want to proceed?\n'
+printf ' > 1. Yes\n'
+printf '   2. No\n'
+printf ' Esc to cancel\n'
+FEOF
+tmx send-keys -t "$P46P" \
+  "$(printf 'bash %q; touch %q' "$TESTROOT/feed46.sh" "$TESTROOT/fed46p")" Enter
+assert "46 前置：權限框 fixture 已印進 pane" wait_for 20 test -f "$TESTROOT/fed46p"
+tmx send-keys -t "$P46C" "$(printf 'touch %q' "$TESTROOT/fed46c")" Enter
+assert "46 前置：乾淨 pane 就緒" wait_for 20 test -f "$TESTROOT/fed46c"
+
+ab "$D46" register w46p "$P46P" 2>/dev/null
+ab "$D46" register w46c "$P46C" 2>/dev/null
+ab "$D46" register w46m "$P46M" 2>/dev/null
+ab "$D46" register w46d "$P46C" 2>/dev/null
+id46p="$(ab "$D46" send w46p --from alice --message hi 2>/dev/null)"
+id46c="$(ab "$D46" send w46c --from alice --message hi 2>/dev/null)"
+id46m="$(ab "$D46" send w46m --from alice --message hi 2>/dev/null)"
+id46d="$(ab "$D46" send w46d --from alice --message hi 2>/dev/null)"
+# send 全部完成後才進 copy-mode／除名（send 的通知不是本組受測面）
+tmx copy-mode -t "$P46M"
+ab "$D46" unregister w46d 2>/dev/null
+
+# (1) return 政策：Prompt 去抖確立＋grace 滿 → exit 125、秒級返回
+#     （0.2s 輪詢 → 探測約每 1s；去抖 2 次＋grace 1s ≈ 3s，遠小於 30s timeout）
+t46=$SECONDS
+env AGENT_BRIDGE_DATA="$D46" AGENT_BRIDGE_POLL_INTERVAL=0.2 PATH="$SHIM:$PATH" \
+  "$BRIDGE" await "$id46p" --on-blocker return --blocker-grace 1 --timeout 30 \
+  > "$TESTROOT/aw46p.out" 2> "$TESTROOT/aw46p.err"; rc46p=$?
+dt46=$(( SECONDS - t46 ))
+assert "46(1)：權限框＋return → exit 125（CLI-AWAIT-4）" test "$rc46p" -eq 125
+assert "46(1)：秒級返回（${dt46}s ≤ 15，不是等滿 timeout）" test "$dt46" -le 15
+assert "46(1)：stderr 說明提前返回" grep -q '提前返回' "$TESTROOT/aw46p.err"
+assert "46(1)：stdout 無終態字（僅 exit 0 印終態）" test ! -s "$TESTROOT/aw46p.out"
+
+# (2) 預設 warn：同一權限框只警告、不提前返回，逾時語意不變（124）
+env AGENT_BRIDGE_DATA="$D46" AGENT_BRIDGE_POLL_INTERVAL=0.2 PATH="$SHIM:$PATH" \
+  "$BRIDGE" await "$id46p" --timeout 4 \
+  > /dev/null 2> "$TESTROOT/aw46w.err"; rc46w=$?
+assert "46(2)：預設 warn → 仍逾時 124（Blocked 不吃掉逾時語意）" test "$rc46w" -eq 124
+assert "46(2)：warn 有印權限框警告" grep -q '權限確認框' "$TESTROOT/aw46w.err"
+
+# (3) 乾淨 pane＋return：不誤觸發，正常逾時 124
+env AGENT_BRIDGE_DATA="$D46" AGENT_BRIDGE_POLL_INTERVAL=0.2 PATH="$SHIM:$PATH" \
+  "$BRIDGE" await "$id46c" --on-blocker return --blocker-grace 0 --timeout 2 \
+  > /dev/null 2> "$TESTROOT/aw46c.err"; rc46c=$?
+assert "46(3)：乾淨 pane 不誤觸發（124 逾時）" test "$rc46c" -eq 124
+assert "46(3)：乾淨 pane 無任何 blocker 警告" \
+  bash -c '! grep -q "權限確認框\|提前返回" "$1"' _ "$TESTROOT/aw46c.err"
+
+# (4) copy-mode：提示一次但永不提前返回（人在介入不是卡死）
+env AGENT_BRIDGE_DATA="$D46" AGENT_BRIDGE_POLL_INTERVAL=0.2 PATH="$SHIM:$PATH" \
+  "$BRIDGE" await "$id46m" --on-blocker return --blocker-grace 0 --timeout 3 \
+  > /dev/null 2> "$TESTROOT/aw46m.err"; rc46m=$?
+assert "46(4)：copy-mode 永不提前返回（124 逾時）" test "$rc46m" -eq 124
+assert "46(4)：copy-mode 有提示" grep -q 'copy-mode' "$TESTROOT/aw46m.err"
+
+# (5) pane 解析不到（agent 已除名）：降級純輪詢、stderr 提示、await 照常可用
+env AGENT_BRIDGE_DATA="$D46" AGENT_BRIDGE_POLL_INTERVAL=0.2 PATH="$SHIM:$PATH" \
+  "$BRIDGE" await "$id46d" --on-blocker return --blocker-grace 0 --timeout 1 \
+  > /dev/null 2> "$TESTROOT/aw46d.err"; rc46d=$?
+assert "46(5)：pane 解析不到 → 降級純輪詢仍逾時 124（CLI-AWAIT-3）" test "$rc46d" -eq 124
+assert "46(5)：降級有 stderr 提示" grep -q '改純輪詢' "$TESTROOT/aw46d.err"
+
+tmx kill-window -t "$W46" 2>/dev/null || true
+
+else
+  printf 'SKIP: 46 await blocker 探測（SRC_KIND=bash：bash 正本凍結在 M4，不含探測）\n'
+fi
+
+fi  # end grp 46
+# ---- 47. page 層：兩類事件的推播與去重（tui-design §1／§9 rubric v2） ----
+if grp 47; then
+# 動機：page 層是「推到人面前、不用打開任何東西」那一層。單元測試已鎖住
+# 模型與 ladder（ab-core `page.rs`）；這裡鎖的是**真的走完整支 CLI** 之後
+# 的可觀察事實——事件流落了幾筆、自訂通知命令收到什麼、哪些子指令零推播。
+# 與 40–46 同理只對 Rust 執行（bash 正本凍結在 M4，page 層是 Rust 獨有）。
+if [[ "$SRC_KIND" == rust ]]; then
+
+D47="$TESTROOT/d47"
+mkdir -p "$D47"
+EV47="$D47/state/page-events.jsonl"
+# 自訂推播命令：把 argv 原樣記下來。用它取代桌面通知那一層，測試因此
+# **不會真的去彈使用者的通知**，而且看得到 title／body 的實際內容
+# NOTIFY_CMD 的契約是 **argv[0]**（一支可執行檔，後接 title、body 兩個參數），
+# 不是一段 shell 字串——所以這裡要有 shebang 而不是 `bash <script>`
+cat > "$TESTROOT/pager47.sh" <<'PEOF'
+#!/usr/bin/env bash
+printf '%s\n' "$1" >> "$PAGER47_LOG"
+printf '%s\n' "$2" >> "$PAGER47_LOG"
+PEOF
+chmod +x "$TESTROOT/pager47.sh"
+PAGER47_LOG="$TESTROOT/pager47.log"
+: > "$PAGER47_LOG"
+ab47() {
+  env AGENT_BRIDGE_DATA="$D47" PATH="$SHIM:$PATH" \
+    AGENT_BRIDGE_NOTIFY_CMD="$TESTROOT/pager47.sh" \
+    PAGER47_LOG="$PAGER47_LOG" "$BRIDGE" "$@"
+}
+ev47_count() { test -f "$EV47" && grep -c . "$EV47" || echo 0; }
+ev47_kind() { grep -c "\"kind\":\"$1\"" "$EV47" 2>/dev/null || echo 0; }
+# 該類別的事件**全部**都帶得出地點（`-s` 一次吃完整份，斷言因此與行序無關；
+# 逐行跑的話 jq -e 的退出碼只反映最後一行，前面幾筆空的地點會靜默通過）。
+# 寫成具名函式而不是 `bash -c`：jq 的 `$l` 在內層 shell 的雙引號裡會先被吃掉，
+# jq 收到的是 `startswith()`——第一版就是這樣假紅的
+# 推播記錄是「title 一行、body 各一行」順序寫下的，整份 grep 分不出哪一段
+# 屬於哪一則——另一則帶了地點就能替這一則作假（跨廠複核 nit 2）。這兩個
+# helper 把斷言鎖回**同一則通知**。同樣寫成具名函式而不是 `bash -c`
+pager47_title_has() { # <標題片段> <期望片段>
+  grep -F "$1" "$PAGER47_LOG" | grep -qF "$2"
+}
+pager47_adjacent() { # <前一行> <下一行>：兩行 MUST 相鄰＝同一則通知的內文
+  grep -A1 -Fx "$1" "$PAGER47_LOG" | grep -Fxq "$2"
+}
+ev47_loc_ok() { # ev47_loc_ok <kind> <expected-prefix>
+  jq -se --arg k "$1" --arg l "$2" \
+    'map(select(.kind == $k)) | length > 0 and all(.[]; .location | startswith($l))' \
+    "$EV47" >/dev/null
+}
+
+# 前置：兩個 worker，各自一個真 pane
+W47="$(tmx new-window -dP -F '#{window_id}' -t it "$pane_cmd")"
+P47A="$(tmx list-panes -t "$W47" -F '#{pane_id}' | head -1)"
+P47B="$(tmx split-window -dP -F '#{pane_id}' -t "$W47" "$pane_cmd")"
+ab47 register w47a "$P47A" >/dev/null 2>&1
+ab47 register w47b "$P47B" >/dev/null 2>&1
+
+# (1) fail → 恰一筆 task-failed，且自訂通知命令收到 agent 名與 task id
+#
+# **這一組的 title／body 斷言是 PG4 實測（2026-08-03）打回來的**：受測者說得出
+# 「誰、出了什麼事」，卻卡在「要不要切過去看」。所以地點與失敗原因是契約的
+# 一部分，不是文案品味——而且它們的產生點（`agent_location`、從 response.md
+# 取第一行）都只活在 CLI 層，ab-core 的單元測試碰不到，只有這裡守得住。
+LOC47="$(tmx display-message -p -t "$P47A" '#{session_name}:#{window_index}')"
+id47a="$(ab47 send w47a --from boss --message "去做 a" 2>/dev/null)"
+ab47 receive "$id47a" >/dev/null 2>&1
+ab47 fail "$id47a" --message "磁碟滿了寫不進去
+第二行不該進通知" >/dev/null 2>&1
+assert "47(1)：fail 恰落一筆 task-failed（rubric v2 page 條 1）" \
+  test "$(ev47_kind task-failed)" -eq 1
+assert "47(1)：通知標題帶 agent 名（不必開面板就知道是誰）" \
+  grep -q 'w47a' "$PAGER47_LOG"
+assert "47(1)：通知內文帶 task id" grep -qF "$id47a" "$PAGER47_LOG"
+# 地點：PG4 條 3 的一半——「要切過去看」這動作得有起點
+assert "47(1)：通知標題帶 session:window（PG4：說得出切去哪裡）" \
+  grep -qF "$LOC47" "$PAGER47_LOG"
+# 原因：條 3 的另一半——決定要不要現在出手的是原因，不是狀態字
+assert "47(1)：通知內文首行是失敗原因（PG4：說得出要不要出手）" \
+  grep -qF "磁碟滿了寫不進去" "$PAGER47_LOG"
+assert_fails "47(1)：多行失敗訊息 MUST NOT 整份灌進通知（只取第一行）" \
+  grep -qF "第二行不該進通知" "$PAGER47_LOG"
+# 原因與 task id MUST 是同一則通知的兩行（整份 grep 分不出這件事）
+assert "47(1)：原因與 task id 同屬一則通知的內文" \
+  pager47_adjacent "磁碟滿了寫不進去" "$id47a"
+# 事件流也要留下當時的地點（事後回查用；window 後來改名或關掉都還原得回來）
+assert "47(1)：事件流記下當時的 location" ev47_loc_ok task-failed "$LOC47"
+
+# (2) reply（completed）零推播——rubric v2 page 條 3
+before47="$(ev47_count)"
+id47b="$(ab47 send w47b --from boss --message "去做 b" 2>/dev/null)"
+ab47 receive "$id47b" >/dev/null 2>&1
+ab47 reply "$id47b" --message "做好了" >/dev/null 2>&1
+assert "47(2)：reply 完成 MUST NOT 推播" test "$(ev47_count)" -eq "$before47"
+
+# (3) cancel 零推播
+id47c="$(ab47 send w47a --from boss --message "去做 c" 2>/dev/null)"
+ab47 cancel "$id47c" >/dev/null 2>&1
+assert "47(3)：cancel MUST NOT 推播" test "$(ev47_count)" -eq "$before47"
+
+# (4) pane 死了卻還掛著非終態 task → scan 恰一則；再掃零則（去重）
+#
+# 先補上 owner 欄再殺 pane：**人工註冊本來就沒有 owner**（38c 的既有裁定，
+# 不是缺陷），而 page 層真正的服務對象是 spawn 出身的 worker——那一類一定有
+# owner。地點的 fallback 只有在有 owner 時才有標的，所以這裡把 w47b 補成
+# spawn 出身的形狀，否則測到的是「人工註冊 ＋ pane 已死」這個天生無解的角落。
+own47="$(tmx display-message -p -t "$P47B" '#{session_name}:#{window_id}')"
+jq --arg o "$own47" '.owner = $o' "$D47/agents/w47b.json" > "$TESTROOT/w47b.tmp" \
+  && mv "$TESTROOT/w47b.tmp" "$D47/agents/w47b.json"
+id47d="$(ab47 send w47b --from boss --message "會被丟下的活" 2>/dev/null)"
+tmx kill-pane -t "$P47B" 2>/dev/null || true
+assert "47(4) 前置：w47b 的 pane 真的不在了" \
+  bash -c '! '"$REAL_TMUX"' -L '"$SOCK"' -f /dev/null list-panes -a -F "#{pane_id}" | grep -qFx "$1"' \
+  _ "$P47B"
+n47="$(ab47 scan 2>/dev/null)"
+assert "47(4)：pane 死掛非終態 task → scan 恰推一則" test "$n47" -eq 1
+assert "47(4)：事件流裡是 worker-died" test "$(ev47_kind worker-died)" -eq 1
+assert "47(4)：通知內文帶被丟下的 task id" grep -qF "$id47d" "$PAGER47_LOG"
+# **pane 死了仍要說得出地點**：worker-died 正是最需要「切去哪」的那一類，而
+# 它的 pane 依定義已經不在了——地點只能退到 owner 的 window 才解得出來。
+# 只問 pane 的實作會在這裡靜默地少一段（`resolve_location` 的 fallback）
+assert "47(4)：pane 已死仍解得出地點（退到 owner 的 window）" \
+  ev47_loc_ok worker-died "$LOC47"
+# 事件流有地點、通知標題卻漏掉——這條的 oracle 換成**那一則通知本身**，
+# 免得事件流替通知作保（跨廠複核 nit 2）
+assert "47(4)：死訊通知的標題自己就帶得出地點" \
+  pager47_title_has "w47b 死了" "$LOC47"
+# 死訊內文 MUST 指出「然後要做什麼」（PG4 第三輪：知道它死了之後卡住）
+assert "47(4)：死訊內文說得出下一步（清理或改派）" \
+  pager47_adjacent "pane 已不存在，需要清理或改派" "$id47d"
+n47b="$(ab47 scan 2>/dev/null)"
+assert "47(4)：重掃 MUST NOT 重推（rubric v2 page 條 2）" test "$n47b" -eq 0
+assert "47(4)：重掃 MUST NOT 重複落盤" test "$(ev47_kind worker-died)" -eq 1
+
+# (5) 唯讀子指令 MUST NOT 寫事件流（CLI-RO-1；掃描只掛非唯讀指令）
+rm -f "$D47/state/page-seen"          # 讓「該推的」重新變成新事件
+before47ro="$(ev47_count)"
+ab47 list >/dev/null 2>&1
+ab47 status "$id47d" >/dev/null 2>&1
+assert "47(5)：唯讀指令 MUST NOT 觸發掃描（事件流不變）" \
+  test "$(ev47_count)" -eq "$before47ro"
+
+# (6) 機會式掃描：非唯讀子指令進場時順手發現同一件事（沒有 daemon 的代價
+# 與補償——使用者 2026-08-03 裁定）
+ab47 gc >/dev/null 2>&1
+assert "47(6)：非唯讀子指令進場會順手掃出 pane-exit" \
+  test "$(ev47_count)" -gt "$before47ro"
+
+# (8) **自訂 notifier 不得讀得到呼叫端的 stdin**（跨廠複核 blocker 1）。
+#
+# 鑑別力來自「挑一個自己不讀 stdin 的子指令」：`scan` 不碰 stdin，所以管線
+# 裡的哨兵會原封不動留著——notifier 若繼承了 stdin 就讀得到它，接掉就讀不到。
+# （用 `send --message-file -` 測不出來：那條路徑早在掃描之前就把 stdin 讀完
+# 了，`.stdin(null)` 在不在都會綠——第一版這條測試就是這樣假綠的。）
+cat > "$TESTROOT/sniffer47.sh" <<'GEOF'
+#!/usr/bin/env bash
+# 讀得到什麼就記下來；讀不到（stdin 已被接成 /dev/null）就立刻 EOF
+head -c 200 >> "$SNIFF47_LOG"
+GEOF
+chmod +x "$TESTROOT/sniffer47.sh"
+SNIFF47_LOG="$TESTROOT/sniff47.log"
+: > "$SNIFF47_LOG"
+rm -f "$D47/state/page-seen"          # 讓 worker-died 重新變成待推事件
+sentinel47='SENTINEL-47-MUST-NOT-LEAK'
+printf '%s\n' "$sentinel47" | env AGENT_BRIDGE_DATA="$D47" PATH="$SHIM:$PATH" \
+  AGENT_BRIDGE_NOTIFY_CMD="$TESTROOT/sniffer47.sh" SNIFF47_LOG="$SNIFF47_LOG" \
+  "$BRIDGE" scan >/dev/null 2>&1
+assert "47(8) 前置：sniffer 真的被叫到了（有待推事件）" test -f "$SNIFF47_LOG"
+assert_fails "47(8)：自訂 notifier MUST NOT 讀得到呼叫端的 stdin" \
+  grep -qF "$sentinel47" "$SNIFF47_LOG"
+
+# (9) 不退出的自訂 notifier MUST 有界（同一個 blocker 的另一半）：整個指令
+# 必須在 NOTIFY_TIMEOUT（5s）附近收斂，不是永遠等下去
+cat > "$TESTROOT/hang47.sh" <<'HEOF'
+#!/usr/bin/env bash
+sleep 300
+HEOF
+chmod +x "$TESTROOT/hang47.sh"
+rm -f "$D47/state/page-seen"
+t47start="$(date +%s)"
+env AGENT_BRIDGE_DATA="$D47" PATH="$SHIM:$PATH" \
+  AGENT_BRIDGE_NOTIFY_CMD="$TESTROOT/hang47.sh" \
+  "$BRIDGE" scan >/dev/null 2>&1; rc47h=$?
+t47elapsed=$(( $(date +%s) - t47start ))
+assert "47(9)：卡死的 notifier MUST 被逾時殺掉（實測 ${t47elapsed}s）" \
+  test "$t47elapsed" -lt 30
+assert "47(9)：逾時的推播 MUST NOT 改變退出碼" test "$rc47h" -eq 0
+
+# (7) 推播管道全滅仍落盤、仍 exit 0（rubric v2 page 條 4）
+# **tmux 要是好的**：壞掉的 tmux 會讓掃描整輪不跑（沒有證據就不叫人），
+# 那樣測到的是「沒有事件」而不是「推不出去」。這裡三層各自失敗的方式是：
+# 自訂命令指向不存在的檔、測試 socket 上沒有 attached client（display-message
+# 於是無處可送）、桌面通知那一層被自訂命令取代
+rm -f "$D47/state/page-seen"
+before47f="$(ev47_count)"
+env AGENT_BRIDGE_DATA="$D47" PATH="$SHIM:$PATH" \
+  AGENT_BRIDGE_NOTIFY_CMD="/nonexistent/pager-47" \
+  "$BRIDGE" scan >/dev/null 2>&1; rc47=$?
+assert "47(7)：推播全滅時 scan 仍 exit 0" test "$rc47" -eq 0
+assert "47(7)：推播全滅時事件仍落盤" test "$(ev47_count)" -gt "$before47f"
+
+tmx kill-window -t "$W47" 2>/dev/null || true
+
+else
+  printf 'SKIP: 47 page 層（SRC_KIND=bash：page 層是 Rust 獨有，bash 正本凍結在 M4）\n'
+fi
+
+fi  # end grp 47
 # ---- 總結 ----
+if [[ -n "$GRP_SELECTED" ]]; then
+  printf '\n⚠ PARTIAL RUN（TEST_GROUPS=%s → 實跑:%s，跳過 %d 組）——不得作為收案／merge 證據\n' \
+    "$TEST_GROUPS" "$GRP_SELECTED" "$GRP_SKIPPED"
+fi
 printf '\n共 %d PASS、%d FAIL\n' "$PASS" "$FAIL"
 if (( FAIL > 0 )); then
   exit 1

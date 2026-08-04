@@ -65,11 +65,65 @@ Source: hook_owner_gate
 ### HOOK-OWNER-4 [tested: 34.5+]
 接管成功的寫入 MUST 以本次事件的 session_id 為新 owner，MUST NOT 從舊檔
 沿用（STATE-CHAN-2）。
-Note: hook 端「parent 的新 session」與「巢狀 session」在環境與 payload 面
-不可區分，只能靠時間窗交還、不能靠身分判別（PPID 祖先鏈方案已否決）。
+Note: 在**沒有**行程身分可用時（HOOK-OWNER-5 的落回路徑），hook 端「parent
+的新 session」與「巢狀 session」在環境與 payload 面不可區分，只能靠時間窗
+交還——PPID **祖先鏈**方案在此仍然無效（巢狀的祖先鏈必然包含本尊）。
 `receive` 端刻意不加驗：巢狀繼承同 SPAWN_TAG、tag 比對無效；門在 hook 端
 不發 block（cross-vendor 複核確認此裁定）。
 Source: hook_write_state / cmd_hook
+
+### HOOK-OWNER-5 [tested: 35, 36]
+**行程身分優先於時間窗**。registry 同時具備 `worker_pid` 與
+`worker_starttime`（STATE-AGENT-4）時，閘門 MUST 先確認「本 hook 是記錄的
+worker runtime 自己（含其自有啟動鏈）fork 的」。確認形狀按 registry 的
+`runtime` 欄位逐 runtime 白名單，每一形狀都是實測值、不是介面承諾：
+
+- **直接形**（claude 實測；同時是所有 runtime 的基本形）：hook 的直接 PPID
+  等於 `worker_pid` 且該 pid 的 starttime 等於 `worker_starttime` → MUST
+  放行，且 MUST NOT 再看 `session_id` 或 `ts`。這是 parent `/clear` 換新
+  session_id 的即時自癒路徑（行程沒變，身分就沒變），取代 HOOK-OWNER-2 的
+  TTL 等待。
+- **launcher 形**（`runtime` 為 `codex` 時另 MUST 嘗試；實測見
+  `docs/codex-hooks-probe.md` 補測節）：hook 的直接 PPID 不等於
+  `worker_pid`，但該直接 PPID 的**父行程**等於 `worker_pid`（starttime 驗法
+  同上），**且**該直接 PPID 依 STATE-AGENT-4 的 argv 前兩項規則命中本
+  runtime 名——即它是 `worker_pid` 這個 launcher fork 出的同產品原生執行檔
+  → MUST 放行。恰好一層、不多不少；中介行程的 cmdline 與 starttime MUST
+  依 STATE-AGENT-4 的同快照夾讀規則取得（防走訪期間 pid 重用）。
+- 其餘一切（鏈更長、中介不命中本 runtime 形、`runtime` 欄缺或不在形狀表、
+  兩欄缺其一、行程已不存在、starttime 不符、或執行環境無此能力）→ MUST
+  落回 HOOK-OWNER-2 的 session_id＋TTL 判別，行為與未實作本條時完全相同。
+
+判別 MUST 只在「明確命中白名單形狀」時放行，其餘一律落回；**MUST NOT 把
+不符當成「確認為冒名」而擋**。失效方向因此收斂到現狀，最壞等於未實作。
+Note: **MUST NOT 一般化成「祖先鏈走得到 `worker_pid` 即確認」**——巢狀
+runtime 的祖先鏈必然包含本尊（HOOK-OWNER-4 Note 的否決理由，該否決仍然
+有效）。本條與該否決的界線：這裡確認的是 runtime **自有啟動鏈的實測形狀**
+（hook 是被 worker 自己的啟動鏈 fork 的），不是「鏈上找不找得到本尊」。
+同理 MUST NOT 放寬成「鏈上沒有夾另一個 runtime 形狀的行程即可」或「直接
+PPID 豁免檢查」：實測的巢狀鏈（`docs/rust/m5-proposal.md` §1）是
+hook → 巢狀 claude → bash → 本尊——巢狀 runtime 正是 hook 的直接 PPID、
+其餘中介只有 bash，上述兩種寫法都會把它誤認成本尊。誤認在本條的代價是
+**立即奪權**（不經 TTL），是唯一比未實作更糟的失效方向，故形狀表 MUST
+逐 runtime 白名單、寧可誤落回。
+Note: PPID／鏈形不符不足以推出冒名——合法中介一樣不符：runtime fork 出新的
+主行程而舊主仍活著、或使用者經 `AGENT_BRIDGE_CLAUDE_HOOKS`（公開覆蓋面）
+指定 hook wrapper。當成冒名的話本尊會被**永久**擋死，連 TTL 自癒都到不了，
+比未實作更糟（codex 複核 2026-07-31）。代價是本條不提供「冒名者過 TTL 仍
+擋」這種保證：巢狀 runtime 的暴露面維持 HOOK-OWNER-2 的原狀。
+Note: 兩個形狀都是 2026-07-31 本機實測（claude 直接 fork：`docs/rust/
+m5-proposal.md` §1；codex 為 npm node launcher fork 原生執行檔、原生執行檔
+才 fork hook：`docs/codex-hooks-probe.md` 補測節），不是介面承諾。故本條的
+價值只在命中時的即時自癒，落回路徑是常態而非例外處置。
+Note: 取樣順序 MUST 是先讀自身 PPID、再走中介（如有）、最後驗 `worker_pid`
+的 starttime。反過來的話父行程若在兩次讀取之間退出，hook 會被 reparent，
+於是前一步證實了記錄中的行程、後一步卻拿到新的 PPID。TOCTOU 的保證是
+**取樣到不一致即落回**，不是「所有 interleaving 都必落回」——worker 在走訪
+中途退成 zombie 時 starttime 仍讀得到而可能確認成功，但該 hook 確實出自其
+啟動鏈（取樣當下鏈為真），語意無害。
+registry 對同互信域的 worker 可寫，本條防的是**巢狀 runtime 意外冒用**，
+不是防具寫入權的惡意行為者——後者早已在信任模型之外（STATE-AGENT-4 Note）。
+Source: hook_owner_gate
 
 ## 三事件語意
 
@@ -116,4 +170,39 @@ legacy 送鍵前 MUST 偵測目標 pane 一屏可見文字是否停在 runtime �
 notify-failed 警告；pane 已死、capture 失敗同走 notify-failed，任務仍在
 mailbox 不遺失。偵測是 best-effort 字串特徵比對，特徵字串 MUST 與現裝
 runtime 實際文案保持一致（有 canary 測試守著）。
+比對 MUST **位置有錨**（2026-08-01 收窄，量化依據見 docs/tui-design.md §4）：
+①只掃畫面下緣固定行數——權限框貼底，指令回顯與助理輸出不會；②同一特徵組的
+片段 MUST 落在鄰近行內，而非同屏任意處；③`Requesting permission for:` 單錨
+MUST 降級——必須與同框的問句／選項行／footer 成對。整屏無錨比對 MUST NOT
+回歸：實測一個正常工作中的 coordinator pane 因此被誤判 19/24≈79%。
+收窄後仍 MUST 守住原方向：矮 pane 只剩框下緣、特徵被折行拆散時 MUST 照樣命中
+（漏判＝替 worker 按下批准，是最壞方向）。
 Source: notify_pane / screen_has_prompt
+
+### HOOK-NOTIFY-4 [tested: 8a, 39]
+notify-failed 事件 MUST 帶 `reason=<copy-mode|prompt|send-keys-failed|
+pane-gone|query-failed>`，值域即此五者。欄位 MUST **additive**（append 在
+既有 `pane=`／`cmd=` 之後，不得挪動既有欄位順序）。沒有這個欄位，關卡在
+事後只剩同一個 notify-failed，根因只能靠統計反推（2026-08-01 誤判調查的
+最大阻力）。
+值是**分類桶**，命名 MUST 誠實反映這件事，不得暗示未經證實的根因：
+`pane-gone` 限「pane 確認不存在」與「pane id 非法」；`query-failed`
+（2026-08-03 自 pane-gone 拆出）涵蓋查詢層失敗——tmux 不可用、mode／
+capture 查詢回 None——pane 可能還活著，MUST NOT 當成 pane 死亡的證據
+（codex sandbox 擋 tmux socket 時整排查詢失敗、%139 活著被記 pane-gone
+的實例即拆桶動機）；`send-keys-failed` 涵蓋 `send-keys` 這步
+的**所有**失敗——逾時、非零退出、TOCTOU 空窗內 pane 消失、子行程沒起來——
+實作只拿得到一個 bool，**MUST NOT** 命名成 `send-keys-timeout`。
+bash 正本自 M4 凍結、不實作本條款，SRC_KIND=bash 下相關斷言顯式 SKIP。
+Source: notify_or_defer_outcome / notify_pane_reason
+
+### HOOK-NOTIFY-3 [tested: 39]
+legacy 送鍵前 MUST 確認目標 pane 不在 tmux 的 copy-mode，是則 MUST NOT 送鍵，
+降級為 notify-failed（任務仍在 mailbox）。查不到 mode 狀態同樣 MUST 視為不可
+送鍵（fail-closed，同 HOOK-NOTIFY-2 的 capture 失敗）。**MUST NOT** 為了送鍵
+而把 pane 踢出 copy-mode：捲動位置是人正在介入的現場。
+通知路徑用到的**每一個** tmux 子行程（pane 存活查詢、mode 查詢、capture、
+送鍵）MUST 有逾時（見 env.md ENV-TMUX-1）：檢查與送鍵之間存在 TOCTOU 空窗，
+而 copy-mode 中的 send-keys 實測永不返回；只擋送鍵則任一查詢卡住仍會鎖死
+整條 `send`，上限形同不存在。逾時 MUST 與「tmux 起不來」同樣 fail-closed。
+Source: notify_pane / pane_accepts_keys / tmux::run_bounded

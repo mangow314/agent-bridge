@@ -27,8 +27,38 @@ Source: NAME_RE（cmd_register / cmd_send 驗證）
 每個 agent 一份 `agents/<name>.json`。人工註冊（register）欄位：
 `{name, pane_id, registered_at}`。spawn 出身另含
 `{spawned: true, runtime, model, spawned_at, ready, spawn_tag, owner,
-worker_window}`。
+worker_window}`，以及 STATE-AGENT-4 的 `{worker_pid, worker_starttime}`。
+spawn 另 MUST 寫 STATE-AGENT-5 的 lineage 兩欄。
 Source: cmd_register / cmd_spawn
+
+### STATE-AGENT-5 [tested: 16]
+spawn 出身 MUST 另記 lineage 兩欄（additive、optional、**僅 provenance／
+display**，tui-design.md §9 P4.7）：
+
+- `lineage_root`：恆有值。值為 **generation key＝canonical `spawn_tag` 全串**
+  （registry 既有存法，含 `AGENT_BRIDGE_SPAWN_TAG=` 前綴），**不是名稱**
+  ——名稱會重用，同名 respawn 是新的一代。
+- `parent_agent`：直系 parent 的 canonical `spawn_tag`。**無 parent 時整個
+  key 缺席**（MUST NOT 寫成空字串——「沒有 parent」與「欄位寫壞了」必須分得
+  出來）。
+
+繼承在既有 agents-registry 鎖內完成（lookup 與寫入同一 critical section）：
+呼叫者環境 `AGENT_BRIDGE_SPAWN_TAG` 是**裸值**，MUST 先前綴化為 canonical
+形式再與各 registry `spawn_tag` **byte-for-byte** 比對；合法 match ＝該檔是
+JSON object、`spawned == true`、`spawn_tag` 精確相等（損壞檔跳過，不算 match
+亦不報錯）。**恰一匹配**才認 parent，此時 `lineage_root` 取 parent 的同名
+欄位，缺席或空 MUST 退回 parent 自身 `spawn_tag`；0 筆＝自成根；**≥2 筆＝
+ambiguous，MUST 自成根＋可見警告，MUST NOT 依目錄序任選**。自成根形狀為
+`lineage_root` ＝子代自身 canonical tag、`parent_agent` 缺席。
+
+兩欄只在 spawn 寫入時決定一次，之後任何指令 MUST NOT 更新；`register`
+（人工註冊）MUST NOT 寫這兩欄；legacy registry **永不 backfill**。
+推導的任何失敗 MUST fail-soft（只降級成自成根＋警告），MUST NOT 改變 spawn／
+relay 成敗、cap、owner、ready 或審計等既有行為。
+Note: 兩欄 **MUST NOT 進入任何 auth／CAS 判斷**——despawn／evict 的世代綁定
+照舊只認 `spawn_tag`。理由同 STATE-AGENT-4 的 Note：本檔對同互信域的 worker
+可寫，這兩欄是身分**線索**不是憑證。
+Source: cmd_spawn（lineage 區段）／ab_core::spawn::derive_lineage
 
 ### STATE-AGENT-2 [tested: 20]
 出身判定 MUST 三態：spawn 出身／人工註冊／無法判定（JSON 損壞、非 object、
@@ -41,6 +71,36 @@ register 對既存同名 agent：spawn 出身 MUST 拒絕覆寫（要求先 desp
 人工註冊允許覆寫（換 pane）。registry 寫入 MUST 持 registry 鎖，與
 spawn/despawn/ready 互斥。
 Source: cmd_register
+
+### STATE-AGENT-4 [tested: 35]
+spawn 出身另 MUST 記 `{worker_pid, worker_starttime}`：worker runtime 行程的
+pid，與該 pid 的行程啟動刻度（Linux `/proc/<pid>/stat` 第 22 欄，用於分辨
+pid 重用）。取不到任一項時 MUST 寫入空字串而非讓 spawn 失敗——這兩欄是
+HOOK-OWNER-5 的最佳化輸入，缺了只是落回時間窗判別，不影響 spawn 是否成立。
+Note: `pane_pid` 之所以就是 runtime 本尊，是因為 tmux 直接 exec 啟動命令、
+中間無 shell 層（2026-07-31 實測）。若該前提在某環境不成立，記到的會是中介
+行程的 pid，而本尊 hook 的 PPID 永遠與之不符，HOOK-OWNER-5 的自癒整條失效。
+**故 spawn MUST 在寫入前確認該 pid 的 cmdline 形狀是本次 runtime**，不符則
+兩欄留空走落回路徑。形狀規則 MUST 只看前兩項 argv：argv[0] 的 basename 等於
+runtime 名（直接執行檔），或 argv[0] 是直譯器時 argv[1] 的 basename 等於
+runtime 名（`bash /path/to/claude`、`env codex`；argv[1] 以 `-` 起首者為選項，
+不看）。
+MUST NOT 放寬成「任一 argv 項」：那會把完全不是 runtime 的行程認成 runtime
+（實測 `python -c 'sleep' codex` 誤命中）。夾了 shell 的 `sh -c "…exec
+claude…"` 其 argv[1] 是 `-c`，依本規則正確不命中。
+Note: cmdline 與 starttime MUST 取自同一份行程快照——`starttime → cmdline →
+starttime` 夾住，兩次相同才採用。分兩次讀的話行程可能在中間退出而 pid 被
+重用，於是用舊 runtime 的 argv 驗證成功、卻記下新行程的 starttime。
+Note: 身分確認 MUST NOT 讀 `/proc/<pid>/environ`（行程完整環境，含憑證，屬
+本專案安全邊界的絕對禁區）。spawn tag 存在環境而非 argv，因此確認手段只能
+是 argv 這條較弱的線索；不足之處由「不確定就留空、留空就落回」吸收。
+Note: 分組 35 驗的是「spawn 確實寫入兩欄、且指向該 pane 的同一次行程生命」；
+argv 形狀那一層的錨在 Rust 端——`proc::tests::cmdline_shapes`（規則本體）與
+`spawn::tests::worker_identity_requires_runtime_attestation`（caller 真的有
+呼叫它，把 attestation 拿掉會紅）。
+Note: 本檔對同互信域的 worker 可寫，這兩欄與 `spawn_tag` 同級——是身分**線索**
+不是憑證，防的是巢狀 runtime 的意外冒用而非具寫入權的惡意行為者。
+Source: cmd_spawn
 
 ## tasks/（mailbox）
 

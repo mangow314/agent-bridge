@@ -1,0 +1,13 @@
+[package]
+name = "ab"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+ab-core = { path = "../ab-core" }
+# `ui` 子指令（tui-design.md §2：ab-tui 是 lib，部署維持單一 binary）
+ab-tui = { path = "../ab-tui" }
+# 只為 main 起手的 signal(SIGPIPE, SIG_DFL) 一行（架構 §5）；零傳遞依賴
+libc = "0.2"

@@ -1,0 +1,478 @@
+# Rust 遷移架構設計（ab-core / ab / ab-tui）
+
+- 地位：**結構錨**。行為錨是 `spec/`（90 條款）＋`tests/run-tests.sh`（40 編號
+  分組）；本文件回答「Rust 側怎麼組織」，行為疑義一律回 spec 與 bash 正本
+  （`bin/agent-bridge`，M4 cutover 前不動）。
+- 計畫正本：`~/.claude/plans/cheeky-waddling-meadow.md`（phases × gates）。
+- 判準：M1 實作若與本文件衝突，先改文件再改碼（文件是 review 對象，不是擺設）；
+  模組命名與邊界變更須在 PR 說明列出對映表 diff。
+
+## 1. Crate 邊界
+
+| crate | 角色 | 依賴 |
+|---|---|---|
+| `ab-core` | 領域邏輯庫：狀態、儲存、hook 核心、tmux client | `serde_json`（`preserve_order`，M1 起；使用者裁決 2026-07-31）外不引入依賴 |
+| `ab` | CLI binary：argv 解析、輸出格式化、dispatch | `ab-core`＋`libc`（M2 起，僅為 §5 的 `signal(SIGPIPE, SIG_DFL)` 一行；零傳遞依賴） |
+| `ab-tui` | 佔位；M5 後、fzf/tmux popup 原型驗證有價值才動工 | `ab-core` |
+
+## 2. ab-core 模組對映表（模組 ↔ spec 域 ↔ bash 函式群）
+
+| 模組 | 職責 | spec 域 | 對映 bash 函式（bin/agent-bridge） |
+|---|---|---|---|
+| `paths` | 資料目錄佈局（agents/ tasks/ state/ locks/）、`AGENT_BRIDGE_DATA` 解析 | state.md、env.md | `ensure_dirs`:148 |
+| `config` | `AGENT_BRIDGE_*` 全部 env 的讀取與驗證；**變數名保留字面字串**（check-contract check 1 的 grep 面） | env.md 17 條 | 散落各處的 `${AGENT_BRIDGE_*:-}` 讀取點 |
+| `fsio` | `atomic_write`（tmp＋rename 同目錄）、payload byte 流原樣搬運 | state.md STATE-GEN-2 | `atomic_write`:172、`write_message`:276 |
+| `lock` | mkdir 鎖：佔用重試＋「非佔用即權限」die 分流；RAII guard 只是便利層，**語意不依賴 Drop**（SIGKILL 殘鎖行為＝bash 現況；stale 回收是 M5 行為變更，parity 期禁做） | state.md STATE-LOCK-* | `acquire_lock`:227、`release_lock`:217 |
+| `registry` | agent 註冊表 CRUD、pane 解析、owner/actor 審計欄位 | state.md STATE-AGENT-* | `cmd_register`:476 核心、`is_spawned`:153、`caller_owner`:884、`log_agent_event`:898 |
+| `task` | task 目錄結構、id 生成/驗證、狀態機轉換（queued→delivered→running→終態）、events.log、殘缺 task 目錄清理、**gc（終態 task 清理）** | state.md STATE-TASK-*、cli.md 轉換條款 | `write_message`:276、`log_event`:251、`update_meta_status`:261、`check_task_id`:420、`last_task_at`:457、`send_rollback`:202（清 metadata/status 未寫齊的殘缺 task 目錄，屬 task 寫入交易邊界；交易背景註解始於 :195）、`cmd_gc`:1683 |
+| `notify` | 送鍵通知：權限框雙掃、失敗語意（notify-failed 可復原）、`notify_or_defer` 的 TTL/state 新鮮度 gate | hooks.md HOOK-NOTIFY-*、env.md ENV-TTL-1/2、ENV-NOTIFY-1 | `notify_pane`:330、`screen_has_prompt`:318、`notify_or_defer`:371 |
+| `hook` | hook 三事件核心：身分解析、state 單一寫者、owner gate（session_id 所有權）、oldest-queued；**失敗一律就地吞掉（不上拋 `Result`）**，`run()` 回 `HookOutcome{Silent,Block}`；exit 0 與 panic 兜底在 `ab` dispatch 層（M2 修正，見 §4） | hooks.md 14 條、state.md STATE-CHAN-* | `hook_agent_name`:2010、`hook_write_state`:2035、`hook_owner_gate`:2069、`hook_oldest_queued`:2098、`cmd_hook`:2131 |
+| `spawn` | worker 生命週期：cap、pane 建立、brief 注入、ready 探針、原子回滾、出身防護（tag）、idle/disposable（**evict 的三段式編排在 `ab` CLI 層**，見 §9） | cli.md spawn 群、env.md ENV-SPAWN/READY/TAG | `cmd_spawn`:1063、`spawn_rollback`:940、`rb_kill_tagged`:928、`spawn_wait_ready`:1038、`worker_prompt_arg`:1007、`relay_prompt_arg`:1024、`cmd_despawn`:1476、`cmd_ready`:1594、`cmd_disposable`:1629、`cmd_idle`:1800、`disposable_effective`:444 |
+| `tmux` | `TmuxClient` trait＋`SubprocessTmux` 實作；**以裸名 `tmux` 經 PATH spawn**（測試 shim 攔截前提，tests/run-tests.sh:91-93）；argv 陣列傳參 | （載具，無獨立 spec 域） | `tmux` token 91 次（command-shaped 呼叫約 65；分佈於 notify/spawn/despawn/registry 各函式群） |
+| `time` | ISO 8601 UTC 時戳（`now_iso`）、epoch 換算、TTL 新鮮度；顯式 UTC、不受 locale/TZ | state.md ts 格式 | `now_iso`:144、TTL epoch 比對段 |
+
+覆蓋核對：bash 58 函式中，`cmd_*` 21 個屬 `ab` dispatch 面（邏輯下沉
+ab-core 對應模組）、`err/die/info/usage` 屬 `ab` 輸出層、其餘 helper 已列入
+上表對映欄。M1 實作時逐函式打勾，未列者（如 `rand_suffix`:146、
+`require_jq`:166——Rust 無此依賴、`validate_ready_opts`:988、
+`parse_message_opts`:664、`respond_task`:686）歸入所屬模組不另立。
+
+## 3. 核心型別與所有權
+
+- `AgentName`／`TaskId`：newtype over `String`，建構即驗證（對齊
+  `check_task_id`:420 與 register 的名稱規則）；驗證失敗訊息逐字對齊 bash die。
+- `TaskState`：`enum {Queued, Delivered, Running, Completed, Failed, Cancelled}`
+  ——合法轉換表寫成 `TaskState::can_transition(to)`，非法轉換回傳
+  `Error::IllegalTransition`（訊息對齊 bash）。磁碟表現＝小寫字串
+  （`status` 檔與 metadata.json 逐字同 bash）。
+- **Payload＝`Vec<u8>` 只存在於 `fsio` 邊界**：request/response 內文檔案
+  read/write 原樣 byte 流（分組 6 驗保真），絕不經 `String`／lossy 轉換；
+  結構化 metadata（JSON 欄位、id、時戳）為受控 ASCII/UTF-8，內部 `String`。
+- Store 型別（`Registry`、`TaskStore`）持 `&Paths` 借用，不做全域單例——
+  daemon 化（M5）時可多實例注入。
+
+## 4. 錯誤模型 → exit code
+
+- `ab-core` 全面 `Result<T, Error>`；`Error` 帶「使用者可見訊息」欄位，
+  **訊息文字逐字對齊 bash die 的中文 stderr**（parity gate 驗這個）。
+- `ab` dispatch 層統一收斂：`Err` → stderr 印訊息 → exit code。
+  - 一般指令：die 對應非 0（各條款明定值以 spec/cli.md 為準；CLI-GEN-1 教訓
+    ——呼叫端只能依賴「非 0＝失敗、124＝逾時」，不得依賴「失敗必為 1」）。
+  - `hook` 子指令鐵律：**任何錯誤一律吞掉、exit 0**（bin/agent-bridge:2258-2261）。
+    - M2 修正（原設計為「內部回 `Result`、dispatch 層吞」）：那個形狀表達不了
+      bash 的實際語意。bash 是**逐步就地吞**——`hook_write_state` 寫失敗只讓
+      state 停在舊值，後面的分支照跑；上拋成單一 `Err` 會把「這一步沒做成」
+      誤升級為「整支中止」，兩者對 state 通道的終態不同。故 `ab-core::hook`
+      每個失敗路徑就地收斂，`run()` 不回 `Result`。
+    - dispatch 層兜底保留兩層：無條件 `ExitCode::from(0)`，外加 `catch_unwind`
+      讓 panic 不會變成 101（panic 訊息照樣進 stderr，同 bash 出錯有輸出）。
+  - 唯讀豁免：`status|await|idle|list|hook` 不建目錄；目錄缺失時以「找不到」
+    語意收場（bin/agent-bridge:2266-2268 的 parity）。
+- `panic!` 視為 bug：release 建置 `panic = "abort"` 候選（M1 定案），嚴禁把
+  panic 當錯誤路徑。
+
+## 5. 子行程／signal 政策
+
+- **SIGPIPE**：Rust 預設忽略（寫端得 `EPIPE` Err）；`ab` main 起手以
+  `libc::signal(SIGPIPE, SIG_DFL)` 顯式恢復預設處置，行為對齊 bash「隨管線
+  死」。**M2 已落地**（`restore_sigpipe_default`）。
+  - 裁決（M2）：為這一行引入 `libc`（零傳遞依賴），不採「每個 stdout 寫出點
+    攔 `EPIPE` 再自行 `exit(141)`」——後者碼更多、每新增一個輸出點就多一個
+    漏接機會，且自行退出與被訊號殺死對呼叫端的 `WIFSIGNALED` 仍不等價。
+  - **驗證缺口**：測試套件**沒有任何一組**斷言 SIGPIPE。M1 交接檔稱「驗證
+    錨點是分組 8」，經查不成立——分組 8 是「通知失敗路徑（pane 已死）」，
+    與 SIGPIPE 無關。M2 以手動 canary 佐證（`ab read <大 payload> | head -c 1`
+    的寫端退出碼 bash 141 vs Rust 141；移除該行後 Rust 退回 1 的 mutation
+    反證亦跑過），但**沒有機器 gate 護著**，回歸不會變紅。
+  - `catch_unwind`（hook 分支的 panic 兜底）與 §4 那條 `panic = "abort"` 候選
+    互斥：真要改 abort，得先把 hook 的 panic 兜底換成別的做法。
+  - **hook 分支不恢復 SIG_DFL**：SIG_DFL 之下 stdout 是已關閉管線時整個行程
+    會被訊號殺死（141），違反 hook 的 exit 0 鐵律；bash 那邊 `jq … || true`
+    把寫出失敗吞掉照樣 exit 0。故 `restore_sigpipe_default()` 排在 hook 分流
+    之後（M2 codex 複核 finding 1）。
+
+### 5.1 已裁決、刻意保留的 parity 偏離（M2）
+
+兩項在 M2 codex 複核中被指出，判定為**不修**，理由記在這裡免得下一棒重開。
+
+- **不模擬「jq 不在 PATH 就 no-op」**。bash `cmd_hook`:2142 有
+  `command -v jq || exit 0`；Rust 沒有 jq 依賴，照抄等於讓一個無關工具的缺席
+  癱瘓自己的 hook。§2 覆蓋核對表早已把 `require_jq`:166 記為「Rust 無此依
+  賴」，本項沿用同一裁決。可觀察差異：PATH 無 jq ＋ 有 queued task 的 stop
+  事件，bash 靜默 exit 0、Rust 照發 block JSON。
+- **state 檔的 `ts` 只認 canonical ISO**，不模擬 GNU `date -ud` 的寬鬆方言
+  （`now`、`yesterday` 等）。可觀察差異：異主 ＋ `ts:"now"` 時 bash 判為新鮮
+  而擋下接管，Rust 判為不可解析而放行。不修的理由：`ts` 只由
+  `hook_write_state` 自己寫、恆為 canonical，要踩到這條得先有人直接改寫
+  state 檔——而能直接寫該檔的行為體本來就能把 `owner` 換成自己，gate 的威脅
+  模型不涵蓋它。為了這條引進一個 GNU date 方言 parser 不成比例。
+- **pipe 排空**：子行程（tmux capture 等）輸出一律先讀盡 stdout/stderr 再
+  `wait()`，防 OS pipe buffer 滿載互等死鎖。
+- **繼承環境**：子行程 spawn 不清洗環境（bash 同款）；`AGENT_BRIDGE_PASS_ENV`
+  等穿透語意照 spec。
+- **timeout 語意**：bash 用外部 `timeout`（124）之處，Rust 內建計時但**維持
+  124 退出碼**（cli.md await 條款）。
+
+## 6. 鎖語意（parity 紅線）
+
+`lock::Guard` 釋放走顯式 `release()`＋`Drop` 雙保險，但正確性論證只允許引用
+顯式路徑：SIGKILL／abort 時 Drop 不執行，殘鎖=bash 現況等價（mkdir 鎖天生
+如此）。「非佔用即權限」的 die 分流（分組 8b）在 `acquire` 實作內逐字對齊
+bin/agent-bridge:227 起的錯誤訊息。stale-lock 偵測／回收＝行為變更，屬 M5
+提案範圍，parity 期不得混入。
+
+## 7. 輸出 parity 策略（jq 對拍）
+
+- bash 以 jq 產生的 JSON（metadata.json、state/*.json、list 輸出）逐測例
+  fixture 對拍：先用 bash 版產 fixture（`jq` 實際輸出存檔），Rust 序列化結果
+  `diff` 零差異才進 gate。
+- **解析端走 `serde_json`（`preserve_order`）**（M1 裁決，使用者 2026-07-31）：
+  欄位序＝插入序，重複鍵取後值，與 jq 一致；`Map::insert` 對既有鍵保留原
+  位置，正是 `update_meta_status`（jq `.status = $s`）要的賦值語意。
+- **輸出形狀仍由 `json::render_pretty` 掌控**，不用 `to_string_pretty`：要對齊
+  的是 jq 的形狀而非某個 pretty printer 的預設（該預設隨版本可變）。自家
+  render 讓形狀成為本 repo 測得到、改得動的東西；jq fixture 對拍是 gate。
+- 換 parser 時，M0.5 的邊界測試（重複鍵、裸控制字元、落單 surrogate、非
+  object 根）全數留下改為斷言 serde_json 的行為——它們守的是本專案依賴的
+  JSON 語意，不是某一個實作。
+
+## 8. 流程圖
+
+三張核心流程圖（畫的是 bash 現行為，Rust 實作照此 parity）：
+
+1. send→notify_or_defer→hook 通知鏈 — `docs/rust/flow-notify.md`
+2. spawn 生命週期（cap／ready 探針／原子回滾／出身防護）— `docs/rust/flow-spawn.md`
+3. state 通道 TTL 判定（owner gate 含邊角）— `docs/rust/flow-ttl.md`
+
+## 9. M3（spawn 生命週期）的裁決與偏離
+
+### 9.1 執行檔擺放位置是 brief 解析的前提
+
+bash 以 `readlink -f "$BASH_SOURCE"` 反推 `REPO_ROOT`（:45-46），brief／hooks
+settings 的預設值都掛在它下面。Rust 用 `current_exe()`（Linux 讀
+`/proc/self/exe`，同樣解析完符號連結）套**同一條規則**：`REPO_ROOT ＝
+dirname(dirname(執行檔))`。
+
+代價是 `target/release/ab` 的祖父層是 `target/`，預設 brief 會指到
+`target/share/…`。而測試 22f／23a／16a2 又分別用
+`dirname(dirname($BRIDGE))/share` 與硬編的 `$ROOT/share/…` 反推正本位置，兩者
+必須同時成立。故 **parity gate 的執行載具是 `.gate/ab`**（gitignored，由
+`cargo build --release` 後 `cp` 過去）：
+
+```
+cargo build --release && mkdir -p .gate && cp -f target/release/ab .gate/ab
+BRIDGE=$PWD/.gate/ab bash tests/run-tests.sh
+```
+
+這不是為了讓斷言變綠而搬位置：`bin/` 與 `share/` 是兄弟目錄是本專案的安裝
+佈局，`.gate/` 只是讓建置樹長成那個形狀。M4 cutover 後執行檔就落在 `bin/`，
+這層 staging 隨之消失。計畫原文寫的 `BRIDGE=$PWD/target/release/ab` 在 M3 起
+不再適用（M1/M2 的分組不碰 brief 路徑，故當時看不出來）。
+
+### 9.2 `printf %q` 逐位元重現
+
+`spawn::shell_quote` 重現 bash `printf %q`：安全字元集
+`%+-./0-9:=@A-Z_a-z`（本機 bash 5.3 全 byte 實測導出），其餘 printable 前置
+反斜線，含控制字元則整串走 `$'…'`。分組 16a4／16a5 直接比對
+`pane_start_command` 裡的片段（` no_proxy=st\ a\,b exec `），換成語意等價的
+單引號形式那兩條會紅。
+
+### 9.3 審計失敗在 spawn 必須翻盤
+
+`log_agent_event` 在 despawn／disposable／evict 是「只揭露不翻盤」（不可逆
+動作已完成），但在 **spawn 的 registry 寫入之後、回滾解除之前**必須上拋
+（bash 在 `set -e` 下由 EXIT trap 完成回滾）。吞掉會留下一個沒有審計線、卻
+佔著 cap 的 worker，而呼叫端看到成功。分組 19c/19c'/19d/19e 是這條的錨。
+
+### 9.4 測試 harness 的兩處改動（M3）
+
+parity gate 的前提是**測試對實作語言中立**。兩類斷言原本不是：
+
+1. **注入點掛在 `date(1)`**（§19c'、§21）：那只是 bash 實作恰好會 fork 的外部
+   指令；Rust 內建時戳，場景根本不會發生，測到的變成「實作有沒有用 date」。
+   改掛 `tmux`——19c' 掛回滾必經的 `if-shell`，21 掛鎖內建 pane 的呼叫。
+2. **`sed` 抽 shell 函式本體**（§30 CC canary、§31i 寫入順序）：源碼耦合檢查，
+   與 check-contract 1–3 同類。抽取對象改為固定的 `SRC_BASH`（實作正本），
+   **M4 cutover 時與 check-contract 1–3 一起改綁 Rust 源**。在那之前，Rust 側
+   由兩個單元測試補上同一組不變量（`notify::tests::
+   matcher_uses_the_canary_feature_strings`、`task::tests::
+   status_is_written_before_metadata`）。
+
+改後 bash 基準重跑仍為 756 PASS／0 FAIL。
+
+### 9.5 codex 複核一輪的處置（2026-07-31）
+
+rubric 六條判定 REJECTED／CONFIRMED／REJECTED／REJECTED／CONFIRMED／CONFIRMED。
+兩個 blocker 與五個 should-fix 全數修復並重驗：
+
+| 項目 | 症狀 | 處置 |
+|---|---|---|
+| blocker：despawn 謊報成功 | `remove_file` 的錯誤被吞，仍寫審計＋印「已 despawn」 | 上拋（`NotFound` 視為成功）；bash `:1580` 的裸 `rm -f` 在 `set -e` 下同樣帶走整支 |
+| blocker：poll interval 非 UTF-8 | `env::var().unwrap_or_default()` 把它壓成「未設定」→退 1.0，evict 因此把 config 錯誤誤判成真逾時 | 改 `var_os`＋三態；非 UTF-8 走「值不合法」 |
+| `//` 的空字串語意 | `jq_raw_field` 把 `""` 併進 None，鏈式 fallback 會多掉一層（idle 對 `spawned_at: ""` 印秒數，bash 印 `-`） | 新增 `json::jq_alt`（逐字 `//`），idle／`read_field`／`disposable_effective` 改用它；`jq_raw_field` 維持 `// empty` 形狀給 M2 的 hook 欄位 |
+| `printf %q` 只吃 `&str` | proxy／PASS_ENV 值與 hooks 路徑先 lossy 再引號化，非 UTF-8 位元組變 U+FFFD | `shell_quote` 改收 `&[u8]`（`$'\NNN'` 產物是純 ASCII，故不必把啟動指令改成 bytes）；brief 路徑因為是**單引號字面值**無法跳脫，改 fail-closed 拒絕（相對 bash 的刻意偏離，方向是大聲失敗而非靜默注入錯誤守則） |
+| ready interval 可 panic | `Duration::from_secs_f64(inf)` 在「registry 已寫、回滾已解除」之後 panic | 改 `try_from_secs_f64`，不可表示時退 `Duration::MAX`（＝bash 把超大值交給 `sleep` 的同一終態） |
+| spawn tag 的熵可預測 | 沿用 `task::rand_suffix`，`/dev/urandom` 失敗時退回 pid⊕nanos——但 tag 是 despawn 的殺人依據 | 另立 `secure_hex12()`，讀不到熵直接 `Err`（bash 也是在建 pane 前死） |
+| split 失敗仍重排 | `select-layout` 在傳播錯誤前執行 | 先 `?` 取 pane 再 layout（對齊 `:1299-1301`） |
+| evict stderr 非逐字 | 內層 `cmd_send` die／`cmd_await` 逾時行被吞 | 兩處先 `err_line` 內層訊息再印 evict 的中止／逾時行 |
+
+rubric 6（harness 改動正當性）codex 判 CONFIRMED，並建議 M4 讓
+source-contract checker 顯式接收 `source-kind/source-path`，可行處優先改成
+行為測試——記入 M4 待辦。
+
+### 9.6 已收掉與仍開著的缺口
+
+- **已收（M2 遺留）**：`--message` 的非 UTF-8 位元組。`cmd_send`／`cmd_reply`／
+  `cmd_fail` 改收 `&[OsString]`，`MessageSource::Text` 帶 `Vec<u8>`，payload
+  原樣落檔（架構 §3）。其餘指令的參數是 id／名稱／旗標，續用 lossy 視圖；
+  錯誤文案裡的值一律 lossy（給人看的字串，不是 payload）。
+- **仍開**：SIGPIPE 沒有機器 gate（§5 已記），M3 未新增測試組——那需要在
+  套件裡加一組新分組，屬行為錨（spec/tests）的擴充而非 parity 工作。
+- **仍開**：`meta_str` 對「欄位存在但型別非字串」回空字串（M1 起的已知差異）。
+  M3 新寫的讀取面（`registry::read_field`、`task::last_task_at`、
+  `spawn::idle`）一律走 `json::jq_raw_field`（`jq -r` 語意）；`meta_str` 未一併
+  改，因為它的呼叫端（receive/read 標頭、`respond_task` 找 sender）另有「缺欄位
+  印字面 `null`」的對齊要求，兩套語意合併需要各自的測例，留給 M4 與
+  `--contract-manifest` 的形狀討論一起收。
+
+## 10. M4 cutover 的裁決
+
+### 10.1 為什麼是 shim，執行檔為什麼必須在 `bin/`
+
+`bin/agent-bridge` 這條路徑是對外契約：`~/.local/bin/agent-bridge` 是它的
+symlink，spawn 出去的 pane 也照這個名字呼叫。執行檔是 build 產物、不進版控，
+所以路徑留給 shim、產物擺 `bin/ab`（gitignored）。
+
+擺 `bin/` 不是慣例問題而是硬需求：`config::repo_root()` 取
+`dirname(dirname(current_exe))`（對齊 bash 的 `REPO_ROOT`），`share/` 的三個
+預設路徑由它反推。exec 之後 `/proc/self/exe` 就是 `bin/ab`，祖父層＝repo 根。
+M3 那層 `.gate/` staging 正是為了繞開 `target/release/ab` 祖父層是 `target/`
+的問題，cutover 後退場。
+
+缺產物時 shim **大聲失敗**（exit 127＋建置提示），不靜默退回 bash 正本：
+兩套實作靜默互換會讓套件以為在驗 Rust、其實驗到 bash，那是假綠。
+
+### 10.2 source-contract 檢查改綁 Rust（含 M3 codex 的建議形）
+
+`SRC_KIND`（`rust` 預設／`bash`）成為顯式旋鈕，貫穿兩個檢查載具：
+
+| 檢查 | rust 源 | bash 源 |
+|---|---|---|
+| check-contract 1（env 集合） | `grep -r crates --include='*.rs'` | `grep bin/agent-bridge.bash` |
+| check-contract 2（子指令集合） | `$BRIDGE __implemented-commands` | `grep '^cmd_*()'` |
+| check-contract 3（hook 名＋事件） | 不受影響——名單硬編，只比對 `spec/hooks.md`，從未讀實作 | 同左 |
+| run-tests §30（CC canary 特徵） | `sed` 抽 `notify.rs` 的 `screen_has_prompt` | 抽 bash 同名函式 |
+| run-tests §31i（寫入順序） | `sed` 抽 `task.rs` 的 `update_meta_status`，比 `dir.join("status")` 與 `atomic_write(&meta_path` 的行序 | 抽 bash 同名函式比兩次 `atomic_write` 行序 |
+
+check 2 的 human judgment（計畫列為 M4 待裁）**裁給既有的
+`__implemented-commands`**，不另立 `--contract-manifest`：抗重構的目的它已達成
+（M1–M3 的里程碑 gate 一路在用同一支），而新增一個介面就要再守一次「這不算
+CLI 條款面」的界線。取不到輸出時顯式 fail——空集合會讓 `while` 迴圈零圈通過，
+那是假綠方向。
+
+check 3 之所以不動：它的比對對象只有 spec。`hook_*` 這四個名字在 Rust 側續存
+於 `ab-core/src/hook.rs` 每個函式的對映註解，spec 的 `Source:` 標記仍指得到
+實作（`spec/README.md` 的錨點規則已同步改寫）。
+
+### 10.2.1 kind 必須與載具綁定（M4 codex 複核的兩個 blocker）
+
+`SRC_KIND` 一開始只是「選哪個源碼路徑」，與 `$BRIDGE`（黑箱受測體）各走各的。
+複核實證：`SRC_KIND=bash BRIDGE=<Rust>` 兩邊各自全綠、整套照樣綠——等於沒驗到
+對應關係；`SRC_KIND` 拼錯還會靜默落進 Rust 分支。處置：
+
+- kind 先驗 enum（非 `rust`／`bash` 直接非零退出）
+- 再**實測載具身分**與 kind 交叉比對。判別式用既有的
+  `__implemented-commands`：Rust 認得（rc 0）、bash 正本當未知指令（rc 1）。
+  這是刻意不新增 `__implementation-kind` 的理由——既有介面已經足以自報身分。
+  探針的 `AGENT_BRIDGE_DATA` 指到不可建立的路徑，免得 bash 分支順手建到
+  使用者真實的資料目錄。
+
+同一輪的另一個 blocker 在 check 2：它只驗「載具宣稱的命令都在 spec」（單向）。
+一個退化成只印 `list` 的載具實測會印 `ok`。改成**雙向集合相等**（`sort -u`
+兩邊比 diff），反向那半正是 cutover 後最該紅的形狀。
+
+兩處源碼抽取的蒙混面也一併收窄：抽出後先剝註解行（否則「改 matcher＋留舊字串
+註解」全綠），§31i 改鎖**完整呼叫頭＋第一引數**並在比對前去空白（否則
+`let p = dir.join("status");` 這種 decoy 先命中，寫入順序反轉了斷言照樣綠；
+去空白讓斷言不受 rustfmt 換行影響）。剩下的暴露面是「函式內未使用的字面值／
+死分支」，由 `notify.rs`、`task.rs` 的兩個單元測試鎖。
+
+### 10.3 刻意未在 M4 收的兩項
+
+- **SIGPIPE 仍無機器 gate**（§9.6）：要補得在套件新增一組分組，是行為錨擴充，
+  不是 cutover 工作。
+- **`meta_str` 的型別語意**（§9.6）：原本掛在「與 `--contract-manifest` 一起
+  收」，但 10.2 已裁決不新增該介面，這條就跟著脫鉤。它需要自己的測例（兩套
+  語意各一組），同樣屬行為錨擴充，留給後續獨立處理。
+
+兩項都不是 M4 引入的，也不因 cutover 惡化——但都**仍是開著的缺口**，不得
+當成已完成。
+
+## 11. M5：行程身分閘門（窗 1 關閉）
+
+提案與量測數據：`docs/rust/m5-proposal.md`。條款：HOOK-OWNER-5、STATE-AGENT-4。
+分組 35（17 條斷言）。**只關窗 1**（`/clear` 後的 TTL 降級窗）；窗 2（無鎖
+先到先得的認領競態）維持現狀，論證見 `docs/owner-gate-boundary-assessment.md`。
+
+### 11.1 為什麼不是 daemon
+
+計畫原文寫的是「daemon 單一寫者」。實測後改走行程身分：hook 行程的**直接
+PPID** 就是啟動它的那個 runtime，因此 PPID 一旦等於記錄的 worker pid，本尊
+的身分就是確定的（單向——不符不代表不是本尊，見 11.2）。daemon 真正買到的
+只有窗 2，而窗 2 的前置條件自我矛盾（認領發生在派工前，那一刻巢狀對手還不
+存在），代價卻是常駐行程＋改寫產品定位＋一條「daemon 掛掉就退回現行寫法」的
+降級路徑——而那條路一走，兩個窗就都回來了。
+
+被否決過的是 PPID **祖先鏈**（HOOK-OWNER-4 Note）：巢狀的祖先鏈必然包含本尊，
+鏈式比對區分不出來。直接父行程沒有這個問題。後續的 codex 擴充（§11.7）維持
+同一界線：按 runtime 白名單啟動鏈**形狀**，仍不是泛用祖先鏈。
+
+### 11.2 兩段判別與失效方向
+
+`hook::proc_identity_confirms_self` 只回二態，`owner_gate` 據此分流：
+
+| 情形 | 裁決 | 理由 |
+|---|---|---|
+| 兩欄齊備、PPID == pid、該 pid 的 starttime 相符（直接形） | 放行，不看 sid/ts | `/clear` 換 session_id 但行程沒變＝身分沒變，自癒即時 |
+| `runtime=codex`：PPID 的父行程 == pid（starttime 相符）且 PPID 命中 codex argv 形（launcher 形，§11.7） | 放行，不看 sid/ts | launcher fork 原生執行檔、原生執行檔才 fork hook——一層之隔仍是本尊自有啟動鏈 |
+| 其餘一切（鏈更長、中介不命中、PPID 不符、欄位缺、pid 已死、starttime 不符、無 `/proc`） | 落回 sid＋TTL＝M4 行為 | 確認不了就什麼都不主張 |
+
+**只有相符是結論**。原本第二列寫的是「PPID 不符 → 擋，且 ts 過期也不得接管」，
+2026-07-31 的 codex 複核推翻了它：PPID 不符推不出冒名，合法中介一樣不符——
+runtime fork 出新的主行程而舊主還活著、或使用者經 `AGENT_BRIDGE_CLAUDE_HOOKS`
+（公開覆蓋面）指定 hook wrapper。當時的量測只證明「本機這版 claude 直接 fork
+hook」，那是實測不是契約。把不符當成確定的冒名，本尊會被**永久**誤擋，連 TTL
+自癒都到不了。
+
+**錯誤方向不對稱**是整節的設計軸：誤放行只是回到 M4 的暴露面；誤擋掉的卻是
+worker 本尊，會讓它的 state 通道永久死掉——比未實作更糟。收斂後的 M5 因此是
+**純粹的本尊即時自癒**：窗 1 照樣關上（那是主要目標），但不再提供「冒名者過
+TTL 仍擋」這種保證，巢狀 runtime 的暴露面維持 M4 原狀。失效方向這才真正對稱
+到「最壞等於 M4」。
+
+取樣順序也是這條軸的一部分：hook 端先讀自身 PPID、再驗該 pid 的 starttime。
+反過來的話父行程若在兩次讀取之間退出，hook 會被 reparent，前一步證實了記錄
+中的行程、後一步卻拿到新的 PPID。
+
+### 11.3 身分確認為什麼是 argv 而不是別的
+
+spawn 端要確認 `pane_pid` 真的是 runtime 本尊，否則記錯 pid 會讓本尊的 PPID
+永遠對不上，自癒整條失效。做法是比 cmdline 的**前兩項** argv：
+
+- 只看 `argv[0]` 會漏掉腳本形（`["bash", "/path/to/claude", …]`），所以
+  argv[0] 是直譯器時看 argv[1]；
+- 在整串 cmdline 裡找子字串會把中介 shell 誤認成 runtime
+  （`["sh", "-c", "…exec claude …"]`）——那正是最該避免的誤判方向。依前兩項
+  規則，那個 argv[1] 是 `-c`，正確不命中。
+- 放寬成「任一 argv 項」同樣是誤判：實測 `python -c 'sleep' codex` 會被認成
+  codex（codex 複核 §2）。位置限制是規則的一部分，不是實作偷懶。
+
+cmdline 與 starttime 必須取自同一份快照（`starttime → cmdline → starttime`
+夾住，兩次相同才採用）：分兩次讀的話行程可能在中間退出而 pid 被重用，於是用
+舊 runtime 的 argv 驗證成功、卻記下新行程的 starttime。
+
+**不讀 `/proc/<pid>/environ`**：spawn tag 存在環境而非 argv，用它確認身分本來
+最直接，但那個路徑是本專案安全邊界的絕對禁區（行程完整環境含憑證）。因此身分
+確認只能走 argv 這條較弱的線索，不足之處由「不確定就留空、留空就落回」吸收。
+
+### 11.4 bash 正本凍結
+
+分組 35、36 只對 Rust 執行，`SRC_KIND=bash` 時顯式印 SKIP。bash 正本自 M4
+起是 rollback 基準——它代表「回到 M4 的行為」，不該再長新功能。因此 parity
+的形狀從「兩邊同數字」變成「Rust 784／bash 756＋顯式 SKIP」。
+
+### 11.5 自檢
+
+新斷言以 mutation 反證過，不是看著綠燈就收工：
+
+| mutation | 預期 | 實測 |
+|---|---|---|
+| 停用整條行程身分分支（＝回到 M4） | 35a 紅 | 相符（772 PASS／1 FAIL） |
+| 「PPID 不符」改回「擋，且過期不得接管」 | 35c、35g 紅 | 相符（771 PASS／2 FAIL） |
+| argv 規則放寬回「任一 argv 項」 | `proc::tests::cmdline_shapes` 紅 | 相符 |
+| 拿掉 spawn 的 runtime attestation | `spawn::tests::worker_identity_requires_runtime_attestation` 紅 | 相符 |
+
+第二個 mutation 打的是 11.2 表格第二列那個決定，也是首版被複核推翻的地方；
+35g（合法中介經 wrapper 呼叫 hook）是它的行為錨，沒有這條下次還會退化回去。
+後兩個 mutation 打的是 11.3：**只驗 helper 的單元測試擋不住「caller 被刪」**
+——首版就是這樣假綠的，所以錨改架在 caller 上。
+
+### 11.6 仍開著的
+
+- **巢狀 runtime 的暴露面維持 M4 原狀**：11.2 收斂之後，M5 不再對「PPID 不符」
+  下任何結論，因此不提供「冒名者過 TTL 仍擋」的保證。要真正分辨「合法新主」
+  與「巢狀同 runtime」，得有 runtime 提供的、非繼承的身分（禁讀 environ 的
+  前提下，pid/starttime/argv 三者都做不到，祖先鏈也已知無解）。
+- ~~**codex worker 拿不到自癒**~~（2026-07-31 已量測，`docs/codex-hooks-probe.md`
+  補測節）：codex 經 npm 安裝，`bin/codex` 是一支 **node launcher**，tmux exec
+  的是它（＝`pane_pid`），它不 exec 取代自己而是 fork 出平台原生執行檔，再由
+  原生執行檔 fork hook。中間多一層，hook 的直接 PPID 因此**永遠不等於**
+  `pane_pid`，M5 落地當下對 codex 一律確認不了、全面落回 M4 行為。
+  attestation 仍對所有 runtime 啟用：argv 規則對 launcher 正確命中，寫入的兩欄
+  也確實指向 pane 行程，只是後續比對不會成立。**這無害，因為 11.2 收斂後誤判
+  的後果就是「該放行卻落回」**——反過來說，這次量測正是那次收斂的實證：把實測
+  值代進首版邏輯（pid 活著、starttime 相符、PPID 不符），每一個 codex worker
+  的每一個 hook 都會被永久擋死。
+  「記到原生執行檔那個行程」（改記錄對象）已否決：原生行程在 spawn 當下未必
+  存在，等 ready 又把身分產生時機移進互信域。**已另案立案改走「改比對條件」
+  ——見 §11.7**。
+- **`pane_pid` == runtime 本尊依賴 tmux 直接 exec**：本機實測成立，但那是 tmux
+  的行為不是承諾。分組 35f 鎖住了「記到的 pid 等於 pane_pid 且 starttime 相符」，
+  若哪天中間多一層 shell，argv 比對會失敗、兩欄留空、全面落回（安全但窗回來）。
+- **窗 2**：仍在，仍只有 daemon 一條路，仍是獨立的一件事。
+
+### 11.7 codex 自癒擴充：launcher 形
+
+已落地：`hook::launcher_hop_reaches`＋`proc::ppid_and_starttime`、分組 36
+（11 條斷言）、mutation 自檢（見下）、真 codex canary（`docs/
+codex-hooks-probe.md` canary 節：`/new` 後 51 秒新鮮的 state 被當場接管，
+確認成功非落回）。
+
+讓 codex 也吃到 M5 自癒。路線是**改比對條件**（放寬「相符」的定義），不是
+改記錄對象（§11.6 已否決）；「不符 → 落回、不得當冒名」的裁決（§11.2）原封
+不動——本案動的只有「相符」那一列。
+
+**規則：逐 runtime 白名單啟動鏈形狀。**
+
+- 直接形（所有 runtime 的基本形；claude 實測）：PPID == `worker_pid`。
+- launcher 形（僅 `runtime=codex` 嘗試；實測）：PPID 的父行程 ==
+  `worker_pid`，且 PPID 本身依 STATE-AGENT-4 argv 規則命中 `codex`——它是
+  launcher fork 出的同產品原生執行檔。恰好一層。
+- 其餘一律落回。
+
+**為什麼不是「祖先鏈走得到本尊、中間沒夾 runtime 形狀就確認」**（立案時的
+草案規則）：那條規則對本專案自己量過的巢狀鏈是錯的。`m5-proposal.md` §1 的
+實測巢狀鏈是 `hook → 巢狀 claude → bash → 本尊`——巢狀 runtime 正是 hook 的
+直接 PPID（任何「中間」檢查天然豁免它），其餘中介只有 bash（不是 runtime
+形狀）。草案規則會把它**確認成本尊**。而本案第一次讓誤判可以比 M4 更糟：
+巢狀被誤認＝**立即奪權**（不經 TTL）。所以界線不能畫在「鏈上有沒有夾別的
+runtime」，只能畫在「鏈是否精確等於該 runtime 實測的自有啟動形狀」——
+claude 零層、codex 恰好一層同產品原生執行檔。巢狀鏈在兩個 runtime 下都更長
+——claude 下多巢狀那層；codex 下任何巢狀都掛在 top native 之下，相對 registry
+記的 launcher 至少多一層——一律落回。與
+HOOK-OWNER-4 否決的界線也因此更清楚：我們從不把「鏈上找得到本尊」當證據，
+只認「你是被本尊自己的啟動鏈 fork 的」。
+
+TOCTOU 的保證是**取樣到不一致即落回**（不主張所有 interleaving 必落回：
+worker 走訪中途退成 zombie 時仍可能確認成功，但該 hook 確實出自其啟動鏈，
+語意無害）。中介的 cmdline/starttime 依 STATE-AGENT-4 同快照夾讀；「單次
+stat／夾讀」本身無 hermetic 注入面，屬靜態審查保障，判定條件由
+`launcher_hop_decision` 純核心的單元測試錨住（含兩邊 starttime 不等必拒）。
+registry 三欄（pid/starttime/runtime）取自同一次解析，防 respawn 置換檔案
+時湊出混版身分。
+
+驗收重心跟著風險方向換：主要斷言是**「巢狀（含 claude 巢狀、codex 巢狀）
+不被誤放行」**，不是「codex 本尊會綠」。分組 36 的反例全部用真實形狀的
+行程鏈構造（argv 形狀由 script 名決定，不是 registry 捏的假資料；36f 的
+「上游已死」用真行程死亡＋等 reparent 構造）。mutation 自檢：
+
+| mutation | 預期 | 實測 |
+|---|---|---|
+| 取消白名單、按記錄的 runtime 名認中介（＝草案方向） | 36c（claude 巢狀）紅 | 相符（783／1） |
+| 只刪 runtime 白名單、保留硬編碼 codex attest | 36g（claude worker 下 codex 形中介）紅 | 相符（784／1；36c 對此照不出來——跨廠複核 major 1 補的錨） |
+| 刪 launcher 分支、只比直接 PPID | 36a（codex launcher 本尊）紅 | 相符（783／1） |
+| 不驗中介之父（「恰好一層」上界拆掉） | 36d（鏈更長）紅 | 相符（783／1） |
+
+同快照等式（attest 與 stat 兩邊 starttime 相等）在分組 36 的穩定行程樹上照
+不出來，其行為錨在 Rust 單元測試
+`hook::tests::launcher_hop_decision_confirms_only_the_exact_shape`。

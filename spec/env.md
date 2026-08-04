@@ -1,6 +1,7 @@
 # 環境變數契約
 
-全部 14 個 `AGENT_BRIDGE_*` 變數。通則：
+全部 17 個 `AGENT_BRIDGE_*` 變數（總數由 `tests/check-contract.sh` 第 1 項的
+集合 diff 守著，不是手工維護的宣稱）。通則：
 
 ### ENV-GEN-1 [untested]
 未設定（unset）時每個變數 MUST 取本檔載明的預設值；本檔未列的
@@ -43,6 +44,17 @@ Source: cmd_await
 延遲秒數。預設 `0.3`。
 Source: notify_pane
 
+### ENV-TMUX-1 [tested: 39]
+`AGENT_BRIDGE_TMUX_TIMEOUT`：單次 tmux 子行程的逾時秒數，涵蓋**所有** tmux
+呼叫（通知路徑、spawn 生命週期、TUI read model——tui-design §4 bounded-read
+硬條款：任何一條無界查詢都足以凍結 UI）。預設 `5`，
+`0` 等同不設限。逾時 MUST 殺掉子行程並視同該次呼叫失敗（走 notify-failed
+降級）。壞值 MUST 退預設而非終止：這是防止整個指令被鎖死的安全網（見
+hooks.md HOOK-NOTIFY-3），拼錯一個變數名不該把安全網拆掉。
+合法但極大的值 MUST 夾到內部上限而非 panic——溢位的期限計算會在任務**已建立
+之後**的通知階段炸掉，比不逾時更難救。
+Source: config::tmux_timeout / tmux::run_bounded
+
 ### ENV-TTL-1 [tested: 33, 34]
 `AGENT_BRIDGE_STATE_TTL`：state 檔（見 state.md STATE-CHAN-*）新鮮度秒數。
 預設 `1800`。state 的 `ts` 距今超過 TTL 秒（或解析失敗）時，通知端 MUST 把
@@ -50,7 +62,7 @@ Source: notify_pane
 過期（原生通知通道關閉）。
 Source: notify_or_defer
 
-### ENV-TTL-2 [untested]
+### ENV-TTL-2 [tested: 34]
 通知端（send/reply/cancel 等 CLI 路徑）：值非 0–9 位純數字時 MUST 以錯誤
 終止（die），不得靜默採用預設。
 Source: notify_or_defer
@@ -84,11 +96,26 @@ hook 端由它析出「我是誰」；despawn/evict 以它比對出身與世代�
 設定此變數不構成身分授權（詳 hooks.md 的出身防護條款）。
 Source: cmd_spawn / hook_agent_name / cmd_despawn
 
+## TUI
+
+### ENV-UI-1 [tested: 40]
+`AGENT_BRIDGE_UI_POPUP`：`ui` 的啟動器協定旗標，由 tmux binding
+（`display-popup -E 'agent-bridge ui'`）設定，值 `1` 生效、其餘值等同未設定。
+設定時 `Enter` focus 成功後 MUST 直接正常退出（行程結束＝popup 關閉，人落在
+目標 pane）；未設定時 focus 後繼續執行。程式 MUST NOT 自行偵測是否身處
+popup（tui-design.md §2：模式感知屬啟動器，不進核心）。預設未設定。
+Source: ab_tui::run（event_loop）
+
 ## relay 鏈
 
 ### ENV-PASS-1 [tested: 16]
 `AGENT_BRIDGE_PASS_ENV`：逗號分隔的變數名清單，spawn/relay 時穿透給 worker。
 任一名稱不符合合法變數名文法時 MUST 以錯誤終止。預設空（不穿透）。
+**reserved 變數 MUST 排除**（`AGENT_BRIDGE_SPAWN_TAG`、`AGENT_BRIDGE_RELAY_DEPTH`
+——由 spawn 自行設定）：兩者若獲穿透，其 assignment 會排在 spawn 自己那一個
+之後而覆蓋它，子代於是頂著呼叫者的 tag 開起來（despawn 殺錯世代、lineage 跳錯
+parent、relay 深度重置）。排除採**靜默剔除＋stderr 警告**，MUST NOT 使 spawn
+失敗。雙 runtime 同步（tui-design.md §9 P4.7／§11 B4）。
 Source: cmd_spawn（pass_list）
 
 ### ENV-DEPTH-1 [tested: 23]
@@ -102,3 +129,13 @@ Source: cmd_relay
 空字串或非數字 MUST 以錯誤終止；`0` ＝解除上限。達上限時 relay MUST 拒絕
 並提示需人工介入。
 Source: cmd_relay
+
+### ENV-PAGE-1 [tested: 47]
+`AGENT_BRIDGE_NOTIFY_CMD`：page 層推播的自訂命令（設計正本
+`docs/tui-design.md` §1 的 page 層；Rust 獨有）。值是**一支可執行檔的路徑
+＝argv[0]**，不是一段 shell 字串；呼叫時後接 `<title> <body>` 兩個參數。
+設了就取代桌面通知那一層——這是 SSH／無桌面環境的逃生口（遠端的
+`DISPLAY` 指的是遠端那台的螢幕，桌面通知在那裡等於彈給沒有人看）。
+未設定或空 MUST 視為未設定。命令不存在或非零退出 MUST NOT 影響呼叫端的
+退出碼（CLI-PAGE-1）。
+Source: config::ENV_NOTIFY_CMD / page::SystemPager

@@ -1,0 +1,36 @@
+# P4 baseline replay script（tui-design.md §9 P4）
+#
+# 情境：操作者只有 CLI，要在 12 worker／20 task（分屬 3 個 spawn 來源 window）
+# 的 fixture 上定位
+# 三個異常（1 origin window 已消失的 worker、1 blocked prompt、1 orphaned
+# worker）。
+#
+# 計數規則：**非註解非空行＝一步**（`#` 開頭與空行不計）。步數由
+# run-tests.sh 從本檔機械導出，不得手寫死數字。
+#
+# 誠實性約束（brief）：這是「合法唯讀命令下合理偏短的定位路徑」，不繞遠路。
+# 唯讀＝list／list --long／status／read／idle ＋ tmux 的唯讀查詢；不含任何
+# mutation。每一步下面那行註解說明它在找什麼。
+#
+# 為什麼允許 `tmux capture-pane`：blocked prompt 是**畫面訊號**，而 CLI 沒有
+# blocker 軸——`list --long` 的八欄裡沒有任何一欄看得到它（那正是 TUI 要補的
+# 缺口）。不允許看畫面的話 baseline 的正確率恆為 2/3，量到的就不是效率差距
+# 而是「CLI 做不到」。capture-pane 是唯讀查詢，不改任何狀態。
+
+# 步 1：一次拿到介入視圖。ORIGIN／WHERE／OWNER 三軸同時暴露兩個異常——
+#       orphaned worker 的 WHERE 為 dead（registry 有、pane 不在），
+#       origin window 已消失的那一個 OWNER 為 owner-dead（`list --long` 的
+#       OWNER 欄是 CLI 這一側的事實，保留原字面）。
+ab_p4 list --long > "$P4OUT/list-long.txt"
+
+# 步 2-7：找 blocked prompt。CLI 沒有 blocker 軸，只能逐 pane 看畫面。
+#         掃描序＝`list --long` 的輸出序（registry 字典序），並跳過步 1 已經
+#         判定的兩個異常（去看一個已知 dead 的 pane 是白工，不是誠實路徑）。
+#         每一步把畫面存成 <worker>.screen，之後由「哪個檔含權限框特徵」機械
+#         導出答案——script 自己說明它在看誰，不靠外部對照表。
+tmx capture-pane -p -t "$P4P01" > "$P4OUT/p4w01.screen"
+tmx capture-pane -p -t "$P4P02" > "$P4OUT/p4w02.screen"
+tmx capture-pane -p -t "$P4P03" > "$P4OUT/p4w03.screen"
+tmx capture-pane -p -t "$P4P04" > "$P4OUT/p4w04.screen"
+tmx capture-pane -p -t "$P4P05" > "$P4OUT/p4w05.screen"
+tmx capture-pane -p -t "$P4P06" > "$P4OUT/p4w06.screen"

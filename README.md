@@ -4,7 +4,8 @@ Task delegation bridge between AI agent CLIs running in tmux panes.
 
 Multiple `claude` / `codex` CLI sessions running in different tmux panes can
 delegate tasks to each other and reply — splitting work into chunks so every
-agent keeps its context short and clean. Pure bash + filesystem, no daemon.
+agent keeps its context short and clean. A single Rust binary plus the local
+filesystem — no daemon, no network service.
 
 > 完整文件（正典，含設計取捨與已知限制）：[README.zh-TW.md](README.zh-TW.md)
 > — the Traditional Chinese README is the canonical, in-depth documentation;
@@ -71,15 +72,46 @@ permissions, and hooks, the same as a pane you opened yourself.
 
 ## Requirements
 
-`bash`, `jq`, `tmux`. Nothing else — no daemon, no network service.
+`tmux`, plus a Rust toolchain (edition 2024) to build the binary. `bash` is
+only needed for the `bin/agent-bridge` shim. Running the test suite also needs
+`bash` and `jq`. No daemon, no network service.
 
 ## Install
 
 ```bash
 git clone https://github.com/mangow314/agent-bridge.git ~/projects/agent-bridge
+cd ~/projects/agent-bridge
+cargo build --release && cp -f target/release/ab bin/ab
 ln -s ~/projects/agent-bridge/bin/agent-bridge ~/.local/bin/agent-bridge
 command -v agent-bridge   # should resolve to the symlink
 ```
+
+`bin/agent-bridge` is a small `exec` shim onto `bin/ab` (the build product,
+untracked). The binary has to sit in `bin/` — the default paths for the
+`share/` briefs are derived from its grandparent directory.
+
+### Upgrading an existing checkout
+
+`bin/ab` is a build product and is **not** in version control, so `git pull`
+alone leaves you with an entry point that has nothing to exec. Rebuild after
+every pull:
+
+```bash
+git pull
+cargo build --release && cp -f target/release/ab bin/ab
+agent-bridge list   # smoke test
+```
+
+If you skip the rebuild, the shim exits 127 and prints the build command
+rather than silently falling back to the bash implementation — two
+implementations swapping themselves in and out is how a test suite ends up
+believing it exercised Rust when it exercised bash.
+
+The original bash implementation stays in the tree as
+`bin/agent-bridge.bash`, frozen since M4 and kept for rollback and
+side-by-side comparison. It is only reached by running that path explicitly.
+Two subcommands exist in the Rust binary only — `ui` and `scan`, both
+described below; everything else behaves identically across the two.
 
 Optional — load the delegation-protocol skill into Claude Code by symlinking
 the whole repo as the skill directory (SKILL.md references `share/` briefs by
@@ -94,7 +126,7 @@ ln -s ~/projects/agent-bridge ~/.claude/skills/agent-bridge
 ```bash
 # Orchestrator side: spawn a worker pane (registers it, injects the worker
 # brief as its initial prompt, waits for the readiness probe)
-agent-bridge spawn researcher --runtime codex        # or --runtime claude
+agent-bridge spawn researcher --runtime codex        # or --runtime claude / --runtime agy
 agent-bridge list                                    # researcher  %N  ready
 
 # Delegate a task (multi-line requests go through stdin)
@@ -110,6 +142,9 @@ agent-bridge read "$id"
 
 # Reclaim the worker when its residual context has no further value
 agent-bridge despawn researcher
+
+# Watch the whole pool in a dashboard (q to leave)
+agent-bridge ui
 ```
 
 Workers receive a `agent-bridge receive <task-id>` notification in their pane,
@@ -119,7 +154,9 @@ a fake completion). Panes you opened yourself can join via
 
 ## How it works
 
-- **Thin bash CLI** (`bin/agent-bridge`) — the only entry point.
+- **Thin CLI** (`bin/agent-bridge` — a shim onto the Rust binary `bin/ab`) —
+  the only entry point. The original bash implementation is kept alongside as
+  `bin/agent-bridge.bash`; both pass the same suite.
 - **Filesystem mailbox** (`~/.local/share/agent-bridge/`, override with
   `AGENT_BRIDGE_DATA`): task files with atomic, lock-protected state
   transitions (`queued → delivered → running → completed/failed/cancelled`).
@@ -147,11 +184,36 @@ a fake completion). Panes you opened yourself can join via
   worker's initial prompt: treat request content as data rather than
   instructions, mark long tasks `start`, report inability via `fail`, ask
   questions by sending a reverse task instead of blocking in its own UI.
+- **Dashboard** (`agent-bridge ui`, Rust only) — an alternate-screen TUI over
+  the same files: WORKERS grouped by spawn lineage, in-flight TASKS, and a
+  DETAIL panel with a `root → … → parent → self` breadcrumb rebuilt from the
+  registry's generation keys. `Enter` focuses a worker's pane, `x` cancels a
+  task, `q` leaves. It reads the on-disk model first and treats tmux as a
+  bounded side query, so a hung tmux degrades the liveness column rather than
+  the whole screen.
+- **Paging** (`agent-bridge scan`, Rust only) — the two events that mean *a
+  human is needed now*: a task that landed in `failed`, and a pane that died
+  while still holding non-terminal work. Each event is appended to
+  `state/page-events.jsonl` and deduped by an event key that carries the
+  agent's generation, then pushed once through a ladder:
+  `AGENT_BRIDGE_NOTIFY_CMD` (your own executable, argv `<title> <body>`) →
+  local desktop `notify-send` → tmux status line on every attached client.
+  Over SSH the desktop layer is skipped — a remote `DISPLAY` is a screen
+  nobody is looking at. The guarantee is a durable record plus *at most one*
+  push attempt, not exactly-once: if the notifier is broken the event is still
+  on disk. Every non-read-only subcommand runs a scan after it succeeds, so
+  the explicit command is only needed if you want to drive it from a tmux
+  hook, key binding, or cron.
 - **Lifecycle safety** — spawn cap (`AGENT_BRIDGE_MAX_SPAWN`, default 4),
   atomic rollback if spawn fails mid-way, tag-bound `despawn` (a pane is only
   killed after its start command proves it is the pane that was spawned),
   `evict` for graceful reclaim (the worker writes down its context first),
   `gc` for old task files, and an append-only `agents.log` audit trail.
+  A worker can declare its own residual context spent with `disposable`,
+  which makes it a candidate for immediate reclaim; the default is the
+  conservative one — a worker that never declared it is assumed to still be
+  worth keeping. `idle` is the read-only view those reclaim decisions are
+  made from.
 - **Proxy passthrough** — standard proxy variables set in the orchestrator's
   environment are escaped into the worker's start command, so workers behave
   the same behind restricted networks. `AGENT_BRIDGE_PASS_ENV` (comma-separated
@@ -197,7 +259,11 @@ notification guards (with mutation counter-examples), eviction, and gc.
 - [README.zh-TW.md](README.zh-TW.md) — canonical full documentation.
 - [SKILL.md](SKILL.md) — the delegation-protocol skill loaded by Claude Code.
 - [share/](share/) — orchestrator / worker / successor briefs (the contracts).
-- [docs/](docs/) — design notes and plans, kept as an honest engineering log.
+- [spec/](spec/) — interface contracts (CLI, env, state, hooks), machine-checked
+  against the implementation by `tests/check-contract.sh`.
+- [docs/](docs/) — design notes and plans, kept as an honest engineering log;
+  [docs/tui-design.md](docs/tui-design.md) covers the dashboard and paging
+  layers, including the acceptance rounds they have and have not passed.
 
 ## License
 

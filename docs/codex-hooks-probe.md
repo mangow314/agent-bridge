@@ -30,7 +30,7 @@ without requiring **persisted hook trust** for this invocation」。codex 對 ho
 就是不執行。持久化位置在 `~/.codex/config.toml`：
 
 ```toml
-[hooks.state."/home/mango/.codex/config.toml:pre_tool_use:0:0"]
+[hooks.state."/home/<user>/.codex/config.toml:pre_tool_use:0:0"]
 trusted_hash = "sha256:cecc094d…"
 enabled = true
 ```
@@ -191,3 +191,117 @@ TTL 的降級窗、長壽巢狀 session 越過 TTL 的奪權可能）詳見 READ
 - block 語意本身是在 `--dangerously-bypass-hook-trust` 下測的；走正規信任流程後
   只驗到 hook 會觸發與 busy 派工端到端成功，沒有再單獨重測一次 block JSON 的
   拒絕分支（`stop_hook_active` ＋同 id 放行）。
+
+---
+
+# 補測（2026-07-31）：codex 的 hook 行程樹
+
+M5 把「codex 行程樹未量測」列為開著的缺口（架構 §11.6）。這一節把它量掉。
+
+- 版本：codex-cli **0.146.0**
+- 方法：`bin/agent-bridge` shim 暫時加一段探針，`hook` 子命令進來時先把自身
+  祖先鏈（pid／ppid／starttime／comm）附加到記錄檔再 `exec` 真的執行檔——
+  stdin、argv、退出碼都不碰。spawn 一個真的 codex worker（`m5codex`）取其
+  prompt-submit 與 stop 事件，量完 despawn、`git checkout` 還原 shim。
+- 結論：**codex 的 hook 行程直接父行程不是 `pane_pid`，M5 的行程身分閘門對
+  codex 一律確認不了，全面落回 M4 的時間窗判別。**
+
+## 實測行程樹
+
+```
+hook_pid=1612290  ppid=1609575  starttime=56855455  bash
+        1609575   ppid=1609509  starttime=56853512  codex   <- 原生執行檔，fork hook 的是它
+        1609509   ppid=9411     starttime=56853508  node    <- pane_pid，registry 記的是它
+           9411   ppid=1        starttime=11683     tmux: server
+```
+
+兩個行程的 argv：
+
+```
+1609509: node /home/<user>/.nvm/versions/node/v22.18.0/bin/codex --profile agent-worker
+1609575: /home/<user>/.nvm/.../@openai/codex-linux-x64/vendor/.../bin/codex --profile agent-worker
+```
+
+## 為什麼與 claude 不同
+
+claude 是 tmux 直接 exec 的單一行程，pane_pid 就是 fork hook 的那個行程。
+codex 經 npm 安裝，`bin/codex` 是一支 **node launcher**：tmux exec 的是
+`node …/bin/codex`（＝pane_pid），它**不 exec 取代自己**，而是 fork 出平台
+原生執行檔，再由原生執行檔 fork hook。中間因此多一層。
+
+STATE-AGENT-4 的 argv 規則對 launcher **正確命中**（argv[0] 是直譯器 `node`、
+argv[1] 的 basename 是 `codex`），所以 registry 兩欄照樣寫入：
+
+```
+worker_pid = 1609509（= tmux 回報的 pane_pid）
+worker_starttime = 56853508（與該 pid 當下相符）
+```
+
+命中的是「pane 行程確實是 codex 的啟動器」——這句話為真。不為真的是後面那個
+隱含前提：**啟動器不等於 fork hook 的那個行程**。
+
+## 這同時是本輪修補的實證
+
+把實測值代進 M5 首版的判別邏輯：`worker_pid` 1609509 仍活著（✓）、其
+starttime 與紀錄相符（✓）、hook 的 PPID 1609575 不等於它（✓）——正好命中
+首版那條「明確冒名 → 擋，且 ts 過期也不得接管」。也就是說首版一旦上線，
+**每一個 codex worker 的每一個 hook 事件都會被永久擋死**，state 通道整條沒有
+自癒路徑。
+
+複核者當初的反對是論證加一個合成實測；這次量到的是本機真實存在的形狀。修補
+後的行為是落回 M4：實測期間 `state/m5codex.json` 正常更新（`idle`，owner 為
+codex 的 session id），通知通道與 M5 之前完全相同。
+
+## 追測（同日）：這個窗對 codex 是否真的存在
+
+前一節確認了 codex 拿不到自癒，但「拿不到」只有在 session_id 真的會變、而行程
+不變的情況下才會痛。這是另案立案前的第一道 gate，先量掉。
+
+- 方法：同一支 shim 探針，改記 hook payload 的 `session_id` 與 `PPID`
+  （stdin 照 hook 本身的形狀讀完再餵回去）。spawn 一個 codex worker
+  （`m5sid`），取基準事件，於 pane 內下 `/new`，再送一個 prompt 觸發 turn。
+- 結論：**窗存在。**
+
+```
+/new 前  prompt-submit / stop   sid=019fb677-4b22-77b3-8b67-0814fe3a97ca  ppid=1646226
+/new 後  prompt-submit / stop   sid=019fb677-bebd-7353-ad01-03936ba3f5a4  ppid=1646226
+```
+
+**PPID 完全不變（1646226），session_id 換了。** 這正是 M5 窗 1 的形狀：行程沒
+變＝身分沒變，但 session_id 判別認不出來。
+
+實際傷害也重現了：`/new` 之後兩次 hook 事件都被擋，`state/m5sid.json` 的
+`owner` 停在**舊** sid，ts 凍結在 `/new` 前最後一次寫入。要等 TTL（預設 1800
+秒）過期才交還。
+
+傷害程度取決於凍結當下的值：停在 `idle` 時通知端照樣走 send-keys 送達（回到
+legacy，不算致命）；停在**新鮮的 `busy`** 時通知端不送鍵、而 worker 的 stop
+hook 又被擋著不發 block，**任務會卡在 mailbox 直到 TTL 過期**——那才是這個窗
+真正的代價。
+
+## canary（同日稍後）：launcher 形擴充落地後的復量
+
+上一節的窗已由 launcher 形擴充收掉（HOOK-OWNER-5 現行文、architecture
+§11.7；落地時「有界祖先鏈＋中間不夾 runtime」的草案規則被收窄成逐 runtime
+白名單形狀——草案版對本檔 m5-proposal §1 的實測巢狀鏈會誤放行）。落地後
+以同一支 shim 探針復量（worker `m6canary`，事件只記 PPID 不碰 stdin）：
+
+```
+/new 前  owner=019fb6da-64ff-…  ts=06:26:50（新鮮）  hook ppid=1999985
+/new 後  owner=019fb6da-dcb4-…  ts=06:27:43          hook ppid=1999985
+registry：worker_pid=1999927（launcher）  runtime=codex
+```
+
+`/new` 後第一個 turn 的 hook 事件**當場**把 owner 換成新 sid——舊 ts 距當下
+僅 51 秒、遠小於 TTL，M4 行為下必被時間窗擋住。PPID 前後不變（1999985＝原生
+執行檔），其父即 registry 記的 launcher（1999927）：身分閘門以 launcher 形
+**確認成功，非落回**。codex 的窗 1 就此關閉。
+
+## 尚未收的
+
+- 只量了 npm 全域安裝這一種佈署形狀。若哪天 codex 改成單一原生執行檔直接
+  上 PATH，行程樹會與 claude 同形（直接形命中、launcher 形不再需要），屆時
+  要重量確認。
+- launcher 形釘在「恰好一層」：codex 若改成多層 fork（launcher → broker →
+  原生），比對會失敗、全面落回 M4 行為——安全但窗回來，屆時按新實測形狀擴充
+  白名單。

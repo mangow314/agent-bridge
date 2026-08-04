@@ -1,0 +1,41 @@
+# P4 TUI replay script（tui-design.md §9 P4）
+#
+# 同一個 fixture、同一個任務：定位三個異常（origin window 已消失的 worker／
+# blocked prompt／orphaned worker）。每行一個按鍵（tmux send-keys 的鍵名），`#` 開頭與空行
+# 不計步；步數由 run-tests.sh 從本檔機械導出。
+#
+# 固定初始狀態（設計 §9 P4 附註：replay script 是 fixture 的一部分）：
+# 焦點在 WORKERS 欄第一列（`App::new` 的固定起點）。
+#
+# fixture 的 lineage 拓撲（P4.7 切片 B2 補完 C1，詳見 run-tests.sh 分組 44）：
+#   L1 `lineage p4w01 (6)`      p4w01…p4w06（p4w06 掛在 p4w05 底下）
+#   L2 `lineage p4w07 (5)`      p4w07…p4w11（p4w09 掛在 p4w08 底下）
+#   L3 `lineage p4z9† (c3c3) (1)`  根與中間代都不在 registry → 墓碑組標頭，
+#      成員只有 p4w12，其 DETAIL breadcrumb ＝`p4z9† → … → p4z8† → p4w12`
+#   組序依 generation key 字典序（`p4w01` < `p4w07` < `p4z9`），所以 p4w12
+#   是**列序最後一列**（畫面第 26 行，含 3 行組標頭；已由 read model 實測）。
+#
+# 步 0（不按鍵，故不計步）：P4.7 切片 B1 之後 WORKERS 欄**不再過濾 origin**
+#   （ORIGINS 面板退場，唯一軸是 lineage 分組），全 registry 的 12 個 worker
+#   依三條 lineage 分組同列於一張畫面上，其中兩個異常當場就標出來了——
+#     p4w06 標 ⛔blocked（BLOCKER 軸，§4 v1 matcher）
+#     p4w09 標 ✗dead（registry 有、pane 不在＝orphaned worker）
+#   第三個異常（origin window 已消失）看不出來：worker 的 origin window 死沒死是
+#   **origin 軸**的事實，而 origin 退場成 DETAIL 的證據行，只投影當前選中列。
+#
+# 量測史：
+#   - 首輪只有單向 `Tab` 時 4 步（57%，未達 ≤50%）。
+#   - 反向鍵補入後 3 步（43%）：BTab 到 ORIGINS，再兩次 j 走過三個 origin。
+#   - P4.7 切片 B1（ORIGINS 退場）後 1 步（14%）：兩個異常在步 0 已可見，
+#     只剩 origin 已消失的那一個要把選取移到它身上，才讀得到 DETAIL 的 origin 行。
+#     步數變少不是因為換了異常，是因為前兩個異常不再被 scope 藏起來。
+#   - P4.7 切片 B2（fixture 長出 lineage）：鍵序不變、仍是 1 步。分組讓畫面
+#     多了 3 行組標頭，p4w12 仍是最後一列，`End` 照樣一步到位。
+
+# 步 1：End → 選取跳到最後一列。p4w12 是列序最後一個 worker（它唯一的任務是
+#       終態，不進 WORKERS 的內嵌 task 列），DETAIL 隨即顯示它的
+#       `origin : zzc:@<id> (gone)`——「origin window 已消失」異常的具名證據，
+#       以及墓碑 breadcrumb（`lineage: p4z9† (c3c3) → … → p4z8† (d4d4) → p4w12`）。
+#       同一幀裡 p4w06／p4w09 的標記也仍在畫面上（測試 session 是 200x100，
+#       27 行的 WORKERS 欄不需要捲動，三者本來就同框）。
+End

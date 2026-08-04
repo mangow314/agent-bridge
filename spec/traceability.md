@@ -3,7 +3,7 @@
 - 對映粒度：**分組級**（不逐條 assert；parity 判定單位是分組全綠）。
 - 本表是對映正本；`tests/run-tests.sh` 各分組標頭下的 `# spec:` 註解是
   唯讀鏡像，漂移時以本表為準。
-- untested 計數：3（缺口處置見文末）。
+- untested 計數：2（缺口處置見文末）。
 - 機器核對：`tests/check-contract.sh 4`。
 
 | 分組 | 主題 | 條款 |
@@ -16,7 +16,7 @@
 | 6 | 特殊字元 byte-for-byte 保真 | CLI-SEND-1 |
 | 7 | reply / read / 重複 reply | CLI-REPLY-1, CLI-READ-1, STATE-TASK-4 |
 | 8 | 通知失敗路徑（pane 已死） | CLI-SEND-3 |
-| 8a | 權限對話框時不得送鍵 | HOOK-NOTIFY-2, ENV-NOTIFY-1 |
+| 8a | 權限對話框時不得送鍵 | HOOK-NOTIFY-2, HOOK-NOTIFY-4, ENV-NOTIFY-1 |
 | 8b | 鎖失敗路徑 | STATE-LOCK-1 |
 | 9 | unregister | CLI-UNREGISTER-1 |
 | 10 | start | CLI-START-1 |
@@ -25,7 +25,7 @@
 | 13 | await 等待終態 | CLI-AWAIT-1, CLI-AWAIT-2, ENV-POLL-1 |
 | 14 | tmux 完整 round-trip | CLI-SEND-1, CLI-RECEIVE-1, CLI-REPLY-1 |
 | 15 | 併發壓測 | STATE-TASK-1 |
-| 16 | spawn 核心＋cap＋原子回滾 | CLI-SPAWN-1, CLI-SPAWN-2, CLI-SPAWN-3, CLI-SPAWN-4, ENV-SPAWN-1, ENV-HOOKS-1, ENV-PASS-1, ENV-TAG-1, HOOK-BIND-1, STATE-AGENT-1 |
+| 16 | spawn 核心＋cap＋原子回滾 | CLI-SPAWN-1, CLI-SPAWN-2, CLI-SPAWN-3, CLI-SPAWN-4, ENV-SPAWN-1, ENV-HOOKS-1, ENV-PASS-1, ENV-TAG-1, HOOK-BIND-1, STATE-AGENT-1, STATE-AGENT-5 |
 | 17 | ready／探針 | CLI-READY-1, ENV-READY-1, ENV-READY-2 |
 | 18 | despawn＋出身防護 | CLI-DESPAWN-1 |
 | 18b | 出身證據＝啟動指令的 tag | CLI-DESPAWN-2, ENV-TAG-1 |
@@ -35,7 +35,7 @@
 | 20b | readiness 參數建 pane 前驗 | CLI-SPAWN-2, ENV-READY-1, ENV-READY-2 |
 | 21 | 解鎖失敗不得靜默 | STATE-LOCK-2 |
 | 22 | worker brief 注入 | ENV-BRIEF-1, CLI-SPAWN-7 |
-| 23 | relay 交棒 | CLI-RELAY-1, CLI-RELAY-2, CLI-RELAY-3, ENV-DEPTH-1, ENV-DEPTH-2, ENV-BRIEF-2 |
+| 23 | relay 交棒 | CLI-RELAY-1, CLI-RELAY-2, CLI-RELAY-3, CLI-RELAY-4, ENV-DEPTH-1, ENV-DEPTH-2, ENV-BRIEF-2 |
 | 24 | disposable | CLI-DISPOSABLE-1 |
 | 25 | idle 決策視圖 | CLI-IDLE-1, CLI-IDLE-2 |
 | 26 | evict 三段式 | CLI-EVICT-1, CLI-EVICT-2, CLI-EVICT-3 |
@@ -46,15 +46,28 @@
 | 31 | 第三輪複核修補 | CLI-STATUS-1, CLI-READ-1, CLI-AWAIT-2, CLI-DESPAWN-3, CLI-EVICT-2, CLI-RO-1, ENV-POLL-1, CLI-GEN-3, CLI-SEND-3, STATE-TASK-4, STATE-TASK-5 |
 | 32 | spawn 落點＋owner/actor 審計 | CLI-SPAWN-5, CLI-SPAWN-6 |
 | 33 | 通知原生化 Phase 1 | CLI-HOOK-1, HOOK-ID-1, HOOK-ID-2, HOOK-EVT-1, HOOK-EVT-2, HOOK-EVT-3, HOOK-EVT-4, HOOK-NOTIFY-1, STATE-CHAN-1, STATE-CHAN-2, STATE-CHAN-3, ENV-TTL-1 |
-| 34 | 獨立複核 blocker 修補 | HOOK-ID-3, HOOK-EVT-3, HOOK-NOTIFY-1, ENV-TTL-1 |
+| 34 | 獨立複核 blocker 修補 | HOOK-ID-3, HOOK-EVT-3, HOOK-NOTIFY-1, ENV-TTL-1, ENV-TTL-2 |
 | 34.5+ | 巢狀 runtime 冒名（owner gate） | HOOK-OWNER-1, HOOK-OWNER-2, HOOK-OWNER-3, HOOK-OWNER-4, HOOK-EVT-4, ENV-TTL-3, STATE-CHAN-2 |
+| 35 | 行程身分閘門（M5 窗 1） | HOOK-OWNER-5, STATE-AGENT-4 |
+| 36 | codex launcher 形（HOOK-OWNER-5 自癒擴充） | HOOK-OWNER-5 |
+| 37 | agy runtime（Antigravity CLI） | CLI-SPAWN-1, HOOK-NOTIFY-2 |
+| 38 | list --long 介入視圖 | CLI-LIST-1, CLI-LIST-2 |
+| 39 | copy-mode 送鍵防線 | HOOK-NOTIFY-3, HOOK-NOTIFY-4, ENV-TMUX-1 |
+| 40 | TUI 第一縱切（ui dashboard） | CLI-UI-1, CLI-CANCEL-1, ENV-UI-1 |
+| 41 | TUI 四面板＋唯讀鍵 | CLI-UI-1, CLI-READ-1 |
+| 42 | evict 入口 CAS | CLI-EVICT-4, CLI-EVICT-3 |
+| 43 | TUI evict 證據框（CAS） | CLI-UI-1, CLI-EVICT-4, CLI-EVICT-3 |
+| 44 | P4 效率驗收（replay 步數 gate） | CLI-UI-1, CLI-LIST-2 |
+| 45 | 尾行預覽的 capture-pane 語意（真 tmux） | CLI-UI-1, ENV-TMUX-1 |
+| 46 | await 的 blocker 探測（真 tmux） | CLI-AWAIT-3, CLI-AWAIT-4 |
+| 47 | page 層兩類事件的推播與去重 | CLI-SCAN-1, CLI-SCAN-2, CLI-SCAN-3, CLI-PAGE-1, CLI-PAGE-2, CLI-PAGE-3, CLI-RO-1, ENV-PAGE-1 |
 
 ## `[untested]` 缺口處置（本輪只記錄，不補測）
 
 | 條款 | 缺口 | 處置 |
 |---|---|---|
 | ENV-GEN-1 | 「未列變數不影響行為」無測試枚舉 | 認列不測：負面全稱句無法窮舉；由 check-contract.sh 第 1 項的集合 diff 守住新增變數必入 spec 的方向 |
-| ENV-TTL-2 | 通知端 STATE_TTL 壞值 die 無直接測試（僅 hook 端壞值退預設有測，34.5+） | 建議補測：單一 assert_fails 即可，成本極低；列入下輪或 Rust parity 前置 |
+| HOOK-OWNER-5（部分） | 「同快照夾讀」的單次 stat／夾讀取樣本身無 hermetic 注入面 | 取樣層屬靜態審查保障；判定條件（含兩邊 starttime 不等必拒、runtime 白名單）由 `hook::tests::launcher_hop_decision_confirms_only_the_exact_shape` 錨住，caller 整條路徑由分組 36 錨住 |
 | STATE-GEN-2 | 原子寫入（暫存檔＋rename）無直接斷言 | 認列不測：黑箱難以斷言中間態不可見；分組 15 併發壓測為間接證據；Rust 遷移時以實作審查＋同款壓測守住 |
 
 已知「有行為無測試」的既有缺口（繼承自 notify-native 交接，非本輪新增）：

@@ -59,7 +59,9 @@ context 管理都要自己來。agent-bridge 編排的是你平常手上在用�
 
 三個組成，全部本機、無常駐程序：
 
-1. **薄 bash CLI**（`bin/agent-bridge`）：二十個子指令，唯一的進入點。
+1. **薄 CLI**（`bin/agent-bridge`，exec shim 接到 Rust 執行檔 `bin/ab`）：
+   21 個子指令，唯一的進入點。原本的 bash 實作留在 `bin/agent-bridge.bash`，
+   兩邊過同一套測試。
 2. **檔案系統 mailbox**（預設 `~/.local/share/agent-bridge/`，可用環境變數
    `AGENT_BRIDGE_DATA` 覆蓋）：
    - `agents/<name>.json`：agent 註冊表（`{name, pane_id, registered_at}`；
@@ -138,13 +140,39 @@ queued | delivered | running --cancel--> cancelled（終態）
 
 ## 安裝
 
-硬依賴：`bash`、`jq`、`tmux`（缺 jq 會報錯並以非零碼退出）。
+硬依賴：`tmux`，加上建置用的 Rust toolchain（edition 2024）。`bash` 只有
+`bin/agent-bridge` 這層 shim 會用到；跑測試套件另需 `bash` 與 `jq`。
 
 ```bash
 git clone <repo-url> ~/projects/agent-bridge
+cd ~/projects/agent-bridge
+cargo build --release && cp -f target/release/ab bin/ab
 ln -s ~/projects/agent-bridge/bin/agent-bridge ~/.local/bin/agent-bridge
 command -v agent-bridge   # 應解析到 symlink
 ```
+
+`bin/agent-bridge` 是 exec shim，接到 `bin/ab`（建置產物，不進版控）。執行檔
+必須放在 `bin/` 底下：`share/` 的 briefs 預設路徑是從它的祖父層目錄反推的。
+
+### 升級既有的 clone（多裝置必讀）
+
+`bin/ab` 是建置產物、**不進版控**，所以只 `git pull` 會留下一個 exec 不到
+任何東西的入口。每次 pull 之後都要重建：
+
+```bash
+git pull
+cargo build --release && cp -f target/release/ab bin/ab
+agent-bridge list   # 冒煙測試
+```
+
+漏了重建的話，shim 會 **exit 127 並印出建置指令**，而不是靜默退回 bash
+正本——兩套實作靜默互換，會讓測試套件以為在驗 Rust、其實驗到 bash（假綠）。
+這個「大聲失敗」是刻意的。
+
+bash 正本以 `bin/agent-bridge.bash` 留在樹上，**自 M4 起凍結**，只作 rollback
+與雙實作對照之用，且只有顯式執行那個路徑才會跑到。兩套實作的子指令差集恰是
+**`ui` 與 `scan` 兩支（Rust 獨有）**，其餘 21 支語意相同——這是設計上的分歧
+（page 層與看板都建立在 Rust 側的資料模型上），不是漂移。
 
 Claude Code 的委派協定 skill：把**整個 repo** symlink 成 skill 目錄
 （SKILL.md 以相對路徑引用 `share/` 的 briefs，必須跟它們同目錄才解析得到；
@@ -160,6 +188,11 @@ ln -s ~/projects/agent-bridge ~/.claude/skills/agent-bridge
 agent-bridge register <agent> <tmux-target>   # 註冊 agent（target 會正規化成 %pane_id）
 agent-bridge unregister <agent>               # 移除註冊（未註冊者報錯）
 agent-bridge list                             # 每行 name<TAB>pane_id<TAB>ready 欄（人工註冊 -；spawned 為 starting/ready）
+agent-bridge list --long                      # 人要介入時的視圖：首行欄名，八欄
+                                              # name/pane/ready/origin/where/owner/disposable/idle
+                                              # where/owner 即時反查 tmux 譯成 <session>:<window>；
+                                              # 查不到 dead / owner-dead，tmux 沒得查 ?（兩者不同）
+                                              # 唯讀：判定 dead 也不清 registry，回收一律走 despawn/evict
 agent-bridge send <agent> --from <sender> (--message <text> | --message-file <path>)
 agent-bridge receive <task-id>                # 標頭走 stderr、request 原文走 stdout
 agent-bridge start <task-id>                  # （worker，可選）delivered → running
@@ -169,9 +202,9 @@ agent-bridge cancel <task-id>                 # （sender）queued/delivered/run
 agent-bridge status <task-id>                 # stdout 只印裸狀態字一行
 agent-bridge read <task-id>                   # completed/failed 可讀；標頭走 stderr、原文走 stdout
 agent-bridge await <task-id> [--timeout <secs>]  # 阻塞至終態，印裸狀態字；逾時 exit 124（其他錯誤非 124）
-agent-bridge spawn <name> --runtime <codex|claude> [--model <model>] [--window]
+agent-bridge spawn <name> --runtime <codex|claude|agy> [--model <model>] [--window]
                                               # spawn worker pane；stdout 只印 pane-id
-agent-bridge relay <name> --runtime <codex|claude> [--model <model>] --handoff <path> \
+agent-bridge relay <name> --runtime <codex|claude|agy> [--model <model>] --handoff <path> \
                           [--window] [--no-select] [--self-exit <my-name>]
                                               # 把主導權交給接手者 session（注入接手者守則＋交接檔）；stdout 只印 pane-id
 agent-bridge despawn <name>                   # 回收 spawn 出身的 worker（人工註冊拒殺）
@@ -182,6 +215,8 @@ agent-bridge evict <name> [--timeout <secs>] [--from <sender>]
                                               # 派收尾任務 → 等筆記落地 → despawn；stdout 只印收尾 task-id
 agent-bridge gc [--older-than <days>] [--apply] [--include-notes]
                                               # 清舊終態 task（預設 14 天）；預設只試算，--apply 才刪
+agent-bridge scan                             # （Rust 獨有）掃一輪 page 層事件並推播；stdout 只印新推的則數
+agent-bridge ui                               # （Rust 獨有）alternate-screen 看板；q 離開
 ```
 
 輸出契約（機器可解析）：
@@ -289,10 +324,29 @@ agent-bridge despawn worker-1                          # 任務收尾：kill pan
     形式（實測見過 `echo` 重導向被換成 Write 工具），但 `agent-bridge` 是外部
     CLI、沒有等價工具可替換，故這條路徑不受影響。另外**不可用 `-p/--print`**：
     那是 headless，跑完即退出，pane 不會留下來收探針
+  - `agy` → `agy --dangerously-skip-permissions --sandbox [--model <m>]
+    --prompt-interactive`（Antigravity CLI，量測正本 `docs/agy-probe.md`）。
+    `--prompt-interactive` 吃空白分隔的旗標值，位置參數因此原樣落為初始
+    prompt，注入路徑與前兩者共用。⚠️ 它**必須排在最後**：那不是布林開關而是
+    吃下一個 token 當值的 string flag（`agy --prompt-interactive
+    --not-a-real-flag --help` rc=0，未知旗標被吞成值而非報錯），擺在 `--model`
+    之前會讓模型旗標被吃掉、真 prompt 錯位。
+    旗標姿態是**使用者裁決**而非實作偏好：agy 沒有 codex `--profile` 那種細粒度
+    權限路線，也沒有 `--settings` 可讓 worker 掛自己的一份，只有粗粒度旗標；
+    sandbox 實測不擋 `agent-bridge` CLI 呼叫與專案內寫檔。
+    ⚠️ 現行 agy（實測 1.1.9）**沒有可掛載的 hooks 介面** → 不產生
+    `state/<name>.json` → 通知端恆走 legacy 送鍵（`notify_or_defer` 的「未知」
+    分支）。這是接受的 degradation：任務狀態機不倚賴 state 通道。另：agy 的
+    權限框 footer 是**小寫** `esc to cancel`，claude 的特徵一個都不命中，故
+    `screen_has_prompt` 另加**兩個**錨：header 的 `Requesting permission for:`，
+    以及下緣備援的 `Do you want to proceed?` ＋小寫 `esc to cancel` 成對。
+    備援錨不是冗餘——worker 預設進共用 window 並 tiled 均分，pane 一多就矮到
+    header 被捲出可見一屏，那時只有下緣還在（回歸鎖在分組 37e）。不補的話送鍵
+    的 Enter 會替 worker 按下預設的「1. Yes」。**bash 正本自 M4 凍結、不支援 agy**，本 runtime 只存在於 Rust
   - 新增 runtime 前必須實測該 CLI 的位置參數確實會被當第一則 user message 執行
     且執行完 session 常駐；只吃 stdin 或需要別的旗標的 CLI 要另外長出注入方式
-- **`--model` 指定 worker 的模型**（兩個 runtime 都吃 `--model` 長旗標，實測
-  2026-07-23）：不給＝繼承該 CLI 的使用者預設——主 session 把預設模型換到高階
+- **`--model` 指定 worker 的模型**（三個 runtime 都吃 `--model` 長旗標，codex／
+  claude 實測 2026-07-23、agy 實測 2026-07-31）：不給＝繼承該 CLI 的使用者預設——主 session 把預設模型換到高階
   層級時，worker 會跟著變貴，**規劃在主 session、執行下放的分工要靠這個旗標
   落地**（策略見 `share/orchestrator-brief.md`）。值會被拼進 pane 啟動命令
   字串，故驗證與 brief 路徑同級：字元集 `[A-Za-z0-9._-]{1,64}` 擋 sh/tmux
@@ -315,7 +369,10 @@ agent-bridge despawn worker-1                          # 任務收尾：kill pan
   旗標——例如 cron wrapper 設的 `CLAUDE_UNATTENDED=1`，若不跟著過去，接手者 pane
   會靜默退回有人值守的寬鬆姿態，而靜默降級比明確失敗難察覺得多。規則與 proxy
   相同：只帶**有設定的**變數（未設的不塞空值）、`printf %q` 跳脫；變數名逐個驗
-  格式，不合法就 fail-closed。
+  格式，不合法就 fail-closed。**保留變數會被剔除**：`AGENT_BRIDGE_SPAWN_TAG`
+  與 `AGENT_BRIDGE_RELAY_DEPTH` 是 spawn 自己拼進啟動指令的，白名單放它們過去
+  只會讓後項 assignment 蓋掉前者（子代頂著呼叫者的 tag 開起來，despawn 殺錯
+  世代、lineage 跳錯 parent）。處置是靜默剔除＋一行警告，不使 spawn 失敗。
   例：`AGENT_BRIDGE_PASS_ENV=CLAUDE_UNATTENDED agent-bridge relay …`
   **不要拿來傳秘密**：值會出現在 pane 的啟動指令裡（`pane_start_command`），任何
   能操作這台 tmux 的人都看得到。白名單本身也只能由可信的 orchestrator 設定——
@@ -344,7 +401,7 @@ agent-bridge despawn worker-1                          # 任務收尾：kill pan
 ### relay：把主導權交給下一棒
 
 ```bash
-agent-bridge relay <name> --runtime <codex|claude> [--model <model>] --handoff <path> \
+agent-bridge relay <name> --runtime <codex|claude|agy> [--model <model>] --handoff <path> \
   [--window] [--no-select] [--self-exit <my-name>]
 ```
 
@@ -442,6 +499,54 @@ registry／審計）與 `spawn` 完全共用，不複製第二份安全不變量
 - **審計**：spawn/despawn 各追加一行到 `agents.log`（append-only）。
 - despawn 對已消失的 pane（如 tmux server 重啟過）仍會清 registry，不卡死。
 
+## ui／scan：看板與呼叫器（Rust 獨有）
+
+池子一大，「現在誰卡住了、哪一筆沒人接」就不是 `list` 的三欄看得出來的。
+這兩支分別回答兩個不同的問題：**我想看時看得到**（`ui`），與
+**我沒在看時它會來找我**（`scan`）。
+
+### `ui`：alternate-screen 看板
+
+```bash
+agent-bridge ui        # q 離開
+```
+
+WORKERS 依 **spawn lineage 分組**（不是依物理位置——relay 一次，物理位置就
+斷了，血緣不會），TASKS 列在飛的任務，DETAIL 給選取項的細節，含一條
+`root → … → parent → self` 的 breadcrumb。breadcrumb 只由 registry 的兩個
+欄位（`lineage_root`／`parent_agent`，值是 canonical generation key 而非
+名字）重建：中間代沒資料就省略號，有資料但 agent 已除名就留墓碑 `†`。
+`Enter` 跳到該 worker 的 pane，`x` 取消選取的 task。
+
+**讀盤為主、tmux 為側查**：畫面的正本是磁碟上的 read model，tmux 只用來補
+死活與權限框兩個軸，且是有界查詢（`AGENT_BRIDGE_TMUX_TIMEOUT`，預設 5 秒）。
+所以 tmux 卡住時退化的是那兩欄，不是整個畫面——看板的啟動不該取決於 tmux。
+
+### `scan`：把「需要人現在出手」送到人面前
+
+事件恰兩類，不打算擴充：**task 進了 `failed`**，以及 **pane 死了卻還掛著
+非終態 task**。每則事件先落盤到 `state/page-events.jsonl`，再推播：
+
+```
+AGENT_BRIDGE_NOTIFY_CMD  →  本機桌面 notify-send  →  tmux status line（逐 client）
+```
+
+- **`AGENT_BRIDGE_NOTIFY_CMD` 的值是 argv[0]**——一支可執行檔的路徑，後接
+  `<title> <body>` 兩個參數，**不是一段 shell 字串**（不會經過 shell，也就沒有
+  注入面）。這是 SSH／無桌面環境接通知的逃生口。
+- **SSH 下不打桌面通知**：有 `SSH_CONNECTION` 就跳過那一層——遠端的
+  `DISPLAY` 是一塊沒有人在看的螢幕。遠端只剩 status line，除非你自己設
+  `AGENT_BRIDGE_NOTIFY_CMD`。
+- **保證強度是 durable record ＋至多嘗試推播一次**，不是 exactly-once。
+  去重軸是帶世代的 event key（同名 respawn 是新事件，不會被上一代的紀錄吃掉）；
+  notifier 壞掉就此作罷而不是每次呼叫重推同一則洗版——事件在磁碟上，事後查得到。
+- **平常不必手動跑**：每個非唯讀且成功完成的子指令進場都會順手掃一輪。顯式的
+  `scan` 是留給想掛 tmux hook／鍵位／cron 的人——我們不主動去改你的 tmux 設定。
+- 通知的**標題**帶「誰、出了什麼事、人在哪」，**內文**首行是決策依據（失敗
+  原因本身，不是「進了 failed 終態」這種狀態字）、末行是 task id。這個形狀是
+  實測打出來的，不是設計者的偏好：受測者原本答得出「誰、出了什麼事」，卻卡在
+  「要不要切過去看」——通知從沒說過切去哪裡。
+
 ## disposable／idle／evict：pane 的去留由上下文殘值決定
 
 worker 做完一件事不代表它該死。它腦裡可能還留著沒寫進 response 的東西——查過
@@ -528,7 +633,8 @@ agent-bridge gc --older-than 30 --apply
 tests/run-tests.sh
 ```
 
-純 bash、零額外依賴。整合測試使用獨立 socket
+測試驅動腳本是 bash，需要 `tmux` 與 `jq`——受測的 Rust 執行檔本身只用到
+`tmux`，不依賴 jq。整合測試使用獨立 socket
 `tmux -L agent-bridge-test -f /dev/null`，不碰使用者真實 tmux server。
 
 ## 開發慣例
@@ -548,6 +654,16 @@ tests/run-tests.sh
 
 ## 已知限制
 
+- **看板的「歸屬可讀性」尚未通過理解驗收**（2026-08-04，PD1 第一輪 1/3）：
+  資料是對的（分組、breadcrumb、unattached 判定都有機器不變式守著），但
+  **人讀不讀得出來是另一回事**，而後者才是這個面板存在的理由。實測打出三個
+  缺口：(1) `[unattached]` 只列出連不上的 task，不說**為什麼**連不上——實際上
+  背後是三種完全不同的原因（同名 respawn 的歷史 task／收件人根本不在 registry／
+  註冊與建立同秒＝不可證），畫面把三者呈現得一模一樣；(2) 直系 parent 是二級
+  資訊（要選取該列再讀 DETAIL 的 breadcrumb），第一眼看不到，受測者於是把
+  「卡住的那一個」當成「派生它的那一個」；(3) 墓碑鏈缺兩代時畫面只讓人看見
+  一代（`†` 之外的中間代只有省略號）。三條都未修，詳見
+  `docs/tui-design.md` §9 的 PD1 節。page 層（通知）的同類驗收已於第三輪通過。
 - **agent 忙碌時通知會延後處理**：已接線 hook 的 claude worker 若 state 檔
   顯示新鮮的 `busy`，`notify_or_defer` 現在完全不送鍵，訊息留在 mailbox，
   改由對方自己的 Stop hook 在 turn 結束時查到並自行 `receive`（通知原生化
@@ -574,7 +690,11 @@ tests/run-tests.sh
     是 `/clear` 換 session id 後的自癒路徑）。殘餘邊界（刻意不美化）：
     (1) `/clear` 後最長一個 TTL（預設 1800 秒）內 parent 的 hooks 被舊 owner
     鎖住，state 凍結、stop 不 block，deferred 任務最壞要等 TTL 過期後 parent
-    的下一次 turn 結束才被取件；(2) 長壽巢狀 session 若存活超過 TTL 且期間
+    的下一次 turn 結束才被取件——**M5 對 claude worker 關掉了這個窗**：spawn
+    記下 worker runtime 的 `(pid, starttime)`，hook 比對自身直接父行程，相符
+    即放行，`/clear` 的自癒因此是即時的。**codex worker 不適用**（npm 的 node
+    launcher 讓行程中間多一層，PPID 對不上，一律落回本段所述的時間窗；實測見
+    `docs/codex-hooks-probe.md` 補測節）；(2) 長壽巢狀 session 若存活超過 TTL 且期間
     parent 零 hook 事件，仍可能奪走所有權；(3) 缺 `session_id` 的 payload
     不參與 state 通道（不寫、不 block），行為退回 legacy 送鍵；(4) `owner`
     欄與 state 檔同屬 worker 可寫互信域，防的是**意外汙染**不是蓄意偽造

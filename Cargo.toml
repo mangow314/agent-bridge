@@ -1,0 +1,13 @@
+# Rust 遷移 workspace（計畫：~/.claude/plans/cheeky-waddling-meadow.md）
+# M4 cutover 起本 workspace 即正本：bin/agent-bridge 是 exec shim，接到建置
+# 產物 bin/ab；bash 正本留存為 bin/agent-bridge.bash（rollback 與對照用）。
+# parity gate＝不帶 BRIDGE 跑 tests/run-tests.sh 全綠（756），
+# `SRC_KIND=bash BRIDGE=$PWD/bin/agent-bridge.bash` 跑同一套驗 bash 側不退。
+[workspace]
+resolver = "3"
+members = ["crates/ab-core", "crates/ab", "crates/ab-tui"]
+
+[workspace.package]
+edition = "2024"
+license = "MIT"
+repository = "https://github.com/mangow314/agent-bridge"
