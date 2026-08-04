@@ -2,9 +2,13 @@
 
 > English overview: [README.md](README.md) — 本檔為完整正典文件（含設計取捨與已知限制的工程程記）。
 
-跨 tmux pane 的 agent 任務委派橋（core MVP）。讓分跑在不同 tmux pane 的多個
-claude / codex CLI session 互相委派任務與回覆，把工作拆細、讓每個 agent 的
-context 保持短而乾淨。
+**AI coding agent 之間的任務信箱與交接協定。**
+
+multiplexer 讓你一次看見所有 agent；agent-bridge 是它上面那層——讓 agent 之間
+**互相委派**：把一塊自足的活交出去、拿回誠實的答案（包含「我做不到」），並讓
+那份工作活過發起它的那個 session 被清洗、壓縮或換人。委派的單位是**任務**
+（檔案上的狀態機）而不是 pane，把工作拆細、讓每個 agent 的 context 保持短而
+乾淨。
 
 ![示範：spawn worker pane、委派任務、讀回覆](docs/assets/demo.gif)
 

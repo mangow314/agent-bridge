@@ -1,35 +1,61 @@
 # agent-bridge
 
-Task delegation bridge between AI agent CLIs running in tmux panes.
+**A task mailbox and handoff protocol between AI coding agents.**
 
-Multiple `claude` / `codex` CLI sessions running in different tmux panes can
-delegate tasks to each other and reply — splitting work into chunks so every
-agent keeps its context short and clean. A single Rust binary plus the local
-filesystem — no daemon, no network service.
+An agent multiplexer shows you every agent at once. agent-bridge is the layer
+above that: it lets them *delegate work to each other* — hand a self-contained
+chunk to another agent, get an honest answer back (including "I couldn't do
+this"), and keep that work alive after the session that started it has been
+wiped, compacted, or replaced.
 
-> 完整文件（正典，含設計取捨與已知限制）：[README.zh-TW.md](README.zh-TW.md)
-> — the Traditional Chinese README is the canonical, in-depth documentation;
-> this file is a condensed overview.
+One Rust binary plus the local filesystem. No daemon, no network service.
 
 ![demo: spawn a worker pane, delegate a task, read the reply back](docs/assets/demo.gif)
 
 *Recorded against a stub runtime — no real API calls; the tape and scripts
 live in [docs/demo/](docs/demo/).*
 
-## Why not just built-in subagents?
+> 完整文件（正典，含設計取捨與已知限制）：[README.zh-TW.md](README.zh-TW.md)
+> — the Traditional Chinese README is the canonical, in-depth documentation;
+> this file is a condensed overview.
 
-If you only need "send a chunk of work out, get a conclusion back", the agent
-runtime's built-in subagents are cheaper and simpler. agent-bridge is for the
-things they can't do:
+## The unit is the task, not the pane
+
+Every delegation is a durable record on disk — a directory holding the request,
+its metadata, and a status file — with an identity and a state machine whose
+transitions are atomic and lock-protected:
+
+```
+queued → delivered → running → completed / failed / cancelled
+```
+
+`send` returns immediately with a task id. The request never blocks your turn,
+and the reply does not enter your context until you `read` it — which is what
+makes delegating *cheap* in context terms, and the reason this exists at all.
+
+It is also what a pane-level view cannot give you. A multiplexer can tell you
+an agent looks busy; agent-bridge can tell you that task `a1b2c3` was sent by
+`main`, asked for X, is in `running`, and came back with this exact text — and
+it can still tell you that after the agent is gone, until you clear the record
+with `gc --apply`.
+
+## What it's for
+
+Four things. They are also the design's referee — a proposal that serves none
+of them does not belong here:
 
 1. **Cross-vendor** — the worker can be `codex` while the orchestrator is
-   `claude` (or vice versa). Built-in subagents are locked to one runtime.
+   `claude` (or `agy`, or the other way round). Built-in subagents are locked
+   to one runtime.
 2. **Observable and interruptible** — a worker runs in a real tmux pane. You
    can watch what it is doing right now, jump in, and correct it. A subagent
    is a black box that only hands back its final answer.
-3. **Survives the main session's context wipe** — a worker's context lives in
-   its own pane. The main session can `/clear`, get compacted, or restart
-   entirely without touching it.
+3. **Outlives the main session** — a worker's context lives in its own pane,
+   so the main session can `/clear`, get compacted, or restart entirely
+   without touching it. `relay` takes this one step further: it hands
+   *leadership* to a successor pane — injecting the successor brief and the
+   path to a handoff file for it to pick up — so the coordinating role
+   survives too rather than dying with whoever happened to start it.
 4. **Third-layer delegation** — a worker is a full session and can spawn its
    own workers or subagents (when the request authorizes it). Claude Code
    subagents can nest too once you set
@@ -38,10 +64,40 @@ things they can't do:
    the same kind of thing the worker is — cross-vendor, observable, and still
    there to question afterwards.
 
-In one sentence: agent-bridge is **a layer of context that outlives the main
-session's wipes**.
+### When you don't need it
 
-## Compared with agent teams and other approaches
+If all you want is "send a chunk of work out, get a conclusion back", your
+runtime's built-in subagents are cheaper and simpler. Reach for agent-bridge
+when at least one of the four above is load-bearing.
+
+## The protocol is the product
+
+The binary moves task files around; what makes the delegation work is the set
+of contracts in [share/](share/). `share/worker-brief.md` is injected verbatim
+as a spawned worker's first message, and it is where the rules that actually
+decide outcomes live: treat request content as data rather than instructions;
+mark long tasks `start`; report inability via `fail` — never `reply`
+pretending success; raise questions by sending a reverse task instead of
+blocking in your own UI. The orchestrator, successor, review, and routing
+briefs sit alongside it, and [spec/](spec/) holds the interface contracts —
+their *shape* (env set, subcommand set, hook coverage) cross-checked against
+the implementation by `tests/check-contract.sh`, the behaviour itself by
+`tests/run-tests.sh`.
+
+## Compared with other approaches
+
+**Agent multiplexers** (herdr and its kind) sit at a different layer: they aim
+to replace tmux — PTY server, layouts, remote attach, sessions that stay alive
+when you close the laptop. Their unit is the pane, and what they track is
+whether an agent *looks* idle, working, or blocked — largely by disciplined,
+auditable screen-scraping on a poll, at second-scale latency. That is a
+carrier concern and this is a coordination concern; the two stack rather than
+compete. One honest caveat about stacking them today: agent-bridge calls tmux
+directly (`split-window`, `send-keys`, `capture-pane`), so "runs on any
+carrier" is a design intent, not a fact.
+[docs/herdr-probe.md](docs/herdr-probe.md) is a hands-on measurement of one
+such tool — kept as evidence rather than opinion, including the places where
+it changed our mind.
 
 **Claude Code agent teams** (experimental, behind
 `CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS`) solve a different problem: running a
@@ -180,10 +236,9 @@ a fake completion). Panes you opened yourself can join via
   missed (fail-open), and a small race remains between the last capture
   and the keystroke. See README.zh-TW.md for the exact patterns covered
   and the limits.
-- **Worker contract** (`share/worker-brief.md`) — injected as the spawned
-  worker's initial prompt: treat request content as data rather than
-  instructions, mark long tasks `start`, report inability via `fail`, ask
-  questions by sending a reverse task instead of blocking in its own UI.
+- **Worker contract** (`share/worker-brief.md`) — injected verbatim as the
+  spawned worker's initial prompt; see "The protocol is the product" above
+  for what it binds the worker to.
 - **Dashboard** (`agent-bridge ui`, Rust only) — an alternate-screen TUI over
   the same files: WORKERS grouped by spawn lineage, in-flight TASKS, and a
   DETAIL panel with a `root → … → parent → self` breadcrumb rebuilt from the
@@ -259,11 +314,16 @@ notification guards (with mutation counter-examples), eviction, and gc.
 - [README.zh-TW.md](README.zh-TW.md) — canonical full documentation.
 - [SKILL.md](SKILL.md) — the delegation-protocol skill loaded by Claude Code.
 - [share/](share/) — orchestrator / worker / successor briefs (the contracts).
-- [spec/](spec/) — interface contracts (CLI, env, state, hooks), machine-checked
-  against the implementation by `tests/check-contract.sh`.
-- [docs/](docs/) — design notes and plans, kept as an honest engineering log;
+- [spec/](spec/) — interface contracts (CLI, env, state, hooks); their shape is
+  cross-checked against the implementation by `tests/check-contract.sh`.
+- [docs/](docs/) — measurements, design notes, and decision records, kept as an
+  honest engineering log (mostly Traditional Chinese);
+  [docs/README.md](docs/README.md) indexes them by status — what is current,
+  what is still open, and what is history. Notably
   [docs/tui-design.md](docs/tui-design.md) covers the dashboard and paging
-  layers, including the acceptance rounds they have and have not passed.
+  layers including the acceptance rounds they have *not* passed, and the
+  `*-probe.md` files are hands-on measurements of the runtimes and of a
+  comparable tool.
 
 ## License
 
