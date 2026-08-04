@@ -326,8 +326,18 @@ pub fn create_task(
     let (task_id, dir) = loop {
         let id = format!("{}-{}", now_compact(), rand_suffix());
         let d = paths.tasks_dir.join(&id);
-        if std::fs::create_dir(&d).is_ok() {
-            break (id, d);
+        match std::fs::create_dir(&d) {
+            Ok(()) => break (id, d),
+            // 只有「已存在」才是 task-id 碰撞。權限不足、唯讀 fs、路徑不是目錄
+            // 等一律立即返回並保留 cause：把它們磨成碰撞訊息會把人帶去錯的方向
+            // 查，還白白重試五次。碰撞那句本身逐字不變（既有 CLI 面）。
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(e) => {
+                return Err(Error::new(format!(
+                    "無法建立 task 目錄 {}：{e}",
+                    d.display()
+                )));
+            }
         }
         tries += 1;
         if tries >= 5 {
@@ -1111,6 +1121,48 @@ fn poll_interval_shape_ok(raw: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 建 task 目錄失敗但**不是**碰撞時（這裡讓 `tasks_dir` 是一個普通檔案，
+    /// `create_dir` 因此拿到 ENOTDIR），訊息 MUST NOT 謊稱「task-id 連續碰撞」，
+    /// 且 MUST 帶得出底層 cause。舊寫法 `create_dir(..).is_ok()` 把權限／唯讀 fs／
+    /// 路徑非目錄全部誤報成碰撞，還白白重試五次。
+    #[test]
+    fn non_collision_mkdir_error_is_not_reported_as_collision() {
+        let root = std::env::temp_dir().join(format!(
+            "ab-core-task-notadir-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        // tasks_dir 指向一個普通檔案：其下的 create_dir 必然非碰撞失敗
+        let tasks_dir = root.join("tasks-is-a-file");
+        std::fs::write(&tasks_dir, b"not a directory").unwrap();
+
+        let paths = Paths {
+            data_dir: root.clone(),
+            agents_dir: root.join("agents"),
+            tasks_dir,
+            locks_dir: root.join("locks"),
+            state_dir: root.join("state"),
+        };
+        let err = create_task(
+            &paths,
+            "sender",
+            "receiver",
+            &MessageSource::Text("x".into()),
+            false,
+        )
+        .expect_err("非碰撞的建目錄失敗 MUST 以錯誤終止");
+
+        let msg = err.to_string();
+        assert!(!msg.contains("連續碰撞"), "非碰撞錯誤被誤報成碰撞：{msg}");
+        assert!(
+            msg.contains("無法建立 task 目錄"),
+            "訊息未指出是建 task 目錄失敗：{msg}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
 
     /// 極大但 finite 的輪詢間隔 MUST NOT panic（`from_secs_f64` 會）：
     /// 那條路徑在 TUI 的一次性工人上會讓 evict 的終局訊息永遠不回來
