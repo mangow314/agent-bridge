@@ -12,7 +12,7 @@
 |---|---|---|
 | `ab-core` | 領域邏輯庫：狀態、儲存、hook 核心、tmux client | `serde_json`（`preserve_order`，M1 起；使用者裁決 2026-07-31）外不引入依賴 |
 | `ab` | CLI binary：argv 解析、輸出格式化、dispatch | `ab-core`＋`libc`（M2 起，僅為 §5 的 `signal(SIGPIPE, SIG_DFL)` 一行；零傳遞依賴） |
-| `ab-tui` | 佔位；M5 後、fzf/tmux popup 原型驗證有價值才動工 | `ab-core` |
+| `ab-tui` | `agent-bridge ui` 的 alternate-screen dashboard（WORKERS｜TASKS｜DETAIL 三欄；設計正本 `docs/tui-design.md`、條款 CLI-UI-1）：lib crate，由 `ab` 的 `ui` 子指令呼叫 `run()` | `ab-core`＋`ratatui`＋`crossterm`（`docs/tui-design.md` §6 的**依賴上限**，僅此三項；不上 async runtime／daemon／clipboard crate） |
 
 ## 2. ab-core 模組對映表（模組 ↔ spec 域 ↔ bash 函式群）
 

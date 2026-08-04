@@ -1,6 +1,6 @@
 # 通知原生化：真 runtime canary 紀錄
 
-驗的是通知原生化（`171bb7f` / `9c6c973` / `d525346`）最大的未驗證假設：整條
+驗的是通知原生化（`e490053` / `be79439` / `b90982d`）最大的未驗證假設：整條
 hook 鏈在**真的 Claude Code session** 上成不成立。在此之前只有單元層 fixture
 證據——測試套件證明 `agent-bridge hook stop` 這支程式的行為正確，但沒有任何證據
 證明 Claude Code 真的會呼叫它、真的接受它吐出的 `decision: block`。
