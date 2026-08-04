@@ -212,7 +212,12 @@ worker 會一律自己做完。這條要寫進 orchestrator-brief。
 
 ### worker-brief 的既有條款衝突（必須改，不是增補）
 
-`share/worker-brief.md:52` 現寫「完成 `reply` 後先清空自己的 context
+> **狀態（已收）**：本節記的是 **plan 當時**的衝突。**Phase 4 已收**
+> （`2c41e6e`「brief：把『context 是資產』寫進兩份守則」）——現行
+> `share/worker-brief.md` 的條款是**相反的**：不要清自己的 context、回覆後原地
+> 待命等下一則通知。現行條款一律以 `share/worker-brief.md` 為準。
+
+`share/worker-brief.md` 現寫「完成 `reply` 後先清空自己的 context
 （`/clear` 或等價操作）再接下一個任務」。**這條與「保留上下文供追問」直接矛盾**
 ——照做的話 reply 完脈絡就沒了，保留 pane 只剩空殼，`disposable` 宣告與 LRU
 驅逐全部失去意義。Phase 4 必須拔掉或改寫這條。
