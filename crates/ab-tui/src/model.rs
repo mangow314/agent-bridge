@@ -746,17 +746,30 @@ pub struct BlockerIndex {
 }
 
 impl BlockerIndex {
-    /// 對指定 pane 逐一查詢。**只查傳進來的 pane**（呼叫端給的是 registry
-    /// 快照裡的 pane）：dashboard 每 2s 一輪，對整台機器的 pane 掃描是白工。
-    pub fn query(tmux: &dyn TmuxClient, panes: &[String]) -> Self {
+    /// 對指定 pane 逐一查詢，連命中的框內容一起帶出來（P5.4 blocker snippet）。
+    ///
+    /// **只查傳進來的 pane**（呼叫端給的是 registry 快照裡的 pane）：
+    /// dashboard 每 2s 一輪，對整台機器的 pane 掃描是白工。
+    ///
+    /// **不新增任何 tmux round trip**：snippet 取自這一輪 `capture-pane` 已經
+    /// 拿在手上的那一屏（§4 bounded-read）。
+    pub fn query_with_snippets(
+        tmux: &dyn TmuxClient,
+        panes: &[String],
+    ) -> (Self, HashMap<String, Vec<String>>) {
         let mut map = HashMap::new();
+        let mut snips = HashMap::new();
         for p in panes {
             if p.is_empty() {
                 continue;
             }
-            map.insert(p.clone(), blocker_of(tmux, p));
+            let (b, snip) = blocker_probe(tmux, p);
+            if let Some(lines) = snip {
+                snips.insert(p.clone(), lines);
+            }
+            map.insert(p.clone(), b);
         }
-        BlockerIndex { panes: Some(map) }
+        (BlockerIndex { panes: Some(map) }, snips)
     }
 
     pub fn unknown() -> Self {
@@ -849,16 +862,22 @@ impl BlockerDebounce {
 /// 先問結構性的 copy-mode 再看畫面：copy-mode 下的 `capture-pane` 拿到的是
 /// 人捲到的位置，拿它判 prompt 只會是誤判。查不到一律 `Unknown`——**MUST NOT
 /// 當成 `None`**（§5：沒有訊號 ≠ 沒有 blocker）。
-pub fn blocker_of(tmux: &dyn TmuxClient, pane: &str) -> Blocker {
+/// 判定＋命中框的內容（P5.4）。內容只在 `Prompt` 那一支存在——其餘三態下
+/// 「框內容」不是缺席，是根本沒有框。
+pub fn blocker_probe(tmux: &dyn TmuxClient, pane: &str) -> (Blocker, Option<Vec<String>>) {
     match tmux.pane_in_mode(pane) {
-        Some(true) => return Blocker::Occluded,
+        Some(true) => return (Blocker::Occluded, None),
         Some(false) => {}
-        None => return Blocker::Unknown,
+        None => return (Blocker::Unknown, None),
     }
     match tmux.capture_pane(pane) {
-        Some(screen) if ab_core::notify::screen_has_prompt(&screen) => Blocker::Prompt,
-        Some(_) => Blocker::None,
-        None => Blocker::Unknown,
+        // snippet 與判定同源（`ab_core::notify` 內同一個 matcher）：一邊說
+        // blocked、另一邊拿不到框，是最難查的那種畫面
+        Some(screen) => match ab_core::notify::prompt_snippet(&screen) {
+            Some(lines) => (Blocker::Prompt, Some(lines)),
+            None => (Blocker::None, None),
+        },
+        None => (Blocker::Unknown, None),
     }
 }
 
@@ -1115,6 +1134,284 @@ pub fn tasks_of(model: &Model, wi: usize) -> impl Iterator<Item = usize> + '_ {
         .map(|(ti, _)| ti)
 }
 
+// ===== P5.3 資料層：兩行列的第二行素材 =====
+
+/// elapsed 的顯示格式（P5.3）：`<60s`＝`Xs`、`<1h`＝`XmYs`、`<24h`＝`XhYm`、
+/// 其餘 `Xd`。解析失敗／now 早於 created（時鐘倒退）＝`-`（fail-closed，
+/// 不顯示負數）。`now` 由呼叫端注入——render 測試要決定性。
+pub fn fmt_elapsed(created_iso: &str, now_epoch: i64) -> String {
+    let Some(created) = ab_core::time::parse_iso_to_epoch(created_iso) else {
+        return "-".to_string();
+    };
+    if now_epoch < created {
+        return "-".to_string();
+    }
+    fmt_secs(now_epoch - created)
+}
+
+/// 秒數 → 顯示字串（`fmt_elapsed` 的內核；idle 時長／事件 ago 共用）。
+pub fn fmt_secs(s: i64) -> String {
+    if s < 60 {
+        format!("{s}s")
+    } else if s < 3600 {
+        format!("{}m{:02}s", s / 60, s % 60)
+    } else if s < 86_400 {
+        format!("{}h{:02}m", s / 3600, (s % 3600) / 60)
+    } else {
+        format!("{}d", s / 86_400)
+    }
+}
+
+/// events.log 行（`<iso> <event>[ <detail>]`）的事件字。壞行＝`None`。
+pub fn event_word(line: &str) -> Option<&str> {
+    line.split_whitespace().nth(1)
+}
+
+/// events.log 行的「多久以前」。時戳解析不出／在未來＝`None`（fail-closed）。
+pub fn event_ago(line: &str, now_epoch: i64) -> Option<String> {
+    let ts = line.split_whitespace().next()?;
+    let at = ab_core::time::parse_iso_to_epoch(ts)?;
+    if now_epoch < at {
+        return None;
+    }
+    Some(fmt_secs(now_epoch - at))
+}
+
+/// worker 兩行列第二行的素材來源（P5.3）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Activity {
+    /// 有 in-flight：`model.tasks` 索引。同 worker 多筆取 **id 最大＝最新**
+    /// （id 前綴是 created_at 的衍生，字典序即時間序；兩者不一致的病態
+    /// fixture 下也只是挑錯「最新」，不影響狀態機）。
+    Current(usize),
+    /// 閒置。`since`＝idle 基準 epoch（語義對齊 spawn.rs `IdleRow`：
+    /// `max(最近 attached task 的 created_at, spawned_at)`；兩者皆解析不出＝
+    /// `None`，顯示層退化）。`last`＝最近 attached 的 `model.recent` 索引
+    /// （`recent` 有 `RECENT_LIMIT` 視窗：任務掉出視窗時退回 spawn 時刻，
+    /// 這是已知近似，見 tui-design.md P5.3 記錄）。
+    Idle {
+        since: Option<i64>,
+        last: Option<usize>,
+    },
+}
+
+/// 這一列 worker 現在在幹嘛。歸屬一律走 `attached`（單一事實源），
+/// **不用名字比對**（同名 respawn 是新的一代）。
+pub fn worker_activity(model: &Model, wi: usize) -> Activity {
+    if let Some(ti) = tasks_of(model, wi).max_by(|a, b| model.tasks[*a].id.cmp(&model.tasks[*b].id))
+    {
+        return Activity::Current(ti);
+    }
+    let w = &model.workers[wi];
+    // recent 是 id 反序（新的在前）：第一筆 attached 即最近一輪
+    let last = model.recent.iter().position(|t| attached(t, w));
+    let last_at = last.and_then(|ri| ab_core::time::parse_iso_to_epoch(&model.recent[ri].created_at));
+    let spawned_at = ab_core::time::parse_iso_to_epoch(&w.spawned_at);
+    let since = match (last_at, spawned_at) {
+        (Some(a), Some(b)) => Some(a.max(b)),
+        (a, b) => a.or(b),
+    };
+    Activity::Idle { since, last }
+}
+
+/// 顯示層淨化：控制字元一律換空白（首行是使用者內容，`\t`／ESC 進 ratatui
+/// cell 會毀版面）。只在 ingest 做一次，render 不再處理。
+pub fn scrub_for_display(s: &str) -> String {
+    s.chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect()
+}
+
+/// run loop 持有的任務摘要快取（P5.3-1）。
+///
+/// - **首行**：request.md 只在 send 時寫一次 → 快取永不失效、同一 id 絕不
+///   重讀（讀不到＝fail-closed 記空字串，同樣不重試——每 500ms 對缺檔任務
+///   重複 open 是無界成本）。
+/// - **尾事件**：events.log 為 append-only，以**檔長變更**判斷重讀
+///   （每輪只付一次 `stat`，不付整檔讀）。
+/// - **記憶體有界**：不在 `tasks ∪ recent` 的 id 一律剔除。
+#[derive(Default)]
+pub struct Summaries {
+    first_lines: HashMap<String, String>,
+    last_events: HashMap<String, (u64, String)>,
+}
+
+impl Summaries {
+    /// 每輪磁碟載入後呼叫（UI thread，與 `Model::load` 同節奏）。
+    pub fn sync(&mut self, paths: &Paths, model: &Model) {
+        let want: std::collections::HashSet<&str> = model
+            .tasks
+            .iter()
+            .chain(model.recent.iter())
+            .map(|t| t.id.as_str())
+            .collect();
+        self.first_lines.retain(|k, _| want.contains(k.as_str()));
+        self.last_events.retain(|k, _| want.contains(k.as_str()));
+        for id in want {
+            if !self.first_lines.contains_key(id) {
+                let line = task::request_first_line(paths, id)
+                    .map(|b| scrub_for_display(&String::from_utf8_lossy(&b)))
+                    .unwrap_or_default();
+                self.first_lines.insert(id.to_string(), line);
+            }
+            let len = std::fs::metadata(task::task_dir(paths, id).join("events.log"))
+                .map(|m| m.len())
+                .unwrap_or(0);
+            let stale = self.last_events.get(id).map(|(l, _)| *l != len).unwrap_or(true);
+            if stale {
+                let line = task::last_event_line(paths, id)
+                    .map(|l| scrub_for_display(&l))
+                    .unwrap_or_default();
+                self.last_events.insert(id.to_string(), (len, line));
+            }
+        }
+    }
+
+    /// 測試注入（不經磁碟）：render 測試要驗第二行內容，不該為此鋪一座
+    /// tempdir。
+    #[cfg(test)]
+    pub fn seed(first: &[(&str, &str)], events: &[(&str, &str)]) -> Self {
+        Summaries {
+            first_lines: first
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
+            last_events: events
+                .iter()
+                .map(|(k, v)| (k.to_string(), (0, v.to_string())))
+                .collect(),
+        }
+    }
+
+    /// request.md 首行（顯示層已淨化；缺檔＝空字串）。
+    pub fn first_line(&self, id: &str) -> &str {
+        self.first_lines.get(id).map(|s| s.as_str()).unwrap_or("")
+    }
+
+    /// events.log 尾行（原格式 `<iso> <event>[ <detail>]`；缺＝空字串）。
+    pub fn last_event(&self, id: &str) -> &str {
+        self.last_events
+            .get(id)
+            .map(|(_, s)| s.as_str())
+            .unwrap_or("")
+    }
+}
+
+/// blocker 框的畫面內容快取（P5.4，裁定 7 吸收變體 D 的價值）。
+///
+/// **零新增 tmux 流量**：內容來自 blocker probe 那一輪**已經抓在手上**的
+/// `capture-pane` 輸出，隨同一則 `Msg::Live` 帶回來，不另發查詢。
+///
+/// **只活在 TUI 記憶體、不落盤**（同 §4 occluded 前值的紀律）：它是一屏的
+/// 觀測，不是任務資料；寫進 task-plane 會讓一份易失的畫面快照變成證據。
+///
+/// **降旗即清**：顯示層的 blocker 不再是 `Prompt` 的 pane，其 snippet 立刻
+/// 移除——留著就是拿一份舊畫面替「現在被擋住」背書。
+#[derive(Default)]
+pub struct Snippets {
+    panes: HashMap<String, Vec<String>>,
+}
+
+impl Snippets {
+    /// 一輪 probe 的結果落地。`shown` 是**去抖之後**要顯示的那份索引：
+    /// 去抖期間（首次命中、尚未升旗）畫面說的是「沒有可見 blocker」，那時
+    /// 顯示框內容等於搶在判定之前先下結論。
+    pub fn apply(&mut self, fresh: HashMap<String, Vec<String>>, shown: &BlockerIndex) {
+        self.panes.extend(fresh);
+        self.panes.retain(|p, _| shown.get(p) == Blocker::Prompt);
+    }
+
+    pub fn get(&self, pane: &str) -> Option<&[String]> {
+        self.panes.get(pane).map(|v| v.as_slice())
+    }
+
+    #[cfg(test)]
+    pub fn len(&self) -> usize {
+        self.panes.len()
+    }
+}
+
+/// 一列 worker 的**注意力等級**（P5.4 triage）。
+///
+/// 排序用 `Ord`：`Blocked > Dead > Failed > None`（裁定 2）。**這是注意力軸，
+/// 不是可刪度軸**（§5）——`None` 在最下面只代表「現在沒有需要人介入的訊號」，
+/// 不代表可以回收；idle 之間也不互相排序。
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug, Default)]
+pub enum Severity {
+    #[default]
+    None,
+    /// 最近一輪任務收在 failed
+    Failed,
+    /// pane 查了但不在（**不含** unknown：沒有訊號不是異常）
+    Dead,
+    /// 停在權限／計畫確認框，正在等人
+    Blocked,
+}
+
+/// 單列的 severity。三個判準各自都是**既有事實**，不新造狀態：blocker 軸、
+/// liveness 軸、最近一輪任務的終態。
+pub fn worker_severity(
+    model: &Model,
+    wi: usize,
+    live: &LiveIndex,
+    blockers: &BlockerIndex,
+) -> Severity {
+    let w = &model.workers[wi];
+    if blockers.get(&w.pane) == Blocker::Prompt {
+        return Severity::Blocked;
+    }
+    // `Unknown` MUST NOT 浮頂：tmux 停擺時全體升等於整份排序作廢（§5 三態）
+    if pane_liveness(live, &w.pane) == Liveness::Dead {
+        return Severity::Dead;
+    }
+    if let Activity::Idle { last: Some(ri), .. } = worker_activity(model, wi)
+        && model.recent[ri].status == "failed"
+    {
+        return Severity::Failed;
+    }
+    Severity::None
+}
+
+/// 一組的 severity＝組內最大值（空組回 `None`）。
+pub fn group_severity(
+    model: &Model,
+    g: &Group,
+    live: &LiveIndex,
+    blockers: &BlockerIndex,
+) -> Severity {
+    g.members
+        .iter()
+        .map(|&wi| worker_severity(model, wi, live, blockers))
+        .max()
+        .unwrap_or_default()
+}
+
+/// **組間浮頂、組內不排**（裁定 2）。
+///
+/// 為什麼只動組序：組內序是 snapshot 序（檔名字典序），既是 fixture 斷言的
+/// 地基、也是人記得住的位置；把它按狀態重排，等於每 2s 就重畫一次名單順序。
+/// 組間用 **stable sort**，同 severity 的組維持原本的字典序／standalone 段
+/// 相對位置。
+///
+/// 呼叫端 MUST 在**資料事件邊緣**呼叫（load 後／`Msg::Live` 後／stale 降級
+/// 邊緣），並緊接 `App::relocate`——每幀重排會讓 selection 追著排序跑。
+///
+/// **排序前先回到 canonical 序**（`group_by_lineage`，跨廠複核 2026-08-05
+/// finding 5）：對「已經排過的組」再做一次 stable sort，同分時保留的是上一輪
+/// 的浮頂序——severity 消失之後組序就再也回不到原本的字典序，畫面於是留著
+/// 一個沒有事實支撐的排名。從 canonical 序起排讓這個函式成為
+/// (workers, live, blockers) 的**純函式**：與呼叫次數、與上一輪排成什麼樣
+/// 都無關。
+pub fn apply_triage(model: &mut Model, live: &LiveIndex, blockers: &BlockerIndex) {
+    let mut sev: Vec<(Severity, Group)> = group_by_lineage(&model.workers)
+        .into_iter()
+        .map(|g| (group_severity(model, &g, live, blockers), g))
+        .collect();
+    // `sort_by_key` 是 stable：同分維持 canonical 序
+    sev.sort_by_key(|(s, _)| std::cmp::Reverse(*s));
+    model.groups = sev.into_iter().map(|(_, g)| g).collect();
+}
+
 /// WORKERS 欄的一列：worker 列或其下的 in-flight task 列（§2 selection
 /// model：兩者皆可選取，task 列自帶 immutable task id）。值是 `Model`
 /// 內的索引，不複製資料。
@@ -1182,12 +1479,79 @@ pub fn worker_row_lines(model: &Model, filter: &Filter) -> Vec<usize> {
     let mut line = 0usize;
     walk_workers(model, filter, |ev| match ev {
         WalkEvent::GroupHead(_) => line += 1,
-        WalkEvent::Row(_) => {
+        WalkEvent::Row(r) => {
+            // 記的是該列的**頂行**；捲動端要保證整列可見時自行加
+            // `row_height - 1` 取底行
             out.push(line);
-            line += 1;
+            line += row_height(r);
         }
     });
     out
+}
+
+/// 行高的**單一事實源**（P5.3 兩行列）：worker 列佔 2 行（第二行＝活動摘要），
+/// 內嵌 task 子列維持 1 行——子列自己就是任務，摘要不重複。行號會計
+/// （`worker_row_lines`）與畫線（`render_workers`）都吃這一份；固定值是
+/// 行號會計單純性的前提（「極窄退化單行」因此不做，見 plan 裁定 4）。
+pub fn row_height(row: Row) -> usize {
+    match row {
+        Row::Worker(_) => 2,
+        Row::Task { .. } => 1,
+    }
+}
+
+/// TASKS 欄的行高（P5.3 兩行列）——**該欄的單一事實源**。
+///
+/// 與 `row_height` **是兩件事**，故不共用：後者答的是 WORKERS 走訪裡某一列
+/// 佔幾行（worker 2、內嵌 task 子列 1），這裡答的是 TASKS 那份平坦列表每列
+/// 佔幾行（恆 2）。共用一個函式會把「WORKERS 底下的 task 子列」與「TASKS 欄
+/// 的 task 列」當成同一種東西——它們的行高本來就不同。
+///
+/// 三個消費點 MUST 全部走這一份：`render_tasks` 推幾行、捲動餵哪個行號、
+/// 捲軌總量幾行，加上 `app::page_move` 的一頁幾列。任一處寫死數字，症狀就是
+/// 靜默跳列或 thumb 指錯位置（跨廠複核 2026-08-05 finding 3 實證）。
+pub const TASK_ROW_H: usize = 2;
+
+/// WORKERS 欄的總行數（組標頭＋各列行高）——捲軌總量的單一來源。
+pub fn worker_lines_total(model: &Model, filter: &Filter) -> usize {
+    let mut line = 0usize;
+    walk_workers(model, filter, |ev| match ev {
+        WalkEvent::GroupHead(_) => line += 1,
+        WalkEvent::Row(r) => line += row_height(r),
+    });
+    line
+}
+
+/// pane 的人類可辨識位置 `<session>:<window-name>`（P5.3 裁定 8）。
+///
+/// 資料全部來自既有 `LiveIndex`（零新增 tmux 查詢）。多重 linked window 時
+/// **不靜默任選**（CLI-LIST-2 cardinality 紀律）：取排序後第一個位置並綴
+/// `+N` 標出其餘數量——「current session 優先」需要一條新查詢才知道自己在哪，
+/// 不值得為顯示欄付（Enter focus 的 action 層照舊做完整判斷）。
+/// window name 查不到＝退回 window id；pane 不在快照（dead／unknown）＝`None`，
+/// 呼叫端退回裸 pane id。
+pub fn pane_location_label(live: &LiveIndex, pane: &str) -> Option<String> {
+    let locs = live.panes.as_ref()?.get(pane)?;
+    if locs.is_empty() {
+        return None;
+    }
+    let mut sorted: Vec<&(String, String)> = locs.iter().collect();
+    sorted.sort();
+    sorted.dedup();
+    let (sess, wid) = sorted[0];
+    let name = live
+        .windows
+        .as_ref()
+        .and_then(|w| w.get(wid))
+        .and_then(|ls| ls.iter().find(|(s, _)| s == sess))
+        .map(|(_, n)| n.as_str())
+        .filter(|n| !n.is_empty());
+    let label = format!("{sess}:{}", name.unwrap_or(wid.as_str()));
+    Some(if sorted.len() > 1 {
+        format!("{label}+{}", sorted.len() - 1)
+    } else {
+        label
+    })
 }
 
 /// `rows` 索引 → 「在它之前要插入哪一組的標頭」（render 端畫標頭用）。
@@ -1218,6 +1582,45 @@ pub fn group_visible_members(model: &Model, filter: &Filter) -> HashMap<usize, u
         WalkEvent::Row(Row::Worker(_)) => {
             if let Some(gi) = cur {
                 *out.entry(gi).or_default() += 1;
+            }
+        }
+        WalkEvent::Row(_) => {}
+    });
+    out
+}
+
+/// 一組裡**畫得出來的**成員各異常各幾個（P5.4 組標頭徽章）。
+///
+/// 三個欄位互斥：一列只算它自己的 severity（`worker_severity` 已定序），
+/// 不會既算 blocked 又算 dead——重複計數會讓標頭的數字大於組員數。
+#[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
+pub struct SeverityCounts {
+    pub blocked: usize,
+    pub dead: usize,
+    pub failed: usize,
+}
+
+/// 每組的異常計數。與 `group_visible_members` 走**同一趟** filter 走訪：
+/// 括號裡的成員數與徽章數若來自不同集合，篩選中的標頭會自相矛盾。
+pub fn group_visible_severities(
+    model: &Model,
+    filter: &Filter,
+    live: &LiveIndex,
+    blockers: &BlockerIndex,
+) -> HashMap<usize, SeverityCounts> {
+    let mut out: HashMap<usize, SeverityCounts> = HashMap::new();
+    let mut cur: Option<usize> = None;
+    walk_workers(model, filter, |ev| match ev {
+        WalkEvent::GroupHead(gi) => cur = Some(gi),
+        WalkEvent::Row(Row::Worker(wi)) => {
+            if let Some(gi) = cur {
+                let e = out.entry(gi).or_default();
+                match worker_severity(model, wi, live, blockers) {
+                    Severity::Blocked => e.blocked += 1,
+                    Severity::Dead => e.dead += 1,
+                    Severity::Failed => e.failed += 1,
+                    Severity::None => {}
+                }
             }
         }
         WalkEvent::Row(_) => {}
@@ -1391,6 +1794,7 @@ mod tests {
             ready: "ready".to_string(),
             spawn_tag: format!("tag-{name}"),
             registered_at: "2026-07-31T00:00:00Z".to_string(),
+            spawned_at: String::new(),
             spawned,
             corrupt: false,
             // P4.7 切片 A：lineage 兩欄對這些 fixture 無關（None＝欄位缺席）
@@ -2051,10 +2455,13 @@ mod tests {
                 lines.windows(2).all(|w| w[0] < w[1]),
                 "行號必須嚴格遞增（filter={f:?}）"
             );
+            // P5.3 兩行列：`lines` 記各列**頂行**，最後一列頂行＋其行高＝
+            // 總行數（`worker_lines_total` 是捲軌總量的單一來源，兩者必同源）
             assert_eq!(
-                lines.last().copied().unwrap_or(0) + 1,
-                rows.len() + heads.len(),
-                "總行數＝列數＋組標頭數（filter={f:?}）"
+                lines.last().copied().unwrap_or(0)
+                    + rows.last().map(|r| row_height(*r)).unwrap_or(0),
+                worker_lines_total(&model, &f),
+                "最後一列頂行＋行高＝總行數（filter={f:?}）"
             );
             for (&row, _) in heads.iter() {
                 assert!(
@@ -2105,12 +2512,12 @@ mod tests {
             vec![0, 1],
             "同名多列時 MUST 兩列都顯示，不靜默挑一個"
         );
-        // 行號嚴格遞增，且每一組標頭恰佔一行
+        // 行號嚴格遞增，且每一組標頭恰佔一行（P5.3：總量以行高計）
         assert!(lines.windows(2).all(|w| w[0] < w[1]), "行號必須嚴格遞增");
         assert_eq!(
-            lines.last().copied().unwrap_or(0) + 1,
-            rows.len() + heads.len(),
-            "總行數＝列數＋組標頭數"
+            lines.last().copied().unwrap_or(0) + rows.last().map(|r| row_height(*r)).unwrap_or(0),
+            worker_lines_total(&model, &f),
+            "最後一列頂行＋行高＝總行數"
         );
         // 標頭落點必須是某一列的位置，且該列是 worker 列（組的第一個成員）
         for (&row, _) in heads.iter() {
@@ -2759,7 +3166,7 @@ mod tests {
         for (in_mode, screen, want) in cases {
             let tmux = BlockerTmux { in_mode, screen };
             assert_eq!(
-                blocker_of(&tmux, "%1"),
+                blocker_probe(&tmux, "%1").0,
                 want,
                 "in_mode={in_mode:?} screen={screen:?}"
             );
@@ -2773,7 +3180,7 @@ mod tests {
             in_mode: Some(false),
             screen: Some("idle output"),
         };
-        let idx = BlockerIndex::query(&tmux, &["%1".to_string(), String::new()]);
+        let idx = BlockerIndex::query_with_snippets(&tmux, &["%1".to_string(), String::new()]).0;
         assert_eq!(idx.get("%1"), Blocker::None);
         // 空 pane 不查（registry 缺 pane_id），也不會被當成 none
         assert_eq!(idx.get(""), Blocker::Unknown);
@@ -3097,5 +3504,406 @@ mod tests {
         let out = d.apply(BlockerIndex { panes: Some(m2) });
         assert_eq!(out.get("%1"), Blocker::Prompt); // 連續兩輪
         assert_eq!(out.get("%2"), Blocker::None); // 才第一輪
+    }
+
+    // ===== P5.3-1：fmt_elapsed／worker_activity／Summaries =====
+
+    /// 格式邊界逐條：`<60s`／`<1h`／`<24h`／天；解析失敗與時鐘倒退＝`-`。
+    #[test]
+    fn fmt_elapsed_boundaries() {
+        let base = "2026-08-01T00:00:00Z";
+        let t0 = ab_core::time::parse_iso_to_epoch(base).unwrap();
+        assert_eq!(fmt_elapsed(base, t0), "0s");
+        assert_eq!(fmt_elapsed(base, t0 + 59), "59s");
+        assert_eq!(fmt_elapsed(base, t0 + 60), "1m00s");
+        assert_eq!(fmt_elapsed(base, t0 + 12 * 60 + 40), "12m40s");
+        assert_eq!(fmt_elapsed(base, t0 + 3599), "59m59s");
+        assert_eq!(fmt_elapsed(base, t0 + 3600), "1h00m");
+        assert_eq!(fmt_elapsed(base, t0 + 86_399), "23h59m");
+        assert_eq!(fmt_elapsed(base, t0 + 86_400), "1d");
+        assert_eq!(fmt_elapsed("not-a-date", t0), "-");
+        assert_eq!(fmt_elapsed(base, t0 - 1), "-", "時鐘倒退不得顯示負數");
+    }
+
+    /// 忙碌態：同 worker 多筆 in-flight 取 id 最大＝最新。
+    #[test]
+    fn worker_activity_picks_newest_inflight() {
+        let model = model_of(
+            vec![snap("w1", true, "it:@1")],
+            vec![
+                inflight("20260731T000001Z-aaaa", "w1"),
+                inflight("20260731T000005Z-zzzz", "w1"),
+                inflight("20260731T000003Z-cccc", "w1"),
+            ],
+        );
+        match worker_activity(&model, 0) {
+            Activity::Current(ti) => assert_eq!(model.tasks[ti].id, "20260731T000005Z-zzzz"),
+            other => panic!("預期 Current，得到 {other:?}"),
+        }
+    }
+
+    /// 閒置基準取 `max(最近 attached recent 的 created_at, spawned_at)`：
+    /// 兩個方向各驗一次；兩者皆缺＝None；`last` 指向 recent 裡最新 attached。
+    #[test]
+    fn worker_activity_idle_basis_is_max_of_last_task_and_spawn() {
+        // recent 較晚：基準＝task created_at
+        let mut m = model_of(
+            vec![AgentSnapshot {
+                spawned_at: "2026-07-31T00:00:30Z".to_string(),
+                ..snap("w1", true, "it:@1")
+            }],
+            vec![],
+        );
+        m.recent = vec![
+            inflight("20260731T000200Z-bbbb", "w1"), // 最新（反序在前）
+            inflight("20260731T000100Z-aaaa", "w1"),
+        ];
+        match worker_activity(&m, 0) {
+            Activity::Idle { since, last } => {
+                assert_eq!(
+                    since,
+                    ab_core::time::parse_iso_to_epoch("2026-07-31T00:02:00Z")
+                );
+                assert_eq!(last, Some(0));
+            }
+            other => panic!("預期 Idle，得到 {other:?}"),
+        }
+        // spawn 較晚（respawn 後還沒接過任務的形狀）：基準＝spawned_at
+        let mut m2 = model_of(
+            vec![AgentSnapshot {
+                spawned_at: "2026-07-31T00:05:00Z".to_string(),
+                ..snap("w1", true, "it:@1")
+            }],
+            vec![],
+        );
+        m2.recent = vec![inflight("20260731T000200Z-bbbb", "w1")];
+        match worker_activity(&m2, 0) {
+            Activity::Idle { since, .. } => assert_eq!(
+                since,
+                ab_core::time::parse_iso_to_epoch("2026-07-31T00:05:00Z")
+            ),
+            other => panic!("預期 Idle，得到 {other:?}"),
+        }
+        // 兩者皆解析不出＝None（fail-closed）
+        let m3 = model_of(vec![snap("w1", true, "it:@1")], vec![]);
+        match worker_activity(&m3, 0) {
+            Activity::Idle { since, last } => {
+                assert_eq!(since, None);
+                assert_eq!(last, None);
+            }
+            other => panic!("預期 Idle，得到 {other:?}"),
+        }
+    }
+
+    /// Summaries 快取契約：首行**絕不重讀**（send 後 request.md 不再變，變了
+    /// 也照舊——快取值是權威）；events.log 以檔長變更重讀；集合外 id 剔除；
+    /// 控制字元在 ingest 淨化。
+    #[test]
+    fn summaries_cache_never_rereads_first_line_and_tracks_events_by_len() {
+        let root = std::env::temp_dir().join(format!(
+            "ab-tui-summaries-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let paths = Paths {
+            data_dir: root.clone(),
+            agents_dir: root.join("agents"),
+            tasks_dir: root.join("tasks"),
+            locks_dir: root.join("locks"),
+            state_dir: root.join("state"),
+        };
+        paths.ensure_dirs().unwrap();
+        let id = "20260731T000001Z-aaaa";
+        let dir = paths.tasks_dir.join(id);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("request.md"), b"first\tline\nrest\n").unwrap();
+        std::fs::write(dir.join("events.log"), b"2026-07-31T00:00:01Z created\n").unwrap();
+
+        let mut model = model_of(vec![], vec![inflight(id, "w1")]);
+        let mut sums = Summaries::default();
+        sums.sync(&paths, &model);
+        assert_eq!(sums.first_line(id), "first line", "控制字元未淨化");
+        assert!(sums.last_event(id).contains("created"));
+
+        // 首行：磁碟改了也不重讀（id 不變 → 快取值是權威）
+        std::fs::write(dir.join("request.md"), b"REWRITTEN\n").unwrap();
+        // events.log：append 改變檔長 → 重讀
+        let mut ev = std::fs::OpenOptions::new()
+            .append(true)
+            .open(dir.join("events.log"))
+            .unwrap();
+        std::io::Write::write_all(&mut ev, b"2026-07-31T00:00:02Z delivered\n").unwrap();
+        drop(ev);
+        sums.sync(&paths, &model);
+        assert_eq!(sums.first_line(id), "first line", "首行不該被重讀");
+        assert!(
+            sums.last_event(id).contains("delivered"),
+            "events.log 變長未重讀：{}",
+            sums.last_event(id)
+        );
+
+        // 集合外剔除：model 不再含這個 id → 快取清空
+        model.tasks.clear();
+        sums.sync(&paths, &model);
+        assert_eq!(sums.first_line(id), "");
+        assert_eq!(sums.last_event(id), "");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // ---- P5.4：triage 組間浮頂 ----
+
+    /// 給定 pane→blocker 的索引（其餘 pane 皆 `None`＝查得到、沒 blocker）。
+    fn blockers_of(pairs: &[(&str, Blocker)]) -> BlockerIndex {
+        BlockerIndex {
+            panes: Some(pairs.iter().map(|(p, b)| (p.to_string(), *b)).collect()),
+        }
+    }
+
+    /// 給定「活著的 pane 集合」的死活索引。
+    fn live_of(panes: &[&str]) -> LiveIndex {
+        LiveIndex {
+            panes: Some(
+                panes
+                    .iter()
+                    .map(|p| (p.to_string(), vec![("s".to_string(), "@1".to_string())]))
+                    .collect(),
+            ),
+            ..LiveIndex::unknown()
+        }
+    }
+
+    /// 組序 → 組標籤序（斷言讀起來像畫面）。
+    fn group_order(m: &Model) -> Vec<String> {
+        m.groups.iter().map(|g| group_label(m, g)).collect()
+    }
+
+    /// 三條 lineage：`aaa`（正常）／`bbb`（有人卡在權限框）／`ccc`（有人死了）。
+    /// pane 由 `snap` 依名字長度決定，這裡名字等長，故顯式改寫。
+    fn triage_model() -> Model {
+        let mut ws = vec![
+            lin("a1", "aaa-1-aaaaaaaaaaaa", Some("aaa-1-aaaaaaaaaaaa"), None),
+            lin("b1", "bbb-1-bbbbbbbbbbbb", Some("bbb-1-bbbbbbbbbbbb"), None),
+            lin("c1", "ccc-1-cccccccccccc", Some("ccc-1-cccccccccccc"), None),
+        ];
+        for (i, w) in ws.iter_mut().enumerate() {
+            w.pane = format!("%{}", i + 1);
+        }
+        model_of(ws, Vec::new())
+    }
+
+    /// **組間浮頂、組內不排**（裁定 2）：severity 高的組整組上移，組內順序與
+    /// 同分組間的相對序一律不動。
+    #[test]
+    fn triage_floats_groups_by_severity_and_keeps_everything_else_stable() {
+        let mut m = triage_model();
+        let before = group_order(&m);
+        assert_eq!(before.len(), 3, "前提：三組");
+
+        // %2 卡在權限框、%3 死了 → bbb 最上、ccc 次之、aaa 墊底
+        let live = live_of(&["%1", "%2"]);
+        let bl = blockers_of(&[("%2", Blocker::Prompt)]);
+        apply_triage(&mut m, &live, &bl);
+        let after = group_order(&m);
+        assert_eq!(
+            (after[0].contains("b1"), after[1].contains("c1")),
+            (true, true),
+            "Blocked > Dead > None：實際 {after:?}"
+        );
+
+        // 同 severity 維持字典序（stable）：全部無異常時順序 MUST 逐字回到原樣
+        let mut m2 = triage_model();
+        apply_triage(&mut m2, &live_of(&["%1", "%2", "%3"]), &blockers_of(&[]));
+        assert_eq!(group_order(&m2), before, "同分不得重排");
+
+        // 冪等：同一份事實再排一次不動
+        let mut m3 = m;
+        apply_triage(&mut m3, &live, &bl);
+        assert_eq!(group_order(&m3), after, "重排 MUST 冪等");
+    }
+
+    /// **severity 消失後組序要回得來**（跨廠複核 2026-08-05 finding 5）。
+    ///
+    /// 失效形態：對「已經排過的組」再 stable sort，同分時保留的是上一輪的
+    /// 浮頂序——blocker 降旗之後 bbb 仍掛在最上面，而畫面上一件事實都沒有
+    /// 支撐那個排名。這條從**已排序狀態**起跑，正是上一版驗不到的那一格。
+    #[test]
+    fn triage_returns_to_the_canonical_order_once_the_severity_clears() {
+        let mut m = triage_model();
+        let canonical = group_order(&m);
+
+        // 先浮頂
+        apply_triage(
+            &mut m,
+            &live_of(&["%1", "%2", "%3"]),
+            &blockers_of(&[("%2", Blocker::Prompt)]),
+        );
+        assert!(group_order(&m)[0].contains("b1"), "前提：已經浮頂");
+
+        // 降旗（同一份 model，接著排）→ MUST 回到 canonical 序
+        apply_triage(
+            &mut m,
+            &live_of(&["%1", "%2", "%3"]),
+            &blockers_of(&[("%2", Blocker::None)]),
+        );
+        assert_eq!(
+            group_order(&m),
+            canonical,
+            "severity 清除後 MUST 回到 canonical 序，不得留著上一輪的排名"
+        );
+
+        // 換一個組出事：排序只跟當下事實有關，與排過幾次無關
+        apply_triage(
+            &mut m,
+            &live_of(&["%1", "%2", "%3"]),
+            &blockers_of(&[("%3", Blocker::Prompt)]),
+        );
+        assert!(group_order(&m)[0].contains("c1"), "改由 c1 浮頂");
+    }
+
+    /// **unknown 不浮頂**（§5 三態）：tmux 停擺時整份索引是 unknown，若當成
+    /// dead 就會整批浮上來——排序等於作廢，而畫面上一件事實都沒有變。
+    #[test]
+    fn an_unknown_axis_never_floats_anything() {
+        let mut m = triage_model();
+        let before = group_order(&m);
+        apply_triage(&mut m, &LiveIndex::unknown(), &BlockerIndex::unknown());
+        assert_eq!(group_order(&m), before, "unknown MUST 維持中性序");
+        // 從**已浮頂**的狀態降級成 unknown 也要回中性序（stale 那一幀走的
+        // 正是這條路：畫面已改說 unknown，排序不得繼續替舊事實背書）
+        let mut m2 = triage_model();
+        apply_triage(
+            &mut m2,
+            &live_of(&["%1", "%3"]),
+            &blockers_of(&[("%2", Blocker::Prompt)]),
+        );
+        assert!(!group_order(&m2)[0].contains("a1"), "前提：已經浮頂");
+        apply_triage(&mut m2, &LiveIndex::unknown(), &BlockerIndex::unknown());
+        assert_eq!(group_order(&m2), before, "降級後 MUST 回中性序");
+        for wi in 0..m.workers.len() {
+            assert_eq!(
+                worker_severity(&m, wi, &LiveIndex::unknown(), &BlockerIndex::unknown()),
+                Severity::None,
+                "unknown 不是異常"
+            );
+        }
+    }
+
+    /// severity 的三個判準各自獨立且定序（`Blocked > Dead > Failed > None`）。
+    #[test]
+    fn severity_ranks_blocked_above_dead_above_failed() {
+        let mut m = triage_model();
+        // c1 的最近一輪任務收在 failed（純磁碟軸，與 tmux 無關）
+        m.recent = vec![InFlight {
+            id: "20260801T000000Z-zzzz".to_string(),
+            created_at: "2026-08-01T00:00:00Z".to_string(),
+            from: "boss".to_string(),
+            to: "c1".to_string(),
+            status: "failed".to_string(),
+        }];
+        let live = live_of(&["%1", "%2", "%3"]);
+        assert_eq!(
+            worker_severity(&m, 2, &live, &blockers_of(&[])),
+            Severity::Failed
+        );
+        // 同一列再加上 dead／blocked：高的贏
+        assert_eq!(
+            worker_severity(&m, 2, &live_of(&["%1", "%2"]), &blockers_of(&[])),
+            Severity::Dead,
+            "死活蓋過 failed"
+        );
+        assert_eq!(
+            worker_severity(
+                &m,
+                2,
+                &live_of(&["%1", "%2"]),
+                &blockers_of(&[("%3", Blocker::Prompt)])
+            ),
+            Severity::Blocked,
+            "blocker 蓋過死活"
+        );
+        assert!(Severity::Blocked > Severity::Dead);
+        assert!(Severity::Dead > Severity::Failed);
+        assert!(Severity::Failed > Severity::None);
+    }
+
+    /// 組標頭徽章數的是**畫得出來的**成員：篩選中不得與括號裡的數字打架。
+    #[test]
+    fn group_badges_count_only_what_the_filter_left() {
+        let m = triage_model();
+        let live = live_of(&["%1", "%2"]);
+        let bl = blockers_of(&[("%2", Blocker::Prompt)]);
+        let all = group_visible_severities(&m, &Filter::default(), &live, &bl);
+        let total: usize = all.values().map(|c| c.blocked + c.dead + c.failed).sum();
+        assert_eq!(total, 2, "全體：一個 blocked、一個 dead");
+
+        let f = Filter {
+            query: "a1".into(),
+        };
+        let filtered = group_visible_severities(&m, &f, &live, &bl);
+        let total: usize = filtered.values().map(|c| c.blocked + c.dead + c.failed).sum();
+        assert_eq!(total, 0, "篩掉之後徽章 MUST 一起消失：{filtered:?}");
+    }
+
+    // ---- P5.4：blocker snippet ----
+
+    /// snippet **只在升旗時留著**：去抖期間（畫面說沒有 blocker）不顯示、
+    /// 降旗即清、整層 unknown 也清。
+    #[test]
+    fn a_snippet_only_survives_while_its_flag_is_up() {
+        let lines = vec!["Do you want to proceed?".to_string(), "> 1. Yes".to_string()];
+        let fresh = || HashMap::from([("%1".to_string(), lines.clone())]);
+
+        let mut s = Snippets::default();
+        // 升旗：留著
+        s.apply(fresh(), &blockers_of(&[("%1", Blocker::Prompt)]));
+        assert_eq!(s.get("%1").map(|v| v.len()), Some(2));
+
+        // 去抖期間：這一輪 probe 命中，但顯示層還是 none → 不得先於判定顯示
+        let mut s2 = Snippets::default();
+        s2.apply(fresh(), &blockers_of(&[("%1", Blocker::None)]));
+        assert_eq!(s2.get("%1"), None, "去抖未升旗 MUST NOT 顯示框內容");
+
+        // 降旗即清：下一輪沒命中（沒有新 snippet），顯示層轉 none
+        s.apply(HashMap::new(), &blockers_of(&[("%1", Blocker::None)]));
+        assert_eq!(s.get("%1"), None, "降旗 MUST 清掉舊框");
+        assert_eq!(s.len(), 0, "不得留下無主的快取");
+
+        // 整層 unknown（tmux 停擺）：舊框同樣不得替「現在被擋住」背書
+        let mut s3 = Snippets::default();
+        s3.apply(fresh(), &blockers_of(&[("%1", Blocker::Prompt)]));
+        s3.apply(HashMap::new(), &BlockerIndex::unknown());
+        assert_eq!(s3.get("%1"), None, "unknown MUST 清掉舊框");
+    }
+
+    /// snippet 與 blocker 判定**同一輪、同一份畫面**產生（零新增 tmux 查詢的
+    /// 前提）：`Prompt` 必有內容，其餘三態必無。
+    #[test]
+    fn the_probe_returns_the_snippet_from_the_same_capture() {
+        let prompt = "Do you want to proceed?\n> 1. Yes\n  4. No\n\nesc to cancel";
+        let cases = [
+            (Some(false), Some(prompt), Blocker::Prompt, true),
+            (Some(false), Some("idle output"), Blocker::None, false),
+            (Some(true), Some(prompt), Blocker::Occluded, false),
+            (Some(false), None, Blocker::Unknown, false),
+        ];
+        for (in_mode, screen, want, has_snip) in cases {
+            let tmux = BlockerTmux { in_mode, screen };
+            let (b, snip) = blocker_probe(&tmux, "%1");
+            assert_eq!(b, want, "in_mode={in_mode:?} screen={screen:?}");
+            assert_eq!(
+                snip.is_some(),
+                has_snip,
+                "只有 Prompt 那一支有框內容：{b:?}"
+            );
+        }
+        // 索引層同樣同源
+        let tmux = BlockerTmux {
+            in_mode: Some(false),
+            screen: Some(prompt),
+        };
+        let (idx, snips) = BlockerIndex::query_with_snippets(&tmux, &["%1".to_string()]);
+        assert_eq!(idx.get("%1"), Blocker::Prompt);
+        assert!(snips.contains_key("%1"), "命中的 pane MUST 有框內容");
     }
 }

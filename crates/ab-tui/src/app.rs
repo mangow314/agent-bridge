@@ -907,7 +907,7 @@ enum Move {
     By(i64),
     /// WORKERS 欄的翻頁：位移量是**一個 viewport 的 rendered lines**，不是
     /// 「幾列」——組標頭佔行不佔列，把行高直接當列數會永久跳過某些列
-    /// （切片 B1 修正輪 G2）。TASKS 欄沒有標頭，行＝列，仍走 `By`
+    /// （切片 B1 修正輪 G2）
     Page {
         lines: usize,
         down: bool,
@@ -916,11 +916,11 @@ enum Move {
     Last,
 }
 
-/// 當前焦點面板的一頁是幾列（PgUp／PgDn 的位移量）。
+/// 當前焦點面板的一頁是幾**行**（viewport 的可視行數）。
 ///
 /// 至少 1：畫面被壓到連一列都放不下時，翻頁仍要能動一列，不然那兩個鍵在窄
 /// 畫面上會變成啞鍵。
-fn page_len(app: &App) -> i64 {
+fn page_lines(app: &App) -> i64 {
     let h = match app.panel {
         Panel::Workers => app.pages.workers,
         Panel::Tasks => app.pages.tasks,
@@ -928,14 +928,24 @@ fn page_len(app: &App) -> i64 {
     i64::from(h).max(1)
 }
 
-/// 翻頁的位移方式：WORKERS 走行號換算（組標頭），TASKS 行＝列直接位移。
+/// 翻頁的位移方式：WORKERS 走行號換算（組標頭佔行不佔列），TASKS 是平坦
+/// 列表、行數／列數只差一個固定行高。
+///
+/// **TASKS 這一支 MUST 除以行高**（跨廠複核 2026-08-05 finding 3）：P5.3 讓
+/// TASKS 也變成兩行列之後，把「可視行數」直接當成「跳幾列」會一次跳過兩倍
+/// 的列——viewport 8 行（＝4 列）、9 筆任務時，PgDn 把 `task_idx` 從 0 推到
+/// 8，中間的第 4 列永遠走不到。行與列兩種單位只要有一處混用，症狀就是靜默
+/// 跳列（同 P5.1 捲軸那次的族群）。
 fn page_move(app: &App, down: bool) -> Move {
     match app.panel {
         Panel::Workers => Move::Page {
-            lines: page_len(app) as usize,
+            lines: page_lines(app) as usize,
             down,
         },
-        Panel::Tasks => Move::By(if down { page_len(app) } else { -page_len(app) }),
+        Panel::Tasks => {
+            let rows = (page_lines(app) / crate::model::TASK_ROW_H as i64).max(1);
+            Move::By(if down { rows } else { -rows })
+        }
     }
 }
 
@@ -991,6 +1001,7 @@ mod tests {
                     ready: "ready".into(),
                     spawn_tag: "t-gen1".into(),
                     registered_at: "2026-07-31T00:00:00Z".into(),
+                    spawned_at: String::new(),
                     spawned: true,
                     corrupt: false,
                     // P4.7 切片 A：lineage 兩欄對這些 fixture 無關（None＝欄位缺席）
@@ -1005,6 +1016,7 @@ mod tests {
                     ready: "ready".into(),
                     spawn_tag: "t-gen1".into(),
                     registered_at: "2026-07-31T00:00:00Z".into(),
+                    spawned_at: String::new(),
                     spawned: true,
                     corrupt: false,
                     // P4.7 切片 A：lineage 兩欄對這些 fixture 無關（None＝欄位缺席）
@@ -1734,6 +1746,7 @@ mod tests {
                 ready: "ready".into(),
                 spawn_tag: "t-gen1".into(),
                 registered_at: "2026-07-31T00:00:00Z".into(),
+                spawned_at: String::new(),
                 spawned: true,
                 corrupt: false,
                 // P4.7 切片 A：lineage 兩欄對這些 fixture 無關（None＝欄位缺席）
@@ -1779,6 +1792,7 @@ mod tests {
                     ready: "ready".into(),
                     spawn_tag: (*tag).into(),
                     registered_at: "2026-07-31T00:00:00Z".into(),
+                    spawned_at: String::new(),
                     spawned: true,
                     corrupt: false,
                     lineage_root: Some(root.to_string()),
@@ -1898,6 +1912,7 @@ mod tests {
                     ready: "ready".into(),
                     spawn_tag: tag.into(),
                     registered_at: "2026-07-31T00:00:00Z".into(),
+                    spawned_at: String::new(),
                     spawned: true,
                     corrupt: false,
                     // P4.7 切片 A：lineage 兩欄對這些 fixture 無關（None＝欄位缺席）
@@ -1958,6 +1973,7 @@ mod tests {
                     ready: "ready".into(),
                     spawn_tag: "t-gen1".into(),
                     registered_at: "2026-07-31T00:00:00Z".into(),
+                    spawned_at: String::new(),
                     spawned: true,
                     corrupt: false,
                     // P4.7 切片 A：lineage 兩欄對這些 fixture 無關（None＝欄位缺席）
@@ -1988,6 +2004,7 @@ mod tests {
                         ready: "ready".into(),
                         spawn_tag: tag.clone(),
                         registered_at: "2026-07-31T00:00:00Z".into(),
+                        spawned_at: String::new(),
                         spawned: true,
                         corrupt: false,
                         // 自己就是自己那一組的根（無 parent 的新式列的合法形狀）
@@ -2018,16 +2035,17 @@ mod tests {
         let mut app = App::new();
         app.pages = pages(8, 4);
 
+        // P5.3 兩行列：位移量仍是 8 **行**＝4 個 worker 列（頂行 1,3,5,…）
         handle_key(&mut app, &m, Key::PageDown);
-        assert_eq!(app.row_idx, 8, "一頁＝WORKERS 的可視高度");
+        assert_eq!(app.row_idx, 4, "一頁＝WORKERS 的可視行高（行→列換算後）");
         handle_key(&mut app, &m, Key::PageDown);
-        assert_eq!(app.row_idx, 16);
+        assert_eq!(app.row_idx, 8);
         for _ in 0..10 {
             handle_key(&mut app, &m, Key::PageDown);
         }
         assert_eq!(app.row_idx, 29, "下緣飽和，MUST NOT wrap 回頂端");
         handle_key(&mut app, &m, Key::PageUp);
-        assert_eq!(app.row_idx, 21);
+        assert_eq!(app.row_idx, 25);
         handle_key(&mut app, &m, Key::Home);
         assert_eq!(app.row_idx, 0);
         handle_key(&mut app, &m, Key::PageUp);
@@ -2054,23 +2072,24 @@ mod tests {
     #[test]
     fn paging_across_group_headers_never_skips_a_row() {
         let m = lineages(9);
-        // 行號：標頭 0、row0=1、標頭 2、row1=3、…、row_i = 2i+1
+        // 行號（P5.3 兩行列）：標頭 0、row0=1–2、標頭 3、row1=4–5、…、
+        // row_i 頂行 = 3i+1
         let nof = crate::model::Filter::default();
         assert_eq!(crate::model::worker_line_of(&m, &nof, 0), 1);
-        assert_eq!(crate::model::worker_line_of(&m, &nof, 4), 9);
+        assert_eq!(crate::model::worker_line_of(&m, &nof, 4), 13);
         let mut app = App::new();
         app.pages = pages(8, 8);
 
         handle_key(&mut app, &m, Key::PageDown);
         assert_eq!(
-            app.row_idx, 4,
-            "第一頁畫得下 row 0–3（行 0–7），下一頁 MUST 從 row 4 起"
+            app.row_idx, 3,
+            "第一頁畫得下 row 0–2（行 0–8 露到 row2 頂行），下一頁 MUST 從 row 3 起"
         );
         handle_key(&mut app, &m, Key::PageDown);
-        assert_eq!(app.row_idx, 8);
+        assert_eq!(app.row_idx, 6);
         // 反向對稱：翻回去落在同一批頁首上
         handle_key(&mut app, &m, Key::PageUp);
-        assert_eq!(app.row_idx, 4);
+        assert_eq!(app.row_idx, 3);
         handle_key(&mut app, &m, Key::PageUp);
         assert_eq!(app.row_idx, 0);
     }
@@ -2120,6 +2139,81 @@ mod tests {
         }
     }
 
+    /// n 筆 recent task 的 model（TASKS 欄剛好 n 列，無 worker）。
+    fn recents(n: usize) -> Model {
+        with_groups(Model {
+            groups: Vec::new(),
+            workers: Vec::new(),
+            tasks: Vec::new(),
+            recent: (0..n)
+                .map(|i| InFlight {
+                    id: format!("20260801T0000{i:02}Z-r{i:03}"),
+                    created_at: format!("2026-08-01T00:00:{i:02}Z"),
+                    from: "boss".into(),
+                    to: "w00".into(),
+                    status: "completed".into(),
+                })
+                .collect(),
+            recent_truncated: false,
+        })
+    }
+
+    /// **TASKS 翻頁 MUST NOT 跳列**（跨廠複核 2026-08-05 finding 3 的回歸）。
+    ///
+    /// 失敗情境逐字：TASKS viewport 8 **行**（P5.3 兩行列＝4 列）、9 筆任務。
+    /// 把可視行數直接當成「跳幾列」的話，一次 PgDn 把 `task_idx` 從 0 推到 8
+    /// ——第 4 列在任何一頁上都不會出現（首屏只到第 3 列，新一頁從第 5 列
+    /// 附近起）。既有的 TASKS 翻頁斷言用的是**沒有 recent task** 的 fixture，
+    /// 只驗到 index 仍是 0，因此對這個 bug 是假綠。
+    #[test]
+    fn tasks_paging_moves_by_rows_not_by_lines() {
+        let m = recents(9);
+        let mut app = App::new();
+        app.panel = Panel::Tasks;
+        app.pages = pages(8, 8);
+
+        handle_key(&mut app, &m, Key::PageDown);
+        assert_eq!(
+            app.task_idx, 4,
+            "一頁＝8 行 ÷ 行高 2 ＝ 4 列（不是 8 列）"
+        );
+        handle_key(&mut app, &m, Key::PageUp);
+        assert_eq!(app.task_idx, 0);
+
+        // 走訪覆蓋：每一列都得在某一頁上出現過
+        for (n, h) in [(9usize, 8u16), (17, 8), (5, 2), (9, 3), (9, 1)] {
+            let m = recents(n);
+            let mut app = App::new();
+            app.panel = Panel::Tasks;
+            app.pages = pages(h, h);
+            let per = (usize::from(h) / crate::model::TASK_ROW_H).max(1);
+            let mut seen = vec![false; n];
+            let mut mark = |app: &App| {
+                // 該頁可見的列＝以選取列為底、往上 per−1 列
+                let top = app.task_idx.saturating_sub(per - 1);
+                for s in &mut seen[top..=app.task_idx] {
+                    *s = true;
+                }
+            };
+            mark(&app);
+            for _ in 0..(2 * n + 4) {
+                handle_key(&mut app, &m, Key::PageDown);
+                mark(&app);
+            }
+            assert_eq!(app.task_idx, n - 1, "翻到底（n={n} h={h}）");
+            for _ in 0..(2 * n + 4) {
+                handle_key(&mut app, &m, Key::PageUp);
+                mark(&app);
+            }
+            assert_eq!(app.task_idx, 0, "翻回頂（n={n} h={h}）");
+            let missed: Vec<usize> = (0..n).filter(|&r| !seen[r]).collect();
+            assert!(
+                missed.is_empty(),
+                "n={n} h={h}：這些列在任何一頁上都沒出現過 {missed:?}"
+            );
+        }
+    }
+
     /// 列數**不足一頁**時，翻頁等於到底／到頂（不越界）。
     #[test]
     fn page_keys_on_a_short_list_land_on_the_edges() {
@@ -2158,6 +2252,7 @@ mod tests {
         let mut app = App::new();
         app.pages = pages(8, 4);
         handle_key(&mut app, &m, Key::PageDown);
+        let before = app.row_idx;
         let Some(Row::Worker(wi)) = app.selected_row(&m) else {
             panic!("應選在 worker 列");
         };
@@ -2182,6 +2277,7 @@ mod tests {
                 ready: "ready".into(),
                 spawn_tag: "t-gen1".into(),
                 registered_at: "2026-07-31T00:00:00Z".into(),
+                spawned_at: String::new(),
                 spawned: true,
                 corrupt: false,
                 // P4.7 切片 A：lineage 兩欄對這些 fixture 無關（None＝欄位缺席）
@@ -2191,7 +2287,7 @@ mod tests {
         );
         let m2 = with_groups(m2);
         app.relocate(&m2);
-        assert_eq!(app.row_idx, 9, "列序後移一格");
+        assert_eq!(app.row_idx, before + 1, "列序後移一格");
         let Some(Row::Worker(wi2)) = app.selected_row(&m2) else {
             panic!("仍應在 worker 列");
         };

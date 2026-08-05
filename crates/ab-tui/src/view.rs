@@ -21,10 +21,13 @@ use ratatui::widgets::{
 use crate::action::{cancel_cmdline, evidence};
 use crate::app::{App, EnterAct, Panel, Sel};
 use crate::model::{
-    Blocker, BlockerIndex, DISK_STALE, Freshness, LiveIndex, Liveness, Model, Row,
-    STANDALONE_LABEL, TMUX_STALE, age_is_worth_showing, breadcrumb, breadcrumb_line,
-    breadcrumb_line_fit, group_label, group_line_offsets, group_visible_members, origin_label,
-    pane_liveness, window_detail, worker_line_of,
+    Activity, Blocker, BlockerIndex, DISK_STALE, Freshness, LiveIndex, Liveness, Model, Row,
+    STANDALONE_LABEL, Severity, Snippets, Summaries, TMUX_STALE, age_is_worth_showing, breadcrumb,
+    breadcrumb_line, breadcrumb_line_fit, event_ago, event_word, fmt_elapsed, fmt_secs,
+    TASK_ROW_H, group_label, group_line_offsets, group_visible_members, group_visible_severities,
+    origin_label, pane_liveness, pane_location_label, row_height, scrub_for_display,
+    truncate_with_ellipsis, window_detail, worker_activity, worker_line_of, worker_lines_total,
+    worker_severity,
 };
 use crate::theme;
 
@@ -41,18 +44,12 @@ const DETAIL_W: u16 = 43 + 2;
 /// 兩欄並排（中欄＋DETAIL）的最小寬。ORIGINS 退場後少了 24 欄，同一台 80 欄
 /// 終端機因此更容易走得進並排版面
 const TWO_COL_MIN_W: u16 = MID_MIN_W + DETAIL_W;
-/// 底條模式下 DETAIL 的高度。由**最長的那一種選取**回推，而不是照 task 那
-/// 一種抓個大概——DETAIL 的等價 CLI 原文是薄殼原則的憑證（見 `layout`），
-/// 少一行就等於畫面上沒有那條命令。
-///
-/// - worker：name／pane／runtime／ready／lineage／origin／state＋blocker ＝8
-///   ＋空行＋`evidence:`＋1 條命令 ＝**11**
-/// - task：task-id／from／to／status／pane／blocker ＝6
-///   ＋空行＋`evidence:`＋2 條命令 ＝10
-///
-/// 取 11＋上下邊框＝13。（P4.7 切片 B2 從 11 調上來：breadcrumb 那一列把
-/// worker 這一支推長了一行，而舊值連調整前的 `evidence:` 都已經壓在邊界上。）
-const DETAIL_STRIP_H: u16 = 13;
+/// 底條模式下 DETAIL 的高度（P5.3 裁定 4：**compact 摘要條**，取代 P4.7 的
+/// 13 行全欄位版）。內容恰兩行：單行摘要（who／blocker／task／elapsed 擇要）
+/// ＋一條**完整的**等價 CLI 原文——薄殼憑證守的是「命令不得截半條」，compact
+/// 犧牲的是欄位行數不是命令完整性；全欄位要看就把終端拉寬（wide 模式 DETAIL
+/// 不受影響）。
+const DETAIL_STRIP_H: u16 = 4;
 /// DETAIL 各列的 label 寬（`lineage: ` 等，冒號後一個空格）。breadcrumb 收縮
 /// 時要從可用欄寬裡先扣掉它。
 const LINEAGE_LABEL_W: usize = 9;
@@ -64,6 +61,8 @@ const WARN_ROWS: usize = 3;
 /// ——PgUp／PgDn 的一頁是「該面板的可視高度」，兩邊各算一份就會在窄畫面下
 /// 各說各話（切片 C）。
 struct Areas {
+    /// 頂部聚合 stat header（P5.3 裁定 7 的 B）：一行、無框、不可選取。
+    header: Rect,
     workers: Rect,
     tasks: Rect,
     detail: Rect,
@@ -90,7 +89,8 @@ fn footer_rows(warnings: usize, extra: usize) -> u16 {
 }
 
 fn layout(area: Rect, warnings: usize, extra: usize) -> Areas {
-    let [main, footer] = Layout::vertical([
+    let [header, main, footer] = Layout::vertical([
+        Constraint::Length(1),
         Constraint::Min(3),
         Constraint::Length(footer_rows(warnings, extra)),
     ])
@@ -104,23 +104,38 @@ fn layout(area: Rect, warnings: usize, extra: usize) -> Areas {
     // 底條**，而不是壓縮任何一方。80 欄下底條有整整 78 欄，命令原文照樣成行；
     // 犧牲的只是垂直空間，那是列表捲動本來就處理得了的。
     let strip = main.width < TWO_COL_MIN_W;
-    let (mid, detail) = if !strip {
+    if !strip {
         let [m, d] = Layout::horizontal([Constraint::Min(MID_MIN_W), Constraint::Length(DETAIL_W)])
             .areas(main);
-        (m, d)
+        let [workers, tasks] =
+            Layout::vertical([Constraint::Percentage(50), Constraint::Percentage(50)]).areas(m);
+        Areas {
+            header,
+            workers,
+            tasks,
+            detail: d,
+            footer,
+            detail_strip: false,
+        }
     } else {
-        let [m, d] =
-            Layout::vertical([Constraint::Min(6), Constraint::Length(DETAIL_STRIP_H)]).areas(main);
-        (m, d)
-    };
-    let [workers, tasks] =
-        Layout::vertical([Constraint::Percentage(50), Constraint::Percentage(50)]).areas(mid);
-    Areas {
-        workers,
-        tasks,
-        detail,
-        footer,
-        detail_strip: strip,
+        // 直向堆疊配比（P5.3 裁定 4，修 known gap #3）：triage 主體優先——
+        // WORKERS 吃掉大部分伸縮空間，DETAIL 壓成固定高度的摘要條（compact
+        // 呈現見 `render_detail`）。舊配比讓 DETAIL 拿 13 行、WORKERS 剩 1 行
+        // 可視列，主從是反的。
+        let [workers, tasks, detail] = Layout::vertical([
+            Constraint::Fill(5),
+            Constraint::Fill(2),
+            Constraint::Length(DETAIL_STRIP_H),
+        ])
+        .areas(main);
+        Areas {
+            header,
+            workers,
+            tasks,
+            detail,
+            footer,
+            detail_strip: true,
+        }
     }
 }
 
@@ -137,6 +152,9 @@ pub fn panel_heights(area: Rect, warnings: usize, extra: usize) -> crate::app::P
     }
 }
 
+// P5.3 起簽名多了 `sums`／`now_epoch`（摘要快取與注入時鐘，兩者都是「render
+// 不得自己去問磁碟／牆鐘」的直接後果）——參數多一個是那條紀律的代價
+#[allow(clippy::too_many_arguments)]
 pub fn render(
     f: &mut Frame,
     model: &Model,
@@ -144,6 +162,9 @@ pub fn render(
     blockers: &BlockerIndex,
     app: &App,
     fresh: Freshness,
+    sums: &Summaries,
+    snippets: &Snippets,
+    now_epoch: i64,
 ) {
     let a = layout(
         f.area(),
@@ -152,9 +173,21 @@ pub fn render(
     );
     let (workers_area, tasks_area, detail_area, footer) = (a.workers, a.tasks, a.detail, a.footer);
 
-    render_workers(f, workers_area, model, live, blockers, app);
-    render_tasks(f, tasks_area, model, app);
-    render_detail(f, detail_area, model, live, blockers, app, a.detail_strip);
+    render_header(f, a.header, model, live, blockers);
+    render_workers(f, workers_area, model, live, blockers, app, sums, now_epoch);
+    render_tasks(f, tasks_area, model, app, sums, now_epoch);
+    render_detail(
+        f,
+        detail_area,
+        model,
+        live,
+        blockers,
+        app,
+        a.detail_strip,
+        sums,
+        snippets,
+        now_epoch,
+    );
     render_footer(f, footer, model, app, blockers, fresh);
 
     // overlay 優先序：確認框（cancel／evict）> 全文 pager > 摘要頁 >
@@ -178,6 +211,92 @@ fn sel_prefix(selected: bool) -> &'static str {
     if selected { "▶ " } else { "  " }
 }
 
+/// task status → 列 glyph（WORKERS 第二行與 TASKS 列共用**同一份**——兩處
+/// 各抄一張表就會在新增狀態時漂移）。glyph 與權威字同一語意軸、同色；
+/// 它是裝飾，不取代狀態字。
+fn status_glyph(status: &str) -> &'static str {
+    match status {
+        "completed" => "✓",
+        "failed" => "✗",
+        "cancelled" => "-",
+        _ => "⚙",
+    }
+}
+
+/// 頂部聚合 stat header（P5.3 裁定 7 的 B）：`workers N` ＋各軸計數。
+///
+/// 計數**一律取自 model 全池**，與列表的 filter／捲動解耦（gate f）——它回答
+/// 「整體健不健康」，被篩掉的 worker 也算。各桶屬**不同的軸**（activity／
+/// blocker／liveness／最近終態），同一 worker 可同時進多桶（running 且
+/// blocked 正是最要看的那種），加總**不必**等於 workers 總數。freshness 角標
+/// 留在 footer（既有位置），不重複印。
+fn render_header(
+    f: &mut Frame,
+    area: Rect,
+    model: &Model,
+    live: &LiveIndex,
+    blockers: &BlockerIndex,
+) {
+    let mut running = 0usize;
+    let mut idle = 0usize;
+    let mut failed = 0usize;
+    let mut dead = 0usize;
+    let mut blocked = 0usize;
+    for (wi, w) in model.workers.iter().enumerate() {
+        match worker_activity(model, wi) {
+            Activity::Current(_) => running += 1,
+            Activity::Idle { last, .. } => {
+                idle += 1;
+                if let Some(ri) = last
+                    && model.recent[ri].status == "failed"
+                {
+                    failed += 1;
+                }
+            }
+        }
+        if pane_liveness(live, &w.pane) == Liveness::Dead {
+            dead += 1;
+        }
+        if blockers.get(&w.pane) == Blocker::Prompt {
+            blocked += 1;
+        }
+    }
+    let mut spans = vec![Span::raw(format!(" workers {}", model.workers.len()))];
+    let push = |spans: &mut Vec<Span<'static>>, text: String, style: Option<ratatui::style::Style>| {
+        spans.push(Span::raw(" │ "));
+        spans.push(match style {
+            Some(s) => Span::styled(text, s),
+            None => Span::raw(text),
+        });
+    };
+    push(
+        &mut spans,
+        format!("⚙ running {running}"),
+        Some(theme::status_style("running")),
+    );
+    // 桶名用 `prompt`（blocker 軸的正名）而非 `blocked`：後者與 WORKERS 列的
+    // `⛔blocked` 標記字面相同，會攪渾字元層斷言的定位（且 task status 沒有
+    // blocked 這個詞，§2 的顯示紀律）
+    push(
+        &mut spans,
+        format!("⛔ prompt {blocked}"),
+        theme::blocker_style(Blocker::Prompt),
+    );
+    push(
+        &mut spans,
+        format!("✗ dead {dead}"),
+        Some(theme::liveness_style(Liveness::Dead)),
+    );
+    push(
+        &mut spans,
+        format!("✗ failed {failed}"),
+        Some(theme::status_style("failed")),
+    );
+    push(&mut spans, format!("idle {idle}"), None);
+    f.render_widget(Paragraph::new(Line::from(spans)), area);
+}
+
+#[allow(clippy::too_many_arguments)]
 fn render_workers(
     f: &mut Frame,
     area: Rect,
@@ -185,6 +304,8 @@ fn render_workers(
     live: &LiveIndex,
     blockers: &BlockerIndex,
     app: &App,
+    sums: &Summaries,
+    now_epoch: i64,
 ) {
     let focused = app.panel == Panel::Workers;
     let rows = app.rows(model);
@@ -192,21 +313,47 @@ fn render_workers(
     let heads = group_line_offsets(model, &app.filter);
     // 標頭的括號數字算**畫得出來的**那些（過濾中 `members.len()` 會說謊）
     let visible = group_visible_members(model, &app.filter);
+    // 組標頭的異常徽章（P5.4）：同一趟走訪的計數
+    let badges = group_visible_severities(model, &app.filter, live, blockers);
     let mut lines = Vec::new();
     for (i, row) in rows.iter().enumerate() {
         // 這一列是某組的第一個成員 → 先畫該組的標頭
         if let Some(gi) = heads.get(&i) {
             let g = &model.groups[*gi];
-            // **標頭不上任何語意色**：組是分類不是狀態，染色會與 status／
-            // liveness 搶同一份注意力，而它一格狀態資訊都沒有多給
-            lines.push(Line::from(Span::raw(format!(
+            // **標頭本身不上語意色**：組是分類不是狀態，整條染色會與 status／
+            // liveness 搶同一份注意力，而它一格狀態資訊都沒有多給。
+            let mut head = vec![Span::raw(format!(
                 "{} ({})",
                 group_label(model, g),
                 visible.get(gi).copied().unwrap_or(g.members.len())
-            ))));
+            ))];
+            // 但**摺線以下的異常要在標頭上說出來**（P5.4）：組浮到最上面之後，
+            // 若組標頭不說「為什麼浮上來」，排序就成了沒有理由的位移。徽章沿用
+            // 既有 glyph 與語意色，數的是**畫得出來的**成員（與括號數字同一個
+            // 集合，篩選中不會自相矛盾）
+            let c = badges.get(gi).copied().unwrap_or_default();
+            let mut badge = |n: usize, glyph: &str, style: Option<ratatui::style::Style>| {
+                if n == 0 {
+                    return;
+                }
+                head.push(Span::raw("  "));
+                let text = format!("{glyph}{n}");
+                head.push(match style {
+                    Some(s) => Span::styled(text, s),
+                    None => Span::raw(text),
+                });
+            };
+            badge(c.blocked, "⛔", theme::blocker_style(Blocker::Prompt));
+            badge(
+                c.dead,
+                "✗",
+                Some(theme::liveness_style(Liveness::Dead)),
+            );
+            badge(c.failed, "✗", Some(theme::status_style("failed")));
+            lines.push(Line::from(head));
         }
         let selected = focused && i == app.row_idx;
-        let spans = match *row {
+        match *row {
             Row::Worker(wi) => {
                 let w = &model.workers[wi];
                 let rt = if w.runtime.is_empty() {
@@ -221,16 +368,27 @@ fn render_workers(
                     Liveness::Unknown => "  ?",
                 };
                 let b = blockers.get(&w.pane);
-                // 前段（名稱／runtime／pane／ready）不帶語意色；死活與 blocker
-                // 各自成 Span 上色。三段接起來與原本那個 format! 逐字相同
-                let mut v = vec![Span::raw(format!(
-                    "{}▸ {}  {}  {}  {}",
-                    sel_prefix(selected),
-                    w.name,
-                    rt,
-                    if w.pane.is_empty() { "-" } else { &w.pane },
-                    w.ready,
-                ))];
+                // pane 欄升級為 location（P5.3 裁定 8）：`session:window-name
+                // %pane`；快照查不到（dead／unknown／tmux 失聯）退回裸 pane id
+                let pane_disp = if w.pane.is_empty() { "-" } else { &w.pane };
+                let where_disp = match pane_location_label(live, &w.pane) {
+                    Some(loc) => format!("{loc} {pane_disp}"),
+                    None => pane_disp.to_string(),
+                };
+                // 前段（名稱／runtime／位置／ready）不帶語意色；死活與 blocker
+                // 各自成 Span 上色。有異常的那幾列名稱走 BOLD（P5.4）——與組間
+                // 浮頂是同一件事的兩種表達：排序說「先看這一組」，粗體說「組裡
+                // 是這幾個」。**只加粗不上色**（見 `theme::attention_style`）
+                let attention = worker_severity(model, wi, live, blockers) != Severity::None;
+                let mut v = vec![
+                    Span::raw(format!("{}▸ ", sel_prefix(selected))),
+                    if attention {
+                        Span::styled(w.name.clone(), theme::attention_style())
+                    } else {
+                        Span::raw(w.name.clone())
+                    },
+                    Span::raw(format!("  {}  {}  {}", rt, where_disp, w.ready)),
+                ];
                 if !alive.is_empty() {
                     v.push(Span::styled(alive, theme::liveness_style(l)));
                 }
@@ -241,19 +399,27 @@ fn render_workers(
                         None => Span::raw(mark),
                     });
                 }
-                v
+                lines.push(styled(v, selected));
+                // 第二行（P5.3 兩行列）：活動摘要。行高恆為 2
+                // （`model::row_height` 的前提），空摘要也佔行
+                lines.push(styled(
+                    worker_second_line(model, sums, wi, now_epoch, area.width),
+                    selected,
+                ));
             }
             Row::Task { task, .. } => {
                 let t = &model.tasks[task];
                 // status 是權威字（queued/delivered/running），不縮寫不造詞。
                 // 縮排只留 `└ `：中欄最窄（MID_MIN_W）時 task id 仍要整條進得去
-                vec![
-                    Span::raw(format!("{}└ {}  ", sel_prefix(selected), t.id)),
-                    Span::styled(t.status.clone(), theme::status_style(&t.status)),
-                ]
+                lines.push(styled(
+                    vec![
+                        Span::raw(format!("{}└ {}  ", sel_prefix(selected), t.id)),
+                        Span::styled(t.status.clone(), theme::status_style(&t.status)),
+                    ],
+                    selected,
+                ));
             }
         };
-        lines.push(styled(spans, selected));
     }
     if rows.is_empty() {
         // 空的原因有兩種，畫面要說得出是哪一種：一個都沒註冊，還是被 filter
@@ -297,8 +463,14 @@ fn render_workers(
     // 同一個值**，包含無選取那一輪的落點（`worker_line_of` 查不到就退回
     // `row_idx`）——這裡另發明一個 fallback 的話，thumb 會指到畫面沒有捲到的
     // 位置，而那正是捲軸唯一的用途。
-    let lines_total = rows.len() + heads.len();
-    let line = worker_line_of(model, &app.filter, app.row_idx);
+    let lines_total = worker_lines_total(model, &app.filter);
+    // 兩行列（P5.3）：捲動保證選取列**整列**可見——餵**底行**行號
+    // （頂行＋行高−1）；viewport ≥ 行高時頂行必然一起在窗內
+    let sel_h = rows
+        .get(app.row_idx)
+        .map(|r| row_height(*r))
+        .unwrap_or(1);
+    let line = worker_line_of(model, &app.filter, app.row_idx) + sel_h - 1;
     // 捲軸與內容吃同一個視窗起點——分開算兩次的話，thumb 會指到畫面沒捲到的位置
     let offset = scroll_offset(line, area);
     let block = panel_block(&title, focused);
@@ -306,36 +478,135 @@ fn render_workers(
     render_scrollbar(f, area, lines_total, offset as usize);
 }
 
+/// WORKERS 兩行列的第二行（P5.3）。
+///
+/// - 忙碌：`⚙ <權威字> <elapsed> · <request 首行>`——glyph＋權威字同
+///   status 色；首行是使用者內容（已於 ingest 淨化），截斷不換行（行高
+///   固定 2 是行號會計的前提）。
+/// - 閒置：`idle <時長> · last: <事件> <ago>`；最近任務進 failed 終態時改為
+///   `✗ failed <ago> · <its 首行>`——那是 attention 的素材，但只上 status
+///   語意色，不預選、不暗示可回收（§5）。
+fn worker_second_line(
+    model: &Model,
+    sums: &Summaries,
+    wi: usize,
+    now_epoch: i64,
+    panel_w: u16,
+) -> Vec<Span<'static>> {
+    // 4＝縮排（selection 欄 2＋glyph 欄 2）；2＝邊框；1＝捲軸欄
+    let budget = (panel_w as usize).saturating_sub(4 + 2 + 1);
+    let fit = |prefix_w: usize, s: &str| truncate_with_ellipsis(s, budget.saturating_sub(prefix_w));
+    match worker_activity(model, wi) {
+        Activity::Current(ti) => {
+            let t = &model.tasks[ti];
+            let head = format!("{} {}", status_glyph(&t.status), t.status);
+            let tail = format!(
+                " {} · {}",
+                fmt_elapsed(&t.created_at, now_epoch),
+                sums.first_line(&t.id)
+            );
+            vec![
+                Span::raw("    "),
+                Span::styled(head.clone(), theme::status_style(&t.status)),
+                Span::raw(fit(head.chars().count(), &tail)),
+            ]
+        }
+        Activity::Idle { since, last } => {
+            if let Some(ri) = last {
+                let t = &model.recent[ri];
+                if t.status == "failed" {
+                    let ago = event_ago(sums.last_event(&t.id), now_epoch)
+                        .map(|a| format!("{a} ago"))
+                        .unwrap_or_else(|| "-".to_string());
+                    let tail = format!(" {ago} · {}", sums.first_line(&t.id));
+                    return vec![
+                        Span::raw("    "),
+                        Span::styled("✗ failed".to_string(), theme::status_style("failed")),
+                        Span::raw(fit("✗ failed".chars().count(), &tail)),
+                    ];
+                }
+            }
+            let dur = match since {
+                Some(s) if now_epoch >= s => fmt_secs(now_epoch - s),
+                _ => "-".to_string(),
+            };
+            let last_desc = last
+                .map(|ri| {
+                    let ev = sums.last_event(&model.recent[ri].id);
+                    match (event_word(ev), event_ago(ev, now_epoch)) {
+                        (Some(w), Some(a)) => format!("{w} {a} ago"),
+                        (Some(w), None) => w.to_string(),
+                        _ => "-".to_string(),
+                    }
+                })
+                .unwrap_or_else(|| "-".to_string());
+            vec![Span::raw(format!(
+                "    {}",
+                fit(0, &format!("idle {dur} · last: {last_desc}"))
+            ))]
+        }
+    }
+}
+
 /// TASKS 欄（§2）：**全 pool** 的任務平坦列表（P4.7 切片 B1 起不再依 owner
 /// 過濾——過濾軸隨 ORIGINS 面板一起退場），**含終態**，id 反序。沒有這一欄，
 /// 畫面上就沒有 `r` 讀得動的任務（read 只對 completed／failed 合法）。
-fn render_tasks(f: &mut Frame, area: Rect, model: &Model, app: &App) {
+fn render_tasks(
+    f: &mut Frame,
+    area: Rect,
+    model: &Model,
+    app: &App,
+    sums: &Summaries,
+    now_epoch: i64,
+) {
     let focused = app.panel == Panel::Tasks;
     let rows = app.task_rows(model);
     let mut lines = Vec::new();
     for (i, &ti) in rows.iter().enumerate() {
         let selected = focused && i == app.task_idx;
+        let before = lines.len();
         let t = &model.recent[ti];
-        // status 一律權威字（completed/failed/cancelled/queued/…），glyph 是
-        // 另一軸的裝飾，不取代狀態字
-        let g = match t.status.as_str() {
-            "completed" => "✓",
-            "failed" => "✗",
-            "cancelled" => "-",
-            _ => "⚙",
-        };
-        // glyph 與 status 是**同一個語意軸**（status），同色；中間的 id／to
-        // 不帶語意色。字元序列與原本那個 format! 逐字相同
+        // glyph 抽共用 `status_glyph`（與 WORKERS 第二行同一份表）；glyph 與
+        // status 是**同一個語意軸**（status），同色；中間的 id／to 不帶語意色
+        let g = status_glyph(&t.status);
         let st = theme::status_style(&t.status);
+        // 時間欄（P5.3）：in-flight＝跑了多久（created 起算）；終態＝多久以前
+        // 收場（events.log 尾行時戳）——對 completed/failed，「幾分鐘前結束」
+        // 才是人要的答案，從 created 一直長大的數字是誤導
+        let age = match t.status.as_str() {
+            "completed" | "failed" | "cancelled" => {
+                event_ago(sums.last_event(&t.id), now_epoch)
+                    .map(|a| format!("{a} ago"))
+                    .unwrap_or_else(|| "-".to_string())
+            }
+            _ => fmt_elapsed(&t.created_at, now_epoch),
+        };
         lines.push(styled(
             vec![
                 Span::raw(sel_prefix(selected)),
                 Span::styled(g, st),
                 Span::raw(format!(" {}  {}  ", t.id, t.to)),
                 Span::styled(t.status.clone(), st),
+                Span::raw(format!("  {age}")),
             ],
             selected,
         ));
+        // 第二行（P5.3）：request 首行摘要
+        let budget = (area.width as usize).saturating_sub(4 + 2 + 1);
+        lines.push(styled(
+            vec![Span::raw(format!(
+                "    {}",
+                truncate_with_ellipsis(sums.first_line(&t.id), budget)
+            ))],
+            selected,
+        ));
+        // 行高是**捲動算式與翻頁的前提**：畫出來的行數與 `TASK_ROW_H` 一旦
+        // 不合，症狀是靜默跳列。這裡當場把兩者釘在一起，而不是靠註解約定
+        debug_assert_eq!(
+            lines.len() - before,
+            TASK_ROW_H,
+            "TASKS 每列 MUST 恰畫 TASK_ROW_H 行"
+        );
     }
     if rows.is_empty() {
         // 空的原因有三種，畫面 MUST 說得出是哪一種。**`recent` 本身是空的要
@@ -373,15 +644,17 @@ fn render_tasks(f: &mut Frame, area: Rect, model: &Model, app: &App) {
     // scope 進標題（footer 也印一份）：`s` 切過去之後，畫面上少了一半的列，
     // 人得看得出那是 scope 而不是資料不見了
     let title = format!("TASKS {pos}/{total}{more} [{}]", app.scope.label());
-    // 捲軸與內容吃同一個視窗起點（見 `render_scrollbar`）
-    let offset = scroll_offset(app.task_idx, area);
+    // 兩行列（P5.3）：捲動單位是**行**，選取列的底行＝該列頂行＋行高−1——與
+    // WORKERS 同一條「整列可見」紀律；捲軌總量同單位（P5.1b thumb 追視窗）。
+    // 行高走 `TASK_ROW_H`（單一事實源），不在這裡寫死數字
+    let offset = scroll_offset(app.task_idx * TASK_ROW_H + (TASK_ROW_H - 1), area);
     f.render_widget(
         Paragraph::new(lines)
             .block(panel_block(&title, focused))
             .scroll((offset, 0)),
         area,
     );
-    render_scrollbar(f, area, total, offset as usize);
+    render_scrollbar(f, area, total * TASK_ROW_H, offset as usize);
 }
 
 /// 列表面板的捲軸（P4.6 切片 C 起用於 TASKS，P5.1 起 WORKERS 共用同一份）。
@@ -432,6 +705,7 @@ fn render_scrollbar(f: &mut Frame, area: Rect, total: usize, offset: usize) {
 
 /// DETAIL 欄（§2）：**不可聚焦**，永遠是「當前聚焦面板選中項」的唯讀投影。
 /// evidence 區與 `c` 的 payload 共用 `action::evidence`（白名單同一份來源）。
+#[allow(clippy::too_many_arguments)]
 fn render_detail(
     f: &mut Frame,
     area: Rect,
@@ -440,20 +714,130 @@ fn render_detail(
     blockers: &BlockerIndex,
     app: &App,
     strip: bool,
+    sums: &Summaries,
+    snippets: &Snippets,
+    now_epoch: i64,
 ) {
     let sel = app.selection(model);
+    // 底條 compact（P5.3 裁定 4）：恰兩行——單行摘要＋一條**完整的**等價 CLI
+    // 原文（薄殼憑證守「命令不截半條」；欄位行數讓給 WORKERS，全欄位請拉寬
+    // 終端走 wide 模式）。
+    if strip {
+        let mut lines: Vec<Line> = Vec::new();
+        match &sel {
+            Sel::None => lines.push(Line::from("(nothing selected)")),
+            Sel::Worker(w) => {
+                let mut spans = vec![Span::raw(format!(
+                    "{} {}",
+                    w.name,
+                    if w.pane.is_empty() { "-" } else { &w.pane }
+                ))];
+                let b = blockers.get(&w.pane);
+                if let Some(st) = theme::blocker_style(b) {
+                    spans.push(Span::raw(" · "));
+                    spans.push(Span::styled(blocker_word(b).to_string(), st));
+                }
+                let l = pane_liveness(live, &w.pane);
+                if l == Liveness::Dead {
+                    spans.push(Span::raw(" · "));
+                    spans.push(Span::styled("dead".to_string(), theme::liveness_style(l)));
+                }
+                if let Some(wi) = model.workers.iter().position(|x| std::ptr::eq(x, *w))
+                    && let Activity::Current(ti) = worker_activity(model, wi)
+                {
+                    let t = &model.tasks[ti];
+                    spans.push(Span::raw(format!(" · {} ", t.id)));
+                    spans.push(Span::styled(
+                        t.status.clone(),
+                        theme::status_style(&t.status),
+                    ));
+                    spans.push(Span::raw(format!(
+                        " {}",
+                        fmt_elapsed(&t.created_at, now_epoch)
+                    )));
+                }
+                lines.push(Line::from(spans));
+            }
+            Sel::Task { task, .. } => {
+                lines.push(Line::from(vec![
+                    Span::raw(format!("{} · ", task.id)),
+                    Span::styled(task.status.clone(), theme::status_style(&task.status)),
+                ]));
+            }
+        }
+        if let Some(c) = evidence(&sel)
+            .into_iter()
+            .find(|e| e.starts_with("agent-bridge"))
+        {
+            lines.push(Line::from(format!("$ {c}")));
+        }
+        f.render_widget(
+            Paragraph::new(lines).block(panel_block("DETAIL", false)),
+            area,
+        );
+        return;
+    }
     let mut lines: Vec<Line> = Vec::new();
+    // blocker 框的內容（P5.4）：在 match 裡決定、在 evidence 之後才畫
+    let mut snippet: Option<&[String]> = None;
     match &sel {
         Sel::None => lines.push(Line::from("(nothing selected)")),
         Sel::Worker(w) => {
-            // 底條模式：breadcrumb 必須壓進**一行**（見 `Areas::detail_strip`）
-            let fit = strip.then(|| area.width.saturating_sub(2) as usize);
-            for l in worker_detail(model, w, live, fit) {
+            for l in worker_detail(model, w, live, None) {
                 lines.push(l);
+            }
+            // P5.3 新欄位：當前任務（或最近一輪）＋摘要＋最後事件——沒有它們，
+            // 「這個 worker 在幹嘛」要跳去 TASKS 欄自己拼
+            if let Some(wi) = model.workers.iter().position(|x| std::ptr::eq(x, *w)) {
+                let budget = (area.width as usize).saturating_sub(2 + LINEAGE_LABEL_W);
+                let push_task_lines = |lines: &mut Vec<Line>, id: &str, status: &str, when: String| {
+                    lines.push(Line::from(vec![
+                        Span::raw(format!("task   : {id}  ")),
+                        Span::styled(status.to_string(), theme::status_style(status)),
+                        Span::raw(format!("  {when}")),
+                    ]));
+                    lines.push(Line::from(format!(
+                        "summary: {}",
+                        truncate_with_ellipsis(sums.first_line(id), budget)
+                    )));
+                    let ev = sums.last_event(id);
+                    let desc = match (event_word(ev), event_ago(ev, now_epoch)) {
+                        (Some(w), Some(a)) => format!("{w} {a} ago"),
+                        (Some(w), None) => w.to_string(),
+                        _ => "-".to_string(),
+                    };
+                    lines.push(Line::from(format!("last ev: {desc}")));
+                };
+                match worker_activity(model, wi) {
+                    Activity::Current(ti) => {
+                        let t = &model.tasks[ti];
+                        push_task_lines(
+                            &mut lines,
+                            &t.id,
+                            &t.status,
+                            fmt_elapsed(&t.created_at, now_epoch),
+                        );
+                    }
+                    Activity::Idle { last, .. } => {
+                        if let Some(ri) = last {
+                            let t = &model.recent[ri];
+                            let when = event_ago(sums.last_event(&t.id), now_epoch)
+                                .map(|a| format!("{a} ago"))
+                                .unwrap_or_else(|| "-".to_string());
+                            push_task_lines(&mut lines, &t.id, &t.status, when);
+                        }
+                    }
+                }
             }
             // BLOCKER 是與 ACTIVITY 正交的另一軸（§4 雙軸狀態）：獨立一欄，
             // 不與死活混寫
             lines.push(blocker_line(blockers.get(&w.pane)));
+            // 框內容（P5.4）：**只在真的升旗時**才有東西可畫。它回答的是
+            // 「它在問什麼」——沒有這幾行，人得離開 TUI 去 focus 那個 pane
+            // 才知道。畫在 evidence 之後（見下），等價 CLI 原文的位置不讓
+            snippet = (blockers.get(&w.pane) == Blocker::Prompt)
+                .then(|| snippets.get(&w.pane))
+                .flatten();
         }
         Sel::Task { task, worker } => {
             lines.push(Line::from(format!("task-id: {}", task.id)));
@@ -485,6 +869,19 @@ fn render_detail(
         lines.push(Line::from("evidence:"));
         for c in cmds {
             lines.push(Line::from(format!("  $ {c}")));
+        }
+    }
+    // 框內容排在 evidence **之後**：等價 CLI 原文是薄殼原則的憑證，位置不讓。
+    // 內容是 pane 上的原文（payload 語意）——只淨化控制字元與截寬，不改字。
+    if let Some(snip) = snippet {
+        lines.push(Line::from(""));
+        lines.push(Line::from("prompt:"));
+        let budget = (area.width as usize).saturating_sub(2 + 2);
+        for l in snip {
+            lines.push(Line::from(format!(
+                "  {}",
+                truncate_with_ellipsis(&scrub_for_display(l), budget)
+            )));
         }
     }
     // 窄畫面下**換行而不截斷**：evidence 區的等價 CLI 原文是薄殼原則的憑證
@@ -1286,6 +1683,7 @@ mod tests {
             // **嚴格晚於** registered_at（同秒＝不可證），註冊時間與第一筆
             // task 撞在同一秒的話，內嵌 task 列會整條消失
             registered_at: "2026-07-31T00:00:00Z".to_string(),
+            spawned_at: String::new(),
             spawned,
             corrupt: false,
             // P4.7 切片 A：lineage 兩欄對這些 fixture 無關（None＝欄位缺席）
@@ -1410,6 +1808,13 @@ mod tests {
         draw_at(120, 40, fresh, tweak)
     }
 
+    /// render 測試的固定「現在」：**由呼叫端注入**（P5.3）——elapsed 欄要
+    /// 決定性，牆鐘不得進 render。值選在 fixture 各 task 的 created_at
+    /// （2026-08-01T00:00:0xZ）之後恰一小時，elapsed 字串好心算。
+    fn test_now() -> i64 {
+        ab_core::time::parse_iso_to_epoch("2026-08-01T01:00:00Z").unwrap()
+    }
+
     /// 指定終端機尺寸的版本：窄畫面（DETAIL 走整寬底條）只有這樣才畫得出來。
     fn draw_at(
         w: u16,
@@ -1417,11 +1822,38 @@ mod tests {
         fresh: Freshness,
         tweak: impl FnOnce(&mut Model, &mut App),
     ) -> Buffer {
+        draw_sums(w, h, fresh, &Summaries::default(), tweak)
+    }
+
+    /// 連摘要快取也由呼叫端指定（兩行列的第二行內容要驗得到）。
+    fn draw_sums(
+        w: u16,
+        h: u16,
+        fresh: Freshness,
+        sums: &Summaries,
+        tweak: impl FnOnce(&mut Model, &mut App),
+    ) -> Buffer {
+        draw_snips(w, h, fresh, sums, &Snippets::default(), tweak)
+    }
+
+    /// 連 blocker 框快取也由呼叫端指定（P5.4 snippet 的三態要驗得到）。
+    fn draw_snips(
+        w: u16,
+        h: u16,
+        fresh: Freshness,
+        sums: &Summaries,
+        snips: &Snippets,
+        tweak: impl FnOnce(&mut Model, &mut App),
+    ) -> Buffer {
         let (mut model, live, blockers, mut app) = fixture();
         tweak(&mut model, &mut app);
         let mut t = Terminal::new(TestBackend::new(w, h)).unwrap();
-        t.draw(|f| render(f, &model, &live, &blockers, &app, fresh))
-            .unwrap();
+        t.draw(|f| {
+            render(
+                f, &model, &live, &blockers, &app, fresh, sums, snips, test_now(),
+            )
+        })
+        .unwrap();
         t.backend().buffer().clone()
     }
 
@@ -1430,8 +1862,20 @@ mod tests {
         let (model, live, _, mut app) = fixture();
         tweak(&mut app);
         let mut t = Terminal::new(TestBackend::new(120, 40)).unwrap();
-        t.draw(|f| render(f, &model, &live, &bl, &app, Freshness::default()))
-            .unwrap();
+        t.draw(|f| {
+            render(
+                f,
+                &model,
+                &live,
+                &bl,
+                &app,
+                Freshness::default(),
+                &Summaries::default(),
+                &Snippets::default(),
+                test_now(),
+            )
+        })
+        .unwrap();
         t.backend().buffer().clone()
     }
 
@@ -1646,8 +2090,10 @@ mod tests {
         let tasks_corner = &buf[(0, tasks_top)];
         assert_eq!(tasks_corner.symbol(), "┌");
         assert_eq!(tasks_corner.style().fg, Some(Color::DarkGray));
-        // WORKERS focus：左上角是粗框且帶 BOLD（ORIGINS 退場後中欄從 x=0 起）
-        let workers_corner = &buf[(WORKERS_X0, 0)];
+        // WORKERS focus：左上角是粗框且帶 BOLD（ORIGINS 退場後中欄從 x=0 起；
+        // P5.3 起頂行是 stat header，面板頂由 layout 取，不硬編 0）
+        let workers_top = layout(Rect::new(0, 0, 120, 40), 1, 0).workers.top();
+        let workers_corner = &buf[(WORKERS_X0, workers_top)];
         assert_eq!(workers_corner.symbol(), "┏");
         assert!(workers_corner.style().add_modifier.contains(Modifier::BOLD));
     }
@@ -2072,9 +2518,10 @@ mod tests {
     /// **底條模式**（寬度不足 → DETAIL 走整寬底條）：breadcrumb 與等價 CLI
     /// 原文 MUST 都還在畫面上。
     ///
-    /// 這條在 B2 之前不存在，而 `DETAIL_STRIP_H` 也就沒人守：breadcrumb 讓
-    /// worker 那一支長了一行，舊值 11 會把 `evidence:` 連同命令一起推出畫面
-    /// ——薄殼原則（`layout` 的註解）說那等於畫面上沒有那條命令。
+    /// 底條 compact（P5.3 裁定 4，取代 B2 的 13 行全欄位版）：單行摘要＋一條
+    /// **完整的**等價 CLI 原文。薄殼憑證守的是「命令不截半條」；欄位行數讓給
+    /// WORKERS（known gap #3 的配比反轉修正）；全欄位（含 breadcrumb）是
+    /// wide 模式的內容，不進底條。
     #[test]
     fn the_detail_strip_still_fits_the_breadcrumb_and_the_command() {
         // **會換行的鏈**才驗得到 H3：八代、每個名字 13 欄，整條 125 欄，
@@ -2103,16 +2550,16 @@ mod tests {
         });
         let t = text(&buf);
         assert!(
-            t.contains("lineage: relay-node-01 \u{2192} \u{2026} \u{2192} relay-node-08"),
-            "底條模式的 breadcrumb MUST 收縮成一行（保留 root 與 self）：\n{t}"
+            t.contains("relay-node-08 %8"),
+            "compact 摘要行 MUST 說得出選中者是誰、在哪個 pane：\n{t}"
         );
         assert!(
-            !t.contains("relay-node-01 \u{2192} relay-node-02"),
-            "收縮 MUST 真的發生（整條展開就會換行，把命令推出畫面）：\n{t}"
+            !t.contains("lineage:"),
+            "全欄位（breadcrumb）不進底條——那是 wide 模式的內容：\n{t}"
         );
         assert!(
             t.contains("$ agent-bridge list --long"),
-            "底條模式 MUST 留住等價 CLI 原文（薄殼原則），實際畫面：\n{t}"
+            "底條模式 MUST 留住一條完整的等價 CLI 原文（薄殼原則），實際畫面：\n{t}"
         );
     }
 
@@ -2232,6 +2679,7 @@ mod tests {
             // occl-w 於 2026-08-02 才註冊；這筆 task 是前一天建立的
             m.workers = vec![AgentSnapshot {
                 registered_at: "2026-08-02T00:00:00Z".to_string(),
+                spawned_at: String::new(),
                 ..worker("occl-w", "%5", "codex", "s:@1", true)
             }];
             m.groups = crate::model::group_by_lineage(&m.workers);
@@ -2327,14 +2775,26 @@ mod tests {
         let (model, live, _, mut app) = fixture();
         app.row_idx = ROW_OCCL_W;
         // 快照在**背景 worker 那一側**取得（這一步當然要打 tmux）
-        let bl = BlockerIndex::query(&tmux, &["%5".to_string()]);
+        let bl = BlockerIndex::query_with_snippets(&tmux, &["%5".to_string()]).0;
         let after_query = tmux.0.load(Ordering::SeqCst);
         assert!(after_query > 0, "取快照本來就會打 tmux（對照組）");
 
         let mut t = Terminal::new(TestBackend::new(120, 40)).unwrap();
         for _ in 0..20 {
-            t.draw(|f| render(f, &model, &live, &bl, &app, Freshness::default()))
-                .unwrap();
+            t.draw(|f| {
+                render(
+                    f,
+                    &model,
+                    &live,
+                    &bl,
+                    &app,
+                    Freshness::default(),
+                    &Summaries::default(),
+                    &Snippets::default(),
+                    test_now(),
+                )
+            })
+            .unwrap();
         }
         assert_eq!(
             tmux.0.load(Ordering::SeqCst),
@@ -2388,10 +2848,11 @@ mod tests {
         });
         m.groups = crate::model::group_by_lineage(&m.workers);
         // 列 0/1＝lineage 兩員（前面 1 個標頭）、列 2＝solo（前面 2 個標頭）
+        // P5.3 兩行列：頂行 1、3；solo 前多一個標頭（行 5）→ 頂行 6
         let nof = crate::model::Filter::default();
         assert_eq!(worker_line_of(&m, &nof, 0), 1);
-        assert_eq!(worker_line_of(&m, &nof, 1), 2);
-        assert_eq!(worker_line_of(&m, &nof, 2), 4);
+        assert_eq!(worker_line_of(&m, &nof, 1), 3);
+        assert_eq!(worker_line_of(&m, &nof, 2), 6);
     }
 
     // ---- P5.1：WORKERS 的 scrollbar／N-total ----
@@ -2525,13 +2986,14 @@ mod tests {
             "末列（行 60／共 61）的 thumb MUST 貼著軌道最下格"
         );
 
-        // 關鍵那一格：視窗起點由行位置 22/61 算出（22+1-17＝6／可捲 44），
-        // 用列數算會是 20+1-17＝4／可捲 23——thumb 長度因此差一格
+        // 關鍵那一格（P5.3 兩行列後重量測）：行總數 21 標頭＋40×2＝101、
+        // viewport 16；列 20 的底行決定視窗起點。用列數畫的話 thumb 長度與
+        // 落點都會偏一格以上
         assert_eq!(
             cells(20),
-            vec![4, 5, 6],
-            "列 20 的 thumb MUST 反映行單位的視窗起點（6/44）與行總數 61\
-             （用列數畫會是 [4,5,6,7]；軌道 {track_top}..={track_bottom}）"
+            vec![7, 8],
+            "列 20 的 thumb MUST 反映行單位的視窗起點與行總數 101\
+             （軌道 {track_top}..={track_bottom}）"
         );
     }
 
@@ -2553,8 +3015,9 @@ mod tests {
         };
         let first = at(0);
         assert!(!first.is_empty(), "40 列該畫得出捲軸");
-        // 1..=10 保守地落在第一頁內（視窗遠不只 11 行），視窗起點一律是 0
-        for idx in 1..=10 {
+        // 1..=6 保守地落在第一頁內（P5.3 兩行列：viewport 16 行＝標頭 1＋
+        // 列 0–6 的底行 14；row 7 底行 16 起就要捲），視窗起點一律是 0
+        for idx in 1..=6 {
             assert_eq!(
                 at(idx),
                 first,
@@ -2912,6 +3375,9 @@ mod tests {
                 &BlockerIndex::unknown(),
                 &app,
                 fresh,
+                &Summaries::default(),
+                &Snippets::default(),
+                test_now(),
             )
         })
         .unwrap();
@@ -3243,6 +3709,373 @@ mod tests {
             prose.spans[0].style,
             ratatui::style::Style::default(),
             "`see:` 不在白名單，MUST NOT 誤染"
+        );
+    }
+
+    // ---- P5.3-2：兩行列／stat header／location 欄 ----
+
+    /// 連 `LiveIndex` 都由呼叫端指定（location 欄的多重 linked window 那一態，
+    /// `fixture()` 造不出來——它刻意只給一份乾淨的 pane→window 對照）。
+    fn draw_with_live(live: LiveIndex, tweak: impl FnOnce(&mut Model, &mut App)) -> Buffer {
+        let (mut model, _, blockers, mut app) = fixture();
+        tweak(&mut model, &mut app);
+        let mut t = Terminal::new(TestBackend::new(120, 40)).unwrap();
+        t.draw(|f| {
+            render(
+                f,
+                &model,
+                &live,
+                &blockers,
+                &app,
+                Freshness::default(),
+                &Summaries::default(),
+                &Snippets::default(),
+                test_now(),
+            )
+        })
+        .unwrap();
+        t.backend().buffer().clone()
+    }
+
+    /// stat header 佔第 0 列整寬（`layout` 的 `Constraint::Length(1)`）。計數
+    /// 斷言只准掃這一列：`dead 3` 這種字面在列表區也會出現。
+    fn header_text(buf: &Buffer) -> String {
+        (0..buf.area().width)
+            .map(|x| buf[(x, 0)].symbol())
+            .collect()
+    }
+
+    /// **(a) 第二行內容的絕對格位**（P5.3 兩行列）。
+    ///
+    /// 兩行列最容易靜默壞掉的地方是「第二行畫到別列去了」——內容對、位置錯，
+    /// 全文比對（`text()` + `contains`）驗不出來。所以這裡釘死座標：第二行
+    /// MUST 在自己那一列的第一行**正下方**，且縮排對齊到 glyph 欄。
+    #[test]
+    fn the_worker_second_line_sits_directly_under_its_own_row() {
+        let sums = Summaries::seed(
+            &[("20260801T000000Z-aaaa", "fix the login redirect loop")],
+            &[],
+        );
+        let buf = draw_sums(120, 40, Freshness::default(), &sums, |_, _| {});
+
+        // 第一行：選取列（`▶ `）＋`▸ `＋名稱 → 名稱起點 x=5
+        let (name_x, name_y) = find_in(&buf, "alive-w", WORKERS_X0, DETAIL_X0);
+        assert_eq!(name_x, 5, "第一行的名稱欄起點（邊框 1＋選取欄 2＋`▸ ` 2）");
+
+        // 第二行：4 格縮排＋`⚙ `（glyph 欄）→ 權威字起點 x=7
+        let (word_x, word_y) = find_in(
+            &buf,
+            "running 1h00m · fix the login redirect loop",
+            WORKERS_X0,
+            DETAIL_X0,
+        );
+        assert_eq!(
+            (word_x, word_y),
+            (7, name_y + 1),
+            "第二行 MUST 緊貼在自己那一列的第一行下方、縮排到 glyph 欄之後"
+        );
+
+        // elapsed 由呼叫端注入的 `now` 算出來（牆鐘不得進 render）：任務
+        // created_at＝00:00:00Z、`test_now`＝01:00:00Z
+        assert!(
+            text(&buf).contains("running 1h00m"),
+            "elapsed MUST 由注入的 now 決定"
+        );
+    }
+
+    /// **(b) `End` 之後選取列的兩行都要在 viewport 內。**
+    ///
+    /// 只餵頂行給 `scroll_offset` 的話，末列會剛好卡在窗底：第一行看得到、
+    /// 第二行被邊框吃掉——畫面等於半列。
+    #[test]
+    fn the_last_row_keeps_both_of_its_lines_on_screen() {
+        let buf = draw_model_with(|m, a| {
+            with_workers(40)(m, a);
+            a.row_idx = 39; // `End`
+        });
+        let area = workers_area();
+        let (_, y) = find_in(&buf, "w039", WORKERS_X0, DETAIL_X0);
+        // 內容區＝上下邊框之間
+        let (top, bottom) = (area.top() + 1, area.bottom() - 2);
+        assert!(
+            y >= top,
+            "選取列的第一行要在內容區內（y={y}、內容區 {top}..={bottom}）"
+        );
+        let second = y + 1;
+        assert!(
+            second <= bottom,
+            "選取列的**第二行**也 MUST 在內容區內（第二行 y={second}、內容底 {bottom}）"
+        );
+    }
+
+    /// TASKS 捲軌的頭尾（同 `workers_track_ends` 的理由：不寫死 y）。
+    fn tasks_track_ends() -> (u16, u16) {
+        let scrolling = draw_model_with(with_tasks(40, false));
+        let up = scrollbar_col(&scrolling, "▲")[0];
+        let down = scrollbar_col(&scrolling, "▼")[0];
+        (up + 1, down - 1)
+    }
+
+    /// **(d) TASKS 兩行列捲到底時 thumb 貼底。**
+    ///
+    /// 捲軸的 `total` 忘了跟著改成行單位（仍餵列數）的話，末列的 thumb 會停在
+    /// 軌道半途——畫面等於宣稱「底下還有沒捲到的東西」。
+    #[test]
+    fn the_tasks_thumb_reaches_the_bottom_with_two_line_rows() {
+        let (track_top, track_bottom) = tasks_track_ends();
+        let bottom = scrollbar_col(
+            &draw_model_with(|m, a| {
+                with_tasks(40, false)(m, a);
+                a.task_idx = 39;
+            }),
+            "█",
+        );
+        assert_eq!(
+            bottom.last().copied(),
+            Some(track_bottom),
+            "末列的 thumb MUST 貼著軌道最下格（軌道 {track_top}..={track_bottom}）"
+        );
+        let top = scrollbar_col(&draw_model_with(with_tasks(40, false)), "█");
+        assert_eq!(
+            top.first().copied(),
+            Some(track_top),
+            "首列的 thumb MUST 貼著軌道最上格"
+        );
+    }
+
+    /// **(e) 直向堆疊時 WORKERS 至少佔一半（P5.3 裁定 4，修 known gap #3）。**
+    ///
+    /// 舊配比讓 DETAIL 拿 13 行、WORKERS 只剩 1 列可視——triage 主體反而被
+    /// 摘要擠掉。
+    #[test]
+    fn the_stacked_layout_gives_workers_the_larger_half() {
+        let full = Rect::new(0, 0, 60, 18);
+        let a = layout(full, 0, 0);
+        assert!(a.detail_strip, "前提：60 欄走的是整寬底條版面");
+        let main_h = a.workers.height + a.tasks.height + a.detail.height;
+        assert!(
+            a.workers.height * 2 >= main_h,
+            "WORKERS MUST ≥ 主區的一半（workers={}、main={main_h}）",
+            a.workers.height
+        );
+        assert!(
+            a.workers.height >= a.tasks.height + a.detail.height,
+            "WORKERS MUST 不小於 TASKS＋DETAIL 之和（{} vs {}＋{}）",
+            a.workers.height,
+            a.tasks.height,
+            a.detail.height
+        );
+        assert_eq!(
+            a.detail.height, DETAIL_STRIP_H,
+            "底條高度固定（裡面的字串因此不得換行）"
+        );
+    }
+
+    /// **(f) stat header 的計數來自整池，與列表可見列數解耦。**
+    ///
+    /// header 若改數「畫得出來的列」，篩選中它就會跟著縮水——那正好抹掉它存在
+    /// 的理由：篩選時仍要看得見池子裡還有幾個卡住的。
+    #[test]
+    fn the_header_counts_the_whole_pool_regardless_of_the_filter() {
+        // fixture：5 個 worker／alive-w 有 in-flight running／%1 是 Prompt／
+        // %2 %3 %4 不在 live 快照裡（dead）／沒有任何 worker 的最新任務是 failed
+        let expect = [
+            "workers 5",
+            "running 1",
+            "prompt 1",
+            "dead 3",
+            "failed 0",
+            "idle 4",
+        ];
+        let h = header_text(&draw());
+        for e in expect {
+            assert!(h.contains(e), "header MUST 有「{e}」，實際：{h}");
+        }
+
+        // 篩選只留一列（`occl-w` 身上沒有掛任務，命中的就只有它自己），
+        // 計數不動
+        let filtered = draw_model_with(|_, a| a.filter.query = "occl-w".into());
+        assert!(
+            text(&filtered).contains("WORKERS 1/1"),
+            "前提：篩選後只剩一列"
+        );
+        let h2 = header_text(&filtered);
+        for e in expect {
+            assert!(
+                h2.contains(e),
+                "篩選中 header MUST 仍數整池的「{e}」，實際：{h2}"
+            );
+        }
+    }
+
+    /// **(g) location 欄三態（P5.3 裁定 8）：解析成功／多重 linked window／
+    /// 退回裸 pane id。**
+    ///
+    /// 裸 pane id 回答不了「它在哪個 window」——Enter focus 之前人得先看得出
+    /// 自己要跳去哪。快照查不到時退回裸 id，而不是編一個位置出來。
+    #[test]
+    fn the_location_column_resolves_names_and_falls_back_to_the_bare_pane() {
+        let t = text(&draw());
+        // 一：`%1` 在快照裡且 `@1` 有名字 → `session:window %pane`
+        assert!(
+            t.contains("alive-w  claude  s:main %1  ready"),
+            "解析成功要印 session:window-name＋pane：\n{t}"
+        );
+        // 三：`%2` 不在快照裡 → 退回裸 pane id（不編位置）
+        assert!(
+            t.contains("dead-w  codex  %2  ready"),
+            "查不到位置 MUST 退回裸 pane id：\n{t}"
+        );
+
+        // 二：同一個 pane 掛在兩個 session 的 linked window → 首個（字典序）
+        // ＋`+N`，人看得出「還有別處也指得到它」
+        let mut panes = HashMap::new();
+        panes.insert(
+            "%1".to_string(),
+            vec![
+                ("t".to_string(), "@2".to_string()),
+                ("s".to_string(), "@1".to_string()),
+            ],
+        );
+        let live = LiveIndex {
+            panes: Some(panes),
+            windows: Some(HashMap::from([(
+                "@1".to_string(),
+                vec![("s".to_string(), "main".to_string())],
+            )])),
+            ..LiveIndex::unknown()
+        };
+        let t = text(&draw_with_live(live, |_, _| {}));
+        assert!(
+            t.contains("alive-w  claude  s:main+1 %1  ready"),
+            "多重位置 MUST 標 +N（取字典序首個為代表）：\n{t}"
+        );
+    }
+
+    // ---- P5.4：triage 強調＋blocker snippet ----
+
+    /// **組標頭要說出組裡有什麼異常**（P5.4）。
+    ///
+    /// 沒有徽章的話，一組浮到最上面就成了沒有理由的位移——尤其異常成員在摺線
+    /// 以下時，畫面上一格證據都沒有。
+    #[test]
+    fn a_group_header_says_what_is_wrong_inside_it() {
+        // fixture：%1 是 Prompt、%2 %3 %4 不在 live 快照（dead）
+        let buf = draw();
+        let t = text(&buf);
+        // 五個 worker 同在 standalone 段：一個 blocked、三個 dead
+        assert!(t.contains("(standalone) (5)"), "前提：標頭與成員數：\n{t}");
+        // 徽章緊跟在括號數字之後。`⛔` 是雙寬（第二格是填充空白），所以用它
+        // **後面**那個 ASCII 數字定位，再回頭檢查 glyph 本身（見 `find` 的說明）
+        let (x, y) = find_in(&buf, "1  ✗3", WORKERS_X0, DETAIL_X0);
+        assert_eq!(
+            buf[(x - 2, y)].symbol(),
+            "⛔",
+            "blocked 的組標頭 MUST 帶 ⛔ 徽章：\n{t}"
+        );
+        // 徽章上的是**既有語意色**，不是第七個軸
+        assert_eq!(
+            buf[(x - 2, y)].style().fg,
+            theme::blocker_style(Blocker::Prompt).unwrap().fg,
+            "⛔ 徽章沿用 blocker 語意色"
+        );
+        assert_eq!(
+            style_in_workers(&buf, "✗3").fg,
+            theme::liveness_style(Liveness::Dead).fg,
+            "✗ 徽章沿用死活語意色"
+        );
+
+        // 徽章數的是**事實**，不是裝飾：沒有 blocker 的畫面上一個 ⛔ 都沒有，
+        // 而同一張畫面照樣標得出三個 dead
+        let clean = draw_model_with(|m, a| {
+            with_workers(3)(m, a);
+            m.recent = Vec::new();
+        });
+        let t = text(&clean);
+        assert!(t.contains("(3)  ✗3"), "三個 dead 要數出來：\n{t}");
+        assert!(
+            !t.contains("(3)  ⛔"),
+            "沒有 blocker 的組標頭不得長出 ⛔ 徽章：\n{t}"
+        );
+    }
+
+    /// 有異常的那幾列名稱走 BOLD——**只加粗，不上色**（第七個語意軸不存在），
+    /// 而且 MUST NOT 波及正常列（粗體滿畫面等於沒有強調）。
+    #[test]
+    fn only_the_rows_that_need_attention_are_bold() {
+        let buf = draw();
+        let blocked = style_in_workers(&buf, "alive-w");
+        assert!(
+            blocked.add_modifier.contains(ratatui::style::Modifier::BOLD),
+            "blocked 的列名 MUST 粗體"
+        );
+        // 同一列上不帶語意的鄰格（runtime 欄）拿來當對照：粗體那一段的前景色
+        // MUST 與它逐字相同——強調只加 modifier，不引進第七個語意軸
+        assert_eq!(
+            blocked.fg,
+            style_in_workers(&buf, "claude").fg,
+            "強調 MUST NOT 自帶顏色（會與 status／blocker 搶語意）"
+        );
+        // fixture 裡 occl-w（copy-mode，人正在介入）不是異常：MUST NOT 粗體
+        let calm = style_in_workers(&buf, "occl-w");
+        assert!(
+            !calm.add_modifier.contains(ratatui::style::Modifier::BOLD),
+            "occluded 是人在介入，不是異常（§5）"
+        );
+    }
+
+    /// **blocker snippet 三態**（P5.4，裁定 7 吸收變體 D）：升旗且有快取 →
+    /// 顯示；升旗但沒快取 → 不畫空區塊；沒升旗 → 一行都不畫。
+    #[test]
+    fn the_detail_shows_the_prompt_box_only_while_the_flag_is_up() {
+        let mut snips = Snippets::default();
+        snips.apply(
+            HashMap::from([(
+                "%1".to_string(),
+                vec![
+                    "Do you want to proceed?".to_string(),
+                    "> 1. Yes".to_string(),
+                ],
+            )]),
+            &BlockerIndex {
+                panes: Some(HashMap::from([("%1".to_string(), Blocker::Prompt)])),
+            },
+        );
+        // fixture 的選取列就是 alive-w（%1，帶 Prompt）
+        let t = text(&draw_snips(
+            120,
+            40,
+            Freshness::default(),
+            &Summaries::default(),
+            &snips,
+            |_, _| {},
+        ));
+        assert!(t.contains("prompt:"), "升旗＋有快取 MUST 顯示框內容：\n{t}");
+        assert!(t.contains("Do you want to proceed?"), "框在問什麼：\n{t}");
+        assert!(t.contains("> 1. Yes"), "選項照原文：\n{t}");
+        // 薄殼憑證的位置不讓：等價 CLI 原文仍在畫面上
+        assert!(t.contains("$ agent-bridge"), "evidence MUST 仍在：\n{t}");
+
+        // 升旗但沒快取（剛升旗、下一輪才帶內容回來）：不畫空標題
+        let t = text(&draw());
+        assert!(
+            !t.contains("prompt:"),
+            "沒有內容時 MUST NOT 畫空區塊：\n{t}"
+        );
+
+        // 沒升旗：即使快取裡還有東西也不畫（`Snippets::apply` 已清，這裡驗
+        // render 端同樣以 blocker 為準，兩道都不放行）
+        let t = text(&draw_snips(
+            120,
+            40,
+            Freshness::default(),
+            &Summaries::default(),
+            &snips,
+            |_, a| a.row_idx = ROW_OCCL_W,
+        ));
+        assert!(
+            !t.contains("Do you want to proceed?"),
+            "選到別人時不得畫上一個人的框：\n{t}"
         );
     }
 }

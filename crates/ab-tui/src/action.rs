@@ -521,6 +521,7 @@ mod tests {
             ready: "ready".to_string(),
             spawn_tag: "t-gen1".to_string(),
             registered_at: "2026-07-31T00:00:00Z".to_string(),
+            spawned_at: String::new(),
             spawned: true,
             corrupt: false,
             // P4.7 切片 A：lineage 兩欄對這些 fixture 無關（None＝欄位缺席）

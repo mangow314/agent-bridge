@@ -10,6 +10,7 @@
 //!
 //! 依賴紀律（§6）：只用 std 的 thread＋mpsc，不引入 async runtime。
 
+use std::collections::HashMap;
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::thread;
 
@@ -43,10 +44,11 @@ pub enum Req {
 /// ORIGINS 面板退場後沒有消費者了——初始 selection 不再看 origin——故整則
 /// 移除，連帶 `App::caller_origin`／`caller_pane` 與 `current_pane` 查詢。
 pub enum Msg {
-    /// 一輪 tmux 查詢：死活（§4 liveness）＋ blocker 軸（§4 v1 matcher 契約）。
-    /// 兩者同一輪回報：分兩則會讓畫面出現「死活已更新、blocker 還是上一輪」
-    /// 的混搭狀態
-    Live(LiveIndex, BlockerIndex),
+    /// 一輪 tmux 查詢：死活（§4 liveness）＋ blocker 軸（§4 v1 matcher 契約）
+    /// ＋命中框的畫面內容（P5.4 snippet，來自同一輪 `capture-pane`，零新增
+    /// 查詢）。三者同一則回報：分開送會讓畫面出現「死活已更新、blocker 還是
+    /// 上一輪」的混搭狀態
+    Live(LiveIndex, BlockerIndex, HashMap<String, Vec<String>>),
     Focus {
         label: String,
         pane: String,
@@ -208,11 +210,14 @@ pub fn spawn<T: TmuxClient + Send + 'static>(tmux: T, paths: Paths) -> Handle {
     }
 }
 
-/// 一輪 tmux 查詢：死活索引 ＋ blocker 索引。
+/// 一輪 tmux 查詢：死活索引 ＋ blocker 索引 ＋ 命中框的內容。
 ///
 /// blocker 只對 registry 快照裡的 pane 查（`snapshot` 讀的是小 JSON，不取鎖），
 /// 每個 pane 兩次 bounded 呼叫（`pane_in_mode`＋`capture_pane`）。整輪跑在
 /// 背景 worker 上，卡住的終態是「該欄 stale」，不是凍結（§4 硬條款）。
+///
+/// P5.4 的 snippet **不改這個成本模型**：它是那兩次呼叫裡第二次的回傳值再
+/// 切幾行，沒有第三次呼叫。
 fn live_round(tmux: &dyn TmuxClient, paths: &Paths) -> Msg {
     let live = LiveIndex::query(tmux);
     let panes: Vec<String> = registry::snapshot(paths)
@@ -220,7 +225,8 @@ fn live_round(tmux: &dyn TmuxClient, paths: &Paths) -> Msg {
         .map(|w| w.pane)
         .filter(|p| !p.is_empty())
         .collect();
-    Msg::Live(live, BlockerIndex::query(tmux, &panes))
+    let (blockers, snippets) = BlockerIndex::query_with_snippets(tmux, &panes);
+    Msg::Live(live, blockers, snippets)
 }
 
 /// 呼叫者所在的 owner 標籤 `session:@window`。**唯一消費者是 `spawn` 裡的

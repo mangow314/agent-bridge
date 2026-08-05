@@ -25,7 +25,7 @@ use ab_core::tmux::{SubprocessTmux, TmuxClient};
 use crossterm::event::{self, Event, KeyCode, KeyEventKind};
 
 use app::{App, Effect, Key};
-use model::{BlockerDebounce, BlockerIndex, LiveIndex, Model};
+use model::{BlockerDebounce, BlockerIndex, LiveIndex, Model, Snippets, Summaries};
 use worker::{Msg, Req};
 
 /// 磁碟 read model 的輪詢節奏（§4：500ms；tmux liveness 另以 2s 節流）。
@@ -47,6 +47,10 @@ const ENV_UI_POPUP: &str = "AGENT_BRIDGE_UI_POPUP";
 /// screen）——P1 gate (b)。
 pub fn run() -> Result<()> {
     let paths = Paths::resolve();
+    // 色盤在**進 alternate screen 之前**定案（P5.5）：`COLORTERM` 說得出
+    // 24-bit 才升級，說不出就是原本那份 ANSI 16。進畫面之後再換色盤等於
+    // 同一次執行裡畫面前後不一致
+    theme::init_from_env();
     // tmux 一律走背景 worker：連開場的呼叫者定位都不在 UI thread 上做
     let worker = worker::spawn(SubprocessTmux, paths.clone());
 
@@ -88,10 +92,15 @@ fn event_loop(
     let popup = std::env::var_os(ENV_UI_POPUP).is_some_and(|v| v == "1");
 
     let mut model = Model::load(paths);
+    // P5.3：兩行列第二行的摘要快取（首行永不失效、events.log 檔長變更才重讀）
+    let mut sums = Summaries::default();
+    sums.sync(paths, &model);
     // liveness 起始為 unknown，等 worker 第一則回報——不在 UI thread 上查
     let mut live = LiveIndex::unknown();
     // blocker 軸同樣起始 unknown：unknown MUST NOT 顯示成「沒有 blocker」（§5）
     let mut blockers = BlockerIndex::unknown();
+    // P5.4：blocker 框的畫面內容（只在記憶體、降旗即清，見 `model::Snippets`）
+    let mut snippets = Snippets::default();
     // screen-matcher 來源的 blocker 需連續命中才升旗（§4 去抖）；狀態跨輪，
     // 故活在主迴圈而不是每輪重建的 BlockerIndex 裡
     let mut debounce = BlockerDebounce::new();
@@ -114,21 +123,48 @@ fn event_loop(
     let unknown_live = LiveIndex::unknown();
     let unknown_blockers = BlockerIndex::unknown();
 
+    // stale 降級是**邊緣**觸發 triage 的第三個來源：畫面上的兩個排序鍵在
+    // 降級／回復的那一幀整批換了一份事實
+    let mut degraded_prev = false;
+
     loop {
         let fresh = stamps.freshness(Instant::now());
         // **stale＝降級為 unknown，不是繼續畫舊的**（§4）：背景 worker 卡死時
         // 舊死活／舊 blocker 冒充新鮮，人會據此下判斷（例如以為某個 pane 還
         // 活著而不去看它）。unknown 說的是「現在不知道」，那是真的
-        let (live_view, blockers_view) = if degrade_on_stale(fresh, &mut debounce) {
+        let degraded = degrade_on_stale(fresh, &mut debounce);
+        let (live_view, blockers_view) = if degraded {
             (&unknown_live, &unknown_blockers)
         } else {
             (&live, &blockers)
         };
+        // 只在**翻面那一幀**重排：stale 期間全體降回中性序（unknown 不浮頂，
+        // 見 `worker_severity`），回復時再依真資料浮一次。每幀重排會讓
+        // selection 追著排序跑
+        if degraded != degraded_prev {
+            degraded_prev = degraded;
+            retriage(&mut model, live_view, blockers_view, &mut app);
+            // 框內容跟著同一份顯示層索引走（跨廠複核 2026-08-05 finding 4）：
+            // 整層降級為 unknown 的那一幀，畫面說的是「現在不知道」，一份舊
+            // 框留在記憶體裡等回復就是替一個沒有證據的狀態留著證物。
+            // `apply` 以顯示層索引 retain，unknown 下等於全清
+            snippets.apply(Default::default(), blockers_view);
+        }
         let mut frame = ratatui::layout::Rect::default();
         terminal
             .draw(|f| {
                 frame = f.area();
-                view::render(f, &model, live_view, blockers_view, &app, fresh);
+                view::render(
+                    f,
+                    &model,
+                    live_view,
+                    blockers_view,
+                    &app,
+                    fresh,
+                    &sums,
+                    &snippets,
+                    ab_core::time::now_epoch(),
+                );
             })
             .map_err(|e| Error::new(format!("draw failed: {e}")))?;
         // 一頁多長只有版面知道：量到之後回填給狀態機（PgUp／PgDn 用）
@@ -151,14 +187,25 @@ fn event_loop(
         // worker 回信：non-blocking drain，一則都不等
         while let Some(msg) = worker.try_recv() {
             match msg {
-                Msg::Live(l, b) => {
+                Msg::Live(l, b, s) => {
                     // **只有查得到東西才算成功，而且算的是快照的觀測時間**：
                     // bounded 查詢逾時／tmux 不在時 worker 回的是整層降級的
                     // unknown（那一輪沒有新資料）；查詢卡了十幾秒才回來的那一
                     // 輪則帶著一份早就過期的快照——兩者都不得刷新 freshness，
                     // 否則「查詢愈慢，畫面看起來愈新」（切片 C 核心修正＋F1）
                     stamps.note_live(&l);
-                    apply_live(&mut live, &mut blockers, &mut debounce, l, b);
+                    apply_live(
+                        &mut live,
+                        &mut blockers,
+                        &mut debounce,
+                        &mut snippets,
+                        l,
+                        b,
+                        s,
+                    );
+                    // triage 的資料事件邊緣之二：兩個排序鍵（blocker／死活）
+                    // 都剛換過一份事實
+                    retriage(&mut model, &live, &blockers, &mut app);
                     live_inflight = false;
                 }
                 Msg::Focus { label, pane, res } => match res {
@@ -177,10 +224,16 @@ fn event_loop(
                         Err(e) => e.message,
                     };
                     // 取消結果下一幀就要看得到
-                    model = Model::load(paths);
-                    app.relocate(&model);
-                    last_disk = Instant::now();
-                    stamps.note_disk(last_disk);
+                    refresh_disk(
+                        paths,
+                        &mut model,
+                        &mut sums,
+                        &mut app,
+                        shown_live(degraded, &live, &unknown_live),
+                        shown_blockers(degraded, &blockers, &unknown_blockers),
+                        &mut last_disk,
+                        &mut stamps,
+                    );
                 }
                 // `r`：成功開全螢幕 pager（保留原始 bytes，render 才 lossy）；
                 // 失敗（未回覆／已取消／損壞）逐字沿用 core 的訊息進 footer
@@ -230,16 +283,24 @@ fn event_loop(
                     }
                     app.evict_inflight.remove(&name);
                     // 回收結果下一幀就要看得到（registry／task 都動過了）
-                    model = Model::load(paths);
-                    app.relocate(&model);
-                    last_disk = Instant::now();
-                    stamps.note_disk(last_disk);
+                    refresh_disk(
+                        paths,
+                        &mut model,
+                        &mut sums,
+                        &mut app,
+                        shown_live(degraded, &live, &unknown_live),
+                        shown_blockers(degraded, &blockers, &unknown_blockers),
+                        &mut last_disk,
+                        &mut stamps,
+                    );
                 }
                 // `L` 的回信。判斷（放閘、比對目標、丟棄晚到結果）全在
                 // `app::peek_apply` 這個純函式裡；run loop 的責任只有一件：
                 // **先做一次權威重讀再比對**（跨廠複核 M2）
                 Msg::Peek { target, res } => {
                     peek_arrival(&mut app, &mut model, || Model::load(paths), &target, res);
+                    // peek_arrival 內部已做權威重讀；摘要快取跟上同一份快照
+                    sums.sync(paths, &model);
                     last_disk = Instant::now();
                     stamps.note_disk(last_disk);
                 }
@@ -320,17 +381,72 @@ fn event_loop(
         }
 
         if last_disk.elapsed() >= DISK_POLL {
-            model = Model::load(paths);
-            app.relocate(&model);
-            last_disk = Instant::now();
-            // 這一輪真的完成了一次重讀＝disk 軸的「上次成功」
-            stamps.note_disk(last_disk);
+            // 這一輪真的完成了一次重讀＝disk 軸的「上次成功」（stamps 語意）
+            refresh_disk(
+                        paths,
+                        &mut model,
+                        &mut sums,
+                        &mut app,
+                        shown_live(degraded, &live, &unknown_live),
+                        shown_blockers(degraded, &blockers, &unknown_blockers),
+                        &mut last_disk,
+                        &mut stamps,
+                    );
         }
         if !live_inflight && last_live.elapsed() >= LIVE_POLL {
             live_inflight = worker.send(Req::Live);
             last_live = Instant::now();
         }
     }
+}
+
+/// 磁碟軸的一次完整刷新（P5.3 收攏四處手抄）：權威重讀 → 摘要快取同步 →
+/// triage 重排 → selection 跟人不跟位 → 兩個時間戳。順序不可換——sums 讀的
+/// 集合來自新 model，triage 排的是新 model 的組，relocate 讀的列來自重排後
+/// 的列序。
+#[allow(clippy::too_many_arguments)]
+fn refresh_disk(
+    paths: &Paths,
+    model: &mut Model,
+    sums: &mut Summaries,
+    app: &mut App,
+    live: &LiveIndex,
+    blockers: &BlockerIndex,
+    last_disk: &mut Instant,
+    stamps: &mut Stamps,
+) {
+    *model = Model::load(paths);
+    sums.sync(paths, model);
+    retriage(model, live, blockers, app);
+    *last_disk = Instant::now();
+    stamps.note_disk(*last_disk);
+}
+
+/// 「畫面現在採信的那一份」死活／blocker（跨廠複核 2026-08-05 finding 5）。
+///
+/// triage 的排序鍵 MUST 與同一幀畫出來的兩軸同源。stale 期間畫面顯示 unknown
+/// 卻仍依快取中的舊 Prompt／Dead 浮頂，等於排序在替一份畫面上已經撤回的事實
+/// 背書——那正是 §4「stale＝降級為 unknown，不是繼續畫舊的」要擋的事。
+fn shown_live<'a>(degraded: bool, live: &'a LiveIndex, unknown: &'a LiveIndex) -> &'a LiveIndex {
+    if degraded { unknown } else { live }
+}
+
+fn shown_blockers<'a>(
+    degraded: bool,
+    blockers: &'a BlockerIndex,
+    unknown: &'a BlockerIndex,
+) -> &'a BlockerIndex {
+    if degraded { unknown } else { blockers }
+}
+
+/// triage 的**唯一**入口：重排 → `relocate`。
+///
+/// 兩者綁在一起是硬條件——組序一動，同一個 `row_idx` 就指向別人了。分開呼叫
+/// 的版本會在「剛好排序有變的那一幀」把選取靜默移到另一個 worker 身上，而
+/// `x`／`e` 的目標就是選取（§5）。
+fn retriage(model: &mut Model, live: &LiveIndex, blockers: &BlockerIndex, app: &mut App) {
+    model::apply_triage(model, live, blockers);
+    app.relocate(model);
 }
 
 /// evict 終局是否「乾淨到可以只當一則普通訊息」：唯一算乾淨的是「筆記落地
@@ -620,15 +736,21 @@ fn degrade_on_stale(fresh: model::Freshness, debounce: &mut BlockerDebounce) -> 
 /// 抽成函式而不是內嵌在主迴圈裡，是為了讓「blocker 有沒有真的過去抖」可被
 /// 測試殺掉：內嵌時把 `debounce.apply(b)` 改回 `b` 全套照樣綠——去抖等於裸奔。
 /// liveness 直接覆蓋（它沒有單幀誤判面），blocker MUST 過 `debounce`。
+///
+/// snippet 落地**排在去抖之後**（P5.4）：它吃的是顯示層那份索引，去抖期間
+/// 畫面說「沒有可見 blocker」時就不該有框內容陪著。
 fn apply_live(
     live: &mut LiveIndex,
     blockers: &mut BlockerIndex,
     debounce: &mut BlockerDebounce,
+    snippets: &mut Snippets,
     l: LiveIndex,
     b: BlockerIndex,
+    s: std::collections::HashMap<String, Vec<String>>,
 ) {
     *live = l;
     *blockers = debounce.apply(b);
+    snippets.apply(s, blockers);
 }
 
 #[cfg(test)]
@@ -788,6 +910,52 @@ mod tests {
         BlockerIndex { panes: Some(m) }
     }
 
+    /// **wiring 測試**：畫面採信哪一份兩軸，triage 與 snippet 就吃哪一份
+    /// （跨廠複核 2026-08-05 finding 4／5）。
+    ///
+    /// 這兩條原本各差一步：stale 期間 `refresh_disk` 仍拿快取中的舊 Prompt／
+    /// Dead 去排序（畫面已改說 unknown），而 snippet 要等下一則 `Msg::Live`
+    /// 才被 prune。差別在畫面上是「排名沒有事實支撐」與「舊框留在記憶體」。
+    #[test]
+    fn the_degraded_view_is_what_triage_and_snippets_consume() {
+        let unknown_live = LiveIndex::unknown();
+        let unknown_blockers = BlockerIndex::unknown();
+        let live = LiveIndex {
+            panes: Some(HashMap::from([(
+                "%1".to_string(),
+                vec![("s".to_string(), "@1".to_string())],
+            )])),
+            ..LiveIndex::unknown()
+        };
+        let blockers = prompt_round();
+
+        // 未降級：拿到的是真資料
+        assert_eq!(
+            shown_blockers(false, &blockers, &unknown_blockers).get("%1"),
+            Blocker::Prompt
+        );
+        assert!(shown_live(false, &live, &unknown_live).panes.is_some());
+        // 降級：拿到的是 unknown——與同一幀 render 吃的是同一份
+        assert_eq!(
+            shown_blockers(true, &blockers, &unknown_blockers).get("%1"),
+            Blocker::Unknown
+        );
+        assert!(shown_live(true, &live, &unknown_live).panes.is_none());
+
+        // snippet：以顯示層索引 retain，unknown 那一幀等於全清
+        let mut snips = Snippets::default();
+        snips.apply(
+            HashMap::from([("%1".to_string(), vec!["Do you want to proceed?".to_string()])]),
+            &blockers,
+        );
+        assert!(snips.get("%1").is_some(), "前提：升旗時留著");
+        snips.apply(Default::default(), shown_blockers(true, &blockers, &unknown_blockers));
+        assert!(
+            snips.get("%1").is_none(),
+            "降級那一幀 MUST 清掉舊框（不得等下一則 Msg::Live）"
+        );
+    }
+
     /// **wiring 測試**：`Msg::Live` 的 blocker MUST 經過去抖才進畫面。
     ///
     /// 斷言落在 `view::blocker_mark` 的輸出（人真正看到的那串），而不是只看
@@ -803,9 +971,11 @@ mod tests {
             &mut live,
             &mut blockers,
             &mut debounce,
+            &mut Snippets::default(),
             LiveIndex::unknown(),
             prompt_round(),
-        );
+            Default::default(),
+            );
         assert_eq!(
             view::blocker_mark(blockers.get("%1")),
             "",
@@ -816,9 +986,11 @@ mod tests {
             &mut live,
             &mut blockers,
             &mut debounce,
+            &mut Snippets::default(),
             LiveIndex::unknown(),
             prompt_round(),
-        );
+            Default::default(),
+            );
         assert_eq!(
             view::blocker_mark(blockers.get("%1")),
             "  ⛔blocked",
@@ -950,9 +1122,11 @@ mod tests {
             &mut live,
             &mut blockers,
             &mut debounce,
+            &mut Snippets::default(),
             LiveIndex::unknown(),
             prompt_round(),
-        );
+            Default::default(),
+            );
         assert_eq!(view::blocker_mark(blockers.get("%1")), "");
 
         // 停擺 30 秒：畫面降級為 unknown，連勝同時作廢
@@ -967,9 +1141,11 @@ mod tests {
             &mut live,
             &mut blockers,
             &mut debounce,
+            &mut Snippets::default(),
             LiveIndex::unknown(),
             prompt_round(),
-        );
+            Default::default(),
+            );
         assert_eq!(
             view::blocker_mark(blockers.get("%1")),
             "",
@@ -981,9 +1157,11 @@ mod tests {
             &mut live,
             &mut blockers,
             &mut debounce,
+            &mut Snippets::default(),
             LiveIndex::unknown(),
             prompt_round(),
-        );
+            Default::default(),
+            );
         assert_eq!(view::blocker_mark(blockers.get("%1")), "  ⛔blocked");
 
         // 沒 stale 時不得清（否則等於把去抖永久關掉）
@@ -1069,6 +1247,7 @@ mod tests {
                 ready: "ready".into(),
                 spawn_tag: tag.into(),
                 registered_at: "2026-07-31T00:00:00Z".into(),
+                spawned_at: String::new(),
                 spawned: true,
                 corrupt: false,
                 lineage_root: None,
