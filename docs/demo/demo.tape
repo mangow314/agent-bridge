@@ -37,10 +37,18 @@ Type "EOF"
 Enter
 Type ")"
 Enter
-Sleep 1.5
-Type "# reply lands in the mailbox; the bridge notifies this pane automatically"
+Sleep 1
+Type "# the worker picked it up in its own window — peek while it works:"
 Enter
-Sleep 7.5
+Sleep 1.5
+Ctrl+B
+Type "n"
+Sleep 6.5
+Ctrl+B
+Type "l"
+Sleep 1
+Type "# meanwhile the reply landed; the bridge notified this pane automatically"
+Enter
 Sleep 4
 
 Type "# worker pane keeps its context for follow-ups; reclaim when done:"

@@ -36,7 +36,7 @@ send "agent-bridge start $id"
 sleep 2.4
 send "agent-bridge reply $id --message-file - <<'EOF'"
 sleep 0.3
-send "Suite green: 555 PASS / 0 FAIL (bash tests/run-tests.sh)."
+send "Suite green: 1168 PASS / 0 FAIL (bash tests/run-tests.sh)."
 sleep 0.3
 send "No files modified. Ask follow-ups here — this pane keeps the context."
 sleep 0.3

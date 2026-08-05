@@ -5,3 +5,6 @@ tests/.run-groups.*.sh
 .gate/
 # M4 cutover 後 bin/agent-bridge exec 的 Rust 產物（build 出來，不進版控）
 /bin/ab
+
+# demo 錄影 raw（後製來源，逐格驗收後手動刪）
+docs/demo/*-raw.mp4
