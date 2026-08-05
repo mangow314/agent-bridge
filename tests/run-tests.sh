@@ -142,7 +142,7 @@ declare -A GRP_NEEDS=(
   # 語意 fixture，變數掃描抓不到 manual-x 這種字串依賴）
   [17]="16" [18]="16"
 )
-GRP_KNOWN=" 1 2 3 4 5 6 7 8 8a 8b 9 10 11 12 13 14 15 16 17 18 18b 18c 19 20 20b 21 22 23 24 25 26 27 28 29 30 31 32 33 34 34.5+ 35 36 37 38 39 40 41 42 43 44 45 46 47 "
+GRP_KNOWN=" 1 2 3 4 5 6 7 8 8a 8b 9 10 11 12 13 14 15 16 17 18 18b 18c 19 20 20b 21 22 23 24 25 26 27 28 29 30 31 32 33 34 34.5+ 35 36 37 38 39 40 41 42 43 44 45 46 47 48 "
 GRP_SELECTED=""
 GRP_SKIPPED=0
 if [[ -n "${TEST_GROUPS:-}" ]]; then
@@ -3077,9 +3077,17 @@ if [[ -n "$REAL_CLAUDE" ]] && CANARY_REAL="$(readlink -f "$REAL_CLAUDE" 2>/dev/n
   # 同時在函式內留一段含舊字串的註解，四個斷言仍全綠（獨立複核 2026-07-31）。
   # 剝註解把蒙混面壓到「函式內未使用的字面值／死分支」，那層由
   # notify.rs 的 matcher_uses_the_canary_feature_strings 單元測試鎖
-  sed -n '/^pub fn screen_has_prompt/,/^}/p' "$SRC_NOTIFY_RS" \
+  # P5.4 起 matcher 本體在 `window_hits`（`screen_has_prompt` 與新增的
+  # `prompt_snippet` 都轉呼叫它——判定與 TUI 顯示的框內容必須同源）。抽取
+  # 對象跟著搬，紀律不變：抽的是**真的在做比對的那個函式**，不是外層包裝
+  sed -n '/^fn window_hits/,/^}/p' "$SRC_NOTIFY_RS" \
     | grep -v '^[[:space:]]*//' > "$TESTROOT/canary-fn"
-  assert "CC canary：screen_has_prompt 函式本體可抽出" test -s "$TESTROOT/canary-fn"
+  assert "CC canary：matcher 函式本體（window_hits）可抽出" test -s "$TESTROOT/canary-fn"
+  # 外層包裝仍 MUST 是那個唯一入口：`screen_has_prompt` 轉呼叫 matcher，
+  # 沒有第二套比對
+  assert "CC canary：screen_has_prompt 仍走同一份 matcher" \
+    bash -c "sed -n '/^pub fn screen_has_prompt/,/^}/p' \"\$1\" | grep -q 'prompt_window'" \
+    _ "$SRC_NOTIFY_RS"
   for kw in 'Do you want to ' 'Esc to cancel' \
             'has written up a plan' 'Would you like to proceed'; do
     assert "CC canary：特徵「$kw」與正本 screen_has_prompt 一致" \
@@ -6622,6 +6630,94 @@ tmx kill-window -t "$W47" 2>/dev/null || true
 
 
 fi  # end grp 47
+# ---- 48. 色盤降級後的字元層同一性（CLI-UI-2，真 tmux） ----
+if grp 48; then
+# 動機：P5.5 的 truecolor 是**翻案**，而翻案能成立完全建立在一條可查證的
+# 承諾上——「終端機沒宣告 24-bit 時，畫面與翻案前逐字相同；宣告了也只是加
+# 樣式，字元一格都不動」。這條承諾若破了，既有二十幾組 `capture-pane` 字元
+# 比對會一起變成不可信，而症狀是靜默的。
+#
+# 為什麼非要真 tmux：ratatui 的 `TestBackend` 測得到 cell 的 style，測不到
+# 「真終端機收到的位元組」——RGB 是不是真的以 `38;2;` 送出去、字元有沒有被
+# escape 序列擠位，只有真的畫在 pane 上才看得到。
+#
+# fixture 刻意**不含任何任務**：兩行列的第二行會顯示 elapsed／idle 時長，
+# 那些數字每秒在變，兩次執行之間必然不同——那是時間在動，不是色盤在動。
+# 沒有任務時第二行是固定的 `idle - · last: -`，畫面因此是靜態的。
+
+D48="$TESTROOT/d48"
+mkdir -p "$D48/agents" "$D48/tasks"
+# worker 的 pane 自己一個 window（同分組 44 的理由：與 TUI 擠在一起會把
+# 畫面壓矮，這裡要的是固定版面）
+W48W="$(tmx new-window -dP -F '#{window_id}' -t it "$pane_cmd")"
+P48A="$(tmx list-panes -t "$W48W" -F '#{pane_id}' | head -1)"
+P48B="$(tmx split-window -dP -F '#{pane_id}' -t "$W48W" "$pane_cmd")"
+ab "$D48" register c48-alpha "$P48A" >/dev/null 2>&1
+ab "$D48" register c48-beta "$P48B" >/dev/null 2>&1
+assert "48 前置：兩個 agent 已註冊（畫面上要有東西可上色）" \
+  bash -c 'test -e "$1/agents/c48-alpha.json" && test -e "$1/agents/c48-beta.json"' _ "$D48"
+
+W48="$(tmx new-window -dP -F '#{window_id}' -t it "$pane_cmd")"
+TUI48="$(tmx list-panes -t "$W48" -F '#{pane_id}' | head -1)"
+tmx set-option -t "$W48" window-size manual 2>/dev/null || true
+tmx resize-window -t "$W48" -x 120 -y 40 2>/dev/null || true
+
+# 跑一輪 ui，把**字元層**（`-p`，escape 全剝）與**位元組層**（`-p -e`，
+# 保留 SGR）各存一份，然後 `q` 退出
+ui48_run() {
+  local tag="$1" colorterm="$2"
+  tmx send-keys -t "$TUI48" \
+    "$(printf 'env AGENT_BRIDGE_DATA=%q COLORTERM=%q %q ui' "$D48" "$colorterm" "$BRIDGE")" Enter
+  # shellcheck disable=SC2329  # 經 wait_for 間接呼叫
+  _ui48_ready() {
+    tmx capture-pane -p -t "$TUI48" > "$TESTROOT/c48-$tag.chars" 2>/dev/null &&
+      grep -qF "c48-alpha" "$TESTROOT/c48-$tag.chars"
+  }
+  wait_for 10 _ui48_ready || return 1
+  tmx capture-pane -p -t "$TUI48" > "$TESTROOT/c48-$tag.chars" 2>/dev/null
+  tmx capture-pane -p -e -t "$TUI48" > "$TESTROOT/c48-$tag.bytes" 2>/dev/null
+  tmx send-keys -t "$TUI48" q
+  # 回到 shell（alternate screen 已退出）才能起下一輪
+  # shellcheck disable=SC2329  # 經 wait_for 間接呼叫
+  _ui48_gone() { ! tmx capture-pane -p -t "$TUI48" 2>/dev/null | grep -qF "WORKERS"; }
+  wait_for 10 _ui48_gone
+}
+
+assert "48：降級版（COLORTERM 未宣告 24-bit）起得來" ui48_run plain 256color
+assert "48：升級版（COLORTERM=truecolor）起得來" ui48_run true truecolor
+
+# freshness 是**刻意隨時間變**的一段（`[disk 500ms · tmux 2s]` ↔
+# `disk 2s ago`／`STALE`），兩次執行之間本來就可能不同。它與色盤無關，
+# 故比對前正規化掉——normalise 的是時間，不是顏色。
+c48_norm() { sed -E 's/\[disk [^]]*\]//' "$1"; }
+c48_norm "$TESTROOT/c48-plain.chars" > "$TESTROOT/c48-plain.norm"
+c48_norm "$TESTROOT/c48-true.chars" > "$TESTROOT/c48-true.norm"
+
+assert "48：兩份畫面都真的畫出來了（非空、含兩個 agent）" \
+  bash -c '
+    for f in "$1" "$2"; do
+      test -s "$f" || exit 1
+      grep -qF "c48-alpha" "$f" || exit 1
+      grep -qF "c48-beta" "$f" || exit 1
+      grep -qF "WORKERS" "$f" || exit 1
+    done' _ "$TESTROOT/c48-plain.norm" "$TESTROOT/c48-true.norm"
+
+# 核心斷言：**字元層逐字相同**
+assert "48：升級／降級兩版的字元層逐字相同（顏色只加樣式，不動字元）" \
+  diff -q "$TESTROOT/c48-plain.norm" "$TESTROOT/c48-true.norm"
+
+# 對照組：若兩版根本上了同一組色，上面那條會因為「什麼都沒變」而假綠。
+# 位元組層要看得出差別——truecolor 版 MUST 真的送出 24-bit SGR（`38;2;`），
+# 降級版 MUST 一個都沒有
+assert "48：truecolor 版真的送出 24-bit SGR（38;2;）" \
+  grep -q $'\033''\[[0-9;]*38;2;' "$TESTROOT/c48-true.bytes"
+assert "48：降級版 MUST NOT 送出任何 24-bit SGR" \
+  bash -c '! grep -q "$(printf "\033")\[[0-9;]*38;2;" "$1"' _ "$TESTROOT/c48-plain.bytes"
+
+tmx kill-window -t "$W48" 2>/dev/null || true
+tmx kill-window -t "$W48W" 2>/dev/null || true
+
+fi  # end grp 48
 # ---- 總結 ----
 if [[ -n "$GRP_SELECTED" ]]; then
   printf '\n⚠ PARTIAL RUN（TEST_GROUPS=%s → 實跑:%s，跳過 %d 組）——不得作為收案／merge 證據\n' \

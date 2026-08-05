@@ -294,6 +294,21 @@ herdr 實測 idle→working 1.56s，500ms 輪詢的體感已優於競品，
 - 不得以顏色／排序暗示可刪度；不得因 idle／disposable 預選；不做批次自動清理
 - `c` 只複製 immutable 證據，MUST NOT 複製 mutation 命令
 
+**triage 排序與這條的關係（P5.4，2026-08-04）**：組間浮頂看起來像「排序在
+下判斷」，但它與被禁的那件事方向相反。被禁的是**用排序暗示某一列可以被
+回收**——那是替人做「這個沒用了」的判斷。triage 排的是 attention：三個排序鍵
+（blocker 升旗／pane 死活 `Dead`／最近一輪任務終態 failed）全部是「**有事情
+正在等人**」的訊號，浮上來的是「請你現在看」，不是「這個可以刪」。
+
+三條具體約束把界線釘住：
+
+1. **排序鍵不含「閒多久」**——idle 之間互不排序。閒置時長正是可刪度的代理
+   變數，一旦進了排序鍵，畫面就開始說「越閒的越該處理掉」。
+2. **`Unknown` 不浮頂**。tmux 停擺時整份索引是 unknown，若當成 dead 就會整批
+   上浮：畫面看起來出大事，而實際上一件事實都沒有變（§5 三態）。
+3. **強調只加 BOLD 不上色**，evict 確認框措辭與預選行為逐字不變。粗體說的是
+   「值得先看」；顏色軸留給既有的六種語意，不新增第七軸。
+
 ## 6. 依賴清單（「相對 herdr 低」的具體化）
 
 herdr 的包袱：自帶 PTY server、遠端 manifest、socket API、外掛市集。
@@ -354,6 +369,11 @@ focus 跨 window 語意、CAS（cancel 綁 id）。
 | P5.1b 捲軸語意 | thumb 改追**視窗**而非選取序位（2026-08-03 真實終端目視三輪的發現：同一頁內移動選取時畫面一行沒捲，thumb 卻在滑，讀起來像「上面還有內容被捲掉了」——與 P5 v1 敗因同一族的「畫面提示與可見範圍不符」） | render 測試：同頁內移動選取 thumb MUST 不動、捲到末列 MUST 貼軌道底；既有「捲軸吃行不吃列」的絕對格位斷言隨單位更新 |
 | PG0/PG3 page 層地基 | `ab-core::page`：事件恰兩類、event key（帶 generation key）、`state/page-events.jsonl` 落盤＋`page-seen` 去重；推播 ladder（`AGENT_BRIDGE_NOTIFY_CMD` → 本機桌面 `notify-send` → tmux status line 逐 client） | rubric v2 page 層條 1／2／4 的單元層：重複事件／行程重啟／已 seen 只落一筆只推一次；同名 respawn 是新事件；notifier 全滅仍落盤。ladder：SSH 下 MUST NOT 呼叫 notify-send（遠端 `DISPLAY` 是沒有人看的螢幕）、自訂命令收到 `<title> <body>` argv、逐 client 送且用 `-l` |
 | PG1/PG2 接上 CLI | E1 接 `respond_task` 的 failed 收斂點（`reply`／`cancel` 天然零推）；E2＝`page::scan`＋新 `scan` 子指令＋非唯讀子指令進場的機會式掃描（使用者裁定：不主動改使用者的 tmux 設定） | 分組 47（CLI-SCAN-1/2/3、CLI-PAGE-1/2、ENV-PAGE-1）：fail 恰一則、reply／cancel 零則、pane 死掛非終態恰一則且重掃不重推、唯讀指令零觸發、推播全滅仍落盤仍 exit 0。**掃描的 fail-closed 方向與送鍵路徑相反**：拿不到 pane 清單就整輪不掃（照抄「查不到當作死」會在 tmux 一掛時把整池推爆）；`ui` 排除在機會式之外（否則 dashboard 啟動反過來取決於 page 層，§4 bounded-read） |
+
+| P5.3 兩行列＋stat header | 使用者實跑回饋（2026-08-04）：畫面答得出「誰在跑」卻答不出「在做什麼、跑多久、上一步是什麼」。WORKERS／TASKS 兩層列皆改**兩行**（第二行＝忙碌 `⚙ <權威字> <elapsed> · <request 首行>`／閒置 `idle <時長> · last: <事件> <ago>`）；頂部加**不可選取**的一行 stat header（整池計數，與列表可見列數解耦）；WORKERS line-1 的裸 pane id 升級為 location `<session>:<window-name> %pane`（資料取自既有 `LiveIndex`，多重 linked window 標 `+N`）；窄終端配比修正（WORKERS ≥ 主區一半、DETAIL 壓成固定 4 行 compact 條）。摘要來源＝`request.md` 首行（**有界讀 4096B**，send 後不再變動故快取永不失效）＋`events.log` 尾行（檔長變更才重讀）；`now` 由呼叫端注入，render 不碰牆鐘 | render 測試新增七條：(a) 第二行的絕對格位在自己那一列正下方；(b) `End` 後選取列**兩行**皆在內容區內；(c) PgDn 走訪不跳列（由既有 paging 兩測涵蓋）；(d) TASKS 兩行捲動 thumb 貼軌道底；(e) 60×18 直向堆疊下 WORKERS ≥ 主區一半且 ≥ TASKS＋DETAIL；(f) header 計數＝整池分布且**篩選中不變**；(g) location 三態（解析成功／多重 `+N`／退回裸 pane id）。另分組 40/41/43/44/45 重跑不退步 |
+| P5.4 triage＋blocker snippet | **組間浮頂、組內不排**（`Severity`：`Blocked > Dead > Failed > None`，組取組內最大值、stable sort；只在資料事件邊緣重排＋緊接 `relocate`，不每幀排）；組標頭尾綴異常徽章（`⛔N`／`✗N`，沿用既有 glyph 與語意色，數的是**畫得出來的**成員）；異常列名稱 BOLD（**只加粗不上色**——第七個語意軸不存在）。**blocker snippet**：blocker probe 命中時把 matcher 命中窗的原文尾行（≤6 行、空行不佔額度）隨同一則 `Msg::Live` 帶回，DETAIL 對升旗中的 worker 顯示——**零新增 tmux 查詢**（取自那一輪已在手上的 `capture-pane`）、只存 TUI 記憶體不落盤、降旗即清 | 排序單元測試（浮頂／同分 stable／冪等／`unknown` 不浮／三判準定序）；徽章計數與 filter 同一集合；snippet 三態（升旗留、去抖期不顯示、降旗與整層 unknown 皆清）＋判定與內容同源（`Prompt` 必有、其餘三態必無）；render 三態＋薄殼憑證位置不讓（等價 CLI 原文仍在畫面上）；分組 44 步數 gate 不退步（1 vs 7＝14%） |
+| P5.5 truecolor 色盤 | **翻案**（見下方「翻案記錄」）：`theme` 的語意→顏色抽成 `Palette` 取值表，ANSI 16 那份**逐字不動**，另加 24-bit 一份；`COLORTERM` ∈ {`truecolor`,`24bit`} 才升級，其餘一律降級；`OnceLock` 於進 alternate screen 前 init，**未 init＝ANSI 16**（既有 render 測試零漂移）。不引入外部 crate、語意軸數不變 | `detect` 三案（兩個字面升級／未設空值 256color 未知字面降級／前後空白不害人降級）；兩份色盤的不變量（選取背景不撞任何**同框**語意前景、status 四態與 dim 兩兩可分、failed≡dead／completed≡live）；未 init 時每個 style 逐一等於 ANSI 16；modifier 與邊框型別不隨色盤變 |
+| P5.6 收案 | ui demo GIF（`docs/demo/ui.tape`）＋本表列＋`spec/cli.md` CLI-UI-2＋分組 48（降級後字元層逐字相同） | 全套 `tests/run-tests.sh` 綠（PARTIAL 不得作為收案證據）＋`vhs docs/demo/ui.tape` exit 0 且 `docs/assets/ui.gif` 非空。GIF 敘事＝**human judgment** |
 
 P4 附註：replay script 是 fixture 的一部分（固定初始 selection 與異常排序位置），
 量的是「固定操作序列下的步數差」，不宣稱量到任意操作者的自由行為。
@@ -522,6 +542,38 @@ P5.1 的三輪成果首次在真實終端目視（120x40／80x24／60x18 各一�
    壓成一列而次要面板最大，配比是反的。
 4. 未聚焦的面板仍印 `N/total`，但 `▶` 標記整個消失：標題說第 9 列，畫面上
    找不到第 9 列是哪一列。
+
+**條 3 已於 P5.3 修復**（2026-08-04）：直向堆疊改為 WORKERS `Fill(5)`／
+TASKS `Fill(2)`／DETAIL 固定 4 行 compact 條，60×18 下 WORKERS 拿 7 行、
+TASKS 3 行、DETAIL 4 行；`the_stacked_layout_gives_workers_the_larger_half`
+把它釘成斷言。其餘三條維持認列不修。
+
+### 翻案記錄：truecolor（2026-08-04）
+
+`theme.rs` 原本記載「使用者已否決 truecolor 自訂 palette」，理由是終端機主題
+各異、寫死 RGB 會與使用者配色打架。**使用者於 P5.3–P5.6 立案時重新裁定**：
+採 truecolor **並保留自動降級**。
+
+翻案能成立的關鍵是原否決要防的事仍然成立：升級的條件是終端機**自己宣告**
+`COLORTERM=truecolor`／`24bit`，沒有這個訊號時畫面與翻案前**逐字相同**
+（`without_init_every_style_comes_from_the_ansi16_palette` 逐一釘住，分組 48
+另在真終端比對字元層）。因此這不是「否決被推翻」，是「否決的適用範圍被
+限縮到它原本論證得住的那一半」。
+
+### P5.3–P5.4 的已知近似（認列不修）
+
+1. **idle 時長的視窗近似**：`worker_activity` 的 idle 基準是
+   `max(最近 attached task 的 created_at, spawned_at)`，而 `recent` 有
+   `RECENT_LIMIT` 視窗——任務掉出視窗後基準退回 spawn 時刻，畫面上的
+   `idle <時長>` 因此可能**偏長**。方向是保守的（不會謊報「剛剛才閒下來」），
+   但它是近似不是事實。
+2. **極窄面板不退化成單行**：`row_height` 是單一事實源且**固定**
+   （Worker=2／Task=1）。讓行高隨面板高度變會把行號會計變成條件式，而
+   捲動／捲軸／翻頁四處都吃它——P5.1 的教訓正是「行與列兩種單位混用」。
+   代價是面板高 ≤3 時看得到的 worker 更少（併同上面 known gap 條 2）。
+3. **triage 的排序鍵限三個事實**：blocker（升旗後）／pane 死活（`Dead`，
+   `Unknown` 不算）／最近一輪任務的終態。**不含**「閒多久」——那正是 §5
+   禁止的可刪度暗示，idle 之間互不排序。
 
 ## 10. 開放問題（已全數定案；2026-08-01 使用者拍板回填）
 

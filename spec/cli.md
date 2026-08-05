@@ -534,6 +534,54 @@ evict 的 await 段預設等 300s）：MUST 另起一次性 thread、結果經�
 （`Esc`），且溢位 MUST 有可見計數，MUST NOT 靜默丟棄。
 Source: cmd_ui / ab_tui::run / ab_core::evict
 
+### CLI-UI-2 [tested: 44, 48]
+`ui` 的呈現層補強（設計正本 `docs/tui-design.md` §9 的 P5.3–P5.6 四列）。
+本條款只管**顯示**，不新增任何協定、不改任何 payload 位元組。
+
+**摘要與時間欄**：WORKERS／TASKS 兩層列各為兩行，第二行是活動摘要。摘要文字
+取自 `tasks/<id>/request.md` 的**首行**與 `tasks/<id>/events.log` 的**尾行**，
+兩者皆 MUST 有界讀，且界 MUST 成立於**取得路徑**（先 `take`／先 seek 到尾端，
+不是整檔讀進來再截）：首行至多 4096 bytes，尾行至多檔尾 8192 bytes。
+兩個檔都在 task 目錄下＝worker 可寫面，檔案大小不是本程式保證得了的事實。
+尾行讀取從檔案中段切入時，**首段半條行 MUST 丟棄**（半條事件不得當成一整行
+呈現）。讀不到＝空字串 fail-closed，MUST NOT 反覆重試。
+兩行列的行高 MUST 有單一事實源，捲動位移、捲軌總量與 PgUp／PgDn 的一頁列數
+MUST 全部由它換算——行與列兩種單位只要有一處混用，症狀就是靜默跳列。
+摘要在畫面上是**顯示層截斷**（過長加省略號、MUST NOT
+換行），payload 本身逐字不變——`read` 的 stdout 與 `c` 的 buffer 內容不因此
+改變一個位元組（CLI-READ-1／CLI-UI-1 的 `c` 白名單皆不受影響）。elapsed／
+`ago` 由呼叫端注入的時刻算出，render MUST NOT 自行取牆鐘。
+task status 一律仍是權威字（不存在 `blocked`）；stat header 的計數取自
+**整池**，MUST NOT 隨 filter 或可見列數變動。
+
+**triage 排序**：WORKERS 的**組間**順序 MUST 依組內最大 severity 浮頂，
+severity 恰三個排序鍵且不得擴充——blocker 升旗（`Prompt`）／pane 死活為
+`Dead`／該 worker 最近一輪任務終態為 `failed`；`Blocked > Dead > Failed >
+None`。`Unknown` MUST NOT 浮頂（三態不得壓成兩態）。**組內順序不得重排**，
+排序 MUST stable（同 severity 維持 canonical 序），且 MUST 只在資料事件邊緣
+重排並緊接 selection 重定位。排序 MUST 是**當下事實的函式**：severity 消失後
+組序 MUST 回到 canonical 序，MUST NOT 保留上一輪的排名。stale 降級期間，
+排序鍵 MUST 與同一幀畫面採信的兩軸同源——畫面顯示 unknown 時 MUST NOT 繼續
+依快取中的舊事實浮頂。閒置時長 MUST NOT 進排序鍵，強調 MUST NOT 以顏色
+或排序暗示可刪度（設計 §5）。
+
+**blocker 框內容**：升旗中的 worker 其 DETAIL 得顯示 matcher **命中窗**的
+原文尾行（有界：至多 6 行）。內容 MUST 來自 blocker 探測那一輪已取得的
+`capture-pane` 輸出，**MUST NOT 新增任何 tmux 查詢**（§4 bounded-read）；
+MUST 只存於 TUI 記憶體、**MUST NOT 寫 FS**；顯示層 blocker 不再是 `Prompt`
+時 MUST 立即清除——去抖未升旗、降旗、以及**整層降級為 unknown 的那一幀**
+（MUST NOT 等到下一則探測回報才清）三者皆然。判定與內容 MUST 同源
+（`notify::screen_has_prompt` 與 `notify::prompt_snippet` 走同一份 matcher），
+MUST NOT 出現「標了 blocked 卻拿不到框」或反之。
+
+**色盤降級**：色盤 MUST 依 `COLORTERM` 決定——恰 `truecolor`／`24bit` 兩個
+字面（允許前後空白）升級為 24-bit，其餘（未設、空值、`256color`、認不得的
+字面）MUST 降級回 ANSI 16。降級後的畫面 MUST 與升級前的 ANSI 16 版本逐字
+相同；**兩種色盤下的字元層 MUST 完全相同**（顏色只加樣式不動字元，既有
+`capture-pane` 字元比對因此不受影響）。色盤 MUST 在進 alternate screen 前
+定案，MUST NOT 於同一次執行中途更換。
+Source: ab_tui::view / ab_tui::model / ab_tui::theme / ab_core::notify::prompt_snippet
+
 ---
 
 ## `scan`
