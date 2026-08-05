@@ -10,9 +10,42 @@ multiplexer 讓你一次看見所有 agent；agent-bridge 是它上面那層—�
 並讓那份工作活過發起它的 session 被清洗、壓縮或換人。委派的單位是**任務**
 （檔案上的狀態機）而不是 pane。
 
-![示範：spawn worker pane、委派任務、讀回覆](docs/assets/demo.gif)
+![示範：真實 Claude Code session 就地 spawn codex worker、委派任務、讀回覆](docs/assets/hero.gif)
 
-*示範以 stub runtime 錄製、未打真實 API；劇本見 [docs/demo/](docs/demo/)。*
+*只打一句人話 prompt，其餘全是兩個活 agent 自己的動作：真實 Claude Code
+session `spawn` 出 codex worker（`--here` 預設同窗彈出）、`send` 任務、
+`read` 回覆——這一輪還恰好踩到 worker 忙碌路徑：通知遞延、由 worker 的
+Stop hook 自行從 mailbox 取件。真 API 錄製，等待時間以後製摺疊；劇本見
+[docs/demo/](docs/demo/) 的 `real-*`（stub 版 tape 保留，供免 API 的可重現
+錄影用）。*
+
+<details>
+<summary><b>更多情境錄影</b>——多輪討論 · 跨廠審查 · relay 交棒（同為
+真實 session 錄製）</summary>
+
+### 多輪討論——脈絡留在 pane
+
+![示範：對同一個 worker 連問兩輪，第二輪不必重講前情](docs/assets/discussion.gif)
+
+追問送進同一個 pane，第二輪不必重述第一輪：worker 的脈絡活在它自己的
+pane，不佔你的 session 視窗。
+
+### 獨立審查回合——結構上就是跨廠
+
+![示範：codex pane 獨立審查未提交 diff 並回附驗證的裁決](docs/assets/review.gif)
+
+主導 session 把審查委派給另一家廠牌的 pane；裁決以可留檔的任務紀錄回來，
+而不是一段會被捲走的 scrollback。
+
+### relay——把主導權交棒出去
+
+![示範：task 還在跑就 relay 交棒，接手者收割前任派出的回覆](docs/assets/relay.gif)
+
+主導 session 的 context 吃緊時：先派工、不等結果，寫好交接檔、`relay`
+一個接棒 session——task 跨越交棒仍在跑。接手者讀交接檔、查 `status`、
+收割前任派出的回覆；worker 與任務都原地活過了交棒。
+
+</details>
 
 ## 為什麼不是內建 subagent
 
@@ -162,7 +195,7 @@ ln -s ~/projects/agent-bridge ~/.claude/skills/agent-bridge
 
 | 指令 | 用途 |
 |---|---|
-| `spawn <name> --runtime <codex\|claude\|agy> [--model <m>] [--window]` | 開 worker pane；stdout 只印 pane-id |
+| `spawn <name> --runtime <codex\|claude\|agy> [--model <m>] [--here\|--window]` | 開 worker pane；stdout 只印 pane-id |
 | `relay <name> --runtime … --handoff <path>` | 把主導權交給接手者（見 relay 節） |
 | `register` / `unregister <name> [target]` | 手動掛入／移除既有 pane |
 | `list [--long]` | 池況；`--long` 八欄含 where/owner/disposable/idle |
@@ -227,11 +260,30 @@ agent-bridge list              # worker-1  %N  starting → ready
 agent-bridge despawn worker-1  # 收尾：kill pane＋除名＋審計
 ```
 
-**落點**：tmux 內呼叫時，worker 進這個 orchestrator 專屬的 worker window
-（緊鄰其後、名為 `ab:<orchestrator window 名>`、tiled 均分），同一 owner
-再 spawn 沿用同一窗；落點錨定在呼叫者所在的 tmux window（registry 記
-`owner`），不跟著你正在看的視窗跑，沿用前驗證窗上的 `@ab_owner` 印記。
-`--window` 開獨立 window；tmux 外呼叫退回「目前視窗往下 split」。
+**落點**：`spawn` 接受互斥的 `--here`／`--window`；兩者同時給出、或 here
+layout 壞值，MUST 在建 pane 前拒絕、不留 pane／registry 痕跡。不給旗標時
+auto 判定三選一：
+
+- **呼叫者是人工 session**（`AGENT_BRIDGE_SPAWN_TAG` 未設定或空字串）且
+  tmux 呼叫者可解析→落 `--here`：split 進呼叫者當前 window，依
+  `AGENT_BRIDGE_HERE_LAYOUT` 重排——預設 `main-vertical`，合法值另有
+  `main-horizontal|tiled|even-vertical|even-horizontal|none`（`none`＝只
+  split 不重排）；空字串／非 UTF-8／表外值一律致命壞值，但只在真的會走
+  here 落點的路徑上驗證——`--window`、下面的「spawn 出身」分支、tmux 外
+  呼叫都不解析它，無關的壞值不封鎖這些逃生口。這個落點 MUST NOT 查或寫
+  worker-window reuse 的信任根 `@ab_owner`，registry 的 `worker_window`
+  欄留空。
+- **呼叫者是 spawn 出身**→維持舊行為：同一 owner 既有 worker window
+  （緊鄰其後、名為 `ab:<orchestrator window 名>`、tiled 均分）存活且其
+  `@ab_owner` 印記等於本次解析出的 owner 才沿用（registry 內容本身不足以
+  授權沿用，防 confused-deputy）；否則緊鄰 owner 視窗新建一個。
+- **tmux 外呼叫**（含顯式 `--here` 但沒有可解析呼叫者）→退回「目前視窗
+  往下 split」，不視為錯誤。
+
+`AGENT_BRIDGE_SPAWN_TAG` 在這裡只是落點 provenance 的訊號、不是身分授權：
+判斷錯了頂多是版面 UX 亂了，人可用 `--here`／`--window` 顯式修正，不為此
+新增信任根。`--window` 一律開專屬視窗，不被後續 spawn 沿用。relay 的落點
+規則與 spawn 完全共用（見下方 relay 節）。
 
 **runtime 表**：
 
@@ -317,12 +369,13 @@ worker 契約的唯一正本**，人工註冊的 worker 讀同一份，路徑可
 
 ```bash
 agent-bridge relay <name> --runtime <codex|claude|agy> [--model <m>] \
-  --handoff <path> [--window] [--no-select] [--self-exit <my-name>]
+  --handoff <path> [--here|--window] [--no-select] [--self-exit <my-name>]
 ```
 
 `spawn` 開的是**等派工的 worker**；`relay` 開的是**接手者**——一開始就拿到
 交接檔路徑，讀完自己往下做，不等 `receive`。除了注入
-`share/successor-brief.md` 與切焦點，pane 生命週期與 `spawn` 完全共用。
+`share/successor-brief.md` 與切焦點，pane 生命週期與落點解析（`--here`
+同適用，auto 三選一判定同一套規則，見上方「落點」段）與 `spawn` 完全共用。
 
 - `--self-exit <my-name>`：請接手者回收前一棒——自己殺自己的 pane 會被
   SIGHUP 帶走、審計線斷掉（論證見 lifecycle-safety.md）。第一棒是人工

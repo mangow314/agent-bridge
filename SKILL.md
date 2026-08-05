@@ -26,15 +26,17 @@ agent-bridge list --long              # human-intervention view: header row + na
                                       # read-only: signals, not a "safe to delete" verdict — reclaiming stays despawn/evict
 agent-bridge register <name> <tmux-target>
                                       # manually register an existing pane as an agent (unregister to remove)
-agent-bridge spawn <name> --runtime <codex|claude|agy> [--model <model>] [--window]
+agent-bridge spawn <name> --runtime <codex|claude|agy> [--model <model>] [--here|--window]
                                       # open + register a worker pane; prints pane-id on stdout (no --model = that CLI's default)
-                                      # placement: workers land in this orchestrator's own worker window (created
-                                      # next to it, reused across spawns, tiled); owner granularity is the caller's
-                                      # tmux window; --window = a fully separate window; outside tmux it falls
-                                      # back to splitting the current window
-agent-bridge relay <name> --runtime <codex|claude|agy> [--model <model>] --handoff <path> [--window] [--no-select] [--self-exit <my-name>]
+                                      # placement (auto when neither flag given): a manual session (no spawn tag)
+                                      # defaults to --here (split into the caller's current tmux window); a
+                                      # spawn-origin caller keeps its own dedicated worker window (created next to
+                                      # it, reused across spawns, tiled); outside tmux it falls back to splitting
+                                      # the current window; --here/--window override explicitly and are mutually exclusive
+agent-bridge relay <name> --runtime <codex|claude|agy> [--model <model>] --handoff <path> [--here|--window] [--no-select] [--self-exit <my-name>]
                                       # hand over: open a successor pane (injects successor brief + handoff file); not a worker
                                       # chain depth is capped (AGENT_BRIDGE_MAX_RELAY_DEPTH, default 10); hitting it means stop and get a human, not raise it yourself
+                                      # placement rules are identical to spawn (see above)
 agent-bridge despawn <name>           # reclaim a bridge-spawned worker (manually registered agents are refused)
 agent-bridge idle                     # (orchestrator) worker-pool reclaim view: name/ready/disposable/idle_secs
 agent-bridge evict <name> [--timeout <secs>] [--from <sender>]

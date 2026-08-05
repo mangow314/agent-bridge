@@ -13,10 +13,46 @@ One Rust binary plus the local filesystem — no daemon, no network service.
 Workers are the CLIs you already use, with their existing authentication,
 settings, and hooks.
 
-![demo: spawn a worker pane, delegate a task, read the reply back](docs/assets/demo.gif)
+![demo: a live Claude Code session spawns a codex worker into its window, delegates a task, reads the reply back](docs/assets/hero.gif)
 
-*The flow: `spawn` a worker, `send` a task, `read` the reply. Recorded against
-a stub runtime — no real API calls ([tape and scripts](docs/demo/)).*
+*One human prompt; everything else is two live agents at work. A real Claude
+Code session `spawn`s a codex worker into its own window (the `--here`
+default), `send`s the task, and `read`s the reply back — here the send even
+hits the busy-worker path: the notification is deferred and the worker's
+Stop hook collects the task from the mailbox. Recorded live (agents reply
+in Traditional Chinese); waiting time is folded in post
+([tapes and scripts](docs/demo/), `real-*`; the stub-runtime tapes remain
+for reproducible, API-free recordings).*
+
+<details>
+<summary><b>More recordings</b> — multi-round discussion · cross-vendor
+review · relay handoff (live sessions, recorded the same way)</summary>
+
+### Multi-round discussion — the pane keeps its context
+
+![demo: two rounds of questions to the same worker; round 2 needs no re-briefing](docs/assets/discussion.gif)
+
+The follow-up goes to the same pane, so round 2 never restates round 1: the
+worker's context lives in its pane, not in your session window.
+
+### Independent review round — cross-vendor by construction
+
+![demo: a codex pane audits an uncommitted diff and replies with a verified verdict](docs/assets/review.gif)
+
+The orchestrating session delegates the audit to a pane from another vendor;
+the verdict comes back as a durable task record, not a scrollback memory.
+
+### Relay — hand leadership forward
+
+![demo: relay a successor pane while a task is still in flight; the successor collects the reply](docs/assets/relay.gif)
+
+When the coordinating session's context runs tight: dispatch work, then
+write a handoff file and `relay` a successor while the task is still in
+flight. The successor reads the handoff, checks the task's `status`, and
+collects a reply the predecessor never saw — workers and tasks survive
+the baton pass in place.
+
+</details>
 
 > 完整正典文件：[README.zh-TW.md](README.zh-TW.md)（含設計取捨與完整已知限制）
 > — the Traditional Chinese README is the canonical, in-depth manual; this
@@ -56,7 +92,8 @@ After [installing](#install):
 
 ```bash
 # Spawn a worker pane (registers it, injects the worker-brief contract as its
-# first message, waits for the readiness probe)
+# first message, waits for the readiness probe). From a manual session this
+# defaults to a same-window split (--here); --window forces a separate one.
 agent-bridge spawn researcher --runtime codex   # or --runtime claude / --runtime agy
 
 # Delegate a task (multi-line requests go through stdin)
@@ -133,6 +170,10 @@ Optional: load the delegation skill into Claude Code with
   append-only audit log. On top sit `ui` (a dashboard over the same files)
   and `scan` (paging: a durable event plus at-most-once push when a human is
   needed now).
+- **Placement is automatic** — a manual session's `spawn`/`relay` defaults to
+  a same-window split (layout via `AGENT_BRIDGE_HERE_LAYOUT`, default
+  `main-vertical`); a spawn-origin caller keeps its own dedicated worker
+  window (the old behavior). `--here`/`--window` override explicitly.
 
 ## Trust model & known limits
 
