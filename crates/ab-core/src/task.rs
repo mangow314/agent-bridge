@@ -130,6 +130,74 @@ pub fn log_event(paths: &Paths, id: &str, event: &str, detail: &str) -> Result<(
         .map_err(|e| Error::new(format!("無法寫入 events.log {}：{e}", path.display())))
 }
 
+/// request.md 首行的讀取上限（P5.3 兩行列）。**界只有這一份定義**，且成立於
+/// 資料取得路徑（先 `take` 再讀），不是全讀進記憶體再截——同 `L` 尾行預覽的
+/// bounded 紀律（tui-design.md §3）。
+pub const REQUEST_FIRST_LINE_MAX_BYTES: u64 = 4096;
+
+/// TUI read model（P5.3）：request.md 首行，**有界讀**。二進位安全：回傳
+/// bytes、由 render 端決定 lossy 呈現（與 pager 的 bytes 紀律同族）；CRLF 檔
+/// 尾部的 `\r` 一併剝掉（它是行終止的另一半，不是內容）。讀不到（無檔／IO
+/// 錯）＝`None`，顯示層 fail-closed 自行退化。
+pub fn request_first_line(paths: &Paths, id: &str) -> Option<Vec<u8>> {
+    use std::io::Read;
+    let path = task_dir(paths, id).join("request.md");
+    let f = std::fs::File::open(path).ok()?;
+    let mut buf = Vec::new();
+    f.take(REQUEST_FIRST_LINE_MAX_BYTES)
+        .read_to_end(&mut buf)
+        .ok()?;
+    if let Some(pos) = buf.iter().position(|&b| b == b'\n') {
+        buf.truncate(pos);
+    }
+    if buf.last() == Some(&b'\r') {
+        buf.pop();
+    }
+    Some(buf)
+}
+
+/// events.log 尾行的讀取上限（P5.3 兩行列）。
+///
+/// 為什麼也要有界：正常情況下這個檔只有幾行（狀態轉換才 append），但**檔案
+/// 大小不是本程式能保證的事實**——events.log 在 task 目錄裡，而 task 目錄是
+/// worker 可寫面。UI 每輪在檔長變更時重讀，一個被灌大的檔就會讓 UI thread
+/// 每次分配並讀完整份。界成立於取得路徑（先 seek 到尾端再讀這麼多），不是
+/// 讀完再截（CLI-UI-2「兩者皆 MUST 有界讀」）。
+///
+/// 取 8 KiB：一行事件是 `<iso> <event>[ <detail>]`，detail 已由寫入端限長；
+/// 8 KiB 足以涵蓋尾端數十行，遠超過「最後一個非空行」所需。
+pub const LAST_EVENT_MAX_BYTES: u64 = 8192;
+
+/// TUI read model（P5.3）：events.log 最後一個非空行（原字串，`<iso> <event>
+/// [ <detail>]`）。**有界讀**：只取檔尾 `LAST_EVENT_MAX_BYTES` bytes。
+///
+/// 從中間切進去時**第一行必然是半條**（切點落在某一行中間），故檔案大於界時
+/// 丟掉第一段——寧可少答一行，也不要把半條事件當成完整的一行印在畫面上。
+/// 空行跳過；非 UTF-8／讀不到＝`None`。
+pub fn last_event_line(paths: &Paths, id: &str) -> Option<String> {
+    use std::io::{Read, Seek, SeekFrom};
+    let path = task_dir(paths, id).join("events.log");
+    let mut f = std::fs::File::open(path).ok()?;
+    let len = f.metadata().ok()?.len();
+    let truncated = len > LAST_EVENT_MAX_BYTES;
+    if truncated {
+        f.seek(SeekFrom::End(-(LAST_EVENT_MAX_BYTES as i64))).ok()?;
+    }
+    let mut buf = Vec::new();
+    f.take(LAST_EVENT_MAX_BYTES).read_to_end(&mut buf).ok()?;
+    let content = String::from_utf8(buf).ok()?;
+    let mut lines: Vec<&str> = content.lines().collect();
+    if truncated && !lines.is_empty() {
+        // 切點落在行中間：第一段不是一整行
+        lines.remove(0);
+    }
+    lines
+        .iter()
+        .rev()
+        .find(|l| !l.trim().is_empty())
+        .map(|l| l.to_string())
+}
+
 /// update_meta_status:261 — 同步更新 metadata.json 與裸 status 檔。
 /// **寫入順序不可對調**：先裸 status、後 metadata（bash:265-273 的論證——中途
 /// 被 SIGKILL 時，殘留分歧只會是 metadata.status 落後一步的展示性資訊；反過來
@@ -1971,5 +2039,136 @@ mod tests {
             assert!(TaskState::parse(st).is_some(), "MUST 放行：{st}");
         }
         assert!(TaskState::parse("blocked").is_none());
+    }
+
+    // ===== P5.3：request_first_line／last_event_line =====
+
+    /// 首行讀取的二進位安全與邊界：無換行結尾、CRLF、非 UTF-8、空檔、超界。
+    /// bytes 逐字回傳（lossy 是 render 端的事）；界成立於讀取路徑——超過
+    /// `REQUEST_FIRST_LINE_MAX_BYTES` 的單行只回前界內 bytes，不是整檔讀完再截。
+    #[test]
+    fn request_first_line_is_bounded_and_binary_safe() {
+        let d = Dir::new("ab-core-task-firstline");
+        let paths = test_paths(&d);
+        let write = |id: &str, bytes: &[u8]| {
+            let dir = paths.tasks_dir.join(id);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("request.md"), bytes).unwrap();
+        };
+
+        write("t-plain", b"first line\nsecond line\n");
+        assert_eq!(
+            request_first_line(&paths, "t-plain").unwrap(),
+            b"first line"
+        );
+
+        write("t-noeol", b"no trailing newline");
+        assert_eq!(
+            request_first_line(&paths, "t-noeol").unwrap(),
+            b"no trailing newline"
+        );
+
+        write("t-crlf", b"crlf line\r\nrest\n");
+        assert_eq!(request_first_line(&paths, "t-crlf").unwrap(), b"crlf line");
+
+        write("t-bin", b"\xff\xfe raw \x01 bytes\nrest");
+        assert_eq!(
+            request_first_line(&paths, "t-bin").unwrap(),
+            b"\xff\xfe raw \x01 bytes"
+        );
+
+        write("t-empty", b"");
+        assert_eq!(request_first_line(&paths, "t-empty").unwrap(), b"");
+
+        // 超界單行：只回前 REQUEST_FIRST_LINE_MAX_BYTES 個 bytes
+        let long = vec![b'x'; REQUEST_FIRST_LINE_MAX_BYTES as usize + 1000];
+        write("t-long", &long);
+        let got = request_first_line(&paths, "t-long").unwrap();
+        assert_eq!(got.len(), REQUEST_FIRST_LINE_MAX_BYTES as usize);
+
+        // 缺檔＝None（fail-closed）
+        assert!(request_first_line(&paths, "t-missing").is_none());
+    }
+
+    /// events.log 尾行：取最後**非空**行原文；缺檔＝None。走真的
+    /// `create_task`＋`log_event` 路徑，不手搓格式。
+    #[test]
+    fn last_event_line_returns_latest_nonempty() {
+        let d = Dir::new("ab-core-task-lastev");
+        let paths = test_paths(&d);
+        let id = create_task(
+            &paths,
+            "alice",
+            "bob",
+            &MessageSource::Text("x".into()),
+            false,
+        )
+        .unwrap();
+        log_event(&paths, &id, "delivered", "").unwrap();
+        log_event(&paths, &id, "started", "by=bob").unwrap();
+        let line = last_event_line(&paths, &id).unwrap();
+        assert!(
+            line.contains(" started by=bob"),
+            "尾行不是最後一筆事件：{line}"
+        );
+        // 尾端空行不算事件
+        let log_path = task_dir(&paths, &id).join("events.log");
+        let mut content = std::fs::read_to_string(&log_path).unwrap();
+        content.push_str("\n\n");
+        std::fs::write(&log_path, content).unwrap();
+        assert!(last_event_line(&paths, &id)
+            .unwrap()
+            .contains(" started by=bob"));
+
+        assert!(last_event_line(&paths, "t-missing").is_none());
+    }
+
+    /// **尾行讀取有界**（CLI-UI-2；跨廠複核 2026-08-05 finding 7）：events.log
+    /// 在 task 目錄裡＝worker 可寫面，檔案大小不是本程式保證得了的事實。
+    /// 界 MUST 成立於取得路徑（seek 到尾端再讀），而且從中間切進去的**半條
+    /// 首行不得被當成一整行**印出去。
+    #[test]
+    fn the_last_event_line_is_read_from_a_bounded_tail() {
+        let d = Dir::new("ab-core-task-lastev-bound");
+        let paths = test_paths(&d);
+        let id = create_task(
+            &paths,
+            "alice",
+            "bob",
+            &MessageSource::Text("x".into()),
+            false,
+        )
+        .unwrap();
+        let log_path = task_dir(&paths, &id).join("events.log");
+
+        // 灌到遠超過界：每行都可辨識，最後一行是答案
+        let mut big = String::new();
+        let filler = "2026-08-01T00:00:00Z filler detail=";
+        for i in 0..600 {
+            big.push_str(&format!("{filler}{i:0>40}\n"));
+        }
+        big.push_str("2026-08-05T00:00:00Z completed by=bob\n");
+        std::fs::write(&log_path, &big).unwrap();
+        assert!(
+            big.len() as u64 > LAST_EVENT_MAX_BYTES * 2,
+            "前提：fixture 真的大於界（{} bytes）",
+            big.len()
+        );
+
+        let line = last_event_line(&paths, &id).unwrap();
+        assert_eq!(
+            line, "2026-08-05T00:00:00Z completed by=bob",
+            "尾行 MUST 仍是最後一筆事件"
+        );
+
+        // 半條首行不得外流：把界內的第一段切成一條可辨識的殘句，
+        // 若實作沒有丟掉它，某個輸入下它就會成為「最後一個非空行」
+        let mut only_partial = "X".repeat(LAST_EVENT_MAX_BYTES as usize + 32);
+        only_partial.push('\n');
+        std::fs::write(&log_path, &only_partial).unwrap();
+        assert!(
+            last_event_line(&paths, &id).is_none(),
+            "整份只有一條超長行時，界內看到的全是半條——MUST NOT 當成事件回傳"
+        );
     }
 }

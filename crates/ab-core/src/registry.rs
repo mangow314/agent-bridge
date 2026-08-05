@@ -358,6 +358,10 @@ pub struct AgentSnapshot {
     pub ready: String,
     pub spawn_tag: String,
     pub registered_at: String,
+    /// spawn 出身才有（agents/*.json 既有欄位，read model 補讀，非磁碟 schema
+    /// 變更）；人工註冊／缺失＝空字串。P5.3 idle 基準
+    /// `max(last_task_at, spawned_at)` 的第二個操作數。
+    pub spawned_at: String,
     pub spawned: bool,
     pub corrupt: bool,
     /// lineage 的根（P4.7 切片 A）：**值是 generation key＝canonical
@@ -411,6 +415,7 @@ pub fn snapshot(paths: &Paths) -> Vec<AgentSnapshot> {
                     ready: "?".to_string(),
                     spawn_tag: String::new(),
                     registered_at: String::new(),
+                    spawned_at: String::new(),
                     spawned: false,
                     corrupt: true,
                     // 損壞檔沒有可信的 lineage 可言——缺席不是「它自成根」，
@@ -443,6 +448,7 @@ pub fn snapshot(paths: &Paths) -> Vec<AgentSnapshot> {
             ready: ready.to_string(),
             spawn_tag: json::jq_raw_field(&fields, "spawn_tag").unwrap_or_default(),
             registered_at: json::jq_raw_field(&fields, "registered_at").unwrap_or_default(),
+            spawned_at: json::jq_raw_field(&fields, "spawned_at").unwrap_or_default(),
             spawned,
             corrupt: false,
             // **同一次 parse 取齊**（不另開一次讀檔）：registry 是 atomic
