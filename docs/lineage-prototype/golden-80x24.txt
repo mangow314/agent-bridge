@@ -1,0 +1,24 @@
+┌─ LINEAGE compact · node 5/7 ─────────────────────────────────────────────────┐
+│p4w01 · [planner] · codex                                                     │
+│    running 12m                                                               │
+│  ──▸ p4w05 · [executor] · claude                                             │
+│      running 5m                                                              │
+│    ══▸ p4w02 · — · codex                                                     │
+│        archived · evicted                                                    │
+│      ══▸ p4w03 · — · claude                                                  │
+│          archived · despawned                                                │
+│        ══▸ ▶p4w04 · [tester] · agy                                           │
+│            running 2m                                                        │
+│  ──▸ p4w06 · [executor] · claude                                             │
+│      running 8m ⛔                                                            │
+│─ partial lineage ─                                                           │
+│… unknown generations                                                         │
+│  ··?▸ † …b8ef missing                                                        │
+│    ··?▸ p4w07 · — · codex                                                    │
+│        idle 3m                                                               │
+│─ standalone (display-only) ─                                                 │
+│p4w09 · — · claude                                                            │
+│  manual · not selectable                                                     │
+│                                                                              │
+│                                                                              │
+└────────────────────────────────────────────────────────── Esc back · q quit ─┘
