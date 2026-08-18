@@ -132,6 +132,7 @@ not decide it on their behalf.
 - On an `agent-bridge status <id>` notification showing `cancelled`:
   stop — further reply/fail will be refused.
 - A reply should contain: result summary, files modified, test or
-  verification results, unresolved issues.
+  verification results, unresolved issues. Keep it distilled — at most
+  ~2K tokens; cite paths and file:line instead of dumping raw output.
 - Mark which conclusions are **verified** and which are conjecture: the
   dispatcher cannot see your process and cannot tell the difference.

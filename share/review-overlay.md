@@ -11,6 +11,20 @@ When dispatching any independent review (code-review, codex-rescue, subagent rev
 - The verifier judges but never edits (write/review separation); fixes belong to the maker / main thread.
 - **Security-sensitive escalation**: if the diff touches auth/permissions/crypto/secrets handling, hooks/safety chain, or agent definitions, the verifier dispatch MUST request maximum thoroughness (full adversarial re-run of the relevant checks), regardless of diff size.
 
+## Reference codes in review reports
+
+Long review outputs number their findings with reference codes (F1, F2, …;
+D1 for design items). Hard limits:
+
+- **Single-report scope**: a code is meaningful only inside the report that
+  defined it — never carry F1 across reports or sessions as if it were a
+  global identifier.
+- **Cross-worker merges add a worker prefix**: when the orchestrator merges
+  findings from more than one reviewer, every code gets the worker's name
+  prefixed (e.g. `codex:F1`, `verifier:F1`) to prevent collisions.
+- Reference codes stay in review artifacts; they never enter global
+  output-style prose (compressed codes fight the plain-language style).
+
 ## Review vehicle (which codex to call)
 
 - **Default vehicle: an agent-bridge pane worker** (`--runtime codex`). Mechanics — the spawn/send/await/read sequence, retention vs evict/despawn — follow the agent-bridge skill and its `share/orchestrator-brief.md`; do not restate them here. Review-specific overlay: first-pass review rounds run at the runtime's default tier/effort — review precision holds at lower effort on current frontier models; escalate tier/effort only for security-sensitive diffs or a round that failed to converge, and name the escalation reason in the dispatch. Residual context stays in a live pane for follow-up questioning, and every round dogfoods the bridge.
