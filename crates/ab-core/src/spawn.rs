@@ -973,15 +973,10 @@ fn spawn_locked(
     // registry。吞掉的話會留下一個沒有審計線、卻佔著 cap 的 worker，而呼叫端
     // 看到的是成功。這是 spawn 少數「審計比不可逆動作先發生」的位置——pane 還
     // 在回滾範圍內，所以這裡可以硬起來
-    registry::log_agent_event(
-        paths,
-        tmux,
-        "spawned",
-        name,
-        &pane,
-        &req.runtime,
-        Some(actor),
-    )?;
+    // relay 記 `relayed`、spawn 記 `spawned`（CLI-SPAWN-6 的 action 值域）：
+    // 兩者共用整條生命週期，審計行是唯一分得出 relay 用量的地方
+    let action = if req.relay.is_some() { "relayed" } else { "spawned" };
+    registry::log_agent_event(paths, tmux, action, name, &pane, &req.runtime, Some(actor))?;
     Ok(pane)
 }
 

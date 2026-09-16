@@ -214,6 +214,17 @@ back empty.
   verified and which are conjecture), and directions already ruled out
   with reasons. The worker cannot see your conversation history; a hole
   in the brief leaves it guessing or bouncing the task back.
+- **Same-vendor plain messaging → built-in SendMessage, not a pane
+  worker.** If the other side is a Claude session and you only need to
+  talk (no task record, no reply on disk), use Claude Code's
+  cross-session messaging; the routing rule lives in
+  `share/vehicle-routing.md`.
+- **A worker that never received a task (relay successor, probe,
+  coordinator) is despawned directly — do not evict it.** There are no
+  notes to land. The audit line will read `despawned-unsaved`; for
+  these panes that is the expected record, not a discipline failure
+  （從未收過 task 的 worker 直接 despawn，不必 evict）. Measured
+  2026-09-16: 33 of 129 unsaved names never took a task.
 - Route by blast radius when the task ingests **untrusted external
   material** (web pages, third-party issue text, output of other
   agents): prefer a **codex worker** — its sandbox (workspace-write,

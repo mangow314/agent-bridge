@@ -2,6 +2,12 @@
 
 Referenced from ~/.claude/rules/context-discipline.md; SKILL.md pointer to be added by the repo owner.
 
+**Same-vendor plain messaging is not a bridge case.** A Claude session that only
+needs to talk to another Claude session — no task record, no reply on disk, no
+cross-vendor — uses Claude Code's built-in cross-session messaging (`SendMessage`
+/ `ListAgents`, v2.1.224+, [docs](https://code.claude.com/docs/en/cross-session-messaging)).
+Reach for a pane worker only when at least one row on the right below holds.
+
 Once work is spec-complete, pick the vehicle by four axes — any row on the right → agent-bridge worker; all rows left → subagent (executor/verifier/…):
 
 | subagent | agent-bridge worker |

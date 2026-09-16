@@ -374,6 +374,8 @@ worker 契約的唯一正本**，人工註冊的 worker 讀同一份，路徑可
 
 ### relay：把主導權交給下一棒
 
+> **凍結（2026-09-16）**：只修違反既有契約的故障，不接新功能。裁定與解凍條件見 [docs/scope-2026-09.md](docs/scope-2026-09.md)。
+
 ```bash
 agent-bridge relay <name> --runtime <codex|claude|agy> [--model <m>] \
   --handoff <path> [--here|--window] [--no-select] [--self-exit <my-name>]
@@ -398,6 +400,8 @@ agent-bridge relay <name> --runtime <codex|claude|agy> [--model <m>] \
 
 ## ui／scan：看板與呼叫器（Rust 獨有）
 
+> **凍結（2026-09-16）**：只修違反既有契約的故障，不接新功能。裁定與解凍條件見 [docs/scope-2026-09.md](docs/scope-2026-09.md)。
+
 兩支分別回答：**我想看時看得到**（`ui`）、**我沒在看時它會來找我**（`scan`）。
 
 **`ui`**：alternate-screen 看板（`q` 離開；agent session 不要跑它，會佔住
@@ -418,6 +422,8 @@ TASKS 列在飛任務，DETAIL 給 breadcrumb（缺代省略號、已除名留�
 打出來的：受測者卡在「要不要切過去看」，因為通知從沒說過切去哪裡。
 
 ## disposable／idle／evict／gc：pane 的去留
+
+> **凍結（2026-09-16）**：本節的 `gc` 只修違反既有契約的故障，不接新功能；disposable／idle／evict 不在凍結範圍。裁定見 [docs/scope-2026-09.md](docs/scope-2026-09.md)。
 
 worker 做完一件事不代表它該死——腦裡可能還留著沒寫進 response 的東西。
 **預設保留**，判定者是 worker（`disposable` 宣告），最終回收權在

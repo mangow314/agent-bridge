@@ -2207,6 +2207,8 @@ pane_r1="$(env AGENT_BRIDGE_DATA="$DRELAY" AGENT_BRIDGE_READY_TIMEOUT=0 \
 assert "relay 成功：exit 0" test "$rc" -eq 0
 assert "relay stdout 只印 pane-id（%N）一行" \
   bash -c "[[ '$pane_r1' =~ ^%[0-9]+\$ ]]"
+assert "agents.log 不把 relay 記成 spawned（relay 用量要分得出來）" \
+  bash -c "! grep -qE 'Z spawned r1 ' '$DRELAY/agents.log'"
 assert "relay 注入接手者守則（不是 worker 守則）" \
   grep -q 'agent-bridge successor brief' "$TESTROOT/codex-args.txt"
 assert "relay 注入的不是 worker 守則（兩份心智相反，混用會讓接手者空等 receive）" \
@@ -2218,8 +2220,8 @@ assert "relay 啟動參數含本接手者的名字與首要動作" \
 assert "relay registry：與 spawn 同一套欄位（共用 cmd_spawn）" \
   jq -e '.spawned == true and .runtime == "codex" and (.spawned_at | type == "string")' \
   "$DRELAY/agents/r1.json"
-assert "relay 寫 agents.log（審計線不因換命令而斷）" \
-  grep -qE "Z spawned r1 ${pane_r1} codex -\$" "$DRELAY/agents.log"
+assert "relay 寫 agents.log（審計線不因換命令而斷；action 記 relayed，CLI-SPAWN-6）" \
+  grep -qE "Z relayed r1 ${pane_r1} codex -\$" "$DRELAY/agents.log"
 
 # 23b2. relay --model 直通 cmd_spawn（驗證正本在 spawn 的解析點，relay 不抄第二份）
 env AGENT_BRIDGE_DATA="$DRELAY" AGENT_BRIDGE_READY_TIMEOUT=0 \
@@ -3593,6 +3595,8 @@ assert "32p relay 人工呼叫者預設 here：接棒 pane 落呼叫者 window" 
   test -n "$WRELAY32_WIN" -a "$WRELAY32_WIN" = "$ORC_WIN"
 assert "32p relay here：registry worker_window 留空" \
   jq -e '.worker_window == ""' "$D32/agents/wrelay32.json"
+assert "32p agents.log relayed 尾欄記 actor＝owner（與 32a 的 spawned 同形）" \
+  grep -qE "Z relayed wrelay32 [^ ]+ codex orc:@[0-9]+\$" "$D32/agents.log"
 # CLI-RELAY-3：--no-select 的契約是「不改 active pane」（不是「畫面完全
 # 不變」——here 的 layout 重排可能動版面，這裡只鎖 active pane 不變）。
 # split-window 帶 -d 本就不搶焦點，--no-select 是「不額外再切一次」，

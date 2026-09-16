@@ -33,7 +33,7 @@ agent-bridge spawn <name> --runtime <codex|claude|agy> [--model <model>] [--here
                                       # spawn-origin caller keeps its own dedicated worker window (created next to
                                       # it, reused across spawns, tiled); outside tmux it falls back to splitting
                                       # the current window; --here/--window override explicitly and are mutually exclusive
-agent-bridge relay <name> --runtime <codex|claude|agy> [--model <model>] --handoff <path> [--here|--window] [--no-select] [--self-exit <my-name>]
+agent-bridge relay <name> --runtime <codex|claude|agy> [--model <model>] --handoff <path> [--here|--window] [--no-select] [--self-exit <my-name>]  # [frozen: docs/scope-2026-09.md]
                                       # hand over: open a successor pane (injects successor brief + handoff file); not a worker
                                       # chain depth is capped (AGENT_BRIDGE_MAX_RELAY_DEPTH, default 10); hitting it means stop and get a human, not raise it yourself
                                       # placement rules are identical to spawn (see above)
@@ -61,13 +61,13 @@ agent-bridge fail <task-id> --message-file - <<'EOF'
 EOF
 agent-bridge read "$id"               # (sender) read the reply body (works for completed and failed)
 agent-bridge disposable <name>        # (worker, spawned only) declare this round's context has no residual value
-agent-bridge gc [--older-than <days>] [--include-notes] [--apply]
+agent-bridge gc [--older-than <days>] [--include-notes] [--apply]  # [frozen: docs/scope-2026-09.md]
                                       # clean old terminal-state tasks; dry-run by default, --apply to delete
-agent-bridge scan                     # page-layer sweep: notify a human about failed tasks and dead panes still
+agent-bridge scan                     # [frozen: docs/scope-2026-09.md] page-layer sweep: notify a human about failed tasks and dead panes still
                                       # holding live work; stdout = count of newly pushed events. Every non-read-only
                                       # subcommand already sweeps on the way out, so call this only when driving it
                                       # from a tmux hook / key binding / cron
-agent-bridge ui                       # alternate-screen dashboard for a human to watch the pool (q to leave).
+agent-bridge ui                       # [frozen: docs/scope-2026-09.md] alternate-screen dashboard for a human to watch the pool (q to leave).
                                       # NEVER run this from an agent session: it takes over the terminal and blocks
                                       # until someone presses q. Use list / list --long / idle for machine-readable views
 ```

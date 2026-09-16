@@ -268,8 +268,11 @@ Source: cmd_spawn / caller_owner / config::here_layout
 spawn／despawn／evict／disposable MUST 追加審計行至 `<data>/agents.log`，
 固定 6 欄空白分隔：`<ts> <action> <name> <pane> <runtime> <actor>`；欄值
 MUST 摺疊空白、空值以 `-` 補（欄位安全在寫入點保證，不倚賴上游）。actor
-是 provenance 非認證。
-Source: log_agent_event
+是 provenance 非認證。action 值域：`spawned`｜`relayed`｜`despawned`｜
+`despawned-unsaved`｜`despawn-stale`｜`evicted`｜`evicted-unfinished`｜
+`evicted-timeout`｜`disposable`——relay 開出的接手者記 `relayed`（其餘生命
+週期與 spawn 同，CLI-RELAY-1），spawn 總數＝`spawned`＋`relayed`。
+Source: log_agent_event / cmd_spawn
 
 ### CLI-SPAWN-7 [tested: 22, 27]
 worker／接手者 brief 正本（share/worker-brief.md、share/successor-brief.md）
