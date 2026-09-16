@@ -39,7 +39,8 @@
 
 | 檔 | 狀態 |
 |---|---|
-| [tui-design.md](tui-design.md) | `agent-bridge ui` 的設計正本。**待定案**——含各輪驗收通過與**未通過**的記錄 |
+| [scope-2026-09.md](scope-2026-09.md) | **現行範圍裁定**：收斂到跨廠任務信箱，`ui`／`scan`／`gc`／`relay` 凍結；逐命令 keep／support／freeze 表由 `check-contract.sh 5` 機器核對 |
+| [tui-design.md](tui-design.md) | `agent-bridge ui` 的設計正本。**已凍結**（見 scope-2026-09.md）——含各輪驗收通過與**未通過**的記錄 |
 
 ## 歷史決策記錄
 

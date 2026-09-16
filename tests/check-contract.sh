@@ -6,6 +6,8 @@
 #   3  hooks：hook_* 函式與三事件在 spec/hooks.md 有條款
 #   4  traceability：run-tests.sh 每個編號分組被 traceability.md 引用 >=1 次；
 #      統計 [untested] 數並比對 traceability.md 頂部宣告
+#   5  scope：spec/cli.md 每個子指令在 docs/scope-2026-09.md 的分類表恰出現
+#      一次，且分類 ∈ keep|support|freeze
 #
 # 實作正本是 Rust（bash 正本已退役）：
 #   1  grep crates/**/*.rs
@@ -110,10 +112,44 @@ check_4() {
   fi
 }
 
-if (( $# == 0 )); then set -- 1 2 3 4; fi
+check_5() {
+  local scope=docs/scope-2026-09.md spec_cmds section cand rows bad dup missing
+  # 只看「## 逐命令分類」一節；節內每一條以「| `」起頭的列都是候選資料列，
+  # 解析不出嚴格形狀 | `cmd` | keep|support|freeze | … | 就紅（不能靜默漏列——
+  # 複核 mutation 實證：多一格空白的重複列曾被寬鬆 grep 直接略過而仍綠）
+  section="$(awk '/^## 逐命令分類/{f=1;next} /^## /{f=0} f' "$scope" 2>/dev/null)"
+  # shellcheck disable=SC2016  # 反引號是字面值
+  cand="$(grep '^| `' <<<"$section")"
+  if [[ -z "$cand" ]]; then
+    fail "5 $scope 缺「逐命令分類」表"
+    return
+  fi
+  # shellcheck disable=SC2016
+  bad="$(grep -vE '^\| `[a-z-]+` \| (keep|support|freeze) \| ' <<<"$cand")"
+  if [[ -n "$bad" ]]; then
+    fail "5 scope 分類表有無法解析的列："
+    sed 's/^/     /' <<<"$bad"
+    return
+  fi
+  # shellcheck disable=SC2016
+  rows="$(sed -E 's/^\| `([a-z-]+)` \| ([a-z]+) \| .*$/\1 \2/' <<<"$cand")"
+  dup="$(awk '{print $1}' <<<"$rows" | sort | uniq -d)"
+  # shellcheck disable=SC2016
+  spec_cmds="$(grep -o '^## `[a-z-]*`$' "$SPEC/cli.md" | tr -d '#` ' | sort -u)"
+  missing="$(diff <(printf '%s\n' "$spec_cmds") <(awk '{print $1}' <<<"$rows" | sort -u))"
+  if [[ -n "$dup" || -n "$missing" ]]; then
+    fail "5 scope 分類表與 cli.md 不一致："
+    [[ -n "$dup" ]] && printf '     重複列：%s\n' "$dup"
+    [[ -n "$missing" ]] && sed 's/^/     /' <<<"$missing"
+    return
+  fi
+  ok "5 scope 分類表涵蓋 cli.md 全部子指令、各恰一次（$(grep -c . <<<"$rows") 個）"
+}
+
+if (( $# == 0 )); then set -- 1 2 3 4 5; fi
 for item in "$@"; do
   case "$item" in
-    1) check_1 ;; 2) check_2 ;; 3) check_3 ;; 4) check_4 ;;
+    1) check_1 ;; 2) check_2 ;; 3) check_3 ;; 4) check_4 ;; 5) check_5 ;;
     *) fail "未知項目：$item" ;;
   esac
 done

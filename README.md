@@ -80,6 +80,7 @@ a proposal that serves none of them does not belong here):
 | Built-in subagents | same vendor, inside your session; result lands straight in your context | reply enters context only when you `read` it |
 | Agent multiplexers | unit is the pane; "looks busy" via screen-scraping ([measured](docs/herdr-probe.md)) | unit is the task: who asked what, exact state, exact reply |
 | Claude Code agent teams ([docs](https://code.claude.com/docs/en/agent-teams)) | rich same-vendor collaboration; lead fixed for life, in-process teammates don't survive `/resume` | independent CLI sessions; `relay` hands leadership on |
+| Claude Code cross-session messaging ([docs](https://code.claude.com/docs/en/cross-session-messaging)) | message any peer Claude session by name (v2.1.224+, cross-machine via Remote Control); Claude-only; a message, not a task — no state, no durable reply | cross-vendor; every dispatch is a task record with a state machine and a reply on disk. For plain Claude-to-Claude chatter, use the built-in |
 | MCP cross-calls | synchronous — your turn blocks, full reply enters context | `send` returns at once; reply waits in the mailbox |
 | API frameworks | orchestrate API calls; you manage keys and tools | orchestrates the CLIs you already use, settings included |
 

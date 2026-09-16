@@ -79,6 +79,13 @@ codex，不掛在任何 lead 底下，`relay` 就是把主導權交給下一棒�
 往下再開一層。取捨很直接——全用 Claude、要緊密協作，開 agent teams；要
 跨廠、要 worker 活得比主 session 久，才輪到 agent-bridge。
 
+**官方跨 session 訊息**（Claude Code v2.1.224+ 正式功能，
+[官方文件](https://code.claude.com/docs/en/cross-session-messaging)）：用
+session 名字直接傳訊給同機或 Remote Control 上的另一個 Claude session。它是
+**訊息不是任務**——沒有狀態機、沒有落盤的回覆、只能 Claude 對 Claude。同廠
+的純對話用它就好，不必經 agent-bridge；要跨廠、要每次派工留下可查的 task
+記錄，才輪到 agent-bridge（範圍裁定見 [docs/scope-2026-09.md](docs/scope-2026-09.md)）。
+
 **MCP 跨呼叫**（把 codex 包成 MCP server 給 claude 呼叫）：同步請求—回應，
 呼叫方整個 turn 卡著等，回覆全文直接灌進 context——這正是想避免的事。
 `send` 丟出去就走，回覆躺在 mailbox，要讀再 `read`。
