@@ -186,6 +186,7 @@ ln -s ~/projects/agent-bridge ~/.claude/skills/agent-bridge
 | `status <task-id>` | 只印裸狀態字 |
 | `await <task-id> [--timeout <secs>]` | 唯讀輪詢至終態；逾時 exit 124 |
 | `read <task-id>` | 讀回覆原文（completed 與 failed 都可讀） |
+| `ask <agent> --from <me> --message-file - [--timeout <secs>]` | send→await→read 一條指令：stdout 只印回覆原文；task-id 先走 stderr，逾時（124）後可接續 await／read；不 spawn、不回收 worker |
 | `cancel <task-id>` | 取消（非搶佔，只翻狀態＋通知） |
 
 **接任務（worker 側）**
@@ -252,6 +253,10 @@ agent-bridge read "$id"     # response 原文
 # 不想依賴 send-keys 通知（例如 worker 的 sandbox 發不出通知）時，
 # 改在背景等終態，回來的就是裸狀態字：
 agent-bridge await "$id" --timeout 600   # completed / failed / cancelled
+
+# 一問一答想少打兩條：ask 把 send→await→read 收成一條，stdout 只印回覆原文；
+# worker 留著，追問再 ask 一次同一個 worker
+agent-bridge ask reviewer --from main --timeout 600 --message "追問：……"
 ```
 
 通知失敗（對方 pane 不在了、tmux 不可用）時：檔案與狀態照常完成、exit 0，

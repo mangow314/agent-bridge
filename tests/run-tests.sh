@@ -142,7 +142,7 @@ declare -A GRP_NEEDS=(
   # 語意 fixture，變數掃描抓不到 manual-x 這種字串依賴）
   [17]="16" [18]="16"
 )
-GRP_KNOWN=" 1 2 3 4 5 6 7 8 8a 8b 9 10 11 12 13 14 15 16 17 18 18b 18c 19 20 20b 21 22 23 24 25 26 27 28 29 30 31 32 33 34 34.5+ 35 36 37 38 39 40 41 42 43 44 45 46 47 48 "
+GRP_KNOWN=" 1 2 3 4 5 6 7 8 8a 8b 9 10 11 12 13 14 15 16 17 18 18b 18c 19 20 20b 21 22 23 24 25 26 27 28 29 30 31 32 33 34 34.5+ 35 36 37 38 39 40 41 42 43 44 45 46 47 48 49 "
 GRP_SELECTED=""
 GRP_SKIPPED=0
 if [[ -n "${TEST_GROUPS:-}" ]]; then
@@ -6722,6 +6722,105 @@ tmx kill-window -t "$W48" 2>/dev/null || true
 tmx kill-window -t "$W48W" 2>/dev/null || true
 
 fi  # end grp 48
+# ---- 49. ask：send→await→read 組合（CLI-ASK-1／CLI-ASK-2） ----
+if grp 49; then
+# spec: CLI-ASK-1 CLI-ASK-2
+# 自帶資料目錄；PANE_B 是共用 setup 建的，收到通知會自動 receive（同分組 14），
+# 所以下面的手動 receive 一律吞錯——兩種時序都要綠，不能賭。
+D49="$TESTROOT/d49"
+ab "$D49" register bob "$PANE_B" 2>/dev/null
+
+# 前驗：一律 rc 1，且不留孤兒 task（CLI-ASK-2）
+assert_fails "49：ask 無參數被拒" ab "$D49" ask
+assert_fails "49：ask 缺 --from 被拒" ab "$D49" ask bob --message hi
+assert_fails "49：ask 缺訊息被拒" ab "$D49" ask bob --from alice
+assert_fails "49：ask --message 與 --message-file 並存被拒" \
+  ab "$D49" ask bob --from alice --message a --message-file "$TESTROOT/no-such-49.md"
+assert_fails "49：ask --on-blocker 非法值被拒" \
+  ab "$D49" ask bob --from alice --message hi --on-blocker nope
+assert_fails "49：ask --timeout 非整數被拒" \
+  ab "$D49" ask bob --from alice --message hi --timeout abc
+assert_fails "49：ask 訊息檔不存在被拒" \
+  ab "$D49" ask bob --from alice --message-file "$TESTROOT/no-such-49.md"
+assert_fails "49：ask 收件者未註冊被拒" ab "$D49" ask nobody --from alice --message hi
+assert_fails "49：ask 未知參數被拒" ab "$D49" ask bob --from alice --message hi --bogus
+# 不用分組 26 的 task_count（定義在該組內，partial run 會缺）：直接看目錄空不空
+assert "49：前驗失敗不建 task" bash -c '[[ -z "$(ls -A "$1" 2>/dev/null)" ]]' _ "$D49/tasks"
+
+# 快樂路徑：背景 ask，主線程 reply；訊息含引號與多行，順便驗 payload 保真
+REQ49="$TESTROOT/req49.md"
+printf 'ask 請求 "quoted"\n第二行\n' > "$REQ49"
+ab "$D49" ask bob --from alice --message-file "$REQ49" --timeout 15 \
+  > "$TESTROOT/ask49.out" 2> "$TESTROOT/ask49.err" &
+ASK_PID=$!
+assert "49：等待前先把 task-id 寫到 stderr" \
+  wait_for 5 grep -q '^task-id: ' "$TESTROOT/ask49.err"
+id49="$(sed -n 's/^task-id: //p' "$TESTROOT/ask49.err" | head -1)"
+assert "49：stderr 的 task-id 對應到已建 task" test -f "$D49/tasks/$id49/metadata.json"
+ab "$D49" receive "$id49" >/dev/null 2>&1 || true
+ab "$D49" reply "$id49" --message "答一次" 2>/dev/null
+wait "$ASK_PID"; rc=$?
+assert "49：completed → exit 0" test "$rc" -eq 0
+assert "49：stdout 恰為回覆原文" test "$(cat "$TESTROOT/ask49.out")" = "答一次"
+assert "49：stderr 有 from 標頭（sender）" grep -q '^from: alice$' "$TESTROOT/ask49.err"
+assert "49：stderr 有 to 標頭（收件者）" grep -q '^to: bob$' "$TESTROOT/ask49.err"
+assert "49：events.log 記 read（非唯讀路徑）" \
+  grep -q 'Z read$' "$D49/tasks/$id49/events.log"
+
+# 等價：同一訊息走 send;await;read，request.md 與 stdout 位元相同（CLI-ASK-1）
+idS49="$(ab "$D49" send bob --from alice --message-file "$REQ49" 2>/dev/null)"
+ab "$D49" receive "$idS49" >/dev/null 2>&1 || true
+ab "$D49" reply "$idS49" --message "答一次" 2>/dev/null
+assert "49：send;await 對照組到達 completed" \
+  test "$(ab "$D49" await "$idS49" --timeout 5 2>/dev/null)" = completed
+ab "$D49" read "$idS49" > "$TESTROOT/read49.out" 2>/dev/null
+assert "49：ask 與 send;await;read 的 request.md 位元相同" \
+  cmp -s "$D49/tasks/$id49/request.md" "$D49/tasks/$idS49/request.md"
+assert "49：ask 與 read 的 stdout 位元相同" \
+  cmp -s "$TESTROOT/ask49.out" "$TESTROOT/read49.out"
+
+# failed：原文仍走 stdout、exit 1、stderr 註明 failed（CLI-ASK-2）
+ab "$D49" ask bob --from alice --message "會失敗" --timeout 15 \
+  > "$TESTROOT/ask49f.out" 2> "$TESTROOT/ask49f.err" &
+ASK_PID=$!
+assert "49(failed)：task-id 先到 stderr" \
+  wait_for 5 grep -q '^task-id: ' "$TESTROOT/ask49f.err"
+id49f="$(sed -n 's/^task-id: //p' "$TESTROOT/ask49f.err" | head -1)"
+ab "$D49" receive "$id49f" >/dev/null 2>&1 || true
+ab "$D49" fail "$id49f" --message "原因 X" 2>/dev/null
+wait "$ASK_PID"; rc=$?
+assert "49(failed)：exit 1" test "$rc" -eq 1
+assert "49(failed)：失敗原因仍走 stdout" test "$(cat "$TESTROOT/ask49f.out")" = "原因 X"
+assert "49(failed)：stderr 註明 task failed" \
+  grep -q "^agent-bridge: task $id49f failed$" "$TESTROOT/ask49f.err"
+
+# cancelled：exit 1、stdout 空（沿用 read 的拒絕）
+ab "$D49" ask bob --from alice --message "會取消" --timeout 15 \
+  > "$TESTROOT/ask49c.out" 2> "$TESTROOT/ask49c.err" &
+ASK_PID=$!
+assert "49(cancelled)：task-id 先到 stderr" \
+  wait_for 5 grep -q '^task-id: ' "$TESTROOT/ask49c.err"
+id49c="$(sed -n 's/^task-id: //p' "$TESTROOT/ask49c.err" | head -1)"
+ab "$D49" cancel "$id49c" >/dev/null 2>&1
+wait "$ASK_PID"; rc=$?
+assert "49(cancelled)：exit 1" test "$rc" -eq 1
+assert "49(cancelled)：stdout 為空" test ! -s "$TESTROOT/ask49c.out"
+
+# 逾時：exit 124、task 仍有效、stderr 的 task-id 可接續 await／read（CLI-ASK-2）
+ab "$D49" ask bob --from alice --message "逾時" --timeout 1 \
+  > "$TESTROOT/ask49t.out" 2> "$TESTROOT/ask49t.err"; rc=$?
+assert "49(timeout)：exit 124" test "$rc" -eq 124
+assert "49(timeout)：stdout 為空" test ! -s "$TESTROOT/ask49t.out"
+id49t="$(sed -n 's/^task-id: //p' "$TESTROOT/ask49t.err" | head -1)"
+assert "49(timeout)：stderr 有 task-id" test -n "$id49t"
+ab "$D49" receive "$id49t" >/dev/null 2>&1 || true
+ab "$D49" reply "$id49t" --message "晚到的答案" 2>/dev/null
+assert "49(timeout)：同 id 可接續 await" \
+  test "$(ab "$D49" await "$id49t" --timeout 5 2>/dev/null)" = completed
+assert "49(timeout)：同 id 可接續 read" \
+  test "$(ab "$D49" read "$id49t" 2>/dev/null)" = "晚到的答案"
+
+fi  # end grp 49
 # ---- 總結 ----
 if [[ -n "$GRP_SELECTED" ]]; then
   printf '\n⚠ PARTIAL RUN（TEST_GROUPS=%s → 實跑:%s，跳過 %d 組）——不得作為收案／merge 證據\n' \

@@ -1,4 +1,4 @@
-# CLI 契約（21 個子指令）
+# CLI 契約（24 個子指令）
 
 ## 共通慣例
 
@@ -162,6 +162,28 @@ stderr；記 read 事件（非唯讀路徑）。讀取全程持 task 鎖（與 g
 （TUI 的 `r` 消費同一份，CLI-UI-1），**行為不變**：stdout／stderr 逐字輸出、
 退出碼與拒絕訊息一如既往；CLI 側只剩標頭呈現。
 Source: cmd_read / ab_core::task::read_response
+
+## `ask`
+
+### CLI-ASK-1 [tested: 49]
+`ask <agent> --from <sender> (--message <text> | --message-file <path>)
+[--timeout <secs>] [--on-blocker warn|return|off] [--blocker-grace <secs>]`：
+一條指令依序完成 `send`、`await`、`read`。旗標語意、驗證文法、拒絕訊息與
+三者逐字相同（訊息裡的命令名詞隨指令，如 `ask 需要 --from <sender>`）；task 落盤形狀（request／metadata／events）MUST 與逐條執行
+`send; await; read` 位元相同，stdout MUST 恰為 response 內容（同 CLI-READ-1）。
+MUST 走與三者同一批實作（建 task／通知、輪詢／探測、鎖／read 事件），MUST NOT
+另養狀態或旁路。非唯讀（send 建 task、read 記事件）。不 spawn、不回收 worker：
+追問沿用同一個 worker（docs/scope-2026-09.md 立案依據）。
+Source: cmd_ask / do_send / await_with_blocker / ab_core::task::with_response
+
+### CLI-ASK-2 [tested: 49]
+退出碼：completed `0`；failed `1`（response 原文仍走 stdout，stderr 加
+`agent-bridge: task <id> failed`）；cancelled `1`（沿用 read 的拒絕）；await
+逾時 `124`、blocker 提前返回 `125`，語意與 CLI-AWAIT-2／CLI-AWAIT-4 逐字相同。
+send 成功後、開始等待前 MUST 先把 `task-id: <id>` 寫到 stderr：124／125 之後
+task 仍有效，呼叫端 MUST 能以同 id 接續 `await`／`read`。前驗失敗（用法錯、
+收件者未註冊、訊息檔不存在）MUST NOT 建 task（同 CLI-SEND-2／CLI-SEND-3）。
+Source: cmd_ask
 
 ## `await`
 

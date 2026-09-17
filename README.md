@@ -109,6 +109,14 @@ EOF
 agent-bridge await "$id" --timeout 600
 agent-bridge read "$id"
 
+# Or do all three in one call: send, wait for the terminal state, print
+# the reply body on stdout. The task-id goes to stderr before the wait,
+# so on timeout (124) you can still `await`/`read` it later. The worker
+# stays up for follow-up questions — `ask` never spawns or evicts.
+agent-bridge ask researcher --from main --timeout 600 --message-file - <<'EOF'
+Follow-up question ...
+EOF
+
 # Reclaim the worker once its residual context has no further value
 agent-bridge despawn researcher
 ```

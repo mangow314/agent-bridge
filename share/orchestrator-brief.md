@@ -240,6 +240,14 @@ back empty.
 - After dispatching a long task, use `agent-bridge await`; sending
   while `list` shows `starting` is legal — the message is not lost,
   only the notification may lag.
+- **One question, one answer: `agent-bridge ask`** is send → await →
+  read in a single call (reply body on stdout, `task-id:` on stderr
+  before the wait). It takes the same `--timeout` / `--on-blocker` /
+  `--blocker-grace` as `await`, so the unattended rule below applies
+  unchanged: pass `--on-blocker return`. `ask` never spawns and never
+  reclaims the worker — the pane and its context stay for follow-up
+  questions (measured: a worker answers 3.4 tasks per life on average),
+  so retention vs `evict` remains your separate, auditable decision.
 - **Unattended dispatch: always await with `--on-blocker return`.**
   A worker parked on a permission prompt with no human watching is a
   wall-clock black hole (measured: one hour, 2026-08-01). `await

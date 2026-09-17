@@ -31,6 +31,11 @@ const USAGE: &str = r#"用法：
                                                 --long：加 origin/位置/owner/disposable/idle 的介入視圖（首行為欄名）
   agent-bridge send <agent> --from <sender> (--message <text> | --message-file <path>)
                                                 委派任務；stdout 只印 task-id
+  agent-bridge ask <agent> --from <sender> (--message <text> | --message-file <path>) [--timeout <secs>] [--on-blocker warn|return|off] [--blocker-grace <secs>]
+                                                send → await → read 一條指令：派任務、等到終態、
+                                                stdout 只印回覆原文；task-id 在等待前先走 stderr，
+                                                逾時（124）／提前返回（125）後可用它接續 await／read；
+                                                failed 時原文仍印、exit 1；不 spawn、不回收 worker
   agent-bridge receive <task-id>                取出任務（標頭走 stderr、request 原文走 stdout）
   agent-bridge start <task-id>                  （worker）標記開工（delivered → running）
   agent-bridge reply <task-id> (--message <text> | --message-file <path>)
@@ -109,6 +114,7 @@ fn err_line(msg: &str) {
 // 未實作前不列——列入等於宣稱可用。
 fn print_implemented_commands() {
     for cmd in [
+        "ask",
         "await",
         "cancel",
         "despawn",
@@ -242,6 +248,7 @@ fn main() -> ExitCode {
         "unregister" => cmd_unregister(&paths, rest),
         "list" => cmd_list(&paths, rest),
         "send" => cmd_send(&paths, rest_os),
+        "ask" => cmd_ask(&paths, rest_os),
         "receive" => cmd_receive(&paths, rest),
         "start" => cmd_start(&paths, rest),
         "reply" => cmd_reply(&paths, rest_os),
@@ -414,6 +421,120 @@ fn cmd_send(paths: &Paths, args: &[OsString]) -> Result<()> {
     let src = message_source(mode, &val);
     let task_id = do_send(paths, &to, &from, &src, false)?;
     println!("{task_id}");
+    Ok(())
+}
+
+/// cmd_ask — send → await → read 一條指令（CLI-ASK-1／CLI-ASK-2）。
+///
+/// 只組既有的三條路徑，不另養狀態：建 task 走 `do_send`（與 send 同一份
+/// 前驗與通知），等待走 `await_with_blocker`（與 await 同一份探測），取回覆走
+/// `task::with_response`（與 read 同一把鎖、同一個 read 事件）。立案依據
+/// （docs/scope-2026-09.md）：八週量測每次 spawn 平均收 3.37 個 task，「問一次、
+/// 等到終態、拿回覆」是被證明的主流形狀，而 worker 要留著追問——所以這裡不
+/// spawn、不 evict。
+///
+/// 退出碼：completed 0；failed 1（原文仍在 stdout，stderr 加一行 `task <id>
+/// failed`，呼叫端才能把「worker 誠實失敗」與「成功」分開）；cancelled 1（沿用
+/// read 的拒絕）；逾時 124、blocker 提前返回 125 與 await 逐字相同。`task-id:`
+/// 在等待前就寫到 stderr：124／125 之後 task 仍有效，呼叫端靠它接續。
+fn cmd_ask(paths: &Paths, args: &[OsString]) -> Result<()> {
+    if args.is_empty() {
+        return Err(Error::new(
+            "用法：agent-bridge ask <agent> --from <sender> (--message <text> | --message-file <path>) [--timeout <secs>] [--on-blocker warn|return|off] [--blocker-grace <secs>]",
+        ));
+    }
+    let to = lossy(&args[0]);
+    let mut it = args[1..].iter();
+    let mut from = String::new();
+    let mut mode = ""; // "" | "text" | "file"
+    let mut val = OsString::new();
+    let mut timeout: u64 = 0;
+    let mut on_blocker = "warn".to_string();
+    let mut grace_secs: u64 = 60;
+
+    while let Some(a) = it.next() {
+        match lossy(a).as_str() {
+            "--from" => {
+                let v = it.next().ok_or_else(|| Error::new("--from 需要參數"))?;
+                from = lossy(v);
+            }
+            "--message" => {
+                let v = it.next().ok_or_else(|| Error::new("--message 需要參數"))?;
+                if !mode.is_empty() {
+                    return Err(Error::new("--message 與 --message-file 只能擇一"));
+                }
+                mode = "text";
+                val = v.clone();
+            }
+            "--message-file" => {
+                let v = it
+                    .next()
+                    .ok_or_else(|| Error::new("--message-file 需要參數"))?;
+                if !mode.is_empty() {
+                    return Err(Error::new("--message 與 --message-file 只能擇一"));
+                }
+                mode = "file";
+                val = v.clone();
+            }
+            "--timeout" => {
+                let v = it.next().ok_or_else(|| Error::new("--timeout 需要參數"))?;
+                timeout = parse_secs("--timeout", &lossy(v), 9)?;
+            }
+            "--on-blocker" => {
+                let v = it
+                    .next()
+                    .ok_or_else(|| Error::new("--on-blocker 需要參數（warn|return|off）"))?;
+                on_blocker = parse_on_blocker(&lossy(v))?;
+            }
+            "--blocker-grace" => {
+                let v = it
+                    .next()
+                    .ok_or_else(|| Error::new("--blocker-grace 需要參數"))?;
+                grace_secs = parse_secs("--blocker-grace", &lossy(v), 9)?;
+            }
+            other => return Err(Error::new(format!("未知參數：{other}"))),
+        }
+    }
+    if from.is_empty() {
+        return Err(Error::new("ask 需要 --from <sender>"));
+    }
+    if mode.is_empty() {
+        return Err(Error::new("ask 需要 --message 或 --message-file"));
+    }
+    if mode == "file" && val != "-" && !std::path::Path::new(&val).is_file() {
+        return Err(Error::new(format!(
+            "找不到訊息檔：{}",
+            val.to_string_lossy()
+        )));
+    }
+    let src = message_source(mode, &val);
+    let id = do_send(paths, &to, &from, &src, false)?;
+    eprintln!("task-id: {id}");
+
+    let st = match await_with_blocker(paths, &id, timeout, &on_blocker, grace_secs)? {
+        task::AwaitOutcome::Terminal(st) => st,
+        task::AwaitOutcome::Timeout(st) => {
+            err_line(&format!(
+                "await 逾時（{timeout}s）：task {id} 目前狀態 {st}"
+            ));
+            std::process::exit(124);
+        }
+        task::AwaitOutcome::Blocked { status, since_secs } => {
+            err_line(&format!(
+                "await 提前返回：worker pane 停在權限確認框已 {since_secs}s（task {id} 狀態 {status}）——去 pane 裁決後可重新 await"
+            ));
+            std::process::exit(125);
+        }
+    };
+    // cancelled 在這裡被 with_response 拒絕（訊息同 read）
+    task::with_response(paths, &id, |h, path| {
+        eprintln!("from: {}", h.from);
+        eprintln!("to: {}", h.to);
+        write_payload(path)
+    })?;
+    if st == "failed" {
+        return Err(Error::new(format!("task {id} failed")));
+    }
     Ok(())
 }
 
@@ -839,16 +960,6 @@ fn cmd_await(paths: &Paths, args: &[String]) -> Result<()> {
     let mut timeout: u64 = 0;
     let mut on_blocker = "warn".to_string();
     let mut grace_secs: u64 = 60;
-    let parse_secs = |flag: &str, v: &str, max_len: usize| -> Result<u64> {
-        let ok = !v.is_empty() && v.len() <= max_len && v.bytes().all(|b| b.is_ascii_digit());
-        if !ok {
-            return Err(Error::new(format!(
-                "{flag} 需為非負整數（秒，至多 {max_len} 位）：{v}"
-            )));
-        }
-        // 前導零比照 bash `10#$1` 強制十進位
-        Ok(v.parse().unwrap_or(0))
-    };
     let mut it = args[1..].iter();
     while let Some(a) = it.next() {
         match a.as_str() {
@@ -860,14 +971,7 @@ fn cmd_await(paths: &Paths, args: &[String]) -> Result<()> {
                 let v = it
                     .next()
                     .ok_or_else(|| Error::new("--on-blocker 需要參數（warn|return|off）"))?;
-                match v.as_str() {
-                    "warn" | "return" | "off" => on_blocker = v.clone(),
-                    other => {
-                        return Err(Error::new(format!(
-                            "--on-blocker 需為 warn|return|off：{other}"
-                        )));
-                    }
-                }
+                on_blocker = parse_on_blocker(v)?;
             }
             "--blocker-grace" => {
                 let v = it
@@ -879,6 +983,60 @@ fn cmd_await(paths: &Paths, args: &[String]) -> Result<()> {
         }
     }
 
+    match await_with_blocker(paths, id, timeout, &on_blocker, grace_secs)? {
+        task::AwaitOutcome::Terminal(st) => {
+            println!("{st}");
+            Ok(())
+        }
+        task::AwaitOutcome::Timeout(st) => {
+            err_line(&format!(
+                "await 逾時（{timeout}s）：task {id} 目前狀態 {st}"
+            ));
+            // 專屬退出碼：不走 main 的統一收斂層（那裡一律 1）
+            std::process::exit(124);
+        }
+        task::AwaitOutcome::Blocked { status, since_secs } => {
+            err_line(&format!(
+                "await 提前返回：worker pane 停在權限確認框已 {since_secs}s（task {id} 狀態 {status}）——去 pane 裁決後可重新 await"
+            ));
+            // 125＝blocker 提前返回；124 保留給真逾時（CLI-AWAIT-4）
+            std::process::exit(125);
+        }
+    }
+}
+
+/// `--timeout`／`--blocker-grace` 的秒數驗證：非負整數、至多 `max_len` 位。
+fn parse_secs(flag: &str, v: &str, max_len: usize) -> Result<u64> {
+    let ok = !v.is_empty() && v.len() <= max_len && v.bytes().all(|b| b.is_ascii_digit());
+    if !ok {
+        return Err(Error::new(format!(
+            "{flag} 需為非負整數（秒，至多 {max_len} 位）：{v}"
+        )));
+    }
+    // 前導零比照 bash `10#$1` 強制十進位
+    Ok(v.parse().unwrap_or(0))
+}
+
+/// `--on-blocker` 的值域驗證（warn|return|off）。
+fn parse_on_blocker(v: &str) -> Result<String> {
+    match v {
+        "warn" | "return" | "off" => Ok(v.to_string()),
+        other => Err(Error::new(format!(
+            "--on-blocker 需為 warn|return|off：{other}"
+        ))),
+    }
+}
+
+/// await 的主體（pane 解析 → blocker 探測 → 輪詢），回傳 outcome 由呼叫端決定
+/// 退出碼：`cmd_await` 印終態字，`cmd_ask` 接著 read。124／125 的 `process::exit`
+/// 留在呼叫端，這裡不退出行程。
+fn await_with_blocker(
+    paths: &Paths,
+    id: &str,
+    timeout: u64,
+    on_blocker: &str,
+    grace_secs: u64,
+) -> Result<task::AwaitOutcome> {
     // pane 解析走 task meta 的 to → registry；任一步缺料（task 無 to、agent 未
     // 註冊、registry 無 pane）都**退化成不帶探測的純輪詢**——await 的可用性
     // 不得因 registry 狀態而變（在只讀 sandbox、人工註冊等情境仍要能等）。
@@ -929,26 +1087,7 @@ fn cmd_await(paths: &Paths, args: &[String]) -> Result<()> {
         on_warn: &on_warn,
     });
 
-    match task::await_task_watched(paths, id, timeout, watch.as_ref())? {
-        task::AwaitOutcome::Terminal(st) => {
-            println!("{st}");
-            Ok(())
-        }
-        task::AwaitOutcome::Timeout(st) => {
-            err_line(&format!(
-                "await 逾時（{timeout}s）：task {id} 目前狀態 {st}"
-            ));
-            // 專屬退出碼：不走 main 的統一收斂層（那裡一律 1）
-            std::process::exit(124);
-        }
-        task::AwaitOutcome::Blocked { status, since_secs } => {
-            err_line(&format!(
-                "await 提前返回：worker pane 停在權限確認框已 {since_secs}s（task {id} 狀態 {status}）——去 pane 裁決後可重新 await"
-            ));
-            // 125＝blocker 提前返回；124 保留給真逾時（CLI-AWAIT-4）
-            std::process::exit(125);
-        }
-    }
+    task::await_task_watched(paths, id, timeout, watch.as_ref())
 }
 
 /// cmd_gc:1683 — 預設只試算，`--apply` 才刪。核心在 `ab_core::task::gc`，
