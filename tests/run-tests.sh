@@ -1038,6 +1038,17 @@ assert "codex args 帶相鄰的 --model gpt-test" \
   grep -q -- '--model gpt-test' "$TESTROOT/codex-args.txt"
 assert "codex --model worker 可正常 despawn" ab "$DSPAWN" despawn wm2
 
+# 16a3b. --profile：逐次改用別的 codex profile 檔（本地模型 worker 的入口）。
+# codex-cli 0.155.1 拒絕重複 --profile，所以是「取代」預設，不是疊加——斷言
+# 新值相鄰出現且預設值不殘留
+absp "$DSPAWN" 20 spawn wp1 --runtime codex --profile agent-worker-local >/dev/null 2>&1; rc=$?
+assert "spawn --runtime codex --profile：exit 0" test "$rc" -eq 0
+assert "codex args 帶相鄰的 --profile agent-worker-local" \
+  grep -q -- '--profile agent-worker-local' "$TESTROOT/codex-args.txt"
+assert "指定 --profile 時預設 agent-worker 不殘留" \
+  bash -c "! grep -q -- '--profile agent-worker ' '$TESTROOT/codex-args.txt'"
+assert "codex --profile worker 可正常 despawn" ab "$DSPAWN" despawn wp1
+
 # 未指定 --model：model 欄為空字串＝沿用 runtime 預設；argv 形狀由 16a2 的
 # 「恰好五個參數」白名單鎖住，這裡不重複（w1 是 16a 留下的無 --model spawn）
 assert "未指定 --model 時 registry model 欄為空字串" \
@@ -1058,6 +1069,14 @@ assert_fails "拒絕超長 model（65 字元）" \
   ab "$DSPAWN" spawn wm3 --runtime claude --model "$(printf 'a%.0s' {1..65})"
 assert_fails "--model 缺值時報錯" \
   ab "$DSPAWN" spawn wm3 --runtime claude --model
+# --profile 走同一條文法與同一個「建 pane 前死」契約；非 codex runtime 沒有
+# profile 概念，帶值一樣拒絕
+assert_fails "拒絕非 codex runtime 帶 --profile" \
+  ab "$DSPAWN" spawn wm3 --runtime claude --profile agent-worker-local
+assert_fails "拒絕含分隔符的 profile（x;kill-server）" \
+  ab "$DSPAWN" spawn wm3 --runtime codex --profile 'x;kill-server'
+assert_fails "--profile 缺值時報錯" \
+  ab "$DSPAWN" spawn wm3 --runtime codex --profile
 assert "被拒的 spawn 不建 pane（pane 數不變）" \
   test "$(pane_count)" -eq "$pc_before"
 assert "被拒的 spawn 不留 registry" \
@@ -2239,6 +2258,14 @@ assert "被拒的 relay 不留 registry" \
   bash -c "[[ ! -e '$DRELAY/agents/r1x.json' ]]"
 assert "relay --model 的接手者可正常 despawn（不佔用後續 cap）" \
   env AGENT_BRIDGE_DATA="$DRELAY" PATH="$SHIM:$PATH" "$BRIDGE" despawn r1m
+
+# 23b2b. relay 凍結（docs/scope-2026-09.md）：spawn 的 --profile 不開給 relay，
+# 帶了就走既有「未知參數」拒絕路徑、不建 pane
+assert_fails "relay 拒絕 --profile（凍結中的指令不接新旗標）" \
+  env AGENT_BRIDGE_DATA="$DRELAY" AGENT_BRIDGE_READY_TIMEOUT=0 PATH="$SHIM:$PATH" \
+  "$BRIDGE" relay r1p --runtime codex --profile agent-worker-local --handoff "$HANDOFF" --no-select
+assert "被拒的 relay --profile 不留 registry" \
+  bash -c "[[ ! -e '$DRELAY/agents/r1p.json' ]]"
 
 # 23b3. relay 的接手者也是 claude session（通知原生化 Phase 2）：cmd_relay 全程
 # 共用 cmd_spawn，這裡驗的正是「不必另開分支」這件事本身——接手者同樣要收

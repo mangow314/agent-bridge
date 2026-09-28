@@ -96,6 +96,8 @@ After [installing](#install):
 # first message, waits for the readiness probe). From a manual session this
 # defaults to a same-window split (--here); --window forces a separate one.
 agent-bridge spawn researcher --runtime codex   # or --runtime claude / --runtime agy
+# codex only: --profile <profile> swaps the profile file (default agent-worker),
+# e.g. a local-model worker profile that carries its own approval/sandbox posture
 
 # Delegate a task (multi-line requests go through stdin)
 id=$(agent-bridge send researcher --from main --message-file - <<'EOF'

@@ -26,8 +26,9 @@ agent-bridge list --long              # human-intervention view: header row + na
                                       # read-only: signals, not a "safe to delete" verdict — reclaiming stays despawn/evict
 agent-bridge register <name> <tmux-target>
                                       # manually register an existing pane as an agent (unregister to remove)
-agent-bridge spawn <name> --runtime <codex|claude|agy> [--model <model>] [--here|--window]
-                                      # open + register a worker pane; prints pane-id on stdout (no --model = that CLI's default)
+agent-bridge spawn <name> --runtime <codex|claude|agy> [--model <model>] [--profile <profile>] [--here|--window]
+                                      # open + register a worker pane; prints pane-id on stdout (no --model = that CLI's default;
+                                      # --profile is codex-only and swaps the profile file, default agent-worker)
                                       # placement (auto when neither flag given): a manual session (no spawn tag)
                                       # defaults to --here (split into the caller's current tmux window); a
                                       # spawn-origin caller keeps its own dedicated worker window (created next to

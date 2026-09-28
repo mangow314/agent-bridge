@@ -226,10 +226,12 @@ Source: cmd_await / task::await_task_watched
 ## `spawn`
 
 ### CLI-SPAWN-1 [tested: 16, 37]
-`spawn <name> --runtime <codex|claude|agy> [--model <model>] [--here|--window]`：
+`spawn <name> --runtime <codex|claude|agy> [--model <model>] [--profile <profile>] [--here|--window]`：
 建立 worker pane 並註冊。model 文法 `[A-Za-z0-9][A-Za-z0-9._-]{0,63}`、
 不支援的 runtime、同名已註冊（任一出身）、`--here` 與 `--window` 同時給
-——MUST 全部在建立 pane 之前拒絕。落點細節見 CLI-SPAWN-5。成功時 stdout
+——MUST 全部在建立 pane 之前拒絕。`--profile` 只對 `codex` 有意義：值文法與
+model 相同，省略＝`agent-worker`，非 `codex` runtime 帶 `--profile` MUST 同樣在
+建立 pane 之前拒絕（codex 拒絕重複 `--profile`，故為取代而非疊加）。落點細節見 CLI-SPAWN-5。成功時 stdout
 恰為 pane id 一行。
 
 Note（`agy` 的降級，量測正本 `docs/agy-probe.md`）：現行 agy（實測 1.1.9）

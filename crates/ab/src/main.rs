@@ -50,9 +50,10 @@ const USAGE: &str = r#"用法：
                                                 逾時以 exit 124 退出（其他錯誤一律非 124，供呼叫端區分）
                                                 --on-blocker（預設 warn）：worker pane 卡權限框時警告；
                                                 return＝持續滿 --blocker-grace（預設 60s）以 exit 125 提前返回
-  agent-bridge spawn <name> --runtime <codex|claude|agy> [--model <model>] [--here|--window]
+  agent-bridge spawn <name> --runtime <codex|claude|agy> [--model <model>] [--profile <profile>] [--here|--window]
                                                 spawn 一個 worker pane 並註冊；stdout 只印 pane-id
-                                                （--model 不給＝該 CLI 的使用者預設模型）
+                                                （--model 不給＝該 CLI 的使用者預設模型；
+                                                --profile 僅 codex，不給＝agent-worker）
                                                 落點：人工 session 預設 --here（切進當前 window、套
                                                 AGENT_BRIDGE_HERE_LAYOUT，預設 main-vertical）；
                                                 spawn 出身呼叫者預設 worker window；--window 開專屬視窗
@@ -1140,17 +1141,18 @@ fn cmd_gc(paths: &Paths, args: &[String]) -> Result<()> {
     Ok(())
 }
 
-/// cmd_spawn:1063 的 argv 解析。**`--model` 在解析點就驗**（不等到用時）：
-/// 這個值會進 pane 啟動命令字串，不合法就必須在建 pane 之前死掉。
+/// cmd_spawn:1063 的 argv 解析。**`--model`／`--profile` 在解析點就驗**（不等到
+/// 用時）：這兩個值會進 pane 啟動命令字串，不合法就必須在建 pane 之前死掉。
 fn parse_spawn_args(args: &[String], relay: Option<spawn::Relay>) -> Result<spawn::SpawnRequest> {
     if args.is_empty() {
         return Err(Error::new(
-            "用法：agent-bridge spawn <name> --runtime <codex|claude|agy> [--model <model>] [--here|--window]",
+            "用法：agent-bridge spawn <name> --runtime <codex|claude|agy> [--model <model>] [--profile <profile>] [--here|--window]",
         ));
     }
     let name = args[0].clone();
     let mut runtime = String::new();
     let mut model = String::new();
+    let mut profile = String::new();
     let mut use_window = false;
     let mut here = false;
     let mut it = args[1..].iter();
@@ -1173,6 +1175,17 @@ fn parse_spawn_args(args: &[String], relay: Option<spawn::Relay>) -> Result<spaw
                     )));
                 }
             }
+            "--profile" => {
+                profile = it
+                    .next()
+                    .ok_or_else(|| Error::new("--profile 需要參數"))?
+                    .clone();
+                if !spawn::is_valid_model(&profile) {
+                    return Err(Error::new(format!(
+                        "profile 名稱不合法（僅允許英數起首的 [A-Za-z0-9._-]{{1,64}}）：{profile}"
+                    )));
+                }
+            }
             "--window" => use_window = true,
             "--here" => here = true,
             other => return Err(Error::new(format!("未知參數：{other}"))),
@@ -1185,6 +1198,7 @@ fn parse_spawn_args(args: &[String], relay: Option<spawn::Relay>) -> Result<spaw
         name,
         runtime,
         model,
+        profile,
         use_window,
         here,
         relay,
@@ -1235,6 +1249,8 @@ fn cmd_relay(paths: &Paths, args: &[String]) -> Result<()> {
                     .ok_or_else(|| Error::new("--model 需要參數"))?
                     .clone();
             }
+            // relay 凍結（docs/scope-2026-09.md）：spawn 的 `--profile` 刻意不開給 relay，
+            // 未知參數照常拒絕（使用者裁定 2026-09-28，sdlc codex-profile-flag Concern 5）
             "--handoff" => {
                 handoff = it
                     .next()

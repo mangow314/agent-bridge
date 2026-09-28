@@ -203,7 +203,7 @@ ln -s ~/projects/agent-bridge ~/.claude/skills/agent-bridge
 
 | 指令 | 用途 |
 |---|---|
-| `spawn <name> --runtime <codex\|claude\|agy> [--model <m>] [--here\|--window]` | 開 worker pane；stdout 只印 pane-id |
+| `spawn <name> --runtime <codex\|claude\|agy> [--model <m>] [--profile <profile>] [--here\|--window]` | 開 worker pane；stdout 只印 pane-id |
 | `relay <name> --runtime … --handoff <path>` | 把主導權交給接手者（見 relay 節） |
 | `register` / `unregister <name> [target]` | 手動掛入／移除既有 pane |
 | `list [--long]` | 池況；`--long` 八欄含 where/owner/disposable/idle |
@@ -302,7 +302,9 @@ auto 判定三選一：
 - `codex` → `codex --profile agent-worker`（approval never＋workspace-write，
   需自行加進 `~/.codex/config.toml`；樣板與理由見
   [docs/codex-worker-approval-proposal.md](docs/codex-worker-approval-proposal.md)）。
-  hook 需要人互動式授信一次，見「已知限制」。
+  hook 需要人互動式授信一次，見「已知限制」。`--profile <profile>` 可逐次改用
+  別的 profile 檔（例如本地模型 worker）；指定的 profile 自行負責 approval／
+  sandbox／hooks 姿態，沒有 approval never 的 profile 會讓 worker 卡在權限框。
 - `claude` → `claude --permission-mode auto`，並以
   `--settings share/claude-worker-hooks.json` 注入 worker 專屬 hooks（路徑
   可用 `AGENT_BRIDGE_CLAUDE_HOOKS` 覆蓋，指向合法空 JSON 即停用 state

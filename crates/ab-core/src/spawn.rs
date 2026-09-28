@@ -36,6 +36,8 @@ pub fn is_valid_window(s: &str) -> bool {
 
 /// `MODEL_RE='^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$'`（bin/agent-bridge:38）。
 /// 這個值會被展開進 pane 啟動命令字串，故在解析點就驗。
+/// `spawn --model` 與 `--profile` 共用這條文法，理由相同：值會原樣進 pane 的
+/// 啟動命令字串，必須擋掉分隔符、空白與旗標走私（`-` 起首）。
 pub fn is_valid_model(s: &str) -> bool {
     let mut it = s.bytes();
     match it.next() {
@@ -155,6 +157,9 @@ pub struct SpawnRequest {
     pub runtime: String,
     /// 空字串＝沿用 runtime CLI 的使用者預設模型。
     pub model: String,
+    /// codex 的 profile 名；空字串＝`agent-worker`。只對 runtime=codex 有意義，
+    /// 其他 runtime 帶值 MUST 在建 pane 前拒絕（`spawn` 的 runtime 表預檢）。
+    pub profile: String,
     pub use_window: bool,
     /// `--here`：顯式要求落在呼叫者當前 window。與 `use_window` 互斥；
     /// 兩者皆 false 時走 auto 規則（docs/spawn-here-plan.md）。
@@ -339,9 +344,27 @@ pub fn spawn(paths: &Paths, tmux: &dyn TmuxClient, req: &SpawnRequest) -> Result
     // 擺在 `--model` 之前的話，`--model` 會被吃成 initial prompt、模型旗標
     // 失效、真正的 prompt 變成錯位的位置參數（跨廠複核 2026-07-31 抓出）。
     // 故 agy 的尾旗標從 runtime_cmd 拆出來，等 --model 附加完再接上去。
+    //
+    // codex 的 `--profile` 可由 `spawn --profile <name>` 逐次改用別的 profile 檔
+    // （例如本地模型 worker）；不給＝`agent-worker`。codex-cli 0.155.1 拒絕重複
+    // `--profile`（`cannot be used multiple times`），所以這裡是取代、不是疊加。
+    // 其他 runtime 沒有 profile 概念，帶值一律在建 pane 前拒絕。
+    if req.runtime != "codex" && !req.profile.is_empty() {
+        return Err(Error::new(format!(
+            "--profile 只支援 --runtime codex（收到 runtime={}）",
+            req.runtime
+        )));
+    }
     let hooks_settings = config::claude_hooks_settings();
     let (mut runtime_cmd, runtime_tail) = match req.runtime.as_str() {
-        "codex" => ("codex --profile agent-worker".to_string(), ""),
+        "codex" => {
+            let profile = if req.profile.is_empty() {
+                "agent-worker"
+            } else {
+                req.profile.as_str()
+            };
+            (format!("codex --profile {profile}"), "")
+        }
         "claude" => (
             format!(
                 "claude --permission-mode auto --settings {}",
