@@ -91,6 +91,18 @@ assert_fails() {
   if "$@" >/dev/null 2>&1; then bad "$desc"; else ok "$desc"; fi
 }
 
+# assert_fails_with <desc> <stderr-ERE> cmd…：非零 rc 且 stderr 符合樣式。拒絕類斷言用它，
+# 才擋得住「拒絕原因退化成未知參數」這種假綠（2026-09-28 複核建議）。
+assert_fails_with() {
+  local desc="$1" re="$2"; shift 2
+  local err; err="$("$@" 2>&1 >/dev/null)"; local rc=$?
+  if (( rc != 0 )) && printf '%s' "$err" | grep -qE -- "$re"; then
+    ok "$desc"
+  else
+    bad "$desc (rc=$rc stderr=${err:0:200})"
+  fi
+}
+
 # wait_for <timeout-secs> <cmd...>：輪詢直到 cmd 成功或逾時
 wait_for() {
   local timeout="$1"; shift
@@ -1071,11 +1083,11 @@ assert_fails "--model 缺值時報錯" \
   ab "$DSPAWN" spawn wm3 --runtime claude --model
 # --profile 走同一條文法與同一個「建 pane 前死」契約；非 codex runtime 沒有
 # profile 概念，帶值一樣拒絕
-assert_fails "拒絕非 codex runtime 帶 --profile" \
+assert_fails_with "拒絕非 codex runtime 帶 --profile" "--profile 只支援 --runtime codex" \
   ab "$DSPAWN" spawn wm3 --runtime claude --profile agent-worker-local
-assert_fails "拒絕含分隔符的 profile（x;kill-server）" \
+assert_fails_with "拒絕含分隔符的 profile（x;kill-server）" "profile 名稱不合法" \
   ab "$DSPAWN" spawn wm3 --runtime codex --profile 'x;kill-server'
-assert_fails "--profile 缺值時報錯" \
+assert_fails_with "--profile 缺值時報錯" "--profile 需要參數" \
   ab "$DSPAWN" spawn wm3 --runtime codex --profile
 assert "被拒的 spawn 不建 pane（pane 數不變）" \
   test "$(pane_count)" -eq "$pc_before"
