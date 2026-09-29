@@ -161,6 +161,7 @@ cap as a reason to skip one.
   legacy send-keys path. Nothing in send/receive/reply depends on the state channel,
   so the worker contract is unaffected — but do not expect `notify-deferred` behavior
   from an agy worker.
+- **Independence is a brief clause, not a property of the mailbox.** Every worker can read `~/.local/share/agent-bridge/tasks/`, so a second-opinion worker can see the first one's `response.md` (observed 2026-09-28: an agy worker read the codex worker's reply before answering). The dispatch brief for a plan-stage opinion MUST say: do not read any task directory under `~/.local/share/agent-bridge/tasks/` other than your own task id. Per-worker mailboxes are out of scope (relay/scope freeze); this clause is the guard until then.
 
 ### Orchestrator's arbitration authority (user directive, 2026-07-31)
 

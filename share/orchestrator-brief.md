@@ -219,6 +219,7 @@ back empty.
   talk (no task record, no reply on disk), use Claude Code's
   cross-session messaging; the routing rule lives in
   `share/vehicle-routing.md`.
+- **Plan-stage second opinions: forbid reading other task dirs in the brief.** The mailbox `~/.local/share/agent-bridge/tasks/` is visible to every worker; write "do not read any task directory other than your own" into the brief, or the second opinion collapses into the first. Wording is owned by `share/review-overlay.md`.
 - **A worker that never received a task (relay successor, probe,
   coordinator) is despawned directly — do not evict it.** There are no
   notes to land. The audit line will read `despawned-unsaved`; for
