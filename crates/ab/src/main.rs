@@ -12,7 +12,6 @@ use ab_core::evict;
 use ab_core::hook::{self, HookOutcome};
 use ab_core::lock::acquire_lock;
 use ab_core::notify;
-use ab_core::page;
 use ab_core::paths::Paths;
 use ab_core::registry;
 use ab_core::send;
@@ -69,11 +68,6 @@ const USAGE: &str = r#"用法：
   agent-bridge gc [--older-than <days>] [--apply] [--include-notes]
                                                 清掉夠舊的終態 task（預設 14 天）；未完成的與
                                                 evict 收尾筆記一律保留。預設只試算，--apply 才刪
-  agent-bridge scan                             掃一輪 page 層事件（pane 死了卻還掛著非終態
-                                                task），該通知的推播、印出這一輪推了幾則。
-                                                每個非唯讀子指令進場時也會順手掃一次，所以
-                                                平常不必手動跑；要即時發現可自行掛在 tmux
-                                                hook／鍵位／cron 上
   agent-bridge hook <stop|prompt-submit|notification>
                                                 （由 Claude Code 呼叫，非人工手動用）落地 hook
                                                 協定：stdin 收事件 JSON，依 AGENT_BRIDGE_SPAWN_TAG
@@ -128,9 +122,6 @@ fn print_implemented_commands() {
         "register",
         "relay",
         "reply",
-        // Rust 獨有（bash 正本凍結在 M4 時沒有 page 層）；仍列入，因為
-        // 「已完整實作的契約子指令」是這張表的語意，而 CLI-SCAN-1 是契約
-        "scan",
         "send",
         "spawn",
         "start",
@@ -261,35 +252,11 @@ fn main() -> ExitCode {
         "disposable" => cmd_disposable(&paths, rest),
         "idle" => cmd_idle(&paths, rest),
         "evict" => cmd_evict(&paths, rest),
-        "scan" => cmd_scan(&paths, rest),
         _ => {
             print_usage();
             Err(Error::new(format!("未知指令：{cmd}")))
         }
     };
-
-    // Page 層的機會式掃描（tag `pre-trim-2026-09` 的 docs/tui-design.md §1；使用者 2026-08-03 裁定）：沒有
-    // daemon，所以「pane 死了卻還掛著非終態 task」只能靠有人呼叫時順手發現。
-    //
-    // **擺在指令成功完成之後**（跨廠複核 should-fix 4）。放在 dispatch 之前
-    // 有三個壞處，全都不是退出碼層面而是終局層面：參數打錯／未知指令也會推
-    // 播；`ready` 這條熱路徑會先跑 N 支外部通知才寫 ready，把 spawn 的等待
-    // 推向逾時；`fail`／`cancel` 會先推一則**本次指令正要解除**的
-    // `worker-died`。跑在後面，這三件事都不成立。
-    //
-    // 排除項：唯讀指令（MUST NOT 寫任何東西，CLI-RO-1，而掃描寫事件流）、
-    // 失敗的指令（它的前提沒成立，不該替它發事件）、`scan` 自己（否則它印的
-    // 計數恆為 0）。
-    //
-    // 失敗一律吞掉：它是副作用，不得改變任何子指令的退出碼。
-    if result.is_ok() && !readonly && cmd != "scan" {
-        let tmux = SubprocessTmux;
-        let runner = page::SubprocessRunner;
-        let pager = page::SystemPager::new(&runner, &tmux);
-        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            page::scan(&paths, &tmux, &pager)
-        }));
-    }
 
     match result {
         Ok(()) => ExitCode::from(0),
@@ -694,77 +661,6 @@ fn cmd_start(paths: &Paths, args: &[String]) -> Result<()> {
     Ok(())
 }
 
-/// Page 層（tag `pre-trim-2026-09` 的 docs/tui-design.md §1）：把一則「需要人現在出手」的事件送出去。
-///
-/// **一律吞掉錯誤**：推播是副作用，呼叫端的 exit code 與輸出契約零改變
-/// （§1 非目標）。事件流寫不進去（唯讀 sandbox、磁碟滿）也一樣——那時人本來
-/// 就有更大的問題要處理，不該讓 `fail` 因為通知不出去而失敗。
-fn emit_page(paths: &Paths, event: &page::PageEvent, details: &page::PageDetails) {
-    let tmux = SubprocessTmux;
-    let runner = page::SubprocessRunner;
-    let pager = page::SystemPager::new(&runner, &tmux);
-    let _ = page::emit(paths, event, details, &pager);
-}
-
-/// 從失敗訊息取原因時，最多讀進來的位元組數。原因只取第一個非空行的前 80 個
-/// 字元；8 KiB 對那件事綽綽有餘，而 payload 本身沒有大小上限。
-const REASON_PREFIX_BYTES: u64 = 8192;
-
-/// 讀一個檔的前 `max` 個位元組。讀不到（不存在、沒權限、不是普通檔）回空的
-/// ——呼叫端只拿它當顯示字串，沒有原因就少一段話，不是錯誤。
-fn read_prefix(path: &std::path::Path, max: u64) -> Vec<u8> {
-    use std::io::Read;
-    let Ok(f) = std::fs::File::open(path) else {
-        return Vec::new();
-    };
-    let mut buf = Vec::new();
-    let _ = f.take(max).read_to_end(&mut buf);
-    buf
-}
-
-/// 這個 agent 現在人在哪（`session:window索引 window名`）。
-///
-/// registry 查不到（agent 已除名、檔案壞了）就回 `None`——通知照發、只是少一
-/// 段地點。**MUST NOT 因此讓事件發不出去**：地點是補充，不是事件成立的前提。
-///
-/// **走單檔 lookup，不建全池 snapshot**（跨廠複核 should-fix 4）：為了找一個
-/// agent 而讀完 `agents/` 底下每一個 `*.json`，會讓一個不相關的巨大檔或 FIFO
-/// 拖住整個 `fail`——而那時 task 已經轉 failed、鎖也放掉了，重試又會被終態擋
-/// 下。單檔路徑也是 registry 其他讀取點（`read_pane`／`read_field`）的既有慣例。
-fn agent_location(paths: &Paths, agent: &str) -> Option<String> {
-    if !ab_core::validate::is_valid_name(agent) {
-        return None;
-    }
-    let file = paths.agents_dir.join(format!("{agent}.json"));
-    let pane = registry::read_pane(&file);
-    let owner = registry::read_field(&file, "owner", "");
-    page::resolve_location(&SubprocessTmux, &pane, &owner)
-}
-
-/// cmd_scan — 顯式掃一輪 page 層事件（Rust 獨有，bash 正本自 M4 凍結）。
-///
-/// 平常不必手動跑（每個非唯讀子指令進場都會順手掃）；這一支是給「要即時
-/// 發現」的人自己掛 tmux hook／鍵位／cron 用的——我們**不主動去改使用者的
-/// tmux 設定**（使用者 2026-08-03 裁定）。
-///
-/// stdout 只印一個數字（這一輪新推了幾則），比照其他子指令的「stdout 是機器
-/// 讀的、說明走 stderr」。
-fn cmd_scan(paths: &Paths, args: &[String]) -> Result<()> {
-    if !args.is_empty() {
-        return Err(Error::new("用法：agent-bridge scan（不吃參數）"));
-    }
-    let tmux = SubprocessTmux;
-    let runner = page::SubprocessRunner;
-    let pager = page::SystemPager::new(&runner, &tmux);
-    let fresh = page::scan(paths, &tmux, &pager)
-        .into_iter()
-        .filter(|o| matches!(o, page::EmitOutcome::Emitted { .. }))
-        .count();
-    println!("{fresh}");
-    eprintln!("page 層掃描完成：新事件 {fresh} 則");
-    Ok(())
-}
-
 /// respond_task:686 — reply／fail 的共用主體：寫 response.md、轉終態、
 /// 通知 sender 讀回覆。
 fn respond_task(
@@ -791,34 +687,6 @@ fn respond_task(
     })();
     guard.release();
     outcome?;
-
-    // Page 層事件 1／2（§1）：**只有 fail 推**。這裡是 failed 終態的單一收斂點
-    // ——`reply` 走同一支但帶 `Completed`，所以 completed／cancelled 天然零推播，
-    // 不需要另外寫排除條件（rubric v2 page 層條 3）。
-    if final_state == TaskState::Failed {
-        let to = task::meta_str(&dir, "to").unwrap_or_default();
-        // 原因讀**剛寫好的 response.md**，不從 `src` 再取一次：`--message-file -`
-        // 的 stdin 已經被讀完，重取只會拿到空的。內容是 worker 寫的不可信
-        // payload（可能非 UTF-8），只當顯示字串用，走 lossy
-        //
-        // **只讀前緣，不整份載入**（跨廠複核 should-fix 4）：要的只是第一個
-        // 非空行的前 80 個字元，整份 `read` 會為一則通知再付一次 O(size) I/O
-        // 與記憶體——而 payload 大小沒有上限。讀不到就沒有原因，通知照發。
-        let msg = read_prefix(&dir.join("response.md"), REASON_PREFIX_BYTES);
-        let details = page::PageDetails {
-            location: agent_location(paths, &to),
-            ..Default::default()
-        }
-        .with_reason(&String::from_utf8_lossy(&msg));
-        emit_page(
-            paths,
-            &page::PageEvent::TaskFailed {
-                agent: to,
-                task: id.to_string(),
-            },
-            &details,
-        );
-    }
 
     // 通知 sender 來讀回覆；sender 未註冊（或已除名）就只是不通知，不是錯誤。
     let from = task::meta_str(&dir, "from")?;

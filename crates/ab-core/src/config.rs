@@ -46,9 +46,6 @@ pub const ENV_RELAY_DEPTH: &str = "AGENT_BRIDGE_RELAY_DEPTH";
 pub const ENV_MAX_RELAY_DEPTH: &str = "AGENT_BRIDGE_MAX_RELAY_DEPTH";
 /// 單次 tmux 送鍵子行程的逾時秒數（0＝不設限）。
 pub const ENV_TMUX_TIMEOUT: &str = "AGENT_BRIDGE_TMUX_TIMEOUT";
-/// Page 層推播的自訂命令（argv[0]，後接 title、body 兩個參數）。設了就取代
-/// 桌面通知那一層——SSH／無桌面環境的逃生口（ntfy、telegram…）。
-pub const ENV_NOTIFY_CMD: &str = "AGENT_BRIDGE_NOTIFY_CMD";
 /// here 落點 split 後套用的 tmux layout（`none`＝只 split 不重排）。
 pub const ENV_HERE_LAYOUT: &str = "AGENT_BRIDGE_HERE_LAYOUT";
 

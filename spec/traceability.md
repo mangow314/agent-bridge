@@ -56,7 +56,6 @@
 | 41 | read：stdout/stderr 分流與 response 缺檔時標頭先印 | CLI-READ-1 |
 | 42 | evict 入口 CAS | CLI-EVICT-4, CLI-EVICT-3 |
 | 46 | await 的 blocker 探測（真 tmux） | CLI-AWAIT-3, CLI-AWAIT-4 |
-| 47 | page 層兩類事件的推播與去重 | CLI-SCAN-1, CLI-SCAN-2, CLI-SCAN-3, CLI-PAGE-1, CLI-PAGE-2, CLI-PAGE-3, CLI-RO-1, ENV-PAGE-1 |
 | 49 | ask：send→await→read 組合 | CLI-ASK-1, CLI-ASK-2 |
 
 ## `[untested]` 缺口處置（本輪只記錄，不補測）

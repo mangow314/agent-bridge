@@ -67,10 +67,6 @@ agent-bridge read "$id"               # (sender) read the reply body (works for 
 agent-bridge disposable <name>        # (worker, spawned only) declare this round's context has no residual value
 agent-bridge gc [--older-than <days>] [--include-notes] [--apply]  # [frozen: docs/scope-2026-09.md]
                                       # clean old terminal-state tasks; dry-run by default, --apply to delete
-agent-bridge scan                     # [frozen: docs/scope-2026-09.md] page-layer sweep: notify a human about failed tasks and dead panes still
-                                      # holding live work; stdout = count of newly pushed events. Every non-read-only
-                                      # subcommand already sweeps on the way out, so call this only when driving it
-                                      # from a tmux hook / key binding / cron
 ```
 
 Multi-line content always goes through `--message-file -` (stdin heredoc),

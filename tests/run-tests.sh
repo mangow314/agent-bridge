@@ -141,7 +141,7 @@ assert_reason() {
 }
 
 # ---- TEST_GROUPS 分組過濾（政策見 docs/testing-policy.md）----
-# TEST_GROUPS=46,47 只跑指定分組；空＝全套。partial run 會在總結印警告，
+# TEST_GROUPS=46,49 只跑指定分組；空＝全套。partial run 會在總結印警告，
 # 不得作為收案／merge 證據。GRP_NEEDS 是**靜態審計**出的跨組依賴
 # （變數＋函式；audit：scratchpad/audit_groups.py 形，2026-08-03），選中組
 # 自動拉入依賴組（傳遞閉包）。新分組若引用他組狀態，必須同步補這張表——
@@ -154,7 +154,7 @@ declare -A GRP_NEEDS=(
   # 語意 fixture，變數掃描抓不到 manual-x 這種字串依賴）
   [17]="16" [18]="16"
 )
-GRP_KNOWN=" 1 2 3 4 5 6 7 8 8a 8b 9 10 11 12 13 14 15 16 17 18 18b 18c 19 20 20b 21 22 23 24 25 26 27 28 29 30 31 32 33 34 34.5+ 35 36 37 38 39 41 42 46 47 49 "
+GRP_KNOWN=" 1 2 3 4 5 6 7 8 8a 8b 9 10 11 12 13 14 15 16 17 18 18b 18c 19 20 20b 21 22 23 24 25 26 27 28 29 30 31 32 33 34 34.5+ 35 36 37 38 39 41 42 46 49 "
 GRP_SELECTED=""
 GRP_SKIPPED=0
 if [[ -n "${TEST_GROUPS:-}" ]]; then
@@ -5191,207 +5191,6 @@ tmx kill-window -t "$W46" 2>/dev/null || true
 
 
 fi  # end grp 46
-# ---- 47. page 層：兩類事件的推播與去重（tag `pre-trim-2026-09` 的 tui-design §1／§9 rubric v2） ----
-if grp 47; then
-# 動機：page 層是「推到人面前、不用打開任何東西」那一層。單元測試已鎖住
-# 模型與 ladder（ab-core `page.rs`）；這裡鎖的是**真的走完整支 CLI** 之後
-# 的可觀察事實——事件流落了幾筆、自訂通知命令收到什麼、哪些子指令零推播。
-
-D47="$TESTROOT/d47"
-mkdir -p "$D47"
-EV47="$D47/state/page-events.jsonl"
-# 自訂推播命令：把 argv 原樣記下來。用它取代桌面通知那一層，測試因此
-# **不會真的去彈使用者的通知**，而且看得到 title／body 的實際內容
-# NOTIFY_CMD 的契約是 **argv[0]**（一支可執行檔，後接 title、body 兩個參數），
-# 不是一段 shell 字串——所以這裡要有 shebang 而不是 `bash <script>`
-cat > "$TESTROOT/pager47.sh" <<'PEOF'
-#!/usr/bin/env bash
-printf '%s\n' "$1" >> "$PAGER47_LOG"
-printf '%s\n' "$2" >> "$PAGER47_LOG"
-PEOF
-chmod +x "$TESTROOT/pager47.sh"
-PAGER47_LOG="$TESTROOT/pager47.log"
-: > "$PAGER47_LOG"
-ab47() {
-  env AGENT_BRIDGE_DATA="$D47" PATH="$SHIM:$PATH" \
-    AGENT_BRIDGE_NOTIFY_CMD="$TESTROOT/pager47.sh" \
-    PAGER47_LOG="$PAGER47_LOG" "$BRIDGE" "$@"
-}
-ev47_count() { test -f "$EV47" && grep -c . "$EV47" || echo 0; }
-ev47_kind() { grep -c "\"kind\":\"$1\"" "$EV47" 2>/dev/null || echo 0; }
-# 該類別的事件**全部**都帶得出地點（`-s` 一次吃完整份，斷言因此與行序無關；
-# 逐行跑的話 jq -e 的退出碼只反映最後一行，前面幾筆空的地點會靜默通過）。
-# 寫成具名函式而不是 `bash -c`：jq 的 `$l` 在內層 shell 的雙引號裡會先被吃掉，
-# jq 收到的是 `startswith()`——第一版就是這樣假紅的
-# 推播記錄是「title 一行、body 各一行」順序寫下的，整份 grep 分不出哪一段
-# 屬於哪一則——另一則帶了地點就能替這一則作假（跨廠複核 nit 2）。這兩個
-# helper 把斷言鎖回**同一則通知**。同樣寫成具名函式而不是 `bash -c`
-pager47_title_has() { # <標題片段> <期望片段>
-  grep -F "$1" "$PAGER47_LOG" | grep -qF "$2"
-}
-pager47_adjacent() { # <前一行> <下一行>：兩行 MUST 相鄰＝同一則通知的內文
-  grep -A1 -Fx "$1" "$PAGER47_LOG" | grep -Fxq "$2"
-}
-ev47_loc_ok() { # ev47_loc_ok <kind> <expected-prefix>
-  jq -se --arg k "$1" --arg l "$2" \
-    'map(select(.kind == $k)) | length > 0 and all(.[]; .location | startswith($l))' \
-    "$EV47" >/dev/null
-}
-
-# 前置：兩個 worker，各自一個真 pane
-W47="$(tmx new-window -dP -F '#{window_id}' -t it "$pane_cmd")"
-P47A="$(tmx list-panes -t "$W47" -F '#{pane_id}' | head -1)"
-P47B="$(tmx split-window -dP -F '#{pane_id}' -t "$W47" "$pane_cmd")"
-ab47 register w47a "$P47A" >/dev/null 2>&1
-ab47 register w47b "$P47B" >/dev/null 2>&1
-
-# (1) fail → 恰一筆 task-failed，且自訂通知命令收到 agent 名與 task id
-#
-# **這一組的 title／body 斷言是 PG4 實測（2026-08-03）打回來的**：受測者說得出
-# 「誰、出了什麼事」，卻卡在「要不要切過去看」。所以地點與失敗原因是契約的
-# 一部分，不是文案品味——而且它們的產生點（`agent_location`、從 response.md
-# 取第一行）都只活在 CLI 層，ab-core 的單元測試碰不到，只有這裡守得住。
-LOC47="$(tmx display-message -p -t "$P47A" '#{session_name}:#{window_index}')"
-id47a="$(ab47 send w47a --from boss --message "去做 a" 2>/dev/null)"
-ab47 receive "$id47a" >/dev/null 2>&1
-ab47 fail "$id47a" --message "磁碟滿了寫不進去
-第二行不該進通知" >/dev/null 2>&1
-assert "47(1)：fail 恰落一筆 task-failed（rubric v2 page 條 1）" \
-  test "$(ev47_kind task-failed)" -eq 1
-assert "47(1)：通知標題帶 agent 名（不必開面板就知道是誰）" \
-  grep -q 'w47a' "$PAGER47_LOG"
-assert "47(1)：通知內文帶 task id" grep -qF "$id47a" "$PAGER47_LOG"
-# 地點：PG4 條 3 的一半——「要切過去看」這動作得有起點
-assert "47(1)：通知標題帶 session:window（PG4：說得出切去哪裡）" \
-  grep -qF "$LOC47" "$PAGER47_LOG"
-# 原因：條 3 的另一半——決定要不要現在出手的是原因，不是狀態字
-assert "47(1)：通知內文首行是失敗原因（PG4：說得出要不要出手）" \
-  grep -qF "磁碟滿了寫不進去" "$PAGER47_LOG"
-assert_fails "47(1)：多行失敗訊息 MUST NOT 整份灌進通知（只取第一行）" \
-  grep -qF "第二行不該進通知" "$PAGER47_LOG"
-# 原因與 task id MUST 是同一則通知的兩行（整份 grep 分不出這件事）
-assert "47(1)：原因與 task id 同屬一則通知的內文" \
-  pager47_adjacent "磁碟滿了寫不進去" "$id47a"
-# 事件流也要留下當時的地點（事後回查用；window 後來改名或關掉都還原得回來）
-assert "47(1)：事件流記下當時的 location" ev47_loc_ok task-failed "$LOC47"
-
-# (2) reply（completed）零推播——rubric v2 page 條 3
-before47="$(ev47_count)"
-id47b="$(ab47 send w47b --from boss --message "去做 b" 2>/dev/null)"
-ab47 receive "$id47b" >/dev/null 2>&1
-ab47 reply "$id47b" --message "做好了" >/dev/null 2>&1
-assert "47(2)：reply 完成 MUST NOT 推播" test "$(ev47_count)" -eq "$before47"
-
-# (3) cancel 零推播
-id47c="$(ab47 send w47a --from boss --message "去做 c" 2>/dev/null)"
-ab47 cancel "$id47c" >/dev/null 2>&1
-assert "47(3)：cancel MUST NOT 推播" test "$(ev47_count)" -eq "$before47"
-
-# (4) pane 死了卻還掛著非終態 task → scan 恰一則；再掃零則（去重）
-#
-# 先補上 owner 欄再殺 pane：**人工註冊本來就沒有 owner**（38c 的既有裁定，
-# 不是缺陷），而 page 層真正的服務對象是 spawn 出身的 worker——那一類一定有
-# owner。地點的 fallback 只有在有 owner 時才有標的，所以這裡把 w47b 補成
-# spawn 出身的形狀，否則測到的是「人工註冊 ＋ pane 已死」這個天生無解的角落。
-own47="$(tmx display-message -p -t "$P47B" '#{session_name}:#{window_id}')"
-jq --arg o "$own47" '.owner = $o' "$D47/agents/w47b.json" > "$TESTROOT/w47b.tmp" \
-  && mv "$TESTROOT/w47b.tmp" "$D47/agents/w47b.json"
-id47d="$(ab47 send w47b --from boss --message "會被丟下的活" 2>/dev/null)"
-tmx kill-pane -t "$P47B" 2>/dev/null || true
-assert "47(4) 前置：w47b 的 pane 真的不在了" \
-  bash -c '! '"$REAL_TMUX"' -L '"$SOCK"' -f /dev/null list-panes -a -F "#{pane_id}" | grep -qFx "$1"' \
-  _ "$P47B"
-n47="$(ab47 scan 2>/dev/null)"
-assert "47(4)：pane 死掛非終態 task → scan 恰推一則" test "$n47" -eq 1
-assert "47(4)：事件流裡是 worker-died" test "$(ev47_kind worker-died)" -eq 1
-assert "47(4)：通知內文帶被丟下的 task id" grep -qF "$id47d" "$PAGER47_LOG"
-# **pane 死了仍要說得出地點**：worker-died 正是最需要「切去哪」的那一類，而
-# 它的 pane 依定義已經不在了——地點只能退到 owner 的 window 才解得出來。
-# 只問 pane 的實作會在這裡靜默地少一段（`resolve_location` 的 fallback）
-assert "47(4)：pane 已死仍解得出地點（退到 owner 的 window）" \
-  ev47_loc_ok worker-died "$LOC47"
-# 事件流有地點、通知標題卻漏掉——這條的 oracle 換成**那一則通知本身**，
-# 免得事件流替通知作保（跨廠複核 nit 2）
-assert "47(4)：死訊通知的標題自己就帶得出地點" \
-  pager47_title_has "w47b 死了" "$LOC47"
-# 死訊內文 MUST 指出「然後要做什麼」（PG4 第三輪：知道它死了之後卡住）
-assert "47(4)：死訊內文說得出下一步（清理或改派）" \
-  pager47_adjacent "pane 已不存在，需要清理或改派" "$id47d"
-n47b="$(ab47 scan 2>/dev/null)"
-assert "47(4)：重掃 MUST NOT 重推（rubric v2 page 條 2）" test "$n47b" -eq 0
-assert "47(4)：重掃 MUST NOT 重複落盤" test "$(ev47_kind worker-died)" -eq 1
-
-# (5) 唯讀子指令 MUST NOT 寫事件流（CLI-RO-1；掃描只掛非唯讀指令）
-rm -f "$D47/state/page-seen"          # 讓「該推的」重新變成新事件
-before47ro="$(ev47_count)"
-ab47 list >/dev/null 2>&1
-ab47 status "$id47d" >/dev/null 2>&1
-assert "47(5)：唯讀指令 MUST NOT 觸發掃描（事件流不變）" \
-  test "$(ev47_count)" -eq "$before47ro"
-
-# (6) 機會式掃描：非唯讀子指令進場時順手發現同一件事（沒有 daemon 的代價
-# 與補償——使用者 2026-08-03 裁定）
-ab47 gc >/dev/null 2>&1
-assert "47(6)：非唯讀子指令進場會順手掃出 pane-exit" \
-  test "$(ev47_count)" -gt "$before47ro"
-
-# (8) **自訂 notifier 不得讀得到呼叫端的 stdin**（跨廠複核 blocker 1）。
-#
-# 鑑別力來自「挑一個自己不讀 stdin 的子指令」：`scan` 不碰 stdin，所以管線
-# 裡的哨兵會原封不動留著——notifier 若繼承了 stdin 就讀得到它，接掉就讀不到。
-# （用 `send --message-file -` 測不出來：那條路徑早在掃描之前就把 stdin 讀完
-# 了，`.stdin(null)` 在不在都會綠——第一版這條測試就是這樣假綠的。）
-cat > "$TESTROOT/sniffer47.sh" <<'GEOF'
-#!/usr/bin/env bash
-# 讀得到什麼就記下來；讀不到（stdin 已被接成 /dev/null）就立刻 EOF
-head -c 200 >> "$SNIFF47_LOG"
-GEOF
-chmod +x "$TESTROOT/sniffer47.sh"
-SNIFF47_LOG="$TESTROOT/sniff47.log"
-: > "$SNIFF47_LOG"
-rm -f "$D47/state/page-seen"          # 讓 worker-died 重新變成待推事件
-sentinel47='SENTINEL-47-MUST-NOT-LEAK'
-printf '%s\n' "$sentinel47" | env AGENT_BRIDGE_DATA="$D47" PATH="$SHIM:$PATH" \
-  AGENT_BRIDGE_NOTIFY_CMD="$TESTROOT/sniffer47.sh" SNIFF47_LOG="$SNIFF47_LOG" \
-  "$BRIDGE" scan >/dev/null 2>&1
-assert "47(8) 前置：sniffer 真的被叫到了（有待推事件）" test -f "$SNIFF47_LOG"
-assert_fails "47(8)：自訂 notifier MUST NOT 讀得到呼叫端的 stdin" \
-  grep -qF "$sentinel47" "$SNIFF47_LOG"
-
-# (9) 不退出的自訂 notifier MUST 有界（同一個 blocker 的另一半）：整個指令
-# 必須在 NOTIFY_TIMEOUT（5s）附近收斂，不是永遠等下去
-cat > "$TESTROOT/hang47.sh" <<'HEOF'
-#!/usr/bin/env bash
-sleep 300
-HEOF
-chmod +x "$TESTROOT/hang47.sh"
-rm -f "$D47/state/page-seen"
-t47start="$(date +%s)"
-env AGENT_BRIDGE_DATA="$D47" PATH="$SHIM:$PATH" \
-  AGENT_BRIDGE_NOTIFY_CMD="$TESTROOT/hang47.sh" \
-  "$BRIDGE" scan >/dev/null 2>&1; rc47h=$?
-t47elapsed=$(( $(date +%s) - t47start ))
-assert "47(9)：卡死的 notifier MUST 被逾時殺掉（實測 ${t47elapsed}s）" \
-  test "$t47elapsed" -lt 30
-assert "47(9)：逾時的推播 MUST NOT 改變退出碼" test "$rc47h" -eq 0
-
-# (7) 推播管道全滅仍落盤、仍 exit 0（rubric v2 page 條 4）
-# **tmux 要是好的**：壞掉的 tmux 會讓掃描整輪不跑（沒有證據就不叫人），
-# 那樣測到的是「沒有事件」而不是「推不出去」。這裡三層各自失敗的方式是：
-# 自訂命令指向不存在的檔、測試 socket 上沒有 attached client（display-message
-# 於是無處可送）、桌面通知那一層被自訂命令取代
-rm -f "$D47/state/page-seen"
-before47f="$(ev47_count)"
-env AGENT_BRIDGE_DATA="$D47" PATH="$SHIM:$PATH" \
-  AGENT_BRIDGE_NOTIFY_CMD="/nonexistent/pager-47" \
-  "$BRIDGE" scan >/dev/null 2>&1; rc47=$?
-assert "47(7)：推播全滅時 scan 仍 exit 0" test "$rc47" -eq 0
-assert "47(7)：推播全滅時事件仍落盤" test "$(ev47_count)" -gt "$before47f"
-
-tmx kill-window -t "$W47" 2>/dev/null || true
-
-
-fi  # end grp 47
 # ---- 49. ask：send→await→read 組合（CLI-ASK-1／CLI-ASK-2） ----
 if grp 49; then
 # spec: CLI-ASK-1 CLI-ASK-2
