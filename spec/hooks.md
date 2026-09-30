@@ -170,7 +170,9 @@ legacy 送鍵前 MUST 偵測目標 pane 一屏可見文字是否停在 runtime �
 notify-failed 警告；pane 已死、capture 失敗同走 notify-failed，任務仍在
 mailbox 不遺失。偵測是 best-effort 字串特徵比對，特徵字串 MUST 與現裝
 runtime 實際文案保持一致（有 canary 測試守著）。
-比對 MUST **位置有錨**（2026-08-01 收窄，量化依據見 docs/tui-design.md §4）：
+比對 MUST **位置有錨**（2026-08-01 收窄，量化依據見
+tag `pre-trim-2026-09` 的 docs/tui-design.md §4：下緣區 `TAIL_LINES=14`、鄰近窗 `PROXIMITY_LINES=12`，
+真框最深片段距底 9、誤判語料最淺一幀距底 16）：
 ①只掃畫面下緣固定行數——權限框貼底，指令回顯與助理輸出不會；②同一特徵組的
 片段 MUST 落在鄰近行內，而非同屏任意處；③`Requesting permission for:` 單錨
 MUST 降級——必須與同框的問句／選項行／footer 成對。整屏無錨比對 MUST NOT

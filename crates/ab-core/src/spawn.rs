@@ -537,7 +537,7 @@ pub fn spawn(paths: &Paths, tmux: &dyn TmuxClient, req: &SpawnRequest) -> Result
     Ok(pane)
 }
 
-// ---- lineage 繼承（P4.7 切片 A；契約正本 docs/tui-design.md §9 P4.7 列＋§11）----
+// ---- lineage 繼承（P4.7 切片 A；契約正本 tag `pre-trim-2026-09` 的 docs/tui-design.md §9 P4.7 列＋§11）----
 
 /// registry 一列裡與 lineage 有關的欄位（已 parse）。
 ///

@@ -46,8 +46,8 @@ Source: notify_pane
 
 ### ENV-TMUX-1 [tested: 39]
 `AGENT_BRIDGE_TMUX_TIMEOUT`：單次 tmux 子行程的逾時秒數，涵蓋**所有** tmux
-呼叫（通知路徑、spawn 生命週期、TUI read model——tui-design §4 bounded-read
-硬條款：任何一條無界查詢都足以凍結 UI）。預設 `5`，
+呼叫（通知路徑、spawn 生命週期等；任何一條無界查詢都足以讓呼叫端卡死，
+出處：tag `pre-trim-2026-09` 的 docs/tui-design.md §4 bounded-read 硬條款）。預設 `5`，
 `0` 等同不設限。逾時 MUST 殺掉子行程並視同該次呼叫失敗（走 notify-failed
 降級）。壞值 MUST 退預設而非終止：這是防止整個指令被鎖死的安全網（見
 hooks.md HOOK-NOTIFY-3），拼錯一個變數名不該把安全網拆掉。
@@ -117,16 +117,6 @@ window 後套用的 tmux layout（CLI-SPAWN-5）。預設 `main-vertical`；合�
 tmux 外呼叫都不解析此變數，無關的壞值不得封鎖這些逃生口。
 Source: config::here_layout / cmd_spawn
 
-## TUI
-
-### ENV-UI-1 [tested: 40]
-`AGENT_BRIDGE_UI_POPUP`：`ui` 的啟動器協定旗標，由 tmux binding
-（`display-popup -E 'agent-bridge ui'`）設定，值 `1` 生效、其餘值等同未設定。
-設定時 `Enter` focus 成功後 MUST 直接正常退出（行程結束＝popup 關閉，人落在
-目標 pane）；未設定時 focus 後繼續執行。程式 MUST NOT 自行偵測是否身處
-popup（tui-design.md §2：模式感知屬啟動器，不進核心）。預設未設定。
-Source: ab_tui::run（event_loop）
-
 ## relay 鏈
 
 ### ENV-PASS-1 [tested: 16]
@@ -136,7 +126,7 @@ Source: ab_tui::run（event_loop）
 ——由 spawn 自行設定）：兩者若獲穿透，其 assignment 會排在 spawn 自己那一個
 之後而覆蓋它，子代於是頂著呼叫者的 tag 開起來（despawn 殺錯世代、lineage 跳錯
 parent、relay 深度重置）。排除採**靜默剔除＋stderr 警告**，MUST NOT 使 spawn
-失敗。雙 runtime 同步（tui-design.md §9 P4.7／§11 B4）。
+失敗。雙 runtime 同步（tag `pre-trim-2026-09` 的 docs/tui-design.md §9 P4.7／§11 B4）。
 Source: cmd_spawn（pass_list）
 
 ### ENV-DEPTH-1 [tested: 23]
@@ -152,8 +142,8 @@ Source: cmd_relay
 Source: cmd_relay
 
 ### ENV-PAGE-1 [tested: 47]
-`AGENT_BRIDGE_NOTIFY_CMD`：page 層推播的自訂命令（設計正本
-`docs/tui-design.md` §1 的 page 層；Rust 獨有）。值是**一支可執行檔的路徑
+`AGENT_BRIDGE_NOTIFY_CMD`：page 層推播的自訂命令（設計出處：tag
+`pre-trim-2026-09` 的 docs/tui-design.md §1 的 page 層；Rust 獨有）。值是**一支可執行檔的路徑
 ＝argv[0]**，不是一段 shell 字串；呼叫時後接 `<title> <body>` 兩個參數。
 設了就取代桌面通知那一層——這是 SSH／無桌面環境的逃生口（遠端的
 `DISPLAY` 指的是遠端那台的螢幕，桌面通知在那裡等於彈給沒有人看）。

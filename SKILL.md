@@ -71,9 +71,6 @@ agent-bridge scan                     # [frozen: docs/scope-2026-09.md] page-lay
                                       # holding live work; stdout = count of newly pushed events. Every non-read-only
                                       # subcommand already sweeps on the way out, so call this only when driving it
                                       # from a tmux hook / key binding / cron
-agent-bridge ui                       # [frozen: docs/scope-2026-09.md] alternate-screen dashboard for a human to watch the pool (q to leave).
-                                      # NEVER run this from an agent session: it takes over the terminal and blocks
-                                      # until someone presses q. Use list / list --long / idle for machine-readable views
 ```
 
 Multi-line content always goes through `--message-file -` (stdin heredoc),

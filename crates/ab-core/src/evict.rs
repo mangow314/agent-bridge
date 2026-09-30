@@ -1,11 +1,10 @@
-//! evict 的三段式編排（send 收尾任務 → await → despawn），CLI 與 TUI 的
-//! **單一正本**（審查 F6：編排只活在 CLI 層時，TUI 只能自己再抄一份，兩邊
-//! 必然漂移）。
+//! evict 的三段式編排（send 收尾任務 → await → despawn）的**單一正本**
+//! （審查 F6）。
 //!
 //! **函式內不印任何字**（審查 F7）：進度與警告經 `EvictEvent` 交回呼叫端
-//! ——CLI 印 stderr（`Warn` 走 `agent-bridge: ` 前綴、`Info` 走裸行），TUI 進
-//! footer（alternate screen 下 stderr 會畫花畫面）。事件是**串流**而不是最後
-//! 一次回傳：「收尾任務已派出、等待中」那行必須在 await 開始**之前**就看得到。
+//! ——CLI 印 stderr（`Warn` 走 `agent-bridge: ` 前綴、`Info` 走裸行）。事件是
+//! **串流**而不是最後一次回傳：「收尾任務已派出、等待中」那行必須在 await
+//! 開始**之前**就看得到。
 
 use std::path::Path;
 
@@ -68,41 +67,12 @@ impl EvictRequest {
             expect_generation: None,
         }
     }
-
-    /// 等價 CLI 原文（薄殼原則，tui-design §2：TUI 的確認框 MUST 逐字顯示
-    /// 它將要執行的那條命令）。只印**與預設不同**的旗標，人貼上去跑得到同一
-    /// 件事。
-    ///
-    /// 動態值一律經 `shell_quote`（bash `printf %q` 語意）：`pane_id` 與
-    /// `spawn_tag` 讀自 registry，而 registry 是 **worker 可寫面**——含空白就
-    /// 破壞 argv 等價（貼上去是兩個參數），含 `;`／`$(…)` 更是把一句「可貼上
-    /// 重跑」的承諾變成注入通道（codex 複核 major #4）。正常值全落在 `%q` 的
-    /// 安全字元集內（`%5`／`AGENT_BRIDGE_SPAWN_TAG=…` 逐字不變），所以既有
-    /// 畫面斷言不受影響。
-    pub fn cmdline(&self) -> String {
-        let q = |s: &str| crate::spawn::shell_quote(s.as_bytes());
-        let mut s = format!("agent-bridge evict {}", q(&self.name));
-        if self.from != DEFAULT_FROM {
-            s.push_str(&format!(" --from {}", q(&self.from)));
-        }
-        if self.timeout != DEFAULT_TIMEOUT {
-            // u64，沒有引用的必要（也沒有引用的餘地）
-            s.push_str(&format!(" --timeout {}", self.timeout));
-        }
-        if let Some(p) = &self.expect_pane {
-            s.push_str(&format!(" --expect-pane {}", q(p)));
-        }
-        if let Some(g) = &self.expect_generation {
-            s.push_str(&format!(" --expect-generation {}", q(g)));
-        }
-        s
-    }
 }
 
 /// 編排過程中要給人看的訊息。
 ///
 /// 兩類的差別只在 CLI 的呈現慣例（`Warn` 加 `agent-bridge: ` 前綴、`Info` 不
-/// 加），逐字對齊現行 `cmd_evict`；TUI 兩者都進 footer。
+/// 加），逐字對齊現行 `cmd_evict`。
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum EvictEvent {
     Warn(String),
@@ -127,8 +97,8 @@ pub struct EvictOutcome {
 /// 純 fail-fast：避免對人工註冊的 agent 送出一個之後必定被 despawn 拒絕、
 /// 沒人回收的孤兒收尾任務。權威判定仍在 despawn 的鎖內。
 ///
-/// TUI 的 `e` 也走這一份（出身規則不得在 TUI 另寫一套），並且**在確認當下
-/// 再呼叫一次**取當下值當 expect 參數（tui-design §5 compare-and-act）。
+/// compare-and-act（CLI-EVICT-4）：呼叫端可在確認當下再呼叫一次，取當下值當
+/// expect 參數（出處：tag `pre-trim-2026-09` 的 docs/tui-design.md §5）。
 pub fn precheck_registry(f: &Path, name: &str) -> Result<(String, String)> {
     if !f.is_file() {
         return Err(Error::new(format!("未註冊的 agent：{name}")));
@@ -433,64 +403,6 @@ mod tests {
         }
     }
 
-    /// 等價 CLI 原文（薄殼原則）：預設值不入命令列，帶了 expect 就要逐字帶上
-    /// ——TUI 的證據框顯示的就是這一行，人貼出去要跑得到同一件事。
-    #[test]
-    fn cmdline_prints_only_non_default_flags() {
-        let mut req = EvictRequest::new("w1");
-        assert_eq!(req.cmdline(), "agent-bridge evict w1");
-        req.expect_pane = Some("%5".into());
-        req.expect_generation = Some("t-gen1".into());
-        assert_eq!(
-            req.cmdline(),
-            "agent-bridge evict w1 --expect-pane %5 --expect-generation t-gen1"
-        );
-        req.from = "tui".into();
-        req.timeout = 30;
-        assert_eq!(
-            req.cmdline(),
-            "agent-bridge evict w1 --from tui --timeout 30 --expect-pane %5 --expect-generation t-gen1"
-        );
-    }
-
-    /// registry 是 worker 可寫面：`cmdline()` 承諾「可貼上重跑」，動態值就
-    /// MUST 引用（codex 複核 major #4）。空白破壞 argv 等價，`;`／`$(…)`／
-    /// 單引號則是可執行的注入。
-    #[test]
-    fn cmdline_quotes_hostile_registry_values() {
-        let mut req = EvictRequest::new("w1");
-        req.expect_pane = Some("%5 extra".into());
-        req.expect_generation = Some("t; rm -rf /tmp/x".into());
-        let s = req.cmdline();
-        // 引用後：危險字元前一定有反斜線（`printf %q` 形式），不再是裸的
-        // 分隔符／命令起點
-        assert!(s.contains(r"%5\ extra"), "空白 MUST 被引用：{s}");
-        assert!(!s.contains("t; rm"), "分號 MUST NOT 裸露：{s}");
-        assert!(s.contains(r"\;"), "分號 MUST 被引用：{s}");
-
-        req.expect_pane = Some("$(touch /tmp/pwned)".into());
-        req.expect_generation = Some("it's".into());
-        let s = req.cmdline();
-        assert!(!s.contains("$(touch"), "命令替換 MUST NOT 裸露：{s}");
-        assert!(s.contains(r"\$\(touch"), "實際：{s}");
-        assert!(s.contains(r"it\'s"), "單引號 MUST 被引用：{s}");
-
-        // 名稱與 sender 同樣走引用（TUI 的 name 來自 registry 檔名）
-        let mut req2 = EvictRequest::new("w 1");
-        req2.from = "a;b".into();
-        let s2 = req2.cmdline();
-        assert!(s2.contains(r"w\ 1") && s2.contains(r"a\;b"), "實際：{s2}");
-
-        // 正常值逐字不變（既有畫面斷言的前提）
-        let mut req3 = EvictRequest::new("ev43");
-        req3.expect_pane = Some("%12".into());
-        req3.expect_generation = Some("AGENT_BRIDGE_SPAWN_TAG=ab-spawn-ev43-1-abc".into());
-        assert_eq!(
-            req3.cmdline(),
-            "agent-bridge evict ev43 --expect-pane %12 --expect-generation AGENT_BRIDGE_SPAWN_TAG=ab-spawn-ev43-1-abc"
-        );
-    }
-
     /// CLI-EVICT-2 的三支分流不得合併：completed→`evicted`；failed／cancelled
     /// →`evicted-unfinished`；逾時（await 回 `Timeout`，終態字為空）→
     /// `evicted-timeout`。
@@ -504,7 +416,7 @@ mod tests {
         assert_eq!(audit_event("running"), "evicted-timeout");
     }
 
-    /// 出身判定的單一正本（TUI 的 `e` 直接消費這一份）：人工註冊、無法解析、
+    /// 出身判定的單一正本：人工註冊、無法解析、
     /// 缺 spawn_tag 三條都 MUST 拒絕，且訊息各自可辨識。
     #[test]
     fn precheck_rejects_manual_corrupt_and_tagless() {

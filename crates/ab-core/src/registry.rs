@@ -344,12 +344,11 @@ pub fn list(paths: &Paths) -> Result<Vec<(String, String, String)>> {
     Ok(out)
 }
 
-/// TUI read model 的一列（tui-design.md §4）。`ready` 沿用 `list` 的三值
+/// read model 的一列（tag `pre-trim-2026-09` 的 docs/tui-design.md §4）。`ready` 沿用 `list` 的三值
 /// （`ready`／`starting`／`-`）；`runtime`／`owner` 缺欄位以空字串表示。
-/// `spawn_tag`／`registered_at` 也在這裡一起取：TUI 的 `i` 摘要頁需要它們當
-/// provenance 證據，而按鍵當下另外開檔重讀會把**不同世代的欄位拼成同一頁**
-/// （registry 是 atomic replace，respawn 剛好插在中間就成立）。同一次 parse
-/// 取齊才是同一份快照（跨廠審查 major #3）。
+/// `spawn_tag`／`registered_at` 也在這裡一起取：另外開檔重讀會把**不同世代的
+/// 欄位拼成同一列**（registry 是 atomic replace，respawn 剛好插在中間就成立）。
+/// 同一次 parse 取齊才是同一份快照（跨廠審查 major #3）。
 pub struct AgentSnapshot {
     pub name: String,
     pub pane: String,
@@ -370,7 +369,7 @@ pub struct AgentSnapshot {
     /// `Option` 是**契約的一部分**：`None`＝這一列根本沒有這個欄位（legacy
     /// registry，永不 backfill；或人工 `register`），`Some("")`＝欄位在但值
     /// 是空的（寫壞了）。壓成一個空字串會讓「舊資料」與「壞資料」長得一樣，
-    /// 而 TUI 的歸組要靠前者存在與否分流。
+    /// 而歸組要靠前者存在與否分流。
     pub lineage_root: Option<String>,
     /// 直系 parent 的 canonical `spawn_tag`（同上，值是 generation key）。
     /// 自成根時**欄位缺席**（`None`），不是空字串。
@@ -380,10 +379,10 @@ pub struct AgentSnapshot {
     pub parent_agent: Option<String>,
 }
 
-/// registry 全池唯讀快照（TUI read model，tui-design.md §4）。
+/// registry 全池唯讀快照（read model，tag `pre-trim-2026-09` 的 docs/tui-design.md §4）。
 ///
 /// 與 `list` 的 all-or-nothing 語意刻意不同：`list` 是 CLI 契約面（損壞檔
-/// MUST 整體非零退出，CLI-GEN-1），dashboard 的職責則是把損壞**顯示出來**
+/// MUST 整體非零退出，CLI-GEN-1），read model 的職責則是把損壞**顯示出來**
 /// 而不是整面消失——同 `spawn::list_long` 對壞檔的處置（整列降級後繼續）。
 /// 唯讀：不取鎖、不建目錄；目錄缺失＝空池。
 pub fn snapshot(paths: &Paths) -> Vec<AgentSnapshot> {
@@ -614,7 +613,7 @@ mod tests {
     /// 存在且有值、存在但空——`Option<String>` MUST 把前兩者與第三者分開。
     ///
     /// 壓成 `unwrap_or_default()` 的話，legacy 列與「欄位寫成空字串」在讀者
-    /// 眼中一模一樣，而 TUI 的歸組正要靠「有沒有這個欄位」分流。
+    /// 眼中一模一樣，而歸組正要靠「有沒有這個欄位」分流。
     #[test]
     fn snapshot_keeps_lineage_fields_three_valued() {
         let d = Dir::new("ab-core-registry-lineage");

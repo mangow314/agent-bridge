@@ -21,9 +21,7 @@ use ab_core::task::{self, MessageSource, TaskState};
 use ab_core::tmux::{SubprocessTmux, TmuxClient};
 use ab_core::validate::is_valid_name;
 
-// 逐字對齊 bash `usage()`:84（bin/agent-bridge）的 heredoc 內容；
-// 唯一例外是 `ui` 一段——Rust 獨有的子指令（bash 正本自 M4 凍結，不含 TUI），
-// additive 插入，其餘行維持逐字。
+// 逐字對齊 bash `usage()`:84（bin/agent-bridge）的 heredoc 內容。
 const USAGE: &str = r#"用法：
   agent-bridge register <agent> <tmux-target>   註冊 agent 與其 tmux pane
   agent-bridge unregister <agent>               移除 agent 註冊
@@ -76,8 +74,6 @@ const USAGE: &str = r#"用法：
                                                 每個非唯讀子指令進場時也會順手掃一次，所以
                                                 平常不必手動跑；要即時發現可自行掛在 tmux
                                                 hook／鍵位／cron 上
-  agent-bridge ui                               alternate-screen dashboard（OWNERS/WORKERS、
-                                                Enter focus、x cancel；q 離開；docs/tui-design.md）
   agent-bridge hook <stop|prompt-submit|notification>
                                                 （由 Claude Code 呼叫，非人工手動用）落地 hook
                                                 協定：stdin 收事件 JSON，依 AGENT_BRIDGE_SPAWN_TAG
@@ -139,7 +135,6 @@ fn print_implemented_commands() {
         "spawn",
         "start",
         "status",
-        "ui",
         "unregister",
     ] {
         println!("{cmd}");
@@ -267,14 +262,13 @@ fn main() -> ExitCode {
         "idle" => cmd_idle(&paths, rest),
         "evict" => cmd_evict(&paths, rest),
         "scan" => cmd_scan(&paths, rest),
-        "ui" => cmd_ui(rest),
         _ => {
             print_usage();
             Err(Error::new(format!("未知指令：{cmd}")))
         }
     };
 
-    // Page 層的機會式掃描（tui-design §1；使用者 2026-08-03 裁定）：沒有
+    // Page 層的機會式掃描（tag `pre-trim-2026-09` 的 docs/tui-design.md §1；使用者 2026-08-03 裁定）：沒有
     // daemon，所以「pane 死了卻還掛著非終態 task」只能靠有人呼叫時順手發現。
     //
     // **擺在指令成功完成之後**（跨廠複核 should-fix 4）。放在 dispatch 之前
@@ -285,12 +279,10 @@ fn main() -> ExitCode {
     //
     // 排除項：唯讀指令（MUST NOT 寫任何東西，CLI-RO-1，而掃描寫事件流）、
     // 失敗的指令（它的前提沒成立，不該替它發事件）、`scan` 自己（否則它印的
-    // 計數恆為 0）、`ui`（掃描要問 tmux，而 §4 bounded-read 下 TUI 在 tmux
-    // 整個掛住時仍 MUST 畫得出磁碟 read model——分組 40i／40j 實測轉紅過；
-    // 讓 dashboard 的存活取決於 page 層是把優先序顛倒）。
+    // 計數恆為 0）。
     //
     // 失敗一律吞掉：它是副作用，不得改變任何子指令的退出碼。
-    if result.is_ok() && !readonly && cmd != "scan" && cmd != "ui" {
+    if result.is_ok() && !readonly && cmd != "scan" {
         let tmux = SubprocessTmux;
         let runner = page::SubprocessRunner;
         let pager = page::SystemPager::new(&runner, &tmux);
@@ -702,7 +694,7 @@ fn cmd_start(paths: &Paths, args: &[String]) -> Result<()> {
     Ok(())
 }
 
-/// Page 層（tui-design §1）：把一則「需要人現在出手」的事件送出去。
+/// Page 層（tag `pre-trim-2026-09` 的 docs/tui-design.md §1）：把一則「需要人現在出手」的事件送出去。
 ///
 /// **一律吞掉錯誤**：推播是副作用，呼叫端的 exit code 與輸出契約零改變
 /// （§1 非目標）。事件流寫不進去（唯讀 sandbox、磁碟滿）也一樣——那時人本來
@@ -878,7 +870,7 @@ fn cmd_fail(paths: &Paths, args: &[OsString]) -> Result<()> {
 }
 
 /// cmd_cancel:744 — queued/delivered/running 皆可取消；通知失敗不影響取消本身。
-/// 轉態／通知的正本在 `ab_core::task::cancel_task`（TUI 共用同一份，審查 F6）；
+/// 轉態／通知的正本在 `ab_core::task::cancel_task`（審查 F6）；
 /// 這裡只負責 CLI 呈現層——三行 stderr 文案逐字沿用 bash 正本。
 fn cmd_cancel(paths: &Paths, args: &[String]) -> Result<()> {
     if args.len() != 1 {
@@ -923,7 +915,7 @@ fn cmd_status(paths: &Paths, args: &[String]) -> Result<()> {
 
 /// cmd_read:784 — 讀回覆（completed/failed 可）。
 /// 鎖／狀態驗證／read 事件的正本已下沉 `ab_core::task::with_response`
-/// （TUI 的 `r` 消費同一份，審查 F6）；這裡只剩呈現。
+/// （審查 F6）；這裡只剩呈現。
 ///
 /// 走 callback 而非「拿完整 outcome 再印」：三行標頭與 payload **都要在鎖內、
 /// 且標頭在前**——`response.md` 缺檔時舊行為是標頭已印出才失敗，改成外殼呈現
@@ -1327,8 +1319,9 @@ fn cmd_relay(paths: &Paths, args: &[String]) -> Result<()> {
         let _ = tmux.exec(&["select-pane", "-t", &pane]);
     }
     // CLI-RELAY-4：手動起的 session（呼叫者環境無 spawn tag）是接力鏈上唯一
-    // 會彈權限框的形狀，而那個框沒有任何機制偵測得到（tui-design §1 known
-    // gap：偵測＝常駐輪詢，已裁定不做）。這一行提醒就是該 gap 的全部緩解。
+    // 會彈權限框的形狀，而那個框沒有任何機制偵測得到（偵測＝常駐輪詢，已裁定
+    // 不做；tag `pre-trim-2026-09` 的 docs/tui-design.md §1 known gap）。
+    // 這一行提醒就是該 gap 的全部緩解。
     // 判準與 spawn 落點的 auto 規則共用同一個 helper：三態語意（unset／空
     // ＝人工；非 UTF-8＝視為在場）兩路必須一致（P4 審查 CONFIRMED 1）
     if config::caller_is_manual() {
@@ -1389,7 +1382,7 @@ fn cmd_idle(paths: &Paths, args: &[String]) -> Result<()> {
 }
 
 /// cmd_evict:1866 的 argv 解析。編排的正本已下沉 `ab_core::evict::evict`
-/// （TUI 的 `e` 消費同一份，審查 F6）；這裡只剩參數面與呈現層——core 不印字，
+/// （審查 F6）；這裡只剩參數面與呈現層——core 不印字，
 /// 事件在這裡轉成 stderr（`Warn` 走 `agent-bridge: ` 前綴、`Info` 走裸行，
 /// 逐字對齊下沉前的行為），stdout 恰為收尾 task-id 一行（CLI-EVICT-1）。
 fn cmd_evict(paths: &Paths, args: &[String]) -> Result<()> {
@@ -1448,16 +1441,6 @@ fn cmd_evict(paths: &Paths, args: &[String]) -> Result<()> {
     })?;
     println!("{}", outcome.task_id);
     Ok(())
-}
-
-/// CLI-UI-1 — alternate-screen dashboard（設計正本 docs/tui-design.md）。
-/// terminal 生命週期（raw mode／alt screen／panic hook）全部收在
-/// `ab_tui::run` 內；這裡只擋參數面。Rust 獨有指令（bash 正本自 M4 凍結）。
-fn cmd_ui(args: &[String]) -> Result<()> {
-    if !args.is_empty() {
-        return Err(Error::new("用法：agent-bridge ui（不接參數）"));
-    }
-    ab_tui::run()
 }
 
 /// payload 輸出：request/response 原文以 byte 原樣寫進 stdout，

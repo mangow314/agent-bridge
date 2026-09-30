@@ -49,7 +49,7 @@ fn fold_whitespace(s: &str) -> String {
 
 /// 只掃畫面**下緣**這麼多行：權限框永遠貼著 pane 底部，助理輸出／指令回顯不會。
 ///
-/// 取值 14 是量出來的，不是拍的（2026-08-01 實測，記錄見 docs/tui-design.md §4）：
+/// 取值 14 是量出來的，不是拍的（2026-08-01 實測，記錄見 tag `pre-trim-2026-09` 的 docs/tui-design.md §4）：
 /// - 真權限框（Claude Code v2.1.220，33×143 pane）：框出現時**取代**輸入框與
 ///   statusline，整框貼底——`Esc to cancel` 距底 0 行、`Do you want to proceed?`
 ///   距底 5 行、框頂分隔線距底 13 行。agy 的框（docs/agy-probe.md 實測十行）
@@ -99,15 +99,13 @@ const PROXIMITY_LINES: usize = 12;
 /// for:|Do you want to proceed'` 這行指令回顯自己就湊齊三組特徵。三道收窄：
 /// ①只掃下緣 `TAIL_LINES` 行；②組內片段須落在 `PROXIMITY_LINES` 行的鄰近窗內；
 /// ③`Requesting permission for:` 單錨降級——MUST 與同框的選項行／footer 成對。
-/// 誤判方向是漏送通知（任務仍在 mailbox）＋TUI 假警報，比誤批權限框輕；但
+/// 誤判方向是漏送通知（任務仍在 mailbox）＋假警報，比誤批權限框輕；但
 /// 收窄同時把漏判風險壓在量出來的餘裕內，不是拿安全換乾淨。
 pub fn screen_has_prompt(screen: &str) -> bool {
     prompt_window(screen).is_some()
 }
 
-/// 一個鄰近窗（已摺疊空白）是否命中特徵。判定**只有這一份**：`screen_has_prompt`
-/// 與 `prompt_snippet` 共用它，否則 TUI 顯示的「框內容」會有機會與送鍵防線
-/// 實際攔到的東西不是同一件事。
+/// 一個鄰近窗（已摺疊空白）是否命中特徵。判定**只有這一份**。
 fn window_hits(window: &str) -> bool {
     // 特徵組：**組內全部片段**都要落在同一個鄰近窗內才算命中。
     let groups: [&[&str]; 3] = [
@@ -131,54 +129,12 @@ fn window_hits(window: &str) -> bool {
 
 /// **第一個**命中的鄰近窗在 `screen_lines` 裡的行範圍（含兩端）。
 ///
-/// `screen_has_prompt` 原本就是「掃到第一個命中的窗即回 true」，抽出範圍不改
-/// 那條語意，只是把「是哪一個窗命中」這件已經算出來的事保留下來。
+/// `screen_has_prompt` 是「掃到第一個命中的窗即回 true」。
 fn prompt_window(screen: &str) -> Option<(usize, usize)> {
     tail_windows(screen)
         .into_iter()
         .find(|(_, _, w)| window_hits(w))
         .map(|(s, e, _)| (s, e))
-}
-
-/// **最後**一個命中窗的行範圍——snippet 專用。
-///
-/// 判定用的是第一個命中窗（掃到就回，語意不變），但那個窗在特徵湊齊的當下就
-/// 結束了：agy 的框在 `Do you want to proceed?` 那行就已經與 header 湊成一組，
-/// 於是第一個命中窗切在問句上、選項與 footer 全在窗外。要顯示「框在問什麼、
-/// 有哪些選項」就得取延伸到最深的那一個。
-fn prompt_window_last(screen: &str) -> Option<(usize, usize)> {
-    tail_windows(screen)
-        .into_iter()
-        .rfind(|(_, _, w)| window_hits(w))
-        .map(|(s, e, _)| (s, e))
-}
-
-/// TUI 顯示用的框內容上限：命中窗的**最後**這麼多行。
-///
-/// 為什麼有界：鄰近窗最寬 `PROXIMITY_LINES` 行，整段塞進 DETAIL 會把等價 CLI
-/// 原文推出畫面（薄殼原則）。取尾端而非開頭，是因為選項行與 footer 貼在框底
-/// ——「它在問什麼、有哪些選項」都在那裡。
-pub const PROMPT_SNIPPET_MAX_LINES: usize = 6;
-
-/// 命中窗的原文尾行（**不摺疊空白**：那是給比對用的正規化，不是人要讀的東西）。
-///
-/// 回 `None` 代表這一屏沒有命中——與 `screen_has_prompt` 同一份判定，不會出現
-/// 「標了 blocked 卻沒有內容」或反過來的矛盾。
-///
-/// 空行**不佔額度**：框內的留白在終端機上是排版，搬進 DETAIL 那幾行的預算裡
-/// 就是把選項行擠出去。丟掉的只有空白，每一行文字都照原文（含縮排）。
-pub fn prompt_snippet(screen: &str) -> Option<Vec<String>> {
-    let (start, end) = prompt_window_last(screen)?;
-    let lines = screen_lines(screen);
-    let mut kept: Vec<String> = lines[start..=end]
-        .iter()
-        .map(|l| l.trim_end().to_string())
-        .filter(|l| !l.is_empty())
-        .collect();
-    if kept.len() > PROMPT_SNIPPET_MAX_LINES {
-        kept.drain(..kept.len() - PROMPT_SNIPPET_MAX_LINES);
-    }
-    Some(kept)
 }
 
 /// 下緣區內的鄰近窗序列（每個窗已摺疊空白，可直接 `contains`）。
@@ -207,8 +163,7 @@ fn tail_windows(screen: &str) -> Vec<(usize, usize, String)> {
         .collect()
 }
 
-/// 一屏的行（尾端全空白行已剝除）。`tail_windows` 的行索引與 `prompt_snippet`
-/// 取原文都吃這一份，兩邊各切一次的話索引會對不上。
+/// 一屏的行（尾端全空白行已剝除）。
 fn screen_lines(screen: &str) -> Vec<&str> {
     let mut lines: Vec<&str> = screen.split('\n').collect();
     while lines.last().is_some_and(|l| l.trim().is_empty()) {
@@ -393,9 +348,7 @@ fn sleep_notify_delay() {
 
 /// 一次通知嘗試的終態，與寫進 events.log 的事件字一一對應。
 ///
-/// 存在的理由：alternate-screen 的消費端（TUI）不能讓 helper 直接 `eprintln!`
-/// ——stderr 會畫花畫面且訊息進不了 footer。故把「決定」與「印字」拆開：
-/// 這裡只回終態，印字留在 CLI 外殼（`notify_or_defer`）。
+/// 把「決定」與「印字」拆開：這裡只回終態，印字留在 CLI 外殼（`notify_or_defer`）。
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum NotifyOutcome {
     /// 送鍵成功（`notified`）
@@ -483,7 +436,7 @@ pub fn notify_or_defer_outcome(
 }
 
 /// CLI 外殼：終態 → stderr 文案（與 bash 正本逐字一致，既有測試以 byte 級
-/// 比對這兩行）。TUI 不走這條，改用 `notify_or_defer_outcome` 自行呈現。
+/// 比對這兩行）。
 pub fn notify_or_defer(
     paths: &Paths,
     tmux: &dyn TmuxClient,
@@ -690,52 +643,6 @@ mod tests {
         assert!(!screen_has_prompt("Do you want to proceed?"));
     }
 
-    /// **snippet 與判定同源**（P5.4 blocker snippet）：命中才有內容、沒命中就
-    /// 沒有；內容取的是命中窗的**原文尾行**（框在問什麼、有哪些選項都在那裡），
-    /// 而且有界——整個鄰近窗塞進 DETAIL 會把等價 CLI 原文推出畫面。
-    #[test]
-    fn the_prompt_snippet_comes_from_the_very_window_that_matched() {
-        let screen = "● Bash(./bin/agent-bridge receive t1)\n\nCommand\n\
-             ────────\n\nRequesting permission for:\n   ./bin/agent-bridge receive t1\n\n\
-             Do you want to proceed?\n> 1. Yes\n  4. No\n\nesc to cancel";
-        let snip = prompt_snippet(screen).expect("命中的畫面 MUST 有 snippet");
-        assert!(
-            snip.len() <= PROMPT_SNIPPET_MAX_LINES,
-            "有界：{} 行 > 上限 {PROMPT_SNIPPET_MAX_LINES}",
-            snip.len()
-        );
-        assert_eq!(
-            snip.last().map(String::as_str),
-            Some("esc to cancel"),
-            "尾行取的是框底（footer／選項），不是框頂"
-        );
-        assert!(
-            snip.iter().any(|l| l.contains("Do you want to proceed?")),
-            "框在問什麼 MUST 在 snippet 裡：{snip:?}"
-        );
-        // **原文**，不是比對用的摺疊正規化：縮排照留
-        assert!(
-            snip.iter().any(|l| l.starts_with("> 1. Yes")),
-            "選項行照原文：{snip:?}"
-        );
-        assert!(
-            snip.iter().all(|l| !l.is_empty()),
-            "空行不佔 DETAIL 的行預算：{snip:?}"
-        );
-
-        // 沒命中就沒有內容——不得出現「標了 blocked 卻拿不到框」的矛盾
-        assert!(prompt_snippet("$ ls\nfoo bar\n").is_none());
-        assert!(prompt_snippet("Requesting permission for:").is_none());
-        // 兩者永遠同進同出
-        for s in [screen, "$ ls\nfoo bar\n", "Do you want to proceed?"] {
-            assert_eq!(
-                screen_has_prompt(s),
-                prompt_snippet(s).is_some(),
-                "判定與 snippet MUST 同源：{s:?}"
-            );
-        }
-    }
-
     #[test]
     fn pane_re_rejects_injection_shapes() {
         assert!(is_valid_pane("%0"));
@@ -799,7 +706,7 @@ mod tests {
     /// - class A：散文引用 header 單錨（poll-133-20..24，距底 27）
     ///
     /// 沒有這條，把 `TAIL_LINES` 改回整屏（或讓鄰近窗越過下緣區界）就會靜默
-    /// 回到 79% 誤判——那正是 P4 之後 TUI 常駐假 `⛔blocked` 的來源。
+    /// 回到 79% 誤判——那正是 P4 之後常駐假 blocked 的來源。
     #[test]
     fn talking_about_a_permission_box_is_not_a_permission_box() {
         // class B：指令回顯，四個片段擠在同一行

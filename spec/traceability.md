@@ -53,15 +53,10 @@
 | 37 | agy runtime（Antigravity CLI） | CLI-SPAWN-1, HOOK-NOTIFY-2 |
 | 38 | list --long 介入視圖 | CLI-LIST-1, CLI-LIST-2 |
 | 39 | copy-mode 送鍵防線 | HOOK-NOTIFY-3, HOOK-NOTIFY-4, ENV-TMUX-1 |
-| 40 | TUI 第一縱切（ui dashboard） | CLI-UI-1, CLI-CANCEL-1, ENV-UI-1 |
-| 41 | TUI 四面板＋唯讀鍵 | CLI-UI-1, CLI-READ-1 |
+| 41 | read：stdout/stderr 分流與 response 缺檔時標頭先印 | CLI-READ-1 |
 | 42 | evict 入口 CAS | CLI-EVICT-4, CLI-EVICT-3 |
-| 43 | TUI evict 證據框（CAS） | CLI-UI-1, CLI-EVICT-4, CLI-EVICT-3 |
-| 44 | P4 效率驗收（replay 步數 gate） | CLI-UI-1, CLI-UI-2, CLI-LIST-2 |
-| 45 | 尾行預覽的 capture-pane 語意（真 tmux） | CLI-UI-1, ENV-TMUX-1 |
 | 46 | await 的 blocker 探測（真 tmux） | CLI-AWAIT-3, CLI-AWAIT-4 |
 | 47 | page 層兩類事件的推播與去重 | CLI-SCAN-1, CLI-SCAN-2, CLI-SCAN-3, CLI-PAGE-1, CLI-PAGE-2, CLI-PAGE-3, CLI-RO-1, ENV-PAGE-1 |
-| 48 | 色盤降級後的字元層同一性（真 tmux） | CLI-UI-2 |
 | 49 | ask：send→await→read 組合 | CLI-ASK-1, CLI-ASK-2 |
 
 ## `[untested]` 缺口處置（本輪只記錄，不補測）

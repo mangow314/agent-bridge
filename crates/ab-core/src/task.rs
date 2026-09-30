@@ -46,24 +46,6 @@ impl TaskState {
             TaskState::Completed | TaskState::Failed | TaskState::Cancelled
         )
     }
-
-    /// 權威狀態字 → `TaskState`；不在這六個字之內一律 `None`。
-    ///
-    /// `tasks/` 裡任何人都能寫 status 檔，而 dashboard 的 status 軸 MUST 只顯示
-    /// 權威字（tui-design.md §2：不存在 `blocked` 這個 task 狀態）。沒有這道
-    /// 驗證，一個手寫的 `blocked` 就會原字上畫面，並被當成非終態而開得了
-    /// cancel 確認框。
-    pub fn parse(s: &str) -> Option<TaskState> {
-        match s {
-            "queued" => Some(TaskState::Queued),
-            "delivered" => Some(TaskState::Delivered),
-            "running" => Some(TaskState::Running),
-            "completed" => Some(TaskState::Completed),
-            "failed" => Some(TaskState::Failed),
-            "cancelled" => Some(TaskState::Cancelled),
-            _ => None,
-        }
-    }
 }
 
 /// 訊息來源：`--message <text>`／`--message-file <path>`／`--message-file -`（stdin）。
@@ -128,74 +110,6 @@ pub fn log_event(paths: &Paths, id: &str, event: &str, detail: &str) -> Result<(
         .map_err(|e| Error::new(format!("無法開啟 events.log {}：{e}", path.display())))?;
     f.write_all(line.as_bytes())
         .map_err(|e| Error::new(format!("無法寫入 events.log {}：{e}", path.display())))
-}
-
-/// request.md 首行的讀取上限（P5.3 兩行列）。**界只有這一份定義**，且成立於
-/// 資料取得路徑（先 `take` 再讀），不是全讀進記憶體再截——同 `L` 尾行預覽的
-/// bounded 紀律（tui-design.md §3）。
-pub const REQUEST_FIRST_LINE_MAX_BYTES: u64 = 4096;
-
-/// TUI read model（P5.3）：request.md 首行，**有界讀**。二進位安全：回傳
-/// bytes、由 render 端決定 lossy 呈現（與 pager 的 bytes 紀律同族）；CRLF 檔
-/// 尾部的 `\r` 一併剝掉（它是行終止的另一半，不是內容）。讀不到（無檔／IO
-/// 錯）＝`None`，顯示層 fail-closed 自行退化。
-pub fn request_first_line(paths: &Paths, id: &str) -> Option<Vec<u8>> {
-    use std::io::Read;
-    let path = task_dir(paths, id).join("request.md");
-    let f = std::fs::File::open(path).ok()?;
-    let mut buf = Vec::new();
-    f.take(REQUEST_FIRST_LINE_MAX_BYTES)
-        .read_to_end(&mut buf)
-        .ok()?;
-    if let Some(pos) = buf.iter().position(|&b| b == b'\n') {
-        buf.truncate(pos);
-    }
-    if buf.last() == Some(&b'\r') {
-        buf.pop();
-    }
-    Some(buf)
-}
-
-/// events.log 尾行的讀取上限（P5.3 兩行列）。
-///
-/// 為什麼也要有界：正常情況下這個檔只有幾行（狀態轉換才 append），但**檔案
-/// 大小不是本程式能保證的事實**——events.log 在 task 目錄裡，而 task 目錄是
-/// worker 可寫面。UI 每輪在檔長變更時重讀，一個被灌大的檔就會讓 UI thread
-/// 每次分配並讀完整份。界成立於取得路徑（先 seek 到尾端再讀這麼多），不是
-/// 讀完再截（CLI-UI-2「兩者皆 MUST 有界讀」）。
-///
-/// 取 8 KiB：一行事件是 `<iso> <event>[ <detail>]`，detail 已由寫入端限長；
-/// 8 KiB 足以涵蓋尾端數十行，遠超過「最後一個非空行」所需。
-pub const LAST_EVENT_MAX_BYTES: u64 = 8192;
-
-/// TUI read model（P5.3）：events.log 最後一個非空行（原字串，`<iso> <event>
-/// [ <detail>]`）。**有界讀**：只取檔尾 `LAST_EVENT_MAX_BYTES` bytes。
-///
-/// 從中間切進去時**第一行必然是半條**（切點落在某一行中間），故檔案大於界時
-/// 丟掉第一段——寧可少答一行，也不要把半條事件當成完整的一行印在畫面上。
-/// 空行跳過；非 UTF-8／讀不到＝`None`。
-pub fn last_event_line(paths: &Paths, id: &str) -> Option<String> {
-    use std::io::{Read, Seek, SeekFrom};
-    let path = task_dir(paths, id).join("events.log");
-    let mut f = std::fs::File::open(path).ok()?;
-    let len = f.metadata().ok()?.len();
-    let truncated = len > LAST_EVENT_MAX_BYTES;
-    if truncated {
-        f.seek(SeekFrom::End(-(LAST_EVENT_MAX_BYTES as i64))).ok()?;
-    }
-    let mut buf = Vec::new();
-    f.take(LAST_EVENT_MAX_BYTES).read_to_end(&mut buf).ok()?;
-    let content = String::from_utf8(buf).ok()?;
-    let mut lines: Vec<&str> = content.lines().collect();
-    if truncated && !lines.is_empty() {
-        // 切點落在行中間：第一段不是一整行
-        lines.remove(0);
-    }
-    lines
-        .iter()
-        .rev()
-        .find(|l| !l.trim().is_empty())
-        .map(|l| l.to_string())
 }
 
 /// update_meta_status:261 — 同步更新 metadata.json 與裸 status 檔。
@@ -651,11 +565,9 @@ pub struct CancelOutcome {
     pub notify: Option<crate::notify::NotifyOutcome>,
 }
 
-/// cmd_cancel:744 的完整語意（鎖／轉態／事件／通知），CLI 與 TUI 的**單一
-/// 正本**——先前 TUI 另抄一份，兩邊會各自漂移（審查 F6）。
+/// cmd_cancel:744 的完整語意（鎖／轉態／事件／通知）的**單一正本**（審查 F6）。
 ///
-/// **函式內不印任何字**：呈現層由呼叫端決定（CLI 印 stderr；TUI 進 footer，
-/// alternate screen 下 stderr 會畫花畫面，審查 F7）。
+/// **函式內不印任何字**：呈現層由呼叫端決定（CLI 印 stderr，審查 F7）。
 pub fn cancel_task(
     paths: &Paths,
     tmux: &dyn crate::tmux::TmuxClient,
@@ -703,7 +615,7 @@ pub fn cancel_task(
     Ok(out)
 }
 
-/// TUI read model 的一列（tui-design.md §4）：一個尚未到終態的任務。
+/// in-flight read model 的一列（tag `pre-trim-2026-09` 的 docs/tui-design.md §4）：一個尚未到終態的任務。
 /// `status` 是權威狀態字（`queued`／`delivered`／`running`）。
 #[derive(Debug)]
 pub struct InFlight {
@@ -715,14 +627,14 @@ pub struct InFlight {
     /// 欄位，不是磁碟 schema 的新欄位**——metadata 本來就有它，這裡只是把它
     /// 一起讀進來。缺失／讀不到＝空字串（呼叫端 fail-closed）。
     ///
-    /// 為什麼 TUI 的歸屬判定要用它而不是 task-id 前綴：id 前綴只是 created_at
+    /// 為什麼歸屬判定要用它而不是 task-id 前綴：id 前綴只是 created_at
     /// 的衍生副本，兩者不保證一致（測試 fixture 就有一份不一致的）。同一份
     /// read model 對「這個 task 幾點生的」不該有兩套答案——`gc` 那條路徑
     /// （本檔 `created_at` vs 目錄 mtime）早就選過同一邊。
     pub created_at: String,
 }
 
-/// in-flight（非終態）任務的唯讀快照（TUI read model，tui-design.md §4）。
+/// in-flight（非終態）任務的唯讀快照（read model，tag `pre-trim-2026-09` 的 docs/tui-design.md §4）。
 ///
 /// 只認本工具生成形狀的目錄名與完整形狀（metadata＋status 都在）——與 gc
 /// 的掃描門檻同一條理由：`tasks/` 裡任何人都能放目錄。單一損壞任務跳過
@@ -766,97 +678,14 @@ pub fn in_flight(paths: &Paths) -> Vec<InFlight> {
     out
 }
 
-/// 近期任務（**含終態**）的唯讀快照，供 TUI 的 TASKS 面板使用
-/// （tui-design.md §2 版面）。`in_flight` 只看得到非終態，而 `read` 只對
-/// `completed`／`failed` 合法——沒有這一份，畫面上就沒有可讀的任務。
-///
-/// 紀律同 `in_flight`：唯讀、**不取鎖**、只認本工具生成形狀的目錄名、單一
-/// 損壞任務跳過而不是讓整份 dashboard 消失。
-///
-/// **先按目錄名反序排序再截到 `limit`，之後才讀 status／metadata**：`tasks/`
-/// 會長大，500ms 輪詢不能對整個目錄做 N 次檔案讀（截斷後至多 `limit` 筆 I/O）。
-/// 目錄名以時間戳起首，字典序＝時間序，故反序＝新的在前。
-pub fn recent_tasks(paths: &Paths, limit: usize) -> Recent {
-    let Ok(rd) = std::fs::read_dir(&paths.tasks_dir) else {
-        return Recent::default();
-    };
-    let mut names: Vec<String> = rd
-        .filter_map(|e| e.ok())
-        // **候選必須先是目錄**（審查 F4）：只驗檔名字面的話，一個名字剛好長成
-        // `YYYYMMDDTHHMMSSZ-xxxx` 的**普通檔案**也會被算進候選數，於是
-        // `names.len() > limit` 為真、畫面標出 `+`——但截限後保留的每一筆都
-        // 有效、沒有任何更舊的 task 被省略。那個 `+` 是憑空的。
-        //
-        // 用 `file_type()`（不追 symlink）而不是 `path().is_dir()`：task 目錄
-        // 是本工具生成的真目錄，指向別處的 symlink 不是這條路徑認得的形狀。
-        .filter(|e| e.file_type().is_ok_and(|t| t.is_dir()))
-        .filter_map(|e| e.file_name().to_str().map(|s| s.to_string()))
-        .filter(|n| is_generated_task_dirname(n))
-        .collect();
-    names.sort_by(|a, b| b.cmp(a));
-    // 截斷與否在**這裡**才知道：損壞任務會在下面被跳過，所以「回傳筆數等於
-    // limit」判不出截斷（有截斷但跳過幾筆時就會漏報）。呼叫端要據此誠實顯示
-    // 「還有更舊的沒載入」
-    let truncated = names.len() > limit;
-    names.truncate(limit);
-
-    let mut out = Vec::new();
-    for id in names {
-        let dir = paths.tasks_dir.join(&id);
-        let Ok(st) = read_status(&dir) else { continue };
-        // 非權威狀態字＝損壞，比照損壞目錄跳過。放行的話畫面的 status 軸就會
-        // 出現不存在的 task 狀態（§2 硬條款），且未知值會被當成非終態而開得了
-        // cancel 確認框
-        if TaskState::parse(&st).is_none() {
-            continue;
-        }
-        let Ok(content) = std::fs::read_to_string(dir.join("metadata.json")) else {
-            continue;
-        };
-        let Ok(Value::Object(fields)) = json::parse(&content) else {
-            continue;
-        };
-        out.push(InFlight {
-            id,
-            from: json::jq_raw_field(&fields, "from").unwrap_or_default(),
-            to: json::jq_raw_field(&fields, "to").unwrap_or_default(),
-            status: st,
-            created_at: json::jq_raw_field(&fields, "created_at").unwrap_or_default(),
-        });
-    }
-    Recent {
-        tasks: out,
-        truncated,
-    }
-}
-
-/// `recent_tasks` 的結果：任務清單＋**是否還有更舊的沒載入**。
-///
-/// 兩者要一起回傳，否則畫面沒有辦法誠實表達「你看到的不是全部」——而「以為
-/// 看到了全部」正是 dashboard 最容易說出口的謊。
-#[derive(Debug, Default)]
-pub struct Recent {
-    pub tasks: Vec<InFlight>,
-    pub truncated: bool,
-}
-
-/// `read` 一次執行的終態：標頭欄位＋response 的**原始位元組**
-/// （payload 邊界走 bytes 是架構 §3 的紅線，不經 `String` 中轉）。
-#[derive(Debug)]
-pub struct ReadOutcome {
-    pub from: String,
-    pub to: String,
-    pub bytes: Vec<u8>,
-}
-
 /// `read` 的標頭欄位（取自 metadata，於鎖內讀出）。
 pub struct ReadHeader {
     pub from: String,
     pub to: String,
 }
 
-/// cmd_read:784 的完整語意（鎖／狀態驗證／read 事件／payload 呈現），CLI 與
-/// TUI 的**單一正本**——分家就會漂移（審查 F6，同 `cancel_task` 的處置）。
+/// cmd_read:784 的完整語意（鎖／狀態驗證／read 事件／payload 呈現）的**單一
+/// 正本**——分家就會漂移（審查 F6，同 `cancel_task` 的處置）。
 ///
 /// **持鎖到呼叫端把 payload 處理完為止**，故走 callback 而不是「先讀成
 /// `Vec<u8>` 再回傳」：
@@ -901,20 +730,6 @@ pub fn with_response<T>(
     })();
     guard.release();
     outcome
-}
-
-/// `with_response` 的 bytes 版（TUI 用：overlay pager 要的是完整位元組，
-/// 沒有串流對象）。CLI **不走這條**——它要的是「先標頭再串流」的順序。
-pub fn read_response(paths: &Paths, id: &str) -> Result<ReadOutcome> {
-    with_response(paths, id, |h, path| {
-        let bytes = std::fs::read(path)
-            .map_err(|e| Error::new(format!("無法讀取 {}：{e}", path.display())))?;
-        Ok(ReadOutcome {
-            from: h.from.clone(),
-            to: h.to.clone(),
-            bytes,
-        })
-    })
 }
 
 /// await 的正常終局。**逾時必須與操作性失敗分得開**：呼叫端（evict）只在
@@ -962,8 +777,7 @@ pub struct BlockerWatch<'a> {
 /// 每幾輪 status 輪詢做一次 blocker 探測（攤薄 tmux 查詢成本；預設輪詢 1s
 /// 間隔下約每 5 秒一次）。
 const PROBE_EVERY: u32 = 5;
-/// Prompt 須連續命中幾次探測才算確立（同 TUI `BLOCKER_DEBOUNCE_ROUNDS`；
-/// 單次誤判不觸發任何行為）。
+/// Prompt 須連續命中幾次探測才算確立（單次誤判不觸發任何行為）。
 const PROBE_DEBOUNCE: u32 = 2;
 
 /// 探測結果 → 行為的純狀態機（時間注入，單測不需睡眠）。
@@ -1164,8 +978,7 @@ pub fn await_task_watched(
 /// **`try_from_secs_f64` 而非 `from_secs_f64`**：後者對超出 `Duration` 值域的
 /// finite 值是 **panic**，而 `await_task` 的驗證只擋掉「非正數／非有限」
 /// ——`AGENT_BRIDGE_POLL_INTERVAL=1e300` 這種形狀會一路走到這裡。在 CLI 上
-/// 那是 exit 101；在 TUI 的一次性 thread 上是工人直接 unwind、evict 的終局
-/// 訊息永遠不會回來、in-flight 閘永遠不放開（codex 複核 major #3）。
+/// 那是 exit 101（codex 複核 major #3）。
 /// bash 那邊是把值交給 `sleep`，超大值就睡到天荒地老；`Duration::MAX` 是同一
 /// 個終態（處置同 `spawn::wait_ready`）。
 fn poll_sleep(interval: f64) -> std::time::Duration {
@@ -1245,8 +1058,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    /// 極大但 finite 的輪詢間隔 MUST NOT panic（`from_secs_f64` 會）：
-    /// 那條路徑在 TUI 的一次性工人上會讓 evict 的終局訊息永遠不回來
+    /// 極大但 finite 的輪詢間隔 MUST NOT panic（`from_secs_f64` 會）
     /// （codex 複核 major #3）。上界一律夾到 `Duration::MAX`（＝bash 的
     /// 「sleep 到天荒地老」）。
     #[test]
@@ -1669,7 +1481,7 @@ mod tests {
         }
     }
 
-    /// `cancel_task` 是 CLI 與 TUI 的單一正本（審查 F6）：轉態＋`cancelled`
+    /// `cancel_task` 是 cancel 語意的單一正本（審查 F6）：轉態＋`cancelled`
     /// 事件＋通知終態一次到位，且**函式內不印字**（F7，呈現交外殼）。
     #[test]
     fn cancel_task_transitions_and_reports_notify_outcome() {
@@ -1789,12 +1601,11 @@ mod tests {
 
     /// **`created_at` 的磁碟→read-model 管線**（P4.7 切片 C 修正輪 F6）。
     ///
-    /// 兩條 loader（`in_flight`／`recent_tasks`）各自填這個欄位，而上層
-    /// （TUI 的歸屬判定）拿它當**唯一**的同世代證據。沒有這條斷言的話，任一
-    /// 條 loader 哪天誤填成空字串，所有既有測試照樣全綠——真畫面上的症狀是
-    /// 「每一筆 task 都掉進 Unattached」，而那看起來只是 scope 的行為。
+    /// `in_flight` 填這個欄位，而上層（page 層的歸屬判定）拿它當**唯一**的
+    /// 同世代證據。沒有這條斷言的話，loader 哪天誤填成空字串，所有既有測試照樣
+    /// 全綠。
     #[test]
-    fn created_at_flows_from_metadata_into_both_read_models() {
+    fn created_at_flows_from_metadata_into_the_read_model() {
         let d = Dir::new("ab-core-created-at");
         let paths = test_paths(&d);
         let id = create_task(
@@ -1820,31 +1631,18 @@ mod tests {
         let rows = in_flight(&paths);
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].created_at, want, "in_flight MUST 原樣帶入");
-        let rec = recent_tasks(&paths, 100);
-        assert_eq!(rec.tasks.len(), 1);
-        assert_eq!(rec.tasks[0].created_at, want, "recent_tasks MUST 原樣帶入");
 
         // 對照組：metadata 沒有這個欄位（`seed_task` 就不寫）→ 空字串。
         // 上層據此 fail-closed（不可證＝不掛），而不是拿一個假時間去比
         seed_task(&paths, "20260731T000009Z-0009", "queued", None);
-        let seeded = |t: &InFlight| t.id == "20260731T000009Z-0009";
         let rows = in_flight(&paths);
         assert!(
             rows.iter()
-                .find(|t| seeded(t))
+                .find(|t| t.id == "20260731T000009Z-0009")
                 .unwrap()
                 .created_at
                 .is_empty(),
             "欄位缺失 MUST 是空字串"
-        );
-        let rec = recent_tasks(&paths, 100);
-        assert!(
-            rec.tasks
-                .iter()
-                .find(|t| seeded(t))
-                .unwrap()
-                .created_at
-                .is_empty()
         );
     }
 
@@ -1876,299 +1674,5 @@ mod tests {
         if let Some(b) = response {
             std::fs::write(dir.join("response.md"), b).unwrap();
         }
-    }
-
-    /// tui-design §9 P2 gate (b) 的正本：`read_response` 回的 bytes MUST **逐
-    /// byte** 等於 `response.md`（非 ASCII、trailing newline、非文字 byte 全數
-    /// 原樣），且呼叫後 events.log 多一筆 `read`（read 非唯讀路徑）。
-    #[test]
-    fn read_response_returns_verbatim_bytes_and_logs_read_event() {
-        let d = Dir::new("ab-core-read-bytes");
-        let paths = test_paths(&d);
-        let id = "20260731T000010Z-abcd";
-        let mut raw: Vec<u8> = "回覆內容 ✓\n".as_bytes().to_vec();
-        raw.push(0x00); // 非文字 byte：證明走的是 bytes 不是字串
-        raw.extend_from_slice(b"tail\n");
-        seed_task(&paths, id, "completed", Some(&raw));
-
-        let out = read_response(&paths, id).unwrap();
-        assert_eq!(out.bytes, raw, "MUST 逐 byte 等於 response.md");
-        assert_eq!((out.from.as_str(), out.to.as_str()), ("alice", "bob"));
-        let log = std::fs::read_to_string(task_dir(&paths, id).join("events.log")).unwrap();
-        assert_eq!(
-            log.lines().filter(|l| l.ends_with(" read")).count(),
-            1,
-            "實際 events.log：{log}"
-        );
-    }
-
-    /// 拒絕路徑的訊息逐字釘住（CLI-READ-1：cancelled 與未回覆兩條措辭不同，
-    /// 未來改寫會被這裡抓到——CLI 的 stderr 就是這兩條字串）。
-    #[test]
-    fn read_response_rejects_non_readable_states_verbatim() {
-        let d = Dir::new("ab-core-read-reject");
-        let paths = test_paths(&d);
-        let q = "20260731T000011Z-bbbb";
-        let c = "20260731T000012Z-cccc";
-        seed_task(&paths, q, "queued", None);
-        seed_task(&paths, c, "cancelled", None);
-        assert_eq!(
-            read_response(&paths, q).unwrap_err().message,
-            format!("task {q} 尚未回覆（狀態：queued）；查詢進度請用 agent-bridge status {q}")
-        );
-        assert_eq!(
-            read_response(&paths, c).unwrap_err().message,
-            format!("task {c} 已取消（cancelled），沒有回覆可讀")
-        );
-        // 拒絕路徑不得留下 read 事件
-        assert!(!task_dir(&paths, q).join("events.log").exists());
-    }
-
-    /// `recent_tasks`：含終態、依 id 反序（新的在上）、limit 生效、
-    /// 損壞目錄跳過而不是讓整份快照消失。
-    #[test]
-    fn recent_tasks_are_reverse_ordered_limited_and_corruption_tolerant() {
-        let d = Dir::new("ab-core-recent");
-        let paths = test_paths(&d);
-        seed_task(&paths, "20260731T000001Z-0001", "completed", Some(b"x"));
-        seed_task(&paths, "20260731T000002Z-0002", "queued", None);
-        seed_task(&paths, "20260731T000003Z-0003", "cancelled", None);
-        // 損壞（metadata 不是 JSON）與外來目錄名各一
-        let bad = paths.tasks_dir.join("20260731T000004Z-0004");
-        std::fs::create_dir(&bad).unwrap();
-        std::fs::write(bad.join("status"), "queued\n").unwrap();
-        std::fs::write(bad.join("metadata.json"), "{ not json").unwrap();
-        std::fs::create_dir(paths.tasks_dir.join("foreign-dir")).unwrap();
-
-        let rows = recent_tasks(&paths, 100);
-        let ids: Vec<&str> = rows.tasks.iter().map(|t| t.id.as_str()).collect();
-        assert_eq!(
-            ids,
-            vec![
-                "20260731T000003Z-0003",
-                "20260731T000002Z-0002",
-                "20260731T000001Z-0001"
-            ],
-            "反序（新的在上）＋終態亦在列＋損壞者跳過"
-        );
-        assert_eq!(rows.tasks[0].status, "cancelled");
-        assert!(!rows.truncated, "limit 遠大於候選數：沒有截斷");
-        // limit 在**讀檔前**截斷：最新的一筆正是那個損壞目錄，limit=1 時
-        // 截斷後只剩它，讀不出東西就是空清單（證明截斷不是發生在讀檔之後）
-        let one = recent_tasks(&paths, 1);
-        assert!(one.tasks.is_empty(), "截斷在排序之後、讀檔之前");
-        assert!(one.truncated, "截斷旗標看的是**候選數**，不是回傳筆數");
-        let two = recent_tasks(&paths, 2);
-        assert_eq!(two.tasks.len(), 1);
-        assert_eq!(two.tasks[0].id, "20260731T000003Z-0003");
-        assert!(
-            two.truncated,
-            "回傳 1 筆但候選有 4 筆：這正是『用回傳筆數判截斷』會漏報的情況"
-        );
-    }
-
-    /// **F4：截斷旗標的候選必須先是目錄。**
-    ///
-    /// 只驗檔名字面的話，一個名字剛好長成 `YYYYMMDDTHHMMSSZ-xxxx` 的**普通
-    /// 檔案**會被算進候選數：limit=2、兩個有效目錄＋一個字典序最舊的同形普通
-    /// 檔案 → 候選 3 > 2 → 標 `+`。但截限後保留的兩筆全有效、沒有任何更舊的
-    /// task 被省略——那個 `+` 是憑空的。
-    #[test]
-    fn recent_tasks_only_counts_directories_as_candidates() {
-        let d = Dir::new("ab-core-recent-nondir");
-        let paths = test_paths(&d);
-        seed_task(&paths, "20260731T000002Z-0002", "completed", Some(b"x"));
-        seed_task(&paths, "20260731T000003Z-0003", "completed", Some(b"x"));
-        // 名稱完全合法、但它是**檔案**（字典序最舊，截限後本來就輪不到它）
-        std::fs::write(paths.tasks_dir.join("20260731T000001Z-0001"), "not a dir").unwrap();
-
-        let rows = recent_tasks(&paths, 2);
-        let ids: Vec<&str> = rows.tasks.iter().map(|t| t.id.as_str()).collect();
-        assert_eq!(
-            ids,
-            vec!["20260731T000003Z-0003", "20260731T000002Z-0002"],
-            "普通檔案 MUST NOT 進 read model"
-        );
-        assert!(
-            !rows.truncated,
-            "保留的 2 筆全有效、沒有更舊的 task 被省略：MUST NOT 標 +"
-        );
-
-        // 反向對照：把它換成真的目錄，就真的有第三筆被截掉了
-        std::fs::remove_file(paths.tasks_dir.join("20260731T000001Z-0001")).unwrap();
-        seed_task(&paths, "20260731T000001Z-0001", "completed", Some(b"x"));
-        assert!(
-            recent_tasks(&paths, 2).truncated,
-            "正向對照：真的有目錄被截掉時照樣要標 +"
-        );
-    }
-
-    /// 非權威狀態字（`tasks/` 裡任何人都能寫）MUST NOT 進 read model：
-    /// 放行的話畫面的 status 軸就會出現不存在的 task 狀態，而設計正本 §2
-    /// 明訂沒有 `blocked` 這個 task 狀態（跨廠審查 major #2）。
-    #[test]
-    fn recent_tasks_reject_non_authoritative_status() {
-        let d = Dir::new("ab-core-recent-status");
-        let paths = test_paths(&d);
-        seed_task(&paths, "20260731T000001Z-000a", "completed", Some(b"x"));
-        for (id, st) in [
-            ("20260731T000002Z-000b", "blocked"),
-            ("20260731T000003Z-000c", "COMPLETED"),
-            ("20260731T000004Z-000d", ""),
-        ] {
-            seed_task(&paths, id, st, None);
-        }
-
-        let rows = recent_tasks(&paths, 100);
-        let ids: Vec<&str> = rows.tasks.iter().map(|t| t.id.as_str()).collect();
-        assert_eq!(
-            ids,
-            vec!["20260731T000001Z-000a"],
-            "只有六個權威狀態字放行；blocked／大小寫變體／空字串一律跳過"
-        );
-
-        // 六個權威字逐一放行（避免未來收窄過頭把合法狀態也擋掉）
-        for st in [
-            "queued",
-            "delivered",
-            "running",
-            "completed",
-            "failed",
-            "cancelled",
-        ] {
-            assert!(TaskState::parse(st).is_some(), "MUST 放行：{st}");
-        }
-        assert!(TaskState::parse("blocked").is_none());
-    }
-
-    // ===== P5.3：request_first_line／last_event_line =====
-
-    /// 首行讀取的二進位安全與邊界：無換行結尾、CRLF、非 UTF-8、空檔、超界。
-    /// bytes 逐字回傳（lossy 是 render 端的事）；界成立於讀取路徑——超過
-    /// `REQUEST_FIRST_LINE_MAX_BYTES` 的單行只回前界內 bytes，不是整檔讀完再截。
-    #[test]
-    fn request_first_line_is_bounded_and_binary_safe() {
-        let d = Dir::new("ab-core-task-firstline");
-        let paths = test_paths(&d);
-        let write = |id: &str, bytes: &[u8]| {
-            let dir = paths.tasks_dir.join(id);
-            std::fs::create_dir_all(&dir).unwrap();
-            std::fs::write(dir.join("request.md"), bytes).unwrap();
-        };
-
-        write("t-plain", b"first line\nsecond line\n");
-        assert_eq!(
-            request_first_line(&paths, "t-plain").unwrap(),
-            b"first line"
-        );
-
-        write("t-noeol", b"no trailing newline");
-        assert_eq!(
-            request_first_line(&paths, "t-noeol").unwrap(),
-            b"no trailing newline"
-        );
-
-        write("t-crlf", b"crlf line\r\nrest\n");
-        assert_eq!(request_first_line(&paths, "t-crlf").unwrap(), b"crlf line");
-
-        write("t-bin", b"\xff\xfe raw \x01 bytes\nrest");
-        assert_eq!(
-            request_first_line(&paths, "t-bin").unwrap(),
-            b"\xff\xfe raw \x01 bytes"
-        );
-
-        write("t-empty", b"");
-        assert_eq!(request_first_line(&paths, "t-empty").unwrap(), b"");
-
-        // 超界單行：只回前 REQUEST_FIRST_LINE_MAX_BYTES 個 bytes
-        let long = vec![b'x'; REQUEST_FIRST_LINE_MAX_BYTES as usize + 1000];
-        write("t-long", &long);
-        let got = request_first_line(&paths, "t-long").unwrap();
-        assert_eq!(got.len(), REQUEST_FIRST_LINE_MAX_BYTES as usize);
-
-        // 缺檔＝None（fail-closed）
-        assert!(request_first_line(&paths, "t-missing").is_none());
-    }
-
-    /// events.log 尾行：取最後**非空**行原文；缺檔＝None。走真的
-    /// `create_task`＋`log_event` 路徑，不手搓格式。
-    #[test]
-    fn last_event_line_returns_latest_nonempty() {
-        let d = Dir::new("ab-core-task-lastev");
-        let paths = test_paths(&d);
-        let id = create_task(
-            &paths,
-            "alice",
-            "bob",
-            &MessageSource::Text("x".into()),
-            false,
-        )
-        .unwrap();
-        log_event(&paths, &id, "delivered", "").unwrap();
-        log_event(&paths, &id, "started", "by=bob").unwrap();
-        let line = last_event_line(&paths, &id).unwrap();
-        assert!(
-            line.contains(" started by=bob"),
-            "尾行不是最後一筆事件：{line}"
-        );
-        // 尾端空行不算事件
-        let log_path = task_dir(&paths, &id).join("events.log");
-        let mut content = std::fs::read_to_string(&log_path).unwrap();
-        content.push_str("\n\n");
-        std::fs::write(&log_path, content).unwrap();
-        assert!(last_event_line(&paths, &id)
-            .unwrap()
-            .contains(" started by=bob"));
-
-        assert!(last_event_line(&paths, "t-missing").is_none());
-    }
-
-    /// **尾行讀取有界**（CLI-UI-2；跨廠複核 2026-08-05 finding 7）：events.log
-    /// 在 task 目錄裡＝worker 可寫面，檔案大小不是本程式保證得了的事實。
-    /// 界 MUST 成立於取得路徑（seek 到尾端再讀），而且從中間切進去的**半條
-    /// 首行不得被當成一整行**印出去。
-    #[test]
-    fn the_last_event_line_is_read_from_a_bounded_tail() {
-        let d = Dir::new("ab-core-task-lastev-bound");
-        let paths = test_paths(&d);
-        let id = create_task(
-            &paths,
-            "alice",
-            "bob",
-            &MessageSource::Text("x".into()),
-            false,
-        )
-        .unwrap();
-        let log_path = task_dir(&paths, &id).join("events.log");
-
-        // 灌到遠超過界：每行都可辨識，最後一行是答案
-        let mut big = String::new();
-        let filler = "2026-08-01T00:00:00Z filler detail=";
-        for i in 0..600 {
-            big.push_str(&format!("{filler}{i:0>40}\n"));
-        }
-        big.push_str("2026-08-05T00:00:00Z completed by=bob\n");
-        std::fs::write(&log_path, &big).unwrap();
-        assert!(
-            big.len() as u64 > LAST_EVENT_MAX_BYTES * 2,
-            "前提：fixture 真的大於界（{} bytes）",
-            big.len()
-        );
-
-        let line = last_event_line(&paths, &id).unwrap();
-        assert_eq!(
-            line, "2026-08-05T00:00:00Z completed by=bob",
-            "尾行 MUST 仍是最後一筆事件"
-        );
-
-        // 半條首行不得外流：把界內的第一段切成一條可辨識的殘句，
-        // 若實作沒有丟掉它，某個輸入下它就會成為「最後一個非空行」
-        let mut only_partial = "X".repeat(LAST_EVENT_MAX_BYTES as usize + 32);
-        only_partial.push('\n');
-        std::fs::write(&log_path, &only_partial).unwrap();
-        assert!(
-            last_event_line(&paths, &id).is_none(),
-            "整份只有一條超長行時，界內看到的全是半條——MUST NOT 當成事件回傳"
-        );
     }
 }

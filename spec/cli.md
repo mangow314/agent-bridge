@@ -1,4 +1,4 @@
-# CLI 契約（24 個子指令）
+# CLI 契約（23 個子指令）
 
 ## 共通慣例
 
@@ -46,7 +46,7 @@ ready 欄：人工註冊 `-`、spawned 未就緒 `starting`、已就緒 `ready`�
 MUST NOT 因 `--long` 的加入而改變一個位元組。
 Source: cmd_list
 
-### CLI-LIST-2 [tested: 38, 44]
+### CLI-LIST-2 [tested: 38]
 `list --long`（`-l` 為等價別名）：人可讀的介入視圖。首行 MUST 為欄名標頭
 `NAME\tPANE\tREADY\tORIGIN\tWHERE\tOWNER\tDISPOSABLE\tIDLE`，其後每 agent
 一行、TAB 分隔恰八欄。欄值 MUST NOT 含 TAB／換行／控制字元（`name`、
@@ -158,10 +158,10 @@ Source: cmd_status
 拒絕（訊息區分兩者）。stdout 恰為 response 內容；task-id／from／to 標頭走
 stderr；記 read 事件（非唯讀路徑）。讀取全程持 task 鎖（與 gc --apply 的
 刪除互斥，不得讀到被抽走一半的目錄）。
-鎖／狀態驗證／read 事件／payload 讀取的實作已下沉 `ab_core::task::read_response`
-（TUI 的 `r` 消費同一份，CLI-UI-1），**行為不變**：stdout／stderr 逐字輸出、
-退出碼與拒絕訊息一如既往；CLI 側只剩標頭呈現。
-Source: cmd_read / ab_core::task::read_response
+鎖／狀態驗證／read 事件／payload 讀取的實作已下沉 `ab_core::task::with_response`，
+**行為不變**：stdout／stderr 逐字輸出、退出碼與拒絕訊息一如既往；CLI 側只剩
+標頭呈現。
+Source: cmd_read / ab_core::task::with_response
 
 ## `ask`
 
@@ -337,8 +337,8 @@ Source: cmd_relay / relay_prompt_arg
 session 多為接力鏈第一棒）時，relay 成功後 MUST 在 stderr 印**恰一行**
 盯守提醒；判為 spawn 出身（該變數有非空值，含非 UTF-8）時 MUST NOT 印。
 理由：手動 session 的權限框沒有任何機制偵測得到（spawn 出身的 worker 帶
-skip-permission 設定不彈框；偵測＝常駐輪詢，已裁定不做——docs/tui-design.md
-§1 known gap），此行是該 gap 的唯一緩解。此行 MUST NOT 改變 relay 的
+skip-permission 設定不彈框；偵測＝常駐輪詢，已裁定不做——
+tag `pre-trim-2026-09` 的 docs/tui-design.md §1 known gap），此行是該 gap 的唯一緩解。此行 MUST NOT 改變 relay 的
 exit code 與 stdout 契約。
 Source: cmd_relay
 
@@ -444,16 +444,17 @@ await 結果分流 MUST 為：completed → `evicted`；failed/cancelled →
 不得合併。不可放寬。
 Source: cmd_evict / ab_core::evict
 
-### CLI-EVICT-3 [tested: 26, 29, 43]
+### CLI-EVICT-3 [tested: 26, 29]
 despawn 段 MUST 綁定 evict 起始時記下的 spawn_tag 世代：期間同名 agent
 換代 MUST 拒絕回收（失效方向＝多佔一個 cap，不誤殺新 worker）。despawn
 結果為 stale 時 MUST NOT 記任何 evicted* 審計（該 pane 未被回收）。三段
 MUST NOT 包在同一把鎖內；各段之間中斷的失效方向 MUST 不刪未落地脈絡。
 Source: cmd_evict / cmd_despawn
 
-### CLI-EVICT-4 [tested: 42, 43]
+### CLI-EVICT-4 [tested: 42]
 `evict` 的 additive 參數 `--expect-pane <pane>`／`--expect-generation <tag>`
-（compare-and-act，設計正本 `docs/tui-design.md` §5）。兩者各自獨立可用，
+（compare-and-act；設計出處：tag `pre-trim-2026-09` 的 docs/tui-design.md §5）。
+兩者各自獨立可用，
 MUST 只驗帶到的那一項；**兩者皆不帶時行為與現行完全相同**。
 expect 驗證 MUST 在**任何副作用之前**執行，且與收尾任務的建立在**同一把
 registry 鎖內**完成——驗證與建立之間若能換代，收尾任務就會派給新世代並
@@ -476,146 +477,13 @@ exit 0；**任何**失敗（非 JSON stdin、依賴缺失、寫入失敗）MUST 
 需要 block 時得有 stdout。不可放寬。
 Source: cmd_hook
 
-## `ui`
-
-### CLI-UI-1 [tested: 40, 41, 43, 44]
-`ui`：alternate-screen 全螢幕 TUI dashboard（設計正本 `docs/tui-design.md`，
-本條款對應其第一縱切 §8）。MUST 以 alternate screen 進出：退出後（正常
-`q` 退出**與** panic／錯誤退出皆然，後者由 panic hook 保證）MUST 還原
-terminal（raw mode 關閉、離開 alternate screen），且 tmux 的 pane id／
-window id／layout 與 geometry 不變。`Enter` focus 語意：目標 pane 在
-current session → select-window＋select-pane；在其他 session → 先
-switch-client；linked window 多位置 → 優先 current session，否則取第一個
-live location，不彈詢問框。`x` 僅對 task 列合法（worker 列 MUST 提示無
-效），單一確認框 MUST 逐字顯示等價 CLI 原文 `agent-bridge cancel
-<task-id>`，確認後執行與 `cancel` 相同的轉換與通知（CLI-CANCEL-1）。
-狀態顯示為 **ACTIVITY × BLOCKER 雙軸正交**（設計 §4）：BLOCKER 是獨立的一軸，
-MUST NOT 取代 task status、MUST NOT 造出權威字以外的 task 狀態。v1 的 BLOCKER
-契約只承諾兩項（皆有現成實作來源，設計 §4／§7 終審收窄）：`prompt`（沿用
-`notify::screen_has_prompt` 的硬編碼 matcher）與 `occluded`（**結構性查詢**
-`pane_in_mode`，非畫面比對）。三態 MUST 保留：查不到＝`unknown`，
-**MUST NOT 顯示成「沒有 blocker」**（顯示紀律 §5）。查詢與 liveness 同一輪
-節流、同樣 bounded、同樣 MUST NOT 在 UI thread 上執行。
-screen-matcher 來源的 `prompt` MUST 去抖：**連續 2 輪命中才升旗**，未達門檻
-顯示為「沒有可見 blocker」而 **MUST NOT** 謊報成 `unknown`（該輪畫面確實讀到
-了）；降旗 MUST 即時（一輪未命中即撤）。結構性的 `occluded` **MUST NOT** 去抖
-——它不是字串比對，沒有單幀誤判面。去抖狀態只存 TUI 記憶體，MUST NOT 寫 FS。
-代價：升旗＝首次命中後再一輪，以 2s 節流計，**自框出現算起最壞未滿 4s**。
-read model 為磁碟輪詢（500ms）＋tmux 節流查詢（2s）；每條 tmux 查詢
-MUST bounded（ENV-TMUX-1）**且 MUST NOT 在 UI thread 上執行**（背景 worker
-＋channel），逾時該欄降級 unknown、動作顯示進行中，MUST NOT 凍結 UI——
-`AGENT_BRIDGE_TMUX_TIMEOUT=0`（不設限）時亦然。首頁 selection MUST 落在
-current owner（呼叫者所在 `session:@window`；對不上時以 current pane 反查
-registry），而非字典序第一筆。task status MUST 顯示權威狀態字（不存在
-`blocked`）。
-啟動器協定（popup）：程式 MUST NOT 自行偵測 popup；由 binding 設定
-`AGENT_BRIDGE_UI_POPUP=1`（ENV-UI-1）宣告，此模式下 `Enter` focus 成功後
-MUST 直接正常退出（`display-popup -E` 的行程結束即關 popup，人落在目標
-pane）；未設定時 focus 後繼續執行。
-版面（設計 §2 P2）：四面板 `OWNERS｜WORKERS／TASKS｜DETAIL`。TASKS 欄是
-當前選中 owner 底下所有 worker 的任務平坦列表（**含終態**，id 反序）；
-DETAIL 欄 MUST NOT 可聚焦，永遠顯示當前聚焦面板選中項的唯讀細節。`Tab`
-MUST 在 `OWNERS → WORKERS → TASKS → OWNERS` 三欄間循環，`Shift+Tab`
-（`BackTab`）MUST 為其反向且互為逆運算（P4 效率量測驅動的 additive 補入，
-設計 §3／§9 P4 量測史）。`x` 的合法目標
-擴為 WORKERS 欄的 task 列與 TASKS 欄的**非終態**列；TASKS 欄的終態列
-MUST 提示無效且 MUST NOT 開確認框。
-唯讀鍵（三者皆 MUST NOT 改變任何 task／registry 狀態，`read` 事件除外）：
-`r` 讀選中 task 全文，MUST 走與 `read` 相同的實作（同一把 task 鎖、同一組
-拒絕訊息、同樣記 read 事件，CLI-READ-1），且 MUST 在背景 worker 上執行
-（取鎖會 block）；成功以全螢幕 overlay 呈現，失敗訊息進 footer。
-`i` 顯示選中 worker 的摘要頁（name／pane／runtime／owner／ready／
-spawn_tag／registered_at／liveness／in-flight 一覽），資料來源限於 registry
-與已載入的 read model／liveness 快照，MUST NOT 為此新增 tmux 查詢；
-liveness MUST 維持三態（`unknown` MUST NOT 顯示為 dead）。
-`c` 複製**證據**到 tmux buffer（`set-buffer`，可由 `show-buffer` 讀回），
-內容限於 `task-id:`／`pane:`／`agent-bridge read <id>`／
-`agent-bridge status <id>`（worker 列則為 `pane:`＋`agent-bridge list --long`），
-**MUST NOT 含任何 mutation 子指令原文**（cancel／evict／despawn／send／
-spawn／relay／unregister／register／kill／gc）；tmux 不可用時 MUST 以訊息
-降級，MUST NOT 凍結 UI。
-`e` evict 選中 worker（設計 §3／§5 P3）：合法目標**只有 worker 列**（task 列
-MUST 提示無效）。出身非 spawn 出身／registry 無法解析／缺 `spawn_tag` MUST
-拒絕，且判定與訊息 MUST 沿用 evict 的 core 判定（TUI MUST NOT 另寫一套規則）。
-確認框 MUST 逐字顯示等價 CLI 原文（含 `--expect-pane`／`--expect-generation`），
-措辭 MUST 是「派收尾任務後回收」，**MUST NOT 出現任何「安全刪除」語彙**，且
-MUST NOT 以顏色／排序暗示可刪度、MUST NOT 因 idle／disposable 預選。
-確認（`y`）當下 MUST **重讀 registry** 取當下 pane／世代（不得沿用輪詢快照）；
-確認期**任何取不到「與框上同一個 identity」的情況**（值不符、registry 消失／
-損壞、出身變成人工註冊、`spawn_tag` 消失）MUST 一律以 `selection stale` 中止
-且不建 task、不通知、不 kill、不動 registry／審計——原始理由（「未註冊」
-「非 spawn 出身」）在確認期會被讀成「這個 worker 本來就不能 evict」，而事實
-是「你看到的那一代已經不在」。初次開框（`e`）則 MUST 保留原始理由。
-等價 CLI 原文中的動態值（pane／世代／名稱）MUST 經 shell quoting——registry 是
-worker 可寫面，含空白會破壞 argv 等價、含 `;`／`$(…)` 會讓「可貼上重跑」變成
-注入面。確認框在窄畫面 MUST 換行而非截斷（截掉尾端的世代＝人失去判斷依據）。相符則以當下值帶 `--expect-*` 走 evict 的**同一份 core
-編排**（CLI-EVICT-4／CLI-EVICT-3，鎖語意不變）。
-執行段 MUST NOT 跑在常駐 worker thread 上（那條同時負責 liveness 輪詢，
-evict 的 await 段預設等 300s）：MUST 另起一次性 thread、結果經同一個 channel
-回 UI，UI thread MUST NOT 阻塞；同一個 worker 的 evict 在途時 MUST 以 in-flight
-閘擋下重複發動。**每一次發動 MUST 有終局**：thread 起不來、或工人自身 panic
-（unwind）都 MUST 轉成 terminal error 訊息回 UI，MUST NOT 讓畫面停在「進行中」
-且 in-flight 閘不放開。
-警告（core 的 `EvictEvent::Warn`、確認期 stale、非乾淨終局）MUST NOT 只寫進會
-被下一則訊息覆寫的單行 footer：MUST 以 sticky 的有界歷史呈現，由人顯式清除
-（`Esc`），且溢位 MUST 有可見計數，MUST NOT 靜默丟棄。
-Source: cmd_ui / ab_tui::run / ab_core::evict
-
-### CLI-UI-2 [tested: 44, 48]
-`ui` 的呈現層補強（設計正本 `docs/tui-design.md` §9 的 P5.3–P5.6 四列）。
-本條款只管**顯示**，不新增任何協定、不改任何 payload 位元組。
-
-**摘要與時間欄**：WORKERS／TASKS 兩層列各為兩行，第二行是活動摘要。摘要文字
-取自 `tasks/<id>/request.md` 的**首行**與 `tasks/<id>/events.log` 的**尾行**，
-兩者皆 MUST 有界讀，且界 MUST 成立於**取得路徑**（先 `take`／先 seek 到尾端，
-不是整檔讀進來再截）：首行至多 4096 bytes，尾行至多檔尾 8192 bytes。
-兩個檔都在 task 目錄下＝worker 可寫面，檔案大小不是本程式保證得了的事實。
-尾行讀取從檔案中段切入時，**首段半條行 MUST 丟棄**（半條事件不得當成一整行
-呈現）。讀不到＝空字串 fail-closed，MUST NOT 反覆重試。
-兩行列的行高 MUST 有單一事實源，捲動位移、捲軌總量與 PgUp／PgDn 的一頁列數
-MUST 全部由它換算——行與列兩種單位只要有一處混用，症狀就是靜默跳列。
-摘要在畫面上是**顯示層截斷**（過長加省略號、MUST NOT
-換行），payload 本身逐字不變——`read` 的 stdout 與 `c` 的 buffer 內容不因此
-改變一個位元組（CLI-READ-1／CLI-UI-1 的 `c` 白名單皆不受影響）。elapsed／
-`ago` 由呼叫端注入的時刻算出，render MUST NOT 自行取牆鐘。
-task status 一律仍是權威字（不存在 `blocked`）；stat header 的計數取自
-**整池**，MUST NOT 隨 filter 或可見列數變動。
-
-**triage 排序**：WORKERS 的**組間**順序 MUST 依組內最大 severity 浮頂，
-severity 恰三個排序鍵且不得擴充——blocker 升旗（`Prompt`）／pane 死活為
-`Dead`／該 worker 最近一輪任務終態為 `failed`；`Blocked > Dead > Failed >
-None`。`Unknown` MUST NOT 浮頂（三態不得壓成兩態）。**組內順序不得重排**，
-排序 MUST stable（同 severity 維持 canonical 序），且 MUST 只在資料事件邊緣
-重排並緊接 selection 重定位。排序 MUST 是**當下事實的函式**：severity 消失後
-組序 MUST 回到 canonical 序，MUST NOT 保留上一輪的排名。stale 降級期間，
-排序鍵 MUST 與同一幀畫面採信的兩軸同源——畫面顯示 unknown 時 MUST NOT 繼續
-依快取中的舊事實浮頂。閒置時長 MUST NOT 進排序鍵，強調 MUST NOT 以顏色
-或排序暗示可刪度（設計 §5）。
-
-**blocker 框內容**：升旗中的 worker 其 DETAIL 得顯示 matcher **命中窗**的
-原文尾行（有界：至多 6 行）。內容 MUST 來自 blocker 探測那一輪已取得的
-`capture-pane` 輸出，**MUST NOT 新增任何 tmux 查詢**（§4 bounded-read）；
-MUST 只存於 TUI 記憶體、**MUST NOT 寫 FS**；顯示層 blocker 不再是 `Prompt`
-時 MUST 立即清除——去抖未升旗、降旗、以及**整層降級為 unknown 的那一幀**
-（MUST NOT 等到下一則探測回報才清）三者皆然。判定與內容 MUST 同源
-（`notify::screen_has_prompt` 與 `notify::prompt_snippet` 走同一份 matcher），
-MUST NOT 出現「標了 blocked 卻拿不到框」或反之。
-
-**色盤降級**：色盤 MUST 依 `COLORTERM` 決定——恰 `truecolor`／`24bit` 兩個
-字面（允許前後空白）升級為 24-bit，其餘（未設、空值、`256color`、認不得的
-字面）MUST 降級回 ANSI 16。降級後的畫面 MUST 與升級前的 ANSI 16 版本逐字
-相同；**兩種色盤下的字元層 MUST 完全相同**（顏色只加樣式不動字元，既有
-`capture-pane` 字元比對因此不受影響）。色盤 MUST 在進 alternate screen 前
-定案，MUST NOT 於同一次執行中途更換。
-Source: ab_tui::view / ab_tui::model / ab_tui::theme / ab_core::notify::prompt_snippet
-
 ---
 
 ## `scan`
 
 ### CLI-SCAN-1 [tested: 47]
-`scan`：掃一輪 page 層事件並推播（設計正本 `docs/tui-design.md` §1 的 page
-層）。**page 層只存在於 Rust 實作**（退役前的 bash 正本凍結於 M4、不含
+`scan`：掃一輪 page 層事件並推播（設計出處：
+tag `pre-trim-2026-09` 的 docs/tui-design.md §1 的 page 層）。**page 層只存在於 Rust 實作**（退役前的 bash 正本凍結於 M4、不含
 page 層；正本現已自樹移除）。不吃參數；stdout MUST 只印
 一個十進位整數＝這一輪**新**推的事件數（已推過的不計），說明走 stderr。
 事件恰兩類，不得擴充：`task-failed`（`fail` 的收斂點同步發）與
@@ -625,11 +493,10 @@ Source: cmd_scan / ab_core::page::scan
 ### CLI-SCAN-2 [tested: 47]
 `worker-died` 的判定 MUST **先取得整份 pane 清單**再比對，MUST NOT 逐 pane
 查詢後把「查不到」當成「死了」：tmux 不可用時整輪 MUST 零推播（回空），
-不得把整池 worker 判成死。task 是否掛在該 agent 身上，判準與 TUI 的歸屬軸
-同一條——收件人名相符**且** task `created_at` 嚴格晚於該 agent 的
-`registered_at`（同秒＝不可證＝不掛，同名 respawn 不承接上一代的歷史 task）。
-此判準與 TUI 的歸屬軸是**同一份實作**（`ab_core::page::task_belongs_to`；
-`ab_tui::model::attached` 轉呼叫），MUST NOT 各寫一份。
+不得把整池 worker 判成死。task 是否掛在該 agent 身上的判準：收件人名相符
+**且** task `created_at` 嚴格晚於該 agent 的 `registered_at`（同秒＝不可證＝
+不掛，同名 respawn 不承接上一代的歷史 task）。判準實作只有一份
+（`ab_core::page::task_belongs_to`），MUST NOT 另寫一份。
 
 **已知盲點 MUST 明列**：`list-panes` 永久非零（最後一個 tmux server／session
 已退出）與暫時性查詢失敗（逾時、權限、錯 socket）在目前的資料模型下無法
@@ -652,8 +519,7 @@ ready（把 spawn 的等待推向逾時）、並讓 `fail`／`cancel` 先推一�
 正要解除的 `worker-died`。
 
 排除項：唯讀指令（MUST NOT 寫任何東西，CLI-RO-1，而掃描寫事件流）、非零
-退出的指令、`scan` 自身（否則其計數恆為 0）、`ui`（§4 bounded-read：tmux
-掛住時 TUI 仍 MUST 畫得出磁碟 read model，dashboard 的啟動不得取決於 page 層）。
+退出的指令、`scan` 自身（否則其計數恆為 0）。
 Source: main dispatch
 
 ### CLI-PAGE-1 [tested: 47]

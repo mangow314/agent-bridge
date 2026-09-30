@@ -33,7 +33,7 @@ Source: cmd_register / cmd_spawn
 
 ### STATE-AGENT-5 [tested: 16]
 spawn 出身 MUST 另記 lineage 兩欄（additive、optional、**僅 provenance／
-display**，tui-design.md §9 P4.7）：
+display**，tag `pre-trim-2026-09` 的 docs/tui-design.md §9 P4.7）：
 
 - `lineage_root`：恆有值。值為 **generation key＝canonical `spawn_tag` 全串**
   （registry 既有存法，含 `AGENT_BRIDGE_SPAWN_TAG=` 前綴），**不是名稱**

@@ -6,7 +6,7 @@
 //! 下呼叫它。
 //!
 //! **函式內不印任何字**（審查 F7）：`create_send_task` 的 not-ready 警告經
-//! `warn` callback 交回呼叫端——CLI 印 stderr、TUI 進 footer。用 callback 而
+//! `warn` callback 交回呼叫端——CLI 印 stderr。用 callback 而
 //! 不是回傳值，是因為那句警告 MUST 在建 task **之前**發出：建 task 失敗時
 //! （`Err` 路徑）舊行為照樣印得出它。
 

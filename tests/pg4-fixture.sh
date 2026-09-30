@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# tests/pg4-fixture.sh — PG4 理解驗收（tui-design §9 rubric v2 page 層）的量測載具
+# tests/pg4-fixture.sh — PG4 理解驗收（tag `pre-trim-2026-09` 的 tui-design §9 rubric v2 page 層）的量測載具
 #
 # PG4 是 page 層唯一剩下的 human judgment 相位：受測者**只看通知、不開任何面板**
 # （不跑 ui、不看 list、不讀事件流），要能對每一則說出「哪個 agent、為何現在
@@ -53,7 +53,7 @@ PACE="${PG4_PACE:-8}"
 DESKTOP="${PG4_DESKTOP:-1}"
 
 # 從載具 pane 內重跑時 PATH 最前面是 $SHIM，`command -v tmux` 會解析到 shim
-# 自己而自指掛死（p5-fixture 踩過）。逐項掃 PATH、跳過 shim
+# 自己而自指掛死（tag `pre-trim-2026-09` 的 tests/p5-fixture.sh 踩過）。逐項掃 PATH、跳過 shim
 REAL_TMUX="$(type -aP tmux | grep -vF "$SHIM/" | head -1)"
 [[ -n "$REAL_TMUX" ]] || { echo "錯誤：PATH 上找不到真正的 tmux" >&2; exit 1; }
 
