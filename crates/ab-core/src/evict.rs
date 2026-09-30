@@ -238,7 +238,6 @@ pub fn evict(
             name,
             &req.from,
             &MessageSource::Text(EVICT_MSG.as_bytes().to_vec()),
-            true,
             &mut |w| ev(EvictEvent::Warn(w)),
         )
         .map_err(|e| {

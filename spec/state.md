@@ -137,8 +137,7 @@ Source: cmd_send / log_event
 
 ### STATE-TASK-3 [tested: 4]
 `metadata.json` 欄位：`{version: 1, task_id, from, to, created_at,
-updated_at, working_directory, status}`；被 pin 的收尾任務另含
-`pinned: true`（gc MUST 跳過，見 cli.md gc 節）。
+updated_at, working_directory, status}`。
 Source: cmd_send
 
 ### STATE-TASK-4 [tested: 5, 7, 31]
@@ -149,11 +148,10 @@ Source: cmd_send
 completed 的 task 再 reply 覆寫 response）。不可放寬。
 Source: update_meta_status
 
-### STATE-TASK-5 [tested: 19, 28, 31]
+### STATE-TASK-5 [tested: 19, 31]
 缺 `metadata.json` 或 `status` 的 task 目錄不屬於任何狀態：send 中途失敗
-MUST 回滾清除該目錄；gc MUST 只處理完整形狀的目錄（殘缺目錄不得被 gc
-靜默清走，也不得被當成任務）。
-Source: send_rollback / cmd_gc
+MUST 回滾清除該目錄；殘缺目錄不得被當成任務。
+Source: send_rollback
 
 ## state/（worker 活動狀態）
 

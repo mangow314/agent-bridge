@@ -1,4 +1,4 @@
-# CLI 契約（21 個子指令）
+# CLI 契約（20 個子指令）
 
 ## 共通慣例
 
@@ -17,7 +17,7 @@ stdout 保留給資料（task-id、狀態字、訊息內容、清單）；人類
 
 ### CLI-GEN-3 [tested: 3, 31]
 公開參數驗證文法：agent 名 `[A-Za-z0-9_-]+`；task-id `[A-Za-z0-9][A-Za-z0-9._-]*`
-（僅格式驗證；gc 實際清理另用更嚴的 send 產出形狀，見 CLI-GC-2）。不合法
+（僅格式驗證）。不合法
 輸入 MUST 在任何狀態變更前拒絕。
 Source: NAME_RE / TASK_ID_RE / check_task_id
 
@@ -156,8 +156,8 @@ Source: cmd_status
 ### CLI-READ-1 [tested: 7, 31]
 `read <task-id>`：僅 completed/failed 可讀；cancelled 與未回覆狀態 MUST
 拒絕（訊息區分兩者）。stdout 恰為 response 內容；task-id／from／to 標頭走
-stderr；記 read 事件（非唯讀路徑）。讀取全程持 task 鎖（與 gc --apply 的
-刪除互斥，不得讀到被抽走一半的目錄）。
+stderr；記 read 事件（非唯讀路徑）。讀取全程持 task 鎖（不得讀到
+被抽走一半的目錄）。
 鎖／狀態驗證／read 事件／payload 讀取的實作已下沉 `ab_core::task::with_response`，
 **行為不變**：stdout／stderr 逐字輸出、退出碼與拒絕訊息一如既往；CLI 側只剩
 標頭呈現。
@@ -364,34 +364,11 @@ idle_secs MUST 取「最後派工時間」與「本 pane 誕生時間」較晚�
 `<name>\t?\t?\t-` 一行呈現，MUST NOT 靜默跳過（它仍佔 cap）。
 Source: cmd_idle / last_task_at
 
-## `gc`
-
-### CLI-GC-1 [tested: 28]
-`gc [--older-than <days>] [--apply] [--include-notes]`：清理夠舊的終態
-task 目錄。預設 dry-run（stdout 列 `<id>\t<status>\t<created_at>`、不刪）；
-`--apply` 才刪。天數預設 14、0–99999 整數。年齡 MUST 以 metadata
-`created_at` 判定（目錄 mtime 不可信）；讀不出年齡 MUST 視為年輕保留。
-Source: cmd_gc
-
-### CLI-GC-2 [tested: 28]
-刪除門檻文法 MUST 是 send 產出形狀 `^[0-9]{8}T[0-9]{6}Z-[0-9a-f]{4}$`
-（嚴於公開的 TASK_ID_RE）；非此形狀或殘缺（缺 metadata/status）的目錄
-MUST 不碰。不可放寬（寬鬆文法會把任何人放進 tasks/ 的目錄納入 rm 範圍）。
-Source: cmd_gc
-
-### CLI-GC-3 [tested: 28, 29]
-三道保留線，失效方向一律「留著」：(1) 非終態一律不動；(2) `pinned` 收尾
-筆記一律不動，除非 `--include-notes`；(3) 現存 disposable 宣告的「失效
-證據」任務（created_at ≥ 該 agent 的 disposable_at）一律不動——刪掉它會讓
-expired 宣告復活成 yes。實刪 MUST 持該 task 鎖並在鎖內重驗終態；取不到鎖
-記失敗計數、不中止整輪。結尾 MUST 對 stderr 匯報各保留線計數。
-Source: cmd_gc
-
 ## `evict`
 
 ### CLI-EVICT-1 [tested: 26]
 `evict <name> [--timeout <secs>] [--from <sender>]`：三段式驅逐
-send（收尾任務，pinned）→ await → despawn。timeout 預設 300。僅 spawn
+send（收尾任務）→ await → despawn。timeout 預設 300。僅 spawn
 出身；registry 無 `spawn_tag` MUST 拒絕（無法鎖定世代）。收尾任務文案是
 機制的一部分（要求 worker 落地 context 內殘值），MUST 內建於實作、不得
 外部檔案化。成功時 stdout 恰為收尾 task-id 一行。

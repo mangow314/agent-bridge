@@ -1,6 +1,6 @@
 //! `ab` — agent-bridge CLI binary。argv 手寫解析＋dispatch＋stderr/exit code
 //! （架構 §1／§4）。M2 範圍：register/unregister/list/send/receive/start/
-//! reply/fail/cancel/status/read/await/gc/hook。spawn 生命週期群屬 M3，
+//! reply/fail/cancel/status/read/await/hook。spawn 生命週期群屬 M3，
 //! 未實作前一律走「未知指令」分支（不虛構半成品行為）。
 
 use std::ffi::OsString;
@@ -61,9 +61,6 @@ const USAGE: &str = r#"用法：
   agent-bridge evict <name> [--timeout <secs>] [--from <sender>]
                                                 驅逐 worker：派收尾任務 → 等筆記落地 → despawn
                                                 stdout 只印收尾 task-id；逾時仍 despawn（審計記 evicted-timeout）
-  agent-bridge gc [--older-than <days>] [--apply] [--include-notes]
-                                                清掉夠舊的終態 task（預設 14 天）；未完成的與
-                                                evict 收尾筆記一律保留。預設只試算，--apply 才刪
   agent-bridge hook <stop|prompt-submit|notification>
                                                 （由 Claude Code 呼叫，非人工手動用）落地 hook
                                                 協定：stdin 收事件 JSON，依 AGENT_BRIDGE_SPAWN_TAG
@@ -108,7 +105,6 @@ fn print_implemented_commands() {
         "disposable",
         "evict",
         "fail",
-        "gc",
         "hook",
         "idle",
         "list",
@@ -239,7 +235,6 @@ fn main() -> ExitCode {
         "status" => cmd_status(&paths, rest),
         "read" => cmd_read(&paths, rest),
         "await" => cmd_await(&paths, rest),
-        "gc" => cmd_gc(&paths, rest),
         "spawn" => cmd_spawn(&paths, rest),
         "despawn" => cmd_despawn(&paths, rest),
         "ready" => cmd_ready(&paths, rest),
@@ -365,7 +360,7 @@ fn cmd_send(paths: &Paths, args: &[OsString]) -> Result<()> {
         return Err(Error::new("send 需要 --message 或 --message-file"));
     }
     // 訊息來源先驗再建 task 目錄：來源檔不存在時，原本會先留下一個沒有
-    // metadata/status 的殘缺目錄才 die，而 gc 刻意只清完整形狀的目錄
+    // metadata/status 的殘缺目錄才 die
     if mode == "file" && val != "-" && !std::path::Path::new(&val).is_file() {
         return Err(Error::new(format!(
             "找不到訊息檔：{}",
@@ -373,7 +368,7 @@ fn cmd_send(paths: &Paths, args: &[OsString]) -> Result<()> {
         )));
     }
     let src = message_source(mode, &val);
-    let task_id = do_send(paths, &to, &from, &src, false)?;
+    let task_id = do_send(paths, &to, &from, &src)?;
     println!("{task_id}");
     Ok(())
 }
@@ -462,7 +457,7 @@ fn cmd_ask(paths: &Paths, args: &[OsString]) -> Result<()> {
         )));
     }
     let src = message_source(mode, &val);
-    let id = do_send(paths, &to, &from, &src, false)?;
+    let id = do_send(paths, &to, &from, &src)?;
     eprintln!("task-id: {id}");
 
     let st = match await_with_blocker(paths, &id, timeout, &on_blocker, grace_secs)? {
@@ -513,19 +508,10 @@ fn os_bytes(s: &OsString) -> Vec<u8> {
 }
 
 /// cmd_send 的主體（名稱文法 → 收件者已註冊 → 建 task → 通知），回傳 task-id。
-/// evict 的收尾任務走同一條路徑（bash 直接呼叫 `cmd_send`），差別只有 `pinned`
-/// ——收尾筆記裝的是「只存在 worker context 裡」的事實，被 gc 清掉的話這一層
-/// 對「上下文不會憑空消失」的承諾就只是延後兌現。
-fn do_send(
-    paths: &Paths,
-    to: &str,
-    from: &str,
-    src: &MessageSource,
-    pinned: bool,
-) -> Result<String> {
+fn do_send(paths: &Paths, to: &str, from: &str, src: &MessageSource) -> Result<String> {
     // 建 task／通知的正本已下沉 `ab_core::send`（evict 編排共用同一份，審查
     // F6）：core 不印字，警告與通知終態在這裡轉成 stderr（文案逐字沿用）。
-    let task_id = send::create_send_task(paths, to, from, src, pinned, &mut |w| err_line(&w))?;
+    let task_id = send::create_send_task(paths, to, from, src, &mut |w| err_line(&w))?;
     let report = send::notify_send(paths, &SubprocessTmux, to, &task_id)?;
     if let Some(m) = report.message() {
         err_line(&m);
@@ -943,56 +929,6 @@ fn await_with_blocker(
     });
 
     task::await_task_watched(paths, id, timeout, watch.as_ref())
-}
-
-/// cmd_gc:1683 — 預設只試算，`--apply` 才刪。核心在 `ab_core::task::gc`，
-/// 這裡只負責參數解析與報表輸出。
-fn cmd_gc(paths: &Paths, args: &[String]) -> Result<()> {
-    let mut days: u64 = 14;
-    let mut apply = false;
-    let mut include_notes = false;
-    let mut it = args.iter();
-    while let Some(a) = it.next() {
-        match a.as_str() {
-            "--older-than" => {
-                let v = it
-                    .next()
-                    .ok_or_else(|| Error::new("--older-than 需要參數"))?;
-                let ok = !v.is_empty() && v.len() <= 5 && v.bytes().all(|b| b.is_ascii_digit());
-                if !ok {
-                    return Err(Error::new(format!(
-                        "--older-than 需為 0-99999 的整數天：{v}"
-                    )));
-                }
-                days = v.parse().unwrap_or(14);
-            }
-            "--apply" => apply = true,
-            "--include-notes" => include_notes = true,
-            other => return Err(Error::new(format!("未知參數：{other}"))),
-        }
-    }
-
-    let s = task::gc(paths, days, apply, include_notes)?;
-    for (id, st, ts) in &s.candidates {
-        println!("{id}\t{st}\t{ts}");
-    }
-    let kept = format!(
-        "保留 未完成 {}／收尾筆記 {}／宣告失效證據 {}／未滿 {days} 天 {}",
-        s.kept_live, s.kept_pin, s.kept_proof, s.kept_young
-    );
-    if apply {
-        eprintln!("gc：已刪 {} 個；{kept}", s.removed);
-        if s.failed > 0 {
-            err_line(&format!(
-                "警告：{} 個目錄未能刪除（鎖被佔用或權限問題），下次再試",
-                s.failed
-            ));
-        }
-    } else {
-        eprintln!("gc（試算）：可刪 {} 個；{kept}", s.removed);
-        eprintln!("確認無誤後加 --apply 才會真的刪除");
-    }
-    Ok(())
 }
 
 /// cmd_spawn:1063 的 argv 解析。**`--model`／`--profile` 在解析點就驗**（不等到

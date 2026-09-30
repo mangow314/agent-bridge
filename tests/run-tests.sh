@@ -148,13 +148,13 @@ assert_reason() {
 # 漏補的失敗形態是「選中組轉紅」（fail-visible），不會假綠。
 declare -A GRP_NEEDS=(
   [2]="1" [3]="1" [5]="4" [7]="6" [13]="4 6 7 11 12" [22]="19" [27]="22"
-  [29]="25 26" [34.5+]="34" [36]="35" [42]="26"
+  [29]="26" [34.5+]="34" [36]="35" [42]="26"
   # codex 複核補（2026-08-03）：13 需 7（group 6 只 deliver、7 才 reply 成
   # completed，缺 7 會無限等待）；17/18 需 16（manual-x 與 pane_w1 是 16 建的
   # 語意 fixture，變數掃描抓不到 manual-x 這種字串依賴）
   [17]="16" [18]="16"
 )
-GRP_KNOWN=" 1 2 3 4 5 6 7 8 8a 8b 9 10 11 12 13 14 15 16 17 18 18b 18c 19 20 20b 21 22 24 25 26 27 28 29 30 31 32 33 34 34.5+ 35 36 37 38 39 41 42 46 49 "
+GRP_KNOWN=" 1 2 3 4 5 6 7 8 8a 8b 9 10 11 12 13 14 15 16 17 18 18b 18c 19 20 20b 21 22 24 25 26 27 29 30 31 32 33 34 34.5+ 35 36 37 38 39 41 42 46 49 "
 GRP_SELECTED=""
 GRP_SKIPPED=0
 if [[ -n "${TEST_GROUPS:-}" ]]; then
@@ -2314,7 +2314,7 @@ jq -n --arg ts "$now_ts" \
 assert "idle：宣告與新任務同秒 → 仍須轉 expired（否則會誤殺已有新脈絡的 worker）" \
   test "$(idle_field "$DSEC" samesec 3)" = expired
 
-# 名稱重用：tasks/ 是長期累積的（GC 仍是 backlog），同一個名字可能有前一個
+# 名稱重用：tasks/ 是長期累積的，同一個名字可能有前一個
 # pane 留下的任務。idle_secs 若採信那個時間，剛 spawn 的 worker 會顯示成閒置
 # 好幾小時，LRU 就會優先驅逐一個還沒做過事的新 pane——決策視圖說謊。
 # 真鏈驗收 2026-07-22 實地踩到：w1 才 spawn 39 秒卻顯示 21686。
@@ -2583,111 +2583,9 @@ for kw in 'agent-bridge idle' 'agent-bridge evict' 'evicted-timeout' \
 done
 
 fi  # end grp 27
-# ---- 28. gc：清舊 task，但三道保留線都不能破 ----
-if grp 28; then
-# spec: CLI-GC-1 CLI-GC-2 CLI-GC-3 STATE-TASK-5
-# tasks/ 只增不減不只是磁碟問題：idle 的回收決策直接掃這個目錄，資料越髒決策
-# 越不可信（名稱重用那個 bug 的根因就是這裡）。但這是唯一會刪東西的命令，
-# 失效方向必須一律偏向「留著」。
-DGC="$TESTROOT/dgc"
-mkdir -p "$DGC"/{agents,tasks,locks}
-
-# mk_task <id> <status> <created_at> [pinned]
-mk_task() {
-  local id="$1" st="$2" ts="$3" pin="${4:-}"
-  mkdir -p "$DGC/tasks/$id"
-  jq -n --arg id "$id" --arg ts "$ts" --arg pin "$pin" \
-    '{version:1, task_id:$id, from:"alice", to:"bob", created_at:$ts,
-      updated_at:$ts, working_directory:"/tmp", status:"completed"}
-     + (if $pin == "1" then {pinned: true} else {} end)' \
-    > "$DGC/tasks/$id/metadata.json"
-  printf '%s\n' "$st" > "$DGC/tasks/$id/status"
-  printf 'x\n' > "$DGC/tasks/$id/request.md"
-}
-OLD_TS="2020-01-01T00:00:00Z"
-NEW_TS="$(date -u +%FT%TZ)"
-mk_task 20200101T000000Z-0a01 completed "$OLD_TS"
-mk_task 20200101T000000Z-0a02 cancelled "$OLD_TS"
-mk_task 20200101T000000Z-0a03 running   "$OLD_TS"
-mk_task 20200101T000000Z-0a04 completed "$OLD_TS" 1
-mk_task 20200101T000000Z-0a05 queued    "$OLD_TS"
-mk_task 20260101T000000Z-0b01 completed "$NEW_TS"
-# 判不出年紀的：壞掉的 created_at 不該讓它被當成很舊而刪掉
-mk_task 20200101T000000Z-0a06 completed "not-a-timestamp"
-
-# 28a. 預設是試算：一個都不能真的刪
-gc_out="$(ab "$DGC" gc --older-than 1 2>/dev/null)"
-assert "gc：預設只試算，不刪任何東西" \
-  test -d "$DGC/tasks/20200101T000000Z-0a01"
-assert "gc：試算列出可刪的舊終態 task" \
-  bash -c "grep -q '20200101T000000Z-0a01' <<< '$gc_out'"
-assert "gc：試算不列出未完成的 task" \
-  bash -c "! grep -q '20200101T000000Z-0a03' <<< '$gc_out'"
-assert "gc：試算不列出收尾筆記（pinned）" \
-  bash -c "! grep -q '20200101T000000Z-0a04' <<< '$gc_out'"
-
-# 28b. --apply：該刪的刪、三道保留線一條都不能破
-ab "$DGC" gc --older-than 1 --apply >/dev/null 2>&1
-assert "gc：--apply 刪掉夠舊的 completed" \
-  test ! -d "$DGC/tasks/20200101T000000Z-0a01"
-assert "gc：--apply 刪掉夠舊的 cancelled" \
-  test ! -d "$DGC/tasks/20200101T000000Z-0a02"
-# ★ 保留線一：進行中的任務不是垃圾，刪掉等於把還在跑的工作抹掉
-assert "gc：running 的 task 不刪（未完成一律保留）" \
-  test -d "$DGC/tasks/20200101T000000Z-0a03"
-assert "gc：queued 的 task 不刪（還沒人取）" \
-  test -d "$DGC/tasks/20200101T000000Z-0a05"
-# ★ 保留線二：evict 的收尾筆記是這一層刻意留下的脈絡。它若會被 gc 清掉，
-# 「上下文不會憑空消失」就只是延後兌現
-assert "gc：pinned 的收尾筆記不刪（預設）" \
-  test -d "$DGC/tasks/20200101T000000Z-0a04"
-# ★ 保留線三：判不出年紀就不刪
-assert "gc：created_at 壞掉的 task 不刪（判不出年紀就留著）" \
-  test -d "$DGC/tasks/20200101T000000Z-0a06"
-assert "gc：未滿保留期的 task 不刪" \
-  test -d "$DGC/tasks/20260101T000000Z-0b01"
-assert "gc：執行後 locks/ 為空（每個 task 各取各的鎖，不得殘留）" \
-  test -z "$(ls -A "$DGC/locks")"
-
-# 28c. --include-notes 才動筆記，且仍受其他兩條線約束
-ab "$DGC" gc --older-than 1 --apply --include-notes >/dev/null 2>&1
-assert "gc：--include-notes 才刪得掉收尾筆記" \
-  test ! -d "$DGC/tasks/20200101T000000Z-0a04"
-assert "gc：--include-notes 仍不刪未完成的 task" \
-  test -d "$DGC/tasks/20200101T000000Z-0a03"
-
-# 28d. 參數防線
-assert_fails "gc：--older-than 非數字被拒" ab "$DGC" gc --older-than abc
-assert_fails "gc：未知參數被拒" ab "$DGC" gc --bogus
-# 目錄名不合 task-id 格式的東西一律不碰：這是唯一會 rm 的地方，寧可漏掉也不要
-# 讓奇怪的名字走進 rm 的參數。用含空白的名字——TASK_ID_RE 允許 [A-Za-z0-9._-]，
-# 普通目錄名都會通過，只有這類才測得到那道防線
-stray="$DGC/tasks/bad name"
-mkdir -p "$stray"
-jq -n --arg ts "$OLD_TS" \
-  '{version:1, task_id:"x", from:"a", to:"b", created_at:$ts, updated_at:$ts,
-    working_directory:"/tmp", status:"completed"}' > "$stray/metadata.json"
-printf 'completed\n' > "$stray/status"
-ab "$DGC" gc --older-than 1 --apply >/dev/null 2>&1
-assert "gc：目錄名不合 task-id 格式就不碰（即使其他條件都夠格被刪）" \
-  test -d "$stray"
-
-# 28e. evict 的收尾任務要真的被 pin 起來（不是只有測試資料會 pin）
-DGP="$TESTROOT/dgcpin"
-absp "$DGP" 0 spawn gp1 --runtime codex >/dev/null 2>&1
-tid_gp="$(ab "$DGP" evict gp1 --timeout 1 2>/dev/null)"
-assert "gc：evict 送出的收尾任務帶 pinned 標記（否則會被 gc 清掉）" \
-  test "$(jq -r '.pinned // false' "$DGP/tasks/$tid_gp/metadata.json")" = true
-# 一般 send 不該被 pin，否則 gc 永遠清不掉任何東西
-ab "$DGP" register plain-a "$PANE_A" >/dev/null 2>&1
-tid_pl="$(ab "$DGP" send plain-a --from alice --message "一般任務" 2>/dev/null)"
-assert "gc：一般 send 不帶 pinned（否則 gc 等於失效）" \
-  test "$(jq -r '.pinned // false' "$DGP/tasks/$tid_pl/metadata.json")" = false
-
-fi  # end grp 28
 # ---- 29. 第二輪獨立複核的修補（2026-07-23）----
 if grp 29; then
-# spec: CLI-GC-3 CLI-EVICT-3
+# spec: CLI-EVICT-3
 DR2="$TESTROOT/drev2"
 mkdir -p "$DR2"/{agents,tasks,locks}
 
@@ -2726,27 +2624,6 @@ assert "I2：拒絕時 pane 未被動" pane_alive "$pane_r4"
 ab "$DR2" despawn r4 >/dev/null 2>&1 || true
 tmx kill-pane -t "$pane_r4" 2>/dev/null || true
 
-# 29c. I3：gc 不能刪掉「宣告已失效」的證據。idle 判斷宣告有沒有被後續任務推翻
-# 靠的是掃 tasks/；那個任務被清掉，宣告就會從 expired 復活成 yes，
-# orchestrator 據此直接回收一個其實已有新脈絡的 worker
-DR3="$TESTROOT/drev3"
-mkdir -p "$DR3"/{agents,tasks,locks}
-absp "$DR3" 0 spawn r5 --runtime codex >/dev/null 2>&1
-ab "$DR3" disposable r5 >/dev/null 2>&1
-sleep 1
-tid_r5="$(ab "$DR3" send r5 --from alice --message "宣告後的新任務" 2>/dev/null)"
-ab "$DR3" receive "$tid_r5" >/dev/null 2>&1
-ab "$DR3" reply "$tid_r5" --message "done" >/dev/null 2>&1
-assert "I3：宣告後被派工 → idle 顯示 expired（前提）" \
-  test "$(idle_field "$DR3" r5 3)" = expired
-ab "$DR3" gc --older-than 0 --apply >/dev/null 2>&1
-assert "I3：gc 不得刪掉讓宣告失效的那個任務（它是唯一的證據）" \
-  test -d "$DR3/tasks/$tid_r5"
-# ★ 核心斷言：gc 跑完之後，宣告不能復活
-assert "I3：gc 之後 idle 仍是 expired（宣告不得復活成 yes）" \
-  test "$(idle_field "$DR3" r5 3)" = expired
-ab "$DR3" despawn r5 >/dev/null 2>&1 || true
-
 # 29e. I6：despawn 走 stale 路徑時（registry 清掉了、但那個 pane 已不屬於這個
 # agent，沒被回收）return 0，evict 不能把它當成回收成功而補一筆 evicted——
 # 那會讓審計線宣稱發生過一次沒發生的回收。
@@ -2776,17 +2653,6 @@ assert "I6：despawn 走 stale（pane 未回收）時不得寫 evicted 審計" \
 assert "I6：stale 本身仍要留審計（註冊確實被清掉了）" \
   grep -qE "Z despawn-stale r6 " "$DR2/agents.log"
 assert "I6：被指到的無辜 pane 不得被回收" pane_alive "$PANE_A"
-
-# 29d. I5：gc 只碰 send 生成的形狀。公開的 TASK_ID_RE 連 `foo` 都算合法，
-# 拿它當刪除門檻等於把任何人放進 tasks/ 的目錄都納入清理範圍
-mkdir -p "$DR3/tasks/foo"
-jq -n '{version:1, task_id:"foo", from:"a", to:"b",
-        created_at:"2020-01-01T00:00:00Z", updated_at:"2020-01-01T00:00:00Z",
-        working_directory:"/tmp", status:"completed"}' > "$DR3/tasks/foo/metadata.json"
-printf 'completed\n' > "$DR3/tasks/foo/status"
-ab "$DR3" gc --older-than 0 --apply >/dev/null 2>&1
-assert "I5：不是 send 生成的目錄名不刪（唯一會 rm 的路徑要保守）" \
-  test -d "$DR3/tasks/foo"
 
 fi  # end grp 29
 # ---- 30. CC 權限框特徵 canary：安裝中的 claude 仍含防線依賴的字串 ----
@@ -2911,7 +2777,7 @@ assert "audit 不可寫：despawn 拒絕動手（非零）" test "$rc" -ne 0
 assert "audit 不可寫：registry 未動" test -f "$D31B/agents/aud31.json"
 
 # 31f. F7：send 的訊息來源檔不存在→先驗先死，不留殘缺 task 目錄
-# （gc 只清完整形狀，殘缺目錄是永久孤兒）
+# （殘缺目錄是永久孤兒）
 D31C="$TESTROOT/d31c"
 mkdir -p "$D31C/agents"
 jq -n '{name:"w31", pane_id:"%998", registered_at:"2026-01-01T00:00:00Z"}' \
@@ -2921,8 +2787,8 @@ assert_fails "send 來源檔不存在被拒" \
 assert "send 被拒後 tasks/ 零殘留" \
   test -z "$(ls -A "$D31C/tasks" 2>/dev/null)"
 
-# 31g. F6：read 取 task 鎖，與 gc --apply 互斥——鎖被佔用時不硬讀
-# （模擬 gc 正持鎖刪目錄；約 5 秒重試後失敗是預期成本）
+# 31g. F6：read 取 task 鎖——鎖被佔用時不硬讀
+# （模擬另一個持鎖者；約 5 秒重試後失敗是預期成本）
 D31D="$TESTROOT/d31d"
 mkdir -p "$D31D/tasks/20200101T000000Z-cccc" "$D31D/locks/20200101T000000Z-cccc.lock"
 printf 'completed\n' > "$D31D/tasks/20200101T000000Z-cccc/status"

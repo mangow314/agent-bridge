@@ -39,8 +39,7 @@
 | 25 | idle 決策視圖 | CLI-IDLE-1, CLI-IDLE-2 |
 | 26 | evict 三段式 | CLI-EVICT-1, CLI-EVICT-2, CLI-EVICT-3 |
 | 27 | brief 正本策略不變量 | CLI-SPAWN-7 |
-| 28 | gc 三道保留線 | CLI-GC-1, CLI-GC-2, CLI-GC-3, STATE-TASK-5 |
-| 29 | 第二輪複核修補 | CLI-GC-3, CLI-EVICT-3 |
+| 29 | 第二輪複核修補 | CLI-EVICT-3 |
 | 30 | CC 權限框特徵 canary | HOOK-NOTIFY-2 |
 | 31 | 第三輪複核修補 | CLI-STATUS-1, CLI-READ-1, CLI-AWAIT-2, CLI-DESPAWN-3, CLI-EVICT-2, CLI-RO-1, ENV-POLL-1, CLI-GEN-3, CLI-SEND-3, STATE-TASK-4, STATE-TASK-5 |
 | 32 | spawn 落點（`--here`／auto／`--window`）＋owner/actor 審計 | CLI-SPAWN-5, CLI-SPAWN-6, ENV-HERE-1 |

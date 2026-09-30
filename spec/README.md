@@ -9,7 +9,7 @@ M4 之前這裡同時是 Rust 與 bash 兩套實作的 parity 判準；bash 正�
 
 | 檔 | 協定面 |
 |---|---|
-| `cli.md` | 21 個子指令：argv 入 → stdout/stderr/exit code/檔案系統效果 出 |
+| `cli.md` | 20 個子指令：argv 入 → stdout/stderr/exit code/檔案系統效果 出 |
 | `hooks.md` | hook 協定：stdin 事件 JSON、block 回應、exit 0 鐵律、owner gate |
 | `state.md` | 磁碟狀態：agents/ tasks/ state/ locks/ 四類檔案格式與寫入語意 |
 | `env.md` | 14 個 `AGENT_BRIDGE_*` 環境變數：預設值與壞值行為 |

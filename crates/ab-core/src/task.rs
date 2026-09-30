@@ -266,8 +266,8 @@ pub(crate) fn rand_suffix() -> String {
 
 /// task 目錄建立到「完整形狀」（metadata＋status 都寫齊）之間的守衛。
 /// 對映 bash 的 `SEND_RB_DIR`＋EXIT trap（send_rollback:202）：中途任何失敗都
-/// 要把殘缺目錄收走——沒有 metadata/status 的目錄不屬於任何狀態、gc 又刻意只
-/// 碰完整形狀，留下就是永久孤兒。`commit()` 之後才解除。
+/// 要把殘缺目錄收走——沒有 metadata/status 的目錄不屬於任何狀態，
+/// 留下就是永久孤兒。`commit()` 之後才解除。
 struct SendRollback {
     dir: Option<PathBuf>,
 }
@@ -297,13 +297,7 @@ impl Drop for SendRollback {
 /// 這裡的回滾用 `Drop`（與架構 §6 對鎖的紅線不同）是有意的：鎖的紅線是
 /// 「殘鎖行為必須與 bash 等價」，而 bash 的回滾本身就是 EXIT trap——同樣不
 /// 在 SIGKILL 下執行。兩者的失效邊界一致，故此處 Drop 是等價實作而非弱化。
-pub fn create_task(
-    paths: &Paths,
-    from: &str,
-    to: &str,
-    src: &MessageSource,
-    pinned: bool,
-) -> Result<String> {
+pub fn create_task(paths: &Paths, from: &str, to: &str, src: &MessageSource) -> Result<String> {
     let mut tries = 0;
     let (task_id, dir) = loop {
         let id = format!("{}-{}", now_compact(), rand_suffix());
@@ -340,7 +334,7 @@ pub fn create_task(
         .map(|p| p.display().to_string())
         .unwrap_or_default();
     // 欄位序逐字對齊 bash `jq -n '{version, task_id, from, to, created_at,
-    // updated_at, working_directory, status} + (pinned)'`（cmd_send:599-604）；
+    // updated_at, working_directory, status}'`（cmd_send:599-604）；
     // `preserve_order` 下 Map 依插入序輸出。
     let mut fields = Map::new();
     fields.insert("version".into(), Value::from(1));
@@ -351,9 +345,6 @@ pub fn create_task(
     fields.insert("updated_at".into(), Value::from(ts));
     fields.insert("working_directory".into(), Value::from(wd));
     fields.insert("status".into(), Value::from("queued"));
-    if pinned {
-        fields.insert("pinned".into(), Value::Bool(true));
-    }
     let doc = format!("{}\n", json::render_pretty(&Value::Object(fields)));
     atomic_write(&dir.join("metadata.json"), doc.as_bytes())
         .map_err(|_| Error::new("send 無法寫入 metadata（殘缺目錄已回滾）"))?;
@@ -365,26 +356,10 @@ pub fn create_task(
     Ok(task_id)
 }
 
-/// gc 一輪的統計。欄位對映 bash `cmd_gc` 的計數器（kept_live／kept_pin／
-/// kept_proof／kept_young／removed／failed）。
-#[derive(Debug, Default, PartialEq, Eq)]
-pub struct GcStats {
-    pub kept_live: usize,
-    pub kept_pin: usize,
-    pub kept_proof: usize,
-    pub kept_young: usize,
-    pub removed: usize,
-    pub failed: usize,
-    /// 試算模式的待刪清單 `(id, status, created_at)`；`apply` 時為空。
-    pub candidates: Vec<(String, String, String)>,
-}
-
 /// send 生成的 task 目錄名形狀：`^[0-9]{8}T[0-9]{6}Z-[0-9a-f]{4}$`。
 ///
-/// **這裡刻意不用寬鬆的 `TASK_ID_RE`**（cmd_gc:1722-1727）：公開驗證用的
-/// TASK_ID_RE 連 `foo` 都算合法，拿它當刪除門檻等於把任何人放進 `tasks/` 的
-/// 目錄都納入清理範圍。寧可漏掉幾個手工目錄，也不要讓一個不是本工具生成的
-/// 名字走進刪除路徑。
+/// **這裡刻意不用寬鬆的 `TASK_ID_RE`**：公開驗證用的 TASK_ID_RE 連 `foo` 都
+/// 算合法，而 `tasks/` 裡任何人都能放目錄；掃描只認本工具生成的名字。
 fn is_generated_task_dirname(id: &str) -> bool {
     let b = id.as_bytes();
     b.len() == 21
@@ -396,161 +371,6 @@ fn is_generated_task_dirname(id: &str) -> bool {
         && b[17..]
             .iter()
             .all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(c))
-}
-
-/// cmd_gc:1683 — 清掉夠舊的終態 task。未完成的、evict 收尾筆記（pinned）、
-/// 以及「disposable 宣告已失效」的證據一律保留。
-///
-/// 保留證據那條（`kept_proof`）不是可有可無的保守：`idle` 判斷一個 disposable
-/// 宣告是否被後續任務推翻，靠的就是掃 `tasks/` 找晚於 `disposable_at` 的任務；
-/// 那個任務一旦被清掉，宣告會從 expired 復活成 yes，orchestrator 據此直接
-/// 回收一個其實已有新脈絡的 worker。
-///
-/// 架構對映表把 `cmd_gc` 列在 `spawn` 模組（它與 disposable 宣告耦合），
-/// 但 `spawn` 要到 M3 才建，而 gc 動的全部是 task 目錄；M1 先落在 `task`，
-/// 對映表已同步更新（architecture.md §2）。
-pub fn gc(paths: &Paths, days: u64, apply: bool, include_notes: bool) -> Result<GcStats> {
-    let mut stats = GcStats::default();
-    let cutoff = crate::time::now_epoch() - (days as i64) * 86400;
-
-    // 現存 registry 裡還掛著 disposable 宣告的 agent → 宣告時間戳
-    let mut pledge: Vec<(String, String)> = Vec::new();
-    if let Ok(rd) = std::fs::read_dir(&paths.agents_dir) {
-        for entry in rd.filter_map(|e| e.ok()) {
-            let p = entry.path();
-            if p.extension().map(|e| e != "json").unwrap_or(true) {
-                continue;
-            }
-            let Ok(content) = std::fs::read_to_string(&p) else {
-                continue;
-            };
-            let Ok(Value::Object(fields)) = json::parse(&content) else {
-                continue;
-            };
-            if !json::bool_field_is_true(&fields, "disposable") {
-                continue;
-            }
-            let name = json::str_field(&fields, "name").unwrap_or_default();
-            let at = json::str_field(&fields, "disposable_at").unwrap_or_default();
-            if !name.is_empty() && !at.is_empty() {
-                pledge.push((name.to_string(), at.to_string()));
-            }
-        }
-    }
-
-    let mut dirs: Vec<std::path::PathBuf> = match std::fs::read_dir(&paths.tasks_dir) {
-        Ok(rd) => rd
-            .filter_map(|e| e.ok())
-            .map(|e| e.path())
-            .filter(|p| p.is_dir())
-            .collect(),
-        Err(_) => return Ok(stats),
-    };
-    dirs.sort();
-
-    for d in dirs {
-        let id = match d.file_name().and_then(|n| n.to_str()) {
-            Some(n) => n.to_string(),
-            None => continue,
-        };
-        if !is_generated_task_dirname(&id) {
-            continue;
-        }
-        if !d.join("metadata.json").is_file() || !d.join("status").is_file() {
-            continue;
-        }
-        let Ok(st) = read_status(&d) else {
-            continue;
-        };
-        if !matches!(st.as_str(), "completed" | "failed" | "cancelled") {
-            stats.kept_live += 1;
-            continue;
-        }
-
-        // metadata 讀不出來時一律偏保守：pinned 當 true、時間當「判不出年紀」，
-        // 對映 bash `|| pinned=true` 與 `|| ts=""` 的失效方向。
-        let meta = std::fs::read_to_string(d.join("metadata.json")).ok();
-        let fields = meta.as_deref().and_then(|c| match json::parse(c) {
-            Ok(Value::Object(m)) => Some(m),
-            _ => None,
-        });
-        if !include_notes {
-            let pinned = match &fields {
-                Some(m) => json::bool_field_is_true(m, "pinned"),
-                None => true,
-            };
-            if pinned {
-                stats.kept_pin += 1;
-                continue;
-            }
-        }
-
-        let to_who = fields
-            .as_ref()
-            .and_then(|m| json::str_field(m, "to"))
-            .unwrap_or_default()
-            .to_string();
-        // 用 metadata 的 created_at 而不是目錄 mtime：mtime 會被備份、rsync、
-        // 檔案系統操作改掉，created_at 是這個任務自己的事實。
-        let ts = fields
-            .as_ref()
-            .and_then(|m| json::str_field(m, "created_at"))
-            .unwrap_or_default()
-            .to_string();
-
-        // 是某個現存宣告的「已失效證據」就留著。ISO 8601 UTC 定長字串可直接
-        // 字典序比大小；`!(ts < pledge_at)` ＝同秒也算證據（bash:1751 的
-        // 「不小於」，理由同 disposable_effective 的同秒判定）。
-        if !to_who.is_empty()
-            && let Some((_, at)) = pledge.iter().find(|(n, _)| *n == to_who)
-            && !ts.is_empty()
-            && ts.as_str() >= at.as_str()
-        {
-            stats.kept_proof += 1;
-            continue;
-        }
-
-        // 讀不到時間就當它還年輕：判不出年紀的東西不刪
-        let Some(epoch) = crate::time::parse_iso_to_epoch(&ts) else {
-            stats.kept_young += 1;
-            continue;
-        };
-        if epoch >= cutoff {
-            stats.kept_young += 1;
-            continue;
-        }
-
-        if !apply {
-            stats.candidates.push((id.clone(), st.clone(), ts));
-            stats.removed += 1;
-            continue;
-        }
-
-        // 取這個 task 的鎖再刪：狀態轉換都在同一把鎖下，不取就可能在 reply
-        // 寫到一半時把目錄抽走。取不到鎖只算這一個失敗，**不中止整輪**
-        // （bash 用 subshell 達到同樣效果）。
-        let Ok(guard) = crate::lock::acquire_lock(paths, &id) else {
-            stats.failed += 1;
-            continue;
-        };
-        // 拿到鎖後重驗狀態：等鎖那段時間裡它可能已經被 receive／reply 動過
-        let still_terminal = read_status(&d)
-            .map(|s| matches!(s.as_str(), "completed" | "failed" | "cancelled"))
-            .unwrap_or(false);
-        if !still_terminal {
-            guard.release();
-            stats.kept_live += 1;
-            continue;
-        }
-        let removed = std::fs::remove_dir_all(&d).is_ok();
-        guard.release();
-        if removed {
-            stats.removed += 1;
-        } else {
-            stats.failed += 1;
-        }
-    }
-    Ok(stats)
 }
 
 /// `cancel` 一次執行的終態（CLI-CANCEL-1）。轉態本身若失敗會以 `Err` 收場，
@@ -629,15 +449,15 @@ pub struct InFlight {
     ///
     /// 為什麼歸屬判定要用它而不是 task-id 前綴：id 前綴只是 created_at
     /// 的衍生副本，兩者不保證一致（測試 fixture 就有一份不一致的）。同一份
-    /// read model 對「這個 task 幾點生的」不該有兩套答案——`gc` 那條路徑
-    /// （本檔 `created_at` vs 目錄 mtime）早就選過同一邊。
+    /// read model 對「這個 task 幾點生的」不該有兩套答案——一律以 metadata
+    /// 的 `created_at` 為準，不看目錄 mtime。
     pub created_at: String,
 }
 
 /// in-flight（非終態）任務的唯讀快照（read model，tag `pre-trim-2026-09` 的 docs/tui-design.md §4）。
 ///
-/// 只認本工具生成形狀的目錄名與完整形狀（metadata＋status 都在）——與 gc
-/// 的掃描門檻同一條理由：`tasks/` 裡任何人都能放目錄。單一損壞任務跳過
+/// 只認本工具生成形狀的目錄名與完整形狀（metadata＋status 都在）：
+/// `tasks/` 裡任何人都能放目錄。單一損壞任務跳過
 /// 而不是讓整份 dashboard 消失（同 `last_task_at` 的 `|| continue` 方向）。
 /// 唯讀且**不取鎖**：dashboard 每 500ms 掃一輪，取鎖會與正常狀態轉換互撞；
 /// 讀到轉換中途的舊值只是晚一輪刷新，不影響任何狀態機不變量。
@@ -689,8 +509,7 @@ pub struct ReadHeader {
 ///
 /// **持鎖到呼叫端把 payload 處理完為止**，故走 callback 而不是「先讀成
 /// `Vec<u8>` 再回傳」：
-/// - gc --apply 刪目錄前取的就是這把鎖，不取的話從驗完狀態到讀 response
-///   之間目錄可被整個抽走；
+/// - 取 task 鎖，避免從驗完狀態到讀 response 之間目錄被整個抽走；
 /// - 更關鍵的是**呈現順序**。CLI 舊行為是「先印三行標頭到 stderr，再串流
 ///   payload 到 stdout」，兩者都在鎖內。若改成外殼拿到完整 outcome 才印，
 ///   `response.md` 缺檔時就變成一行標頭都不印——那是可觀察的行為改變
@@ -1039,7 +858,6 @@ mod tests {
             "sender",
             "receiver",
             &MessageSource::Text("x".into()),
-            false,
         )
         .expect_err("非碰撞的建目錄失敗 MUST 以錯誤終止");
 
@@ -1205,14 +1023,7 @@ mod tests {
     fn create_task_writes_complete_shape() {
         let d = Dir::new("ab-core-task-test");
         let paths = test_paths(&d);
-        let id = create_task(
-            &paths,
-            "alice",
-            "bob",
-            &MessageSource::Text("hello".into()),
-            false,
-        )
-        .unwrap();
+        let id = create_task(&paths, "alice", "bob", &MessageSource::Text("hello".into())).unwrap();
         let dir = task_dir(&paths, &id);
         assert_eq!(std::fs::read(dir.join("request.md")).unwrap(), b"hello\n");
         assert_eq!(read_status(&dir).unwrap(), "queued");
@@ -1230,8 +1041,7 @@ mod tests {
         let d = Dir::new("ab-core-task-rb");
         let paths = test_paths(&d);
         let missing = d.path.join("no-such-message-file");
-        let err =
-            create_task(&paths, "alice", "bob", &MessageSource::File(missing), false).unwrap_err();
+        let err = create_task(&paths, "alice", "bob", &MessageSource::File(missing)).unwrap_err();
         assert!(
             err.message.contains("殘缺目錄已回滾"),
             "實際：{}",
@@ -1256,7 +1066,7 @@ mod tests {
     fn status_is_written_before_metadata() {
         let d = Dir::new("ab-core-task-wr-order");
         let paths = test_paths(&d);
-        let id = create_task(&paths, "a", "b", &MessageSource::Text(b"x".to_vec()), false).unwrap();
+        let id = create_task(&paths, "a", "b", &MessageSource::Text(b"x".to_vec())).unwrap();
         let dir = task_dir(&paths, &id);
 
         std::fs::remove_file(dir.join("status")).unwrap();
@@ -1279,7 +1089,7 @@ mod tests {
     fn status_update_keeps_field_order() {
         let d = Dir::new("ab-core-task-order");
         let paths = test_paths(&d);
-        let id = create_task(&paths, "a", "b", &MessageSource::Text("x".into()), false).unwrap();
+        let id = create_task(&paths, "a", "b", &MessageSource::Text("x".into())).unwrap();
         let dir = task_dir(&paths, &id);
         update_meta_status(&dir, TaskState::Delivered).unwrap();
         assert_eq!(read_status(&dir).unwrap(), "delivered");
@@ -1311,7 +1121,7 @@ mod tests {
     fn meta_str_matches_jq_raw_output() {
         let d = Dir::new("ab-core-task-meta");
         let paths = test_paths(&d);
-        let id = create_task(&paths, "a", "b", &MessageSource::Text("x".into()), false).unwrap();
+        let id = create_task(&paths, "a", "b", &MessageSource::Text("x".into())).unwrap();
         let dir = task_dir(&paths, &id);
         assert_eq!(meta_str(&dir, "from").unwrap(), "a");
         assert_eq!(meta_str(&dir, "no_such_field").unwrap(), "null");
@@ -1323,162 +1133,38 @@ mod tests {
         assert!(meta_str(&dir, "from").is_err(), "非 object 必須整體失敗");
     }
 
-    /// pinned 任務的 metadata 多一個尾欄位（evict 收尾筆記，gc 一律跳過）。
+    /// legacy_pinned：舊資料的 metadata 可能帶多餘的尾欄位，`status`／`read`
+    /// 路徑照常（泛型 JSON 讀取自然忽略它，不寫遷移）。
     #[test]
-    fn pinned_task_metadata_has_pinned_flag() {
-        let d = Dir::new("ab-core-task-pin");
+    fn legacy_pinned_metadata_is_ignored_by_status_and_read() {
+        let d = Dir::new("ab-core-task-legacy");
         let paths = test_paths(&d);
-        let id = create_task(&paths, "a", "b", &MessageSource::Text("x".into()), true).unwrap();
-        let meta = std::fs::read_to_string(task_dir(&paths, &id).join("metadata.json")).unwrap();
-        assert!(meta.contains("\"pinned\": true"), "實際：{meta}");
-    }
+        let id = create_task(&paths, "alice", "bob", &MessageSource::Text("x".into())).unwrap();
+        let dir = task_dir(&paths, &id);
+        let meta_path = dir.join("metadata.json");
+        let meta = std::fs::read_to_string(&meta_path).unwrap();
+        let Ok(Value::Object(mut fields)) = json::parse(&meta) else {
+            panic!("metadata 應為 object");
+        };
+        fields.insert("pinned".into(), Value::Bool(true)); // legacy_pinned
+        let doc = format!("{}\n", json::render_pretty(&Value::Object(fields)));
+        std::fs::write(&meta_path, doc).unwrap();
+        let raw = std::fs::read_to_string(&meta_path).unwrap();
+        assert!(raw.contains("\"pinned\": true")); // legacy_pinned
 
-    /// gc 的黑箱 parity 分組（28）含 28e 的 spawn/evict 呼叫，gate 延至 M3；
-    /// M1 期由以下單元測試護住核心判定（計畫 M1 列明文）。
-    mod gc_tests {
-        use super::*;
+        // status 路徑：require_task_dir＋read_status；終態轉換照常改寫 metadata
+        update_meta_status(&dir, TaskState::Completed).unwrap();
+        let got = require_task_dir(&paths, &id).unwrap();
+        assert_eq!(read_status(&got).unwrap(), "completed");
 
-        /// 造一個指定 id／狀態／建立時間的完整 task 目錄。
-        fn make_task(paths: &Paths, id: &str, status: &str, created_at: &str, extra: &str) {
-            let dir = paths.tasks_dir.join(id);
-            std::fs::create_dir_all(&dir).unwrap();
-            std::fs::write(dir.join("status"), format!("{status}\n")).unwrap();
-            std::fs::write(
-                dir.join("metadata.json"),
-                format!(
-                    "{{\n  \"version\": 1,\n  \"task_id\": \"{id}\",\n  \"from\": \"alice\",\n  \"to\": \"bob\",\n  \"created_at\": \"{created_at}\",\n  \"updated_at\": \"{created_at}\",\n  \"working_directory\": \"/tmp\",\n  \"status\": \"{status}\"{extra}\n}}\n"
-                ),
-            )
-            .unwrap();
-        }
-
-        const OLD: &str = "2020-01-01T00:00:00Z";
-        const OLD_ID: &str = "20200101T000000Z-aaaa";
-
-        #[test]
-        fn old_terminal_task_is_listed_then_removed() {
-            let d = Dir::new("ab-core-gc-basic");
-            let paths = test_paths(&d);
-            make_task(&paths, OLD_ID, "completed", OLD, "");
-
-            // 試算：列出候選、不刪
-            let s = gc(&paths, 14, false, false).unwrap();
-            assert_eq!(s.removed, 1);
-            assert_eq!(
-                s.candidates,
-                vec![(OLD_ID.to_string(), "completed".to_string(), OLD.to_string())]
-            );
-            assert!(paths.tasks_dir.join(OLD_ID).is_dir(), "試算不得真的刪除");
-
-            // --apply：真刪
-            let s = gc(&paths, 14, true, false).unwrap();
-            assert_eq!(s.removed, 1);
-            assert_eq!(s.failed, 0);
-            assert!(!paths.tasks_dir.join(OLD_ID).exists());
-        }
-
-        /// 未完成的一律保留，不論多舊。
-        #[test]
-        fn unfinished_task_is_kept() {
-            let d = Dir::new("ab-core-gc-live");
-            let paths = test_paths(&d);
-            make_task(&paths, OLD_ID, "queued", OLD, "");
-            let s = gc(&paths, 14, true, false).unwrap();
-            assert_eq!((s.removed, s.kept_live), (0, 1));
-            assert!(paths.tasks_dir.join(OLD_ID).is_dir());
-        }
-
-        /// evict 收尾筆記（pinned）預設保留；`--include-notes` 才納入清理。
-        #[test]
-        fn pinned_note_kept_unless_include_notes() {
-            let d = Dir::new("ab-core-gc-pin");
-            let paths = test_paths(&d);
-            make_task(&paths, OLD_ID, "completed", OLD, ",\n  \"pinned\": true");
-            let s = gc(&paths, 14, true, false).unwrap();
-            assert_eq!((s.removed, s.kept_pin), (0, 1));
-            let s = gc(&paths, 14, true, true).unwrap();
-            assert_eq!(s.removed, 1);
-        }
-
-        /// 「disposable 宣告已失效」的證據不能刪：晚於（含同秒）宣告時間的
-        /// 任務一旦消失，idle 會把 expired 的宣告判回 yes，orchestrator 據此
-        /// 回收一個其實已有新脈絡的 worker。
-        #[test]
-        fn evidence_of_expired_pledge_is_kept() {
-            let d = Dir::new("ab-core-gc-proof");
-            let paths = test_paths(&d);
-            std::fs::write(
-                paths.agents_dir.join("bob.json"),
-                "{\n  \"name\": \"bob\",\n  \"pane_id\": \"%1\",\n  \"disposable\": true,\n  \"disposable_at\": \"2019-01-01T00:00:00Z\"\n}\n",
-            )
-            .unwrap();
-            make_task(&paths, OLD_ID, "completed", OLD, "");
-            let s = gc(&paths, 14, true, false).unwrap();
-            assert_eq!((s.removed, s.kept_proof), (0, 1));
-            assert!(paths.tasks_dir.join(OLD_ID).is_dir());
-
-            // 宣告晚於任務時，該任務不再是證據，照常清理
-            std::fs::write(
-                paths.agents_dir.join("bob.json"),
-                "{\n  \"name\": \"bob\",\n  \"pane_id\": \"%1\",\n  \"disposable\": true,\n  \"disposable_at\": \"2021-01-01T00:00:00Z\"\n}\n",
-            )
-            .unwrap();
-            let s = gc(&paths, 14, true, false).unwrap();
-            assert_eq!((s.removed, s.kept_proof), (1, 0));
-        }
-
-        /// 未滿天數、以及讀不出建立時間的（判不出年紀）一律保留。
-        #[test]
-        fn young_and_undatable_tasks_are_kept() {
-            let d = Dir::new("ab-core-gc-young");
-            let paths = test_paths(&d);
-            let id =
-                create_task(&paths, "a", "bob", &MessageSource::Text("x".into()), false).unwrap();
-            update_meta_status(&task_dir(&paths, &id), TaskState::Completed).unwrap();
-            // 判不出年紀者：metadata 損壞（pinned 亦判不出，故先落在 kept_pin）
-            let bad = "20200101T000000Z-bbbb";
-            make_task(&paths, bad, "completed", OLD, "");
-            std::fs::write(
-                paths.tasks_dir.join(bad).join("metadata.json"),
-                "{ not json",
-            )
-            .unwrap();
-
-            let s = gc(&paths, 14, true, false).unwrap();
-            assert_eq!(s.removed, 0);
-            assert_eq!(s.kept_young, 1, "剛建立的終態任務應算年輕");
-            assert_eq!(s.kept_pin, 1, "metadata 損壞時 pinned 偏保守判 true");
-            assert!(paths.tasks_dir.join(bad).is_dir());
-        }
-
-        /// 曆法上不存在的 created_at（`2026-02-31`）＝判不出年紀，MUST 保留。
-        /// bash 走 `date -ud`（對這種輸入 rc=1）落在 kept_young 分支；Rust 的
-        /// 時戳解析若靜默換算，這個目錄反而會被刪。
-        #[test]
-        fn invalid_calendar_timestamp_keeps_task() {
-            let d = Dir::new("ab-core-gc-badcal");
-            let paths = test_paths(&d);
-            make_task(&paths, OLD_ID, "completed", "2026-02-31T00:00:00Z", "");
-            let s = gc(&paths, 14, true, false).unwrap();
-            assert_eq!((s.removed, s.kept_young), (0, 1));
-            assert!(paths.tasks_dir.join(OLD_ID).is_dir());
-        }
-
-        /// **非本工具生成的目錄名一律不碰**：TASK_ID_RE 連 `foo` 都算合法，
-        /// 拿它當刪除門檻等於把任何人放進 tasks/ 的目錄納入清理範圍。
-        #[test]
-        fn foreign_directory_names_are_never_touched() {
-            let d = Dir::new("ab-core-gc-foreign");
-            let paths = test_paths(&d);
-            for name in ["foo", "important-notes", "20200101T000000Z-XYZW", "2020"] {
-                make_task(&paths, name, "completed", OLD, "");
-            }
-            let s = gc(&paths, 14, true, false).unwrap();
-            assert_eq!(s, GcStats::default(), "外來目錄不得計入任何分類");
-            for name in ["foo", "important-notes", "20200101T000000Z-XYZW", "2020"] {
-                assert!(paths.tasks_dir.join(name).is_dir(), "{name} 被動到了");
-            }
-        }
+        // read 路徑：with_response 取鎖、驗態、讀標頭、交出 response 路徑
+        std::fs::write(dir.join("response.md"), b"done\n").unwrap();
+        let (from, to, body) = with_response(&paths, &id, |h, path| {
+            Ok((h.from.clone(), h.to.clone(), std::fs::read(path).unwrap()))
+        })
+        .unwrap();
+        assert_eq!((from.as_str(), to.as_str()), ("alice", "bob"));
+        assert_eq!(body, b"done\n");
     }
 
     /// `cancel_task` 是 cancel 語意的單一正本（審查 F6）：轉態＋`cancelled`
@@ -1515,14 +1201,7 @@ mod tests {
 
         let d = Dir::new("ab-core-task-cancel");
         let paths = test_paths(&d);
-        let id = create_task(
-            &paths,
-            "alice",
-            "bob",
-            &MessageSource::Text("x".into()),
-            false,
-        )
-        .unwrap();
+        let id = create_task(&paths, "alice", "bob", &MessageSource::Text("x".into())).unwrap();
         std::fs::write(
             paths.agents_dir.join("bob.json"),
             "{\"name\":\"bob\",\"pane_id\":\"%7\"}\n",
@@ -1555,31 +1234,10 @@ mod tests {
     fn in_flight_filters_terminal_foreign_and_corrupt() {
         let d = Dir::new("ab-core-task-inflight");
         let paths = test_paths(&d);
-        let q = create_task(
-            &paths,
-            "alice",
-            "bob",
-            &MessageSource::Text("x".into()),
-            false,
-        )
-        .unwrap();
-        let r = create_task(
-            &paths,
-            "alice",
-            "bob",
-            &MessageSource::Text("y".into()),
-            false,
-        )
-        .unwrap();
+        let q = create_task(&paths, "alice", "bob", &MessageSource::Text("x".into())).unwrap();
+        let r = create_task(&paths, "alice", "bob", &MessageSource::Text("y".into())).unwrap();
         update_meta_status(&task_dir(&paths, &r), TaskState::Running).unwrap();
-        let done = create_task(
-            &paths,
-            "alice",
-            "bob",
-            &MessageSource::Text("z".into()),
-            false,
-        )
-        .unwrap();
+        let done = create_task(&paths, "alice", "bob", &MessageSource::Text("z".into())).unwrap();
         update_meta_status(&task_dir(&paths, &done), TaskState::Completed).unwrap();
         // 外來目錄名與損壞 status 各一：都不得出現，也不得毒死整份快照
         std::fs::create_dir(paths.tasks_dir.join("foreign-dir")).unwrap();
@@ -1608,14 +1266,7 @@ mod tests {
     fn created_at_flows_from_metadata_into_the_read_model() {
         let d = Dir::new("ab-core-created-at");
         let paths = test_paths(&d);
-        let id = create_task(
-            &paths,
-            "alice",
-            "bob",
-            &MessageSource::Text("x".into()),
-            false,
-        )
-        .unwrap();
+        let id = create_task(&paths, "alice", "bob", &MessageSource::Text("x".into())).unwrap();
         // 期望值直接取自磁碟上的 metadata（不是測試自己造一個時間）
         let meta = std::fs::read_to_string(task_dir(&paths, &id).join("metadata.json")).unwrap();
         let Ok(Value::Object(fields)) = json::parse(&meta) else {
@@ -1654,7 +1305,7 @@ mod tests {
         let raw: Vec<u8> = vec![0xff, 0xfe, 0x00, 0x41, 0x0a, 0x80];
         let src_file = d.path.join("payload.bin");
         std::fs::write(&src_file, &raw).unwrap();
-        let id = create_task(&paths, "a", "b", &MessageSource::File(src_file), false).unwrap();
+        let id = create_task(&paths, "a", "b", &MessageSource::File(src_file)).unwrap();
         let got = std::fs::read(task_dir(&paths, &id).join("request.md")).unwrap();
         assert_eq!(got, raw);
     }

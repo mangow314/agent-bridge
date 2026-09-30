@@ -61,8 +61,6 @@ agent-bridge fail <task-id> --message-file - <<'EOF'
 EOF
 agent-bridge read "$id"               # (sender) read the reply body (works for completed and failed)
 agent-bridge disposable <name>        # (worker, spawned only) declare this round's context has no residual value
-agent-bridge gc [--older-than <days>] [--include-notes] [--apply]  # [frozen: docs/scope-2026-09.md]
-                                      # clean old terminal-state tasks; dry-run by default, --apply to delete
 ```
 
 Multi-line content always goes through `--message-file -` (stdin heredoc),

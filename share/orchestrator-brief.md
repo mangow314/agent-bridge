@@ -147,21 +147,6 @@ sides are not symmetric, so do not gamble.
 which surrenders the "a slot will definitely free up" guarantee — use
 it only when you are certain the other side is alive.
 
-## Maintenance: sweep `tasks/` periodically
-
-`idle`'s reclaim decisions are computed by scanning `tasks/`, and that
-directory only ever grows — the dirtier the data, the less trustworthy
-your decisions and the slower the scan. Run once in a while:
-
-```bash
-agent-bridge gc              # dry-run, touches nothing
-agent-bridge gc --apply      # only deletes after you confirm
-```
-
-Unfinished tasks and evict wrap-up notes are never swept. **After a
-sweep, stop expecting `read <task-id>` to fetch very old ordinary
-replies** — only the wrap-up notes are preserved.
-
 ## Follow-up credibility decays
 
 Keeping a pane is **not** the same as keeping context quality. An idle

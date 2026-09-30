@@ -24,7 +24,6 @@ pub fn create_send_task(
     to: &str,
     from: &str,
     src: &MessageSource,
-    pinned: bool,
     warn: &mut dyn FnMut(String),
 ) -> Result<String> {
     if !is_valid_name(to) {
@@ -49,7 +48,7 @@ pub fn create_send_task(
         ));
     }
 
-    task::create_task(paths, from, to, src, pinned)
+    task::create_task(paths, from, to, src)
 }
 
 /// 一次收件通知的終態＋呈現所需的欄位（呼叫端據此組訊息）。

@@ -72,8 +72,8 @@ pub fn parse_iso_to_epoch(s: &str) -> Option<i64> {
     let days = days_from_civil(y, mo as u32, d as u32);
     // 曆日必須真實存在：`1..=31` 的粗檢會放行 2/31、4/31 這類日期，而
     // `days_from_civil` 對它們照樣算得出天數（溢到次月）。GNU `date -ud`
-    // 對這些輸入是 rc=1，本函式必須同樣回 None——`gc` 靠「判不出年紀就保留」
-    // 護住損壞 metadata，靜默換算會讓那些目錄反而進入刪除候選。
+    // 對這些輸入是 rc=1，本函式必須同樣回 None——呼叫端把 None 當「判不出年紀」
+    // 處理，靜默換算會把損壞的 metadata 當成有效時間。
     // 用逆運算 round-trip 檢查，不另寫一份月長／閏年表。
     if civil_from_days(days) != (y, mo as u32, d as u32) {
         return None;
@@ -132,7 +132,7 @@ mod tests {
     }
 
     /// 不存在的曆日 MUST 回 `None`（GNU `date -ud` 對這些是 rc=1）。
-    /// 靜默換算會讓 gc 把「判不出年紀、該保留」的損壞 metadata 送進刪除候選。
+    /// 靜默換算會把「判不出年紀」的損壞 metadata 當成有效時間。
     #[test]
     fn impossible_calendar_dates_are_rejected() {
         for bad in [
