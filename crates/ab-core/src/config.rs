@@ -34,16 +34,10 @@ pub const ENV_READY_TIMEOUT: &str = "AGENT_BRIDGE_READY_TIMEOUT";
 pub const ENV_READY_PROBE_INTERVAL: &str = "AGENT_BRIDGE_READY_PROBE_INTERVAL";
 /// worker 守則檔路徑。
 pub const ENV_WORKER_BRIEF: &str = "AGENT_BRIDGE_WORKER_BRIEF";
-/// 接手者守則檔路徑（relay 用）。
-pub const ENV_SUCCESSOR_BRIEF: &str = "AGENT_BRIDGE_SUCCESSOR_BRIEF";
 /// claude worker 的 hooks settings 檔路徑。
 pub const ENV_CLAUDE_HOOKS: &str = "AGENT_BRIDGE_CLAUDE_HOOKS";
 /// 額外要穿透進 worker pane 的環境變數名（逗號分隔）。
 pub const ENV_PASS_ENV: &str = "AGENT_BRIDGE_PASS_ENV";
-/// 接力鏈深度（relay 在鏈上逐棒下傳）。
-pub const ENV_RELAY_DEPTH: &str = "AGENT_BRIDGE_RELAY_DEPTH";
-/// 接力鏈深度上限（0＝解除限制）。
-pub const ENV_MAX_RELAY_DEPTH: &str = "AGENT_BRIDGE_MAX_RELAY_DEPTH";
 /// 單次 tmux 送鍵子行程的逾時秒數（0＝不設限）。
 pub const ENV_TMUX_TIMEOUT: &str = "AGENT_BRIDGE_TMUX_TIMEOUT";
 /// here 落點 split 後套用的 tmux layout（`none`＝只 split 不重排）。
@@ -199,7 +193,7 @@ fn repo_root() -> std::path::PathBuf {
         .unwrap_or_default()
 }
 
-/// `${VAR:-<repo_root>/<rel>}`：未設定或空字串取預設（ENV-BRIEF-1/2）。
+/// `${VAR:-<repo_root>/<rel>}`：未設定或空字串取預設（ENV-BRIEF-1）。
 fn path_env_or(name: &str, rel: &str) -> std::path::PathBuf {
     match read_env(name) {
         EnvValue::Text(v) => std::path::PathBuf::from(v),
@@ -214,11 +208,6 @@ fn path_env_or(name: &str, rel: &str) -> std::path::PathBuf {
 /// worker 守則檔（ENV-BRIEF-1）。
 pub fn worker_brief() -> std::path::PathBuf {
     path_env_or(ENV_WORKER_BRIEF, "share/worker-brief.md")
-}
-
-/// 接手者守則檔（ENV-BRIEF-2）。
-pub fn successor_brief() -> std::path::PathBuf {
-    path_env_or(ENV_SUCCESSOR_BRIEF, "share/successor-brief.md")
 }
 
 /// claude worker 的 hooks settings。
@@ -313,35 +302,17 @@ pub fn pass_env_names() -> Result<Vec<String>> {
 
 /// `AGENT_BRIDGE_PASS_ENV` **不得穿透**的保留變數（P4.7 切片 A／B4）。
 ///
-/// 這兩個變數是 spawn 自己拼進啟動指令的：`SPAWN_TAG` 是子代的世代身分
-/// （despawn／回滾／lineage 全靠它），`RELAY_DEPTH` 是接力鏈的棒次。白名單
-/// 若放它們過去，assignment 會排在 spawn 自己那一個**之後**——同一條命令列
-/// 上後項覆蓋前項，子代於是頂著**呼叫者的** tag 開起來：despawn 會殺錯世代、
-/// lineage 會把自己認成自己的 parent、relay 深度會被重置。
+/// `SPAWN_TAG` 是 spawn 自己拼進啟動指令的子代世代身分（despawn／回滾／
+/// lineage 全靠它）。白名單若放它過去，assignment 會排在 spawn 自己那一個
+/// **之後**——同一條命令列上後項覆蓋前項，子代於是頂著**呼叫者的** tag 開起
+/// 來：despawn 會殺錯世代、lineage 會把自己認成自己的 parent。
 ///
 /// 處置是**靜默剔除＋stderr 警告**，不使 spawn 失敗：呼叫端多半是把整份環境
 /// 名單抄過來，讓 spawn 硬失敗只會逼人拆名單，而剔除之後的行為正是他要的。
-pub const RESERVED_PASS_ENV: [&str; 2] = [ENV_SPAWN_TAG, ENV_RELAY_DEPTH];
+pub const RESERVED_PASS_ENV: [&str; 1] = [ENV_SPAWN_TAG];
 
 pub fn is_reserved_pass_env(name: &str) -> bool {
     RESERVED_PASS_ENV.contains(&name)
-}
-
-/// 接力鏈深度（cmd_relay:1438-1445）。bash 用 `${VAR-0}` 而非 `${VAR:-0}`：
-/// **「已設但為空」不吃預設**，會落進格式檢查被拒——否則
-/// `AGENT_BRIDGE_RELAY_DEPTH=''` 會靜默把鏈深度重置成 0，cap 形同虛設。
-/// 故此處不能用 `read_env`（它把空字串歸進 `Unset`）。
-pub fn relay_depth() -> Result<i64> {
-    depth_var(
-        ENV_RELAY_DEPTH,
-        0,
-        "需為非負整數（空值也不接受，避免靜默重置鏈深度）",
-    )
-}
-
-/// 接力鏈深度上限（預設 10；0＝解除限制）。
-pub fn max_relay_depth() -> Result<i64> {
-    depth_var(ENV_MAX_RELAY_DEPTH, 10, "需為非負整數（空值也不接受）")
 }
 
 /// here 落點的 layout（預設 `main-vertical`）。白名單驗證、壞值致命：
@@ -381,21 +352,13 @@ fn parse_here_layout(v: Option<std::ffi::OsString>) -> Result<String> {
     }
 }
 
-/// 「人工 session」判準的**唯一正本**：spawn 落點的 auto 規則與
-/// CLI-RELAY-4 盯守提醒都走這裡，兩路不得各自解讀（P4 審查 CONFIRMED 1）。
+/// 「人工 session」判準的**唯一正本**：spawn 落點的 auto 規則走這裡
+/// （P4 審查 CONFIRMED 1）。
 /// 三態語意：unset 與空字串＝人工（`:-` 慣例——空值視同沒設）；非 UTF-8
 /// ＝視為 tag 在場（保守：寧可少印提醒、worker 不落人類 window，也不把
 /// 亂碼當人工）。tag 是 placement provenance hint，不是身分授權。
 pub fn caller_is_manual() -> bool {
     matches!(read_env(ENV_SPAWN_TAG), EnvValue::Unset)
-}
-
-fn depth_var(name: &str, default: i64, complaint: &str) -> Result<i64> {
-    let Some(os) = std::env::var_os(name) else {
-        return Ok(default);
-    };
-    let raw = os.to_string_lossy().into_owned();
-    parse_ttl(&raw).ok_or_else(|| Error::new(format!("{name} {complaint}：{raw}")))
 }
 
 fn lossy(name: &str) -> String {

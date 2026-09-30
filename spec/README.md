@@ -42,7 +42,6 @@ M4 之前這裡同時是 Rust 與 bash 兩套實作的 parity 判準；bash 正�
 
 ## 既有規格文件的地位
 
-`share/worker-brief.md`、`share/successor-brief.md`、
-`share/claude-worker-hooks.json` 是行為正本的一部分（brief 策略不變量受
+`share/worker-brief.md`、`share/claude-worker-hooks.json` 是行為正本的一部分（brief 策略不變量受
 測試分組 27 保護；hooks.json 三事件裸命令不變量受分組 16 保護）——spec
 **引用不搬家**，避免雙正本漂移。

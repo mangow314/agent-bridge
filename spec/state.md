@@ -53,8 +53,8 @@ ambiguous，MUST 自成根＋可見警告，MUST NOT 依目錄序任選**。自�
 
 兩欄只在 spawn 寫入時決定一次，之後任何指令 MUST NOT 更新；`register`
 （人工註冊）MUST NOT 寫這兩欄；legacy registry **永不 backfill**。
-推導的任何失敗 MUST fail-soft（只降級成自成根＋警告），MUST NOT 改變 spawn／
-relay 成敗、cap、owner、ready 或審計等既有行為。
+推導的任何失敗 MUST fail-soft（只降級成自成根＋警告），MUST NOT 改變 spawn
+成敗、cap、owner、ready 或審計等既有行為。
 Note: 兩欄 **MUST NOT 進入任何 auth／CAS 判斷**——despawn／evict 的世代綁定
 照舊只認 `spawn_tag`。理由同 STATE-AGENT-4 的 Note：本檔對同互信域的 worker
 可寫，這兩欄是身分**線索**不是憑證。

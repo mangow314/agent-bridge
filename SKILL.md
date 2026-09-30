@@ -34,10 +34,6 @@ agent-bridge spawn <name> --runtime <codex|claude|agy> [--model <model>] [--prof
                                       # spawn-origin caller keeps its own dedicated worker window (created next to
                                       # it, reused across spawns, tiled); outside tmux it falls back to splitting
                                       # the current window; --here/--window override explicitly and are mutually exclusive
-agent-bridge relay <name> --runtime <codex|claude|agy> [--model <model>] --handoff <path> [--here|--window] [--no-select] [--self-exit <my-name>]  # [frozen: docs/scope-2026-09.md]
-                                      # hand over: open a successor pane (injects successor brief + handoff file); not a worker
-                                      # chain depth is capped (AGENT_BRIDGE_MAX_RELAY_DEPTH, default 10); hitting it means stop and get a human, not raise it yourself
-                                      # placement rules are identical to spawn (see above)
 agent-bridge despawn <name>           # reclaim a bridge-spawned worker (manually registered agents are refused)
 agent-bridge idle                     # (orchestrator) worker-pool reclaim view: name/ready/disposable/idle_secs
 agent-bridge evict <name> [--timeout <secs>] [--from <sender>]

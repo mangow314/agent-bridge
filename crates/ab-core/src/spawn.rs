@@ -2,7 +2,7 @@
 //! 出身防護（tag）、despawn／evict／idle／disposable（架構 §2 的 `spawn` 列）。
 //!
 //! 對映 bash：`cmd_spawn`:1063、`spawn_rollback`:940、`rb_kill_tagged`:928、
-//! `spawn_wait_ready`:1038、`worker_prompt_arg`:1007、`relay_prompt_arg`:1024、
+//! `spawn_wait_ready`:1038、`worker_prompt_arg`:1007、
 //! `cmd_despawn`:1476、`cmd_ready`:1594、`cmd_disposable`:1629、`cmd_idle`:1800、
 //! `disposable_effective`:444。
 //!
@@ -141,17 +141,7 @@ pub fn shell_quote_os(s: &std::ffi::OsStr) -> String {
     }
 }
 
-/// relay 專屬參數（cmd_relay:1391 的三處差異）。
-pub struct Relay {
-    /// 交接檔路徑（已由呼叫端驗過是可讀普通檔、不含單引號）。
-    pub handoff: String,
-    /// `--self-exit` 指定的前一棒；空字串＝不指定。
-    pub prev: String,
-    /// 下傳給接手者的鏈深度（本棒 +1）。
-    pub depth_next: i64,
-}
-
-/// spawn／relay 共用的請求。
+/// spawn 的請求。
 pub struct SpawnRequest {
     pub name: String,
     pub runtime: String,
@@ -164,7 +154,6 @@ pub struct SpawnRequest {
     /// `--here`：顯式要求落在呼叫者當前 window。與 `use_window` 互斥；
     /// 兩者皆 false 時走 auto 規則（docs/spawn-here-plan.md）。
     pub here: bool,
-    pub relay: Option<Relay>,
 }
 
 /// `worker_prompt_arg`:1007 — brief 檔＋動態尾巴組成 runtime 的 initial prompt
@@ -182,29 +171,6 @@ fn worker_prompt_arg(name: &str, brief: &str) -> Result<String> {
     }
     Ok(format!(
         "\"$(cat -- '{brief}')  -- The above is your worker brief. Your agent name is {name}. First action: immediately run agent-bridge ready {name}\""
-    ))
-}
-
-/// `relay_prompt_arg`:1024 — 接手者守則 ＋ 交接檔路徑 ＋（可選）要回收的前一棒。
-/// 三道防線同 `worker_prompt_arg`，但這裡更要緊：handoff 路徑來自使用者命令列。
-fn relay_prompt_arg(name: &str, brief: &str, handoff: &str, prev: &str) -> Result<String> {
-    if brief.contains('\'') {
-        return Err(Error::new(format!(
-            "接手者 brief 路徑不可含單引號：{brief}"
-        )));
-    }
-    if handoff.contains('\'') {
-        return Err(Error::new(format!("交接檔路徑不可含單引號：{handoff}")));
-    }
-    let tail = if prev.is_empty() {
-        String::new()
-    } else {
-        format!(
-            "After taking over, reclaim your predecessor: run agent-bridge despawn {prev} (if it was a manually started session the command is refused — that is normal; keep working)."
-        )
-    };
-    Ok(format!(
-        "\"$(cat -- '{brief}')  -- The above is your successor brief. Your agent name is {name}. Handoff file to continue from: {handoff}. First action: immediately run agent-bridge ready {name}, then read that handoff and start on its next steps. {tail}\""
     ))
 }
 
@@ -430,23 +396,12 @@ pub fn spawn(paths: &Paths, tmux: &dyn TmuxClient, req: &SpawnRequest) -> Result
     // 要驗普通檔案，不能只驗可讀：`[[ -r ]]` 對目錄一樣成立，而 pane 內的
     // `cat` 讀目錄會失敗、命令替換卻仍返回空字串，runtime 照樣被 exec 起來。
     // -f 一併擋掉 FIFO 與裝置檔（cat 會卡住或讀出無關內容）
-    let (brief_path, brief_kind, brief_env) = if req.relay.is_some() {
-        (
-            config::successor_brief(),
-            "接手者 brief",
-            config::ENV_SUCCESSOR_BRIEF,
-        )
-    } else {
-        (
-            config::worker_brief(),
-            "worker brief",
-            config::ENV_WORKER_BRIEF,
-        )
-    };
+    let brief_path = config::worker_brief();
     if !is_readable_file(&brief_path) {
         return Err(Error::new(format!(
-            "{brief_kind} 不是可讀的普通檔案：{}（可用 {brief_env} 指定）",
-            brief_path.display()
+            "worker brief 不是可讀的普通檔案：{}（可用 {} 指定）",
+            brief_path.display(),
+            config::ENV_WORKER_BRIEF
         )));
     }
     // brief 路徑是**原樣嵌進** pane 啟動指令的單引號字面值（`cat -- '<path>'`），
@@ -457,8 +412,9 @@ pub fn spawn(paths: &Paths, tmux: &dyn TmuxClient, req: &SpawnRequest) -> Result
     // 大聲失敗而非靜默注入錯誤守則（codex 複核 2026-07-31）
     if brief_path.to_str().is_none() {
         return Err(Error::new(format!(
-            "{brief_kind} 路徑不是合法 UTF-8，無法安全嵌入 pane 啟動指令：{}（可用 {brief_env} 指定）",
-            brief_path.display()
+            "worker brief 路徑不是合法 UTF-8，無法安全嵌入 pane 啟動指令：{}（可用 {} 指定）",
+            brief_path.display(),
+            config::ENV_WORKER_BRIEF
         )));
     }
 
@@ -766,10 +722,7 @@ fn spawn_locked(
     // 被注入的 worker A 只要把 B 的 tag 抄進自己的 registry，就能讓
     // orchestrator 的 `despawn A` 殺掉 B 的 pane
     let tag = format!("ab-spawn-{name}-{}-{}", std::process::id(), secure_hex12()?);
-    let prompt_arg = match &req.relay {
-        Some(r) => relay_prompt_arg(name, &ctx.brief_path.to_string_lossy(), &r.handoff, &r.prev)?,
-        None => worker_prompt_arg(name, &ctx.brief_path.to_string_lossy())?,
-    };
+    let prompt_arg = worker_prompt_arg(name, &ctx.brief_path.to_string_lossy())?;
 
     // proxy 環境穿透：pane 的環境繼承自 tmux server，不是 spawn 呼叫者——
     // orchestrator shell 才有的 proxy 變數到不了 worker，在強制走 proxy 的
@@ -804,10 +757,6 @@ fn spawn_locked(
         if let Some(v) = std::env::var_os(&pe) {
             env_prefix.push_str(&format!("{pe}={} ", shell_quote_os(&v)));
         }
-    }
-    // 接力鏈深度只在 relay 路徑下傳：spawn 出來的 worker 不是接力鏈的一環
-    if let Some(r) = &req.relay {
-        env_prefix.push_str(&format!("{}={} ", config::ENV_RELAY_DEPTH, r.depth_next));
     }
 
     let spawn_tag_env = canonical_spawn_tag(&tag);
@@ -996,17 +945,22 @@ fn spawn_locked(
     // registry。吞掉的話會留下一個沒有審計線、卻佔著 cap 的 worker，而呼叫端
     // 看到的是成功。這是 spawn 少數「審計比不可逆動作先發生」的位置——pane 還
     // 在回滾範圍內，所以這裡可以硬起來
-    // relay 記 `relayed`、spawn 記 `spawned`（CLI-SPAWN-6 的 action 值域）：
-    // 兩者共用整條生命週期，審計行是唯一分得出 relay 用量的地方
-    let action = if req.relay.is_some() { "relayed" } else { "spawned" };
-    registry::log_agent_event(paths, tmux, action, name, &pane, &req.runtime, Some(actor))?;
+    registry::log_agent_event(
+        paths,
+        tmux,
+        "spawned",
+        name,
+        &pane,
+        &req.runtime,
+        Some(actor),
+    )?;
     Ok(pane)
 }
 
 /// worker window 的名字：owner 所在 window 名冠上 `ab:` 前綴。
 ///
 /// **冠之前必須把既有的 `ab:` 前綴全部剝掉**：orchestrator 自己就可能坐在
-/// `ab:` 開頭的 window（relay 接棒、或從 worker window 內再 spawn），直接冠
+/// `ab:` 開頭的 window（例如從 worker window 內再 spawn），直接冠
 /// 會逐代累積成 `ab:ab:ab:…`（使用者實測回報，現場堆到七層）。剝到空字串
 /// （owner window 就叫 `ab:`）退回 `workers`，與 owner_winname 為空時同解。
 pub fn worker_window_name(owner_winname: &str) -> String {
@@ -1945,7 +1899,7 @@ mod tests {
 
     /// worker window 名不得逐代累積 `ab:` 前綴（使用者實測回報：現場堆到
     /// `ab:ab:ab:ab:ab:ab:ab:claude`）。累積來自 orchestrator 自己坐在
-    /// `ab:` 開頭的 window（relay 接棒／從 worker window 內再 spawn）。
+    /// `ab:` 開頭的 window（從 worker window 內再 spawn）。
     #[test]
     fn worker_window_name_never_stacks_the_prefix() {
         assert_eq!(worker_window_name("claude"), "ab:claude");
@@ -2397,16 +2351,11 @@ mod tests {
     #[test]
     fn reserved_names_never_reach_the_launch_command() {
         assert!(config::is_reserved_pass_env(config::ENV_SPAWN_TAG));
-        assert!(config::is_reserved_pass_env(config::ENV_RELAY_DEPTH));
         assert!(!config::is_reserved_pass_env("CLAUDE_UNATTENDED"));
 
         // 模擬 spawn 的組裝：reserved 被剔除、其餘照舊進 env_prefix
         let mut env_prefix = String::new();
-        for pe in [
-            config::ENV_SPAWN_TAG,
-            "CLAUDE_UNATTENDED",
-            config::ENV_RELAY_DEPTH,
-        ] {
+        for pe in [config::ENV_SPAWN_TAG, "CLAUDE_UNATTENDED"] {
             if config::is_reserved_pass_env(pe) {
                 continue;
             }
@@ -2418,10 +2367,6 @@ mod tests {
             cmd.matches("AGENT_BRIDGE_SPAWN_TAG=").count(),
             1,
             "MUST 只有一個 tag assignment，實際：{cmd}"
-        );
-        assert!(
-            !cmd.contains(config::ENV_RELAY_DEPTH),
-            "RELAY_DEPTH 同樣是保留變數：{cmd}"
         );
         assert!(cmd.contains("CLAUDE_UNATTENDED=1"), "非保留者照舊穿透");
         assert!(

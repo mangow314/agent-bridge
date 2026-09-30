@@ -35,7 +35,6 @@
 | 20b | readiness 參數建 pane 前驗 | CLI-SPAWN-2, ENV-READY-1, ENV-READY-2 |
 | 21 | 解鎖失敗不得靜默 | STATE-LOCK-2 |
 | 22 | worker brief 注入 | ENV-BRIEF-1, CLI-SPAWN-7 |
-| 23 | relay 交棒 | CLI-RELAY-1, CLI-RELAY-2, CLI-RELAY-3, CLI-RELAY-4, ENV-DEPTH-1, ENV-DEPTH-2, ENV-BRIEF-2 |
 | 24 | disposable | CLI-DISPOSABLE-1 |
 | 25 | idle 決策視圖 | CLI-IDLE-1, CLI-IDLE-2 |
 | 26 | evict 三段式 | CLI-EVICT-1, CLI-EVICT-2, CLI-EVICT-3 |
@@ -44,7 +43,7 @@
 | 29 | 第二輪複核修補 | CLI-GC-3, CLI-EVICT-3 |
 | 30 | CC 權限框特徵 canary | HOOK-NOTIFY-2 |
 | 31 | 第三輪複核修補 | CLI-STATUS-1, CLI-READ-1, CLI-AWAIT-2, CLI-DESPAWN-3, CLI-EVICT-2, CLI-RO-1, ENV-POLL-1, CLI-GEN-3, CLI-SEND-3, STATE-TASK-4, STATE-TASK-5 |
-| 32 | spawn 落點（`--here`／auto／`--window`）＋owner/actor 審計 | CLI-SPAWN-5, CLI-SPAWN-6, ENV-HERE-1, CLI-RELAY-1, CLI-RELAY-3 |
+| 32 | spawn 落點（`--here`／auto／`--window`）＋owner/actor 審計 | CLI-SPAWN-5, CLI-SPAWN-6, ENV-HERE-1 |
 | 33 | 通知原生化 Phase 1 | CLI-HOOK-1, HOOK-ID-1, HOOK-ID-2, HOOK-EVT-1, HOOK-EVT-2, HOOK-EVT-3, HOOK-EVT-4, HOOK-NOTIFY-1, STATE-CHAN-1, STATE-CHAN-2, STATE-CHAN-3, ENV-TTL-1 |
 | 34 | 獨立複核 blocker 修補 | HOOK-ID-3, HOOK-EVT-3, HOOK-NOTIFY-1, ENV-TTL-1, ENV-TTL-2 |
 | 34.5+ | 巢狀 runtime 冒名（owner gate） | HOOK-OWNER-1, HOOK-OWNER-2, HOOK-OWNER-3, HOOK-OWNER-4, HOOK-EVT-4, ENV-TTL-3, STATE-CHAN-2 |

@@ -1,6 +1,6 @@
 # 環境變數契約
 
-全部 18 個 `AGENT_BRIDGE_*` 變數（總數由 `tests/check-contract.sh` 第 1 項的
+全部 13 個 `AGENT_BRIDGE_*` 變數（總數由 `tests/check-contract.sh` 第 1 項的
 集合 diff 守著，不是手工維護的宣稱）。通則：
 
 ### ENV-GEN-1 [untested]
@@ -22,11 +22,6 @@ Source: 全域初始化（DATA_DIR）
 普通檔案，否則以錯誤終止（不得產生無守則的 worker）。
 Note: 預檢之後、pane 內實際讀取之前存在 TOCTOU 空隙，屬已知限制（README）。
 Source: cmd_spawn（WORKER_BRIEF 預檢）
-
-### ENV-BRIEF-2 [tested: 23]
-`AGENT_BRIDGE_SUCCESSOR_BRIEF`：relay 注入的接手者守則檔。預設
-`<repo>/share/successor-brief.md`。同 ENV-BRIEF-1 的失敗語意。
-Source: cmd_relay（SUCCESSOR_BRIEF）
 
 ### ENV-HOOKS-1 [tested: 16]
 `AGENT_BRIDGE_CLAUDE_HOOKS`：spawn claude runtime 時以 `--settings` 注入的
@@ -81,15 +76,15 @@ Source: hook_owner_gate
 Source: cmd_spawn
 
 ### ENV-READY-1 [tested: 16, 20b]
-`AGENT_BRIDGE_READY_TIMEOUT`：spawn/relay 等待 worker 回報 ready 的秒數。
+`AGENT_BRIDGE_READY_TIMEOUT`：spawn 等待 worker 回報 ready 的秒數。
 預設 `30`；`0` ＝不等待、立即返回。
-Source: cmd_spawn / cmd_relay
+Source: cmd_spawn
 
 ### ENV-READY-2 [tested: 16, 20b]
 `AGENT_BRIDGE_READY_PROBE_INTERVAL`：ready 等待期間探針重送間隔秒數。預設 `2`。
-Source: cmd_spawn / cmd_relay
+Source: cmd_spawn
 
-### ENV-TAG-1 [tested: 16, 18b, 23, 32]
+### ENV-TAG-1 [tested: 16, 18b, 32]
 `AGENT_BRIDGE_SPAWN_TAG`：worker 身分標籤，由 spawn 在 worker 行程環境設定，
 文法 MUST 為 `ab-spawn-<name>-<pid>-<12hex>`（`<name>` 符合 `[A-Za-z0-9_-]+`）。
 hook 端由它析出「我是誰」；despawn/evict 以它比對出身與世代。使用者手動
@@ -97,11 +92,11 @@ hook 端由它析出「我是誰」；despawn/evict 以它比對出身與世代�
 （CLI-SPAWN-5）另把它當 placement provenance hint 用，同樣不是身分授權。
 
 「呼叫者是不是人工 session」這個判準是上述兩種用法之外的**第三種**讀法：
-spawn 的 auto 落點規則（CLI-SPAWN-5）與 CLI-RELAY-4 的盯守提醒 MUST 共用
-同一份判準（正本 `config::caller_is_manual`，兩處不得各自解讀——P4 codex
-複核 CONFIRMED 1）。三態語意：**未設定或空字串**＝人工（`:-` 慣例，空值
-視同沒設）；**非 UTF-8**＝視為 tag 在場（即非人工——保守方向：寧可少印
-一次提醒、worker 不落人類 window，也不把讀不出來的亂碼當人工）；其餘任何
+spawn 的 auto 落點規則（CLI-SPAWN-5）MUST 走同一份判準（正本
+`config::caller_is_manual`，不得各自解讀——P4 codex 複核 CONFIRMED 1）。
+三態語意：**未設定或空字串**＝人工（`:-` 慣例，空值視同沒設）；
+**非 UTF-8**＝視為 tag 在場（即非人工——保守方向：worker 不落人類 window，
+也不把讀不出來的亂碼當人工）；其餘任何
 非空字串一律視為 tag 在場，這裡**不驗**上面那條 grammar（判準只問「有沒有
 設」，不是「設得對不對」）。
 Source: cmd_spawn / hook_agent_name / cmd_despawn / config::caller_is_manual
@@ -117,26 +112,14 @@ window 後套用的 tmux layout（CLI-SPAWN-5）。預設 `main-vertical`；合�
 tmux 外呼叫都不解析此變數，無關的壞值不得封鎖這些逃生口。
 Source: config::here_layout / cmd_spawn
 
-## relay 鏈
+## 環境穿透
 
 ### ENV-PASS-1 [tested: 16]
-`AGENT_BRIDGE_PASS_ENV`：逗號分隔的變數名清單，spawn/relay 時穿透給 worker。
+`AGENT_BRIDGE_PASS_ENV`：逗號分隔的變數名清單，spawn 時穿透給 worker。
 任一名稱不符合合法變數名文法時 MUST 以錯誤終止。預設空（不穿透）。
-**reserved 變數 MUST 排除**（`AGENT_BRIDGE_SPAWN_TAG`、`AGENT_BRIDGE_RELAY_DEPTH`
-——由 spawn 自行設定）：兩者若獲穿透，其 assignment 會排在 spawn 自己那一個
-之後而覆蓋它，子代於是頂著呼叫者的 tag 開起來（despawn 殺錯世代、lineage 跳錯
-parent、relay 深度重置）。排除採**靜默剔除＋stderr 警告**，MUST NOT 使 spawn
-失敗。雙 runtime 同步（tag `pre-trim-2026-09` 的 docs/tui-design.md §9 P4.7／§11 B4）。
+**reserved 變數 MUST 排除**（`AGENT_BRIDGE_SPAWN_TAG`——由 spawn 自行設定）：
+若獲穿透，其 assignment 會排在 spawn 自己那一個之後而覆蓋它，子代於是頂著
+呼叫者的 tag 開起來（despawn 殺錯世代、lineage 跳錯 parent）。排除採
+**靜默剔除＋stderr 警告**，MUST NOT 使 spawn 失敗。雙 runtime 同步（tag
+`pre-trim-2026-09` 的 docs/tui-design.md §9 P4.7／§11 B4）。
 Source: cmd_spawn（pass_list）
-
-### ENV-DEPTH-1 [tested: 23]
-`AGENT_BRIDGE_RELAY_DEPTH`：本 session 在接力鏈上的棒次，由鏈上逐棒下傳。
-未設定 MUST 視為 `0`；**空字串或非數字 MUST 以錯誤終止**（空值靜默重置鏈
-深度會癱瘓 cap，不可放寬）。
-Source: cmd_relay
-
-### ENV-DEPTH-2 [tested: 23]
-`AGENT_BRIDGE_MAX_RELAY_DEPTH`：接力鏈棒次上限。未設定 MUST 視為 `10`；
-空字串或非數字 MUST 以錯誤終止；`0` ＝解除上限。達上限時 relay MUST 拒絕
-並提示需人工介入。
-Source: cmd_relay

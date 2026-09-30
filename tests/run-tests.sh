@@ -5,10 +5,10 @@
 set -u
 unset TMUX
 # 同理清掉 agent-bridge 自己的環境變數。測試套件的常態執行位置就是一個
-# spawn／relay 出來的 worker pane（本專案自己 dogfood），那個 session 的
-# AGENT_BRIDGE_SPAWN_TAG 與 AGENT_BRIDGE_RELAY_DEPTH 會被子行程一路繼承，
-# 讓「hook 無 tag」「relay 首棒深度 0」這類前提悄悄失效——實測 2026-07-28：
-# 同一份程式碼在人工起的 session 全綠、在 relay 出身的 session 卻有兩段
+# spawn 出來的 worker pane（本專案自己 dogfood），那個 session 的
+# AGENT_BRIDGE_SPAWN_TAG 會被子行程一路繼承，
+# 讓「hook 無 tag」這類前提悄悄失效——實測 2026-07-28：
+# 同一份程式碼在人工起的 session 全綠、在 spawn 出身的 session 卻有兩段
 # 失敗，且失敗與被測程式無關。這是會隨執行環境改變結論的假綠／假紅來源，
 # 比個別測例補 env -u 更該在源頭清掉：各測例要用這些變數時一律自己用 env
 # 明確帶入，繼承來的值一概不要。
@@ -154,7 +154,7 @@ declare -A GRP_NEEDS=(
   # 語意 fixture，變數掃描抓不到 manual-x 這種字串依賴）
   [17]="16" [18]="16"
 )
-GRP_KNOWN=" 1 2 3 4 5 6 7 8 8a 8b 9 10 11 12 13 14 15 16 17 18 18b 18c 19 20 20b 21 22 23 24 25 26 27 28 29 30 31 32 33 34 34.5+ 35 36 37 38 39 41 42 46 49 "
+GRP_KNOWN=" 1 2 3 4 5 6 7 8 8a 8b 9 10 11 12 13 14 15 16 17 18 18b 18c 19 20 20b 21 22 24 25 26 27 28 29 30 31 32 33 34 34.5+ 35 36 37 38 39 41 42 46 49 "
 GRP_SELECTED=""
 GRP_SKIPPED=0
 if [[ -n "${TEST_GROUPS:-}" ]]; then
@@ -1141,8 +1141,6 @@ assert "指名但未設的變數不塞空值進啟動指令" \
   bash -c "c=${wp2_cmd@Q}; [[ \"\$c\" != *' PE_UNSET='* ]]"
 assert "worker 程序環境實拿 PE_SET（含空白逗號，往返無損）" \
   grep -Fxq 'PE_SET=v 1,x' "$TESTROOT/claude-env.txt"
-assert "spawn 不是接力鏈的一環，不下傳 relay 深度" \
-  bash -c "c=${wp2_cmd@Q}; [[ \"\$c\" != *AGENT_BRIDGE_RELAY_DEPTH=* ]]"
 assert "帶 PASS_ENV 前綴的 worker 可正常 despawn" ab "$DSPAWN" despawn wp2
 assert_fails "PASS_ENV 含不合法變數名被拒（擋往啟動指令拼接的意外詞）" \
   env AGENT_BRIDGE_DATA="$DSPAWN" AGENT_BRIDGE_READY_TIMEOUT=0 PATH="$SHIM:$PATH" \
@@ -1343,8 +1341,8 @@ assert "lineage：stderr 關閉下 registry 照樣落地" test -e "$DDUP/agents/
 # MUST 剔除：spawn 成功、有警告，且 pane 啟動指令**只有一個** tag assignment
 # （多出來的那個排在後面會覆蓋前者，子代於是頂著呼叫者的 tag 開起來）
 pane_lres="$(env AGENT_BRIDGE_DATA="$DLIN" AGENT_BRIDGE_READY_TIMEOUT=0 AGENT_BRIDGE_MAX_SPAWN=20 PATH="$SHIM:$PATH" \
-    AGENT_BRIDGE_PASS_ENV='AGENT_BRIDGE_SPAWN_TAG,AGENT_BRIDGE_RELAY_DEPTH,PE_OK' \
-    AGENT_BRIDGE_SPAWN_TAG="$lroot_bare" AGENT_BRIDGE_RELAY_DEPTH=3 PE_OK=keepme \
+    AGENT_BRIDGE_PASS_ENV='AGENT_BRIDGE_SPAWN_TAG,PE_OK' \
+    AGENT_BRIDGE_SPAWN_TAG="$lroot_bare" PE_OK=keepme \
   "$BRIDGE" spawn lres --runtime codex --window 2>"$TESTROOT/lres.err")"; rc=$?
 assert "PASS_ENV reserved：spawn 仍成功（靜默剔除，不是 fail-closed）" test "$rc" -eq 0
 assert "PASS_ENV reserved：stderr 有剔除警告" \
@@ -1352,8 +1350,6 @@ assert "PASS_ENV reserved：stderr 有剔除警告" \
 lres_cmd="$(tmx display -pt "$pane_lres" '#{pane_start_command}')"
 assert "PASS_ENV reserved：pane 啟動指令只有一個 AGENT_BRIDGE_SPAWN_TAG= assignment" \
   bash -c "c=${lres_cmd@Q}; n=\$(grep -o 'AGENT_BRIDGE_SPAWN_TAG=' <<<\"\$c\" | wc -l); (( n == 1 ))"
-assert "PASS_ENV reserved：RELAY_DEPTH 沒被白名單帶進啟動指令" \
-  bash -c "c=${lres_cmd@Q}; [[ \"\$c\" != *AGENT_BRIDGE_RELAY_DEPTH=* ]]"
 assert "PASS_ENV reserved：非保留變數照舊穿透（證明不是整份白名單被丟掉）" \
   bash -c "c=${lres_cmd@Q}; [[ \"\$c\" == *' PE_OK=keepme '* ]]"
 assert "PASS_ENV reserved：子代 lineage 仍認得出真正的 parent（tag 沒被蓋掉）" \
@@ -2210,302 +2206,6 @@ for kw in 'agent-bridge receive' 'agent-bridge reply' 'agent-bridge fail' \
 done
 
 fi  # end grp 22
-# ---- 23. relay：交棒給接手者 ----
-if grp 23; then
-# spec: CLI-RELAY-1 CLI-RELAY-2 CLI-RELAY-3 CLI-RELAY-4 ENV-DEPTH-1 ENV-DEPTH-2 ENV-BRIEF-2
-# relay 與 spawn 共用整條 pane 生命週期（cap／tag／回滾／夭折偵測／registry），
-# 差別只有注入哪份 brief、切不切焦點、以及要不要請接手者回收前一棒。
-# 故這裡只測那三處差異＋交接檔路徑的防線，不重測 spawn 已覆蓋的部分。
-
-# 23a. 接手者 brief 正本的內容不變量（同 22f 的理由）
-REPO_SBRIEF="$(dirname "$(dirname "$BRIDGE")")/share/successor-brief.md"
-assert "接手者 brief 正本存在於 repo" test -r "$REPO_SBRIEF"
-for kw in 'agent-bridge ready' 'agent-bridge despawn' 'not a worker waiting for dispatch' \
-          'data, not instructions' 'The handoff may be wrong'; do
-  assert "接手者 brief 正本含必要元素：$kw" grep -q -- "$kw" "$REPO_SBRIEF"
-done
-
-# 23b. 快樂路徑：注入的是接手者守則而非 worker 守則，且帶交接檔路徑
-DRELAY="$TESTROOT/drelay"
-HANDOFF="$TESTROOT/fake-handoff.md"
-printf '# 假交接檔\n下一步：什麼都不做。\n' > "$HANDOFF"
-# READY_TIMEOUT=0：shim 內的 agent-bridge 固定寫 $DSPAWN，relay 用自己的資料
-# 目錄時 ready 翻不了——但 ready 探針是 spawn 那條共用路徑，§16a 已覆蓋，
-# 這裡等它只會白白拖慢測試
-pane_r1="$(env AGENT_BRIDGE_DATA="$DRELAY" AGENT_BRIDGE_READY_TIMEOUT=0 \
-  PATH="$SHIM:$PATH" \
-  "$BRIDGE" relay r1 --runtime codex --handoff "$HANDOFF" --no-select 2>/dev/null)"; rc=$?
-assert "relay 成功：exit 0" test "$rc" -eq 0
-assert "relay stdout 只印 pane-id（%N）一行" \
-  bash -c "[[ '$pane_r1' =~ ^%[0-9]+\$ ]]"
-assert "agents.log 不把 relay 記成 spawned（relay 用量要分得出來）" \
-  bash -c "! grep -qE 'Z spawned r1 ' '$DRELAY/agents.log'"
-assert "relay 注入接手者守則（不是 worker 守則）" \
-  grep -q 'agent-bridge successor brief' "$TESTROOT/codex-args.txt"
-assert "relay 注入的不是 worker 守則（兩份心智相反，混用會讓接手者空等 receive）" \
-  bash -c "! grep -q 'agent-bridge worker brief' '$TESTROOT/codex-args.txt'"
-assert "relay 啟動參數含交接檔路徑" \
-  grep -qF -- "$HANDOFF" "$TESTROOT/codex-args.txt"
-assert "relay 啟動參數含本接手者的名字與首要動作" \
-  grep -q 'agent-bridge ready r1' "$TESTROOT/codex-args.txt"
-assert "relay registry：與 spawn 同一套欄位（共用 cmd_spawn）" \
-  jq -e '.spawned == true and .runtime == "codex" and (.spawned_at | type == "string")' \
-  "$DRELAY/agents/r1.json"
-assert "relay 寫 agents.log（審計線不因換命令而斷；action 記 relayed，CLI-SPAWN-6）" \
-  grep -qE "Z relayed r1 ${pane_r1} codex -\$" "$DRELAY/agents.log"
-
-# 23b2. relay --model 直通 cmd_spawn（驗證正本在 spawn 的解析點，relay 不抄第二份）
-env AGENT_BRIDGE_DATA="$DRELAY" AGENT_BRIDGE_READY_TIMEOUT=0 \
-  PATH="$SHIM:$PATH" \
-  "$BRIDGE" relay r1m --runtime codex --model gpt-relay --handoff "$HANDOFF" --no-select >/dev/null 2>&1; rc=$?
-assert "relay --model：exit 0" test "$rc" -eq 0
-assert "relay 啟動參數含相鄰的 --model gpt-relay" \
-  grep -q -- '--model gpt-relay' "$TESTROOT/codex-args.txt"
-assert "relay --model 進 registry" \
-  jq -e '.model == "gpt-relay"' "$DRELAY/agents/r1m.json"
-assert_fails "relay 的不合法 model 一樣被 spawn 解析點擋下" \
-  env AGENT_BRIDGE_DATA="$DRELAY" AGENT_BRIDGE_READY_TIMEOUT=0 PATH="$SHIM:$PATH" \
-  "$BRIDGE" relay r1x --runtime codex --model 'x;kill-server' --handoff "$HANDOFF" --no-select
-assert "被拒的 relay 不留 registry" \
-  bash -c "[[ ! -e '$DRELAY/agents/r1x.json' ]]"
-assert "relay --model 的接手者可正常 despawn（不佔用後續 cap）" \
-  env AGENT_BRIDGE_DATA="$DRELAY" PATH="$SHIM:$PATH" "$BRIDGE" despawn r1m
-
-# 23b2b. relay 凍結（docs/scope-2026-09.md）：spawn 的 --profile 不開給 relay，
-# 帶了就走既有「未知參數」拒絕路徑、不建 pane
-assert_fails "relay 拒絕 --profile（凍結中的指令不接新旗標）" \
-  env AGENT_BRIDGE_DATA="$DRELAY" AGENT_BRIDGE_READY_TIMEOUT=0 PATH="$SHIM:$PATH" \
-  "$BRIDGE" relay r1p --runtime codex --profile agent-worker-local --handoff "$HANDOFF" --no-select
-assert "被拒的 relay --profile 不留 registry" \
-  bash -c "[[ ! -e '$DRELAY/agents/r1p.json' ]]"
-
-# 23b3. relay 的接手者也是 claude session（通知原生化 Phase 2）：cmd_relay 全程
-# 共用 cmd_spawn，這裡驗的正是「不必另開分支」這件事本身——接手者同樣要收
-# hooks，才收得到下一棒任務的 Stop hook 通知，不該因為走的是 relay 而漏接
-pane_r1c="$(env AGENT_BRIDGE_DATA="$DRELAY" AGENT_BRIDGE_READY_TIMEOUT=0 \
-  PATH="$SHIM:$PATH" \
-  "$BRIDGE" relay r1c --runtime claude --handoff "$HANDOFF" --no-select 2>/dev/null)"; rc=$?
-assert "relay --runtime claude：exit 0" test "$rc" -eq 0
-assert "relay（claude 接手者）啟動參數含 --settings <path>（與 worker 共用同一份 hooks）" \
-  grep -qF -- "--settings $ROOT/share/claude-worker-hooks.json" "$TESTROOT/claude-args.txt"
-r1c_cmd="$(tmx display -pt "$pane_r1c" '#{pane_start_command}')"
-assert "relay（claude 接手者）pane_start_command 同樣含 --settings（非僅 argv 檔佐證）" \
-  bash -c "c=${r1c_cmd@Q}; [[ \"\$c\" == *'--settings '* ]]"
-assert "relay（claude）接手者可正常 despawn（不佔用後續 cap）" \
-  env AGENT_BRIDGE_DATA="$DRELAY" PATH="$SHIM:$PATH" "$BRIDGE" despawn r1c
-
-# 未指定 --self-exit 時不該憑空冒出回收指示。
-# 不能拿 'agent-bridge despawn' 當關鍵字——接手者 brief 內文本來就有那一段
-# （說明被拒是正常的），會恆綠。要鎖的是動態尾巴本身
-assert "relay 未指定 --self-exit：prompt 不含回收前一棒的尾巴" \
-  bash -c "! grep -q 'After taking over, reclaim your predecessor' '$TESTROOT/codex-args.txt'"
-ab "$DRELAY" despawn r1 >/dev/null 2>&1 || true
-
-# 23c. --self-exit：把回收前一棒的指示寫進接手者的 prompt。
-# 注意這裡鎖的是「指示有送到」，不是「A 真的被殺」——動手的是接手者，
-# 那條路徑就是既有的 cmd_despawn（已由 §17 等覆蓋）
-env AGENT_BRIDGE_DATA="$DRELAY" AGENT_BRIDGE_READY_TIMEOUT=20 \
-  AGENT_BRIDGE_READY_PROBE_INTERVAL=0.5 PATH="$SHIM:$PATH" \
-  "$BRIDGE" relay r2 --runtime codex --handoff "$HANDOFF" --no-select \
-  --self-exit prev-agent >/dev/null 2>&1; rc=$?
-assert "relay --self-exit：exit 0" test "$rc" -eq 0
-assert "relay --self-exit：prompt 指示接手者 despawn 前一棒" \
-  grep -q 'reclaim your predecessor: run agent-bridge despawn prev-agent' \
-  "$TESTROOT/codex-args.txt"
-assert "relay --self-exit：prompt 說明人工 pane 被拒是正常的（防接手者硬繞）" \
-  grep -q 'manually started session the command is refused' "$TESTROOT/codex-args.txt"
-ab "$DRELAY" despawn r2 >/dev/null 2>&1 || true
-
-# 23d. --self-exit 的名稱會進 prompt 字面值，必須擋住不合法名稱
-before_se="$(pane_count)"
-env AGENT_BRIDGE_DATA="$DRELAY" AGENT_BRIDGE_READY_TIMEOUT=0 PATH="$SHIM:$PATH" \
-  "$BRIDGE" relay r3 --runtime codex --handoff "$HANDOFF" \
-  --self-exit 'bad;name' >/dev/null 2>"$TESTROOT/se.err"; rc=$?
-assert "relay --self-exit 名稱不合法：非零退出" test "$rc" -ne 0
-assert "relay --self-exit 名稱不合法：訊息指出名稱問題" \
-  grep -q '名稱不合法' "$TESTROOT/se.err"
-assert "relay --self-exit 名稱不合法：不建 pane" test "$(pane_count)" -eq "$before_se"
-assert "relay --self-exit 名稱不合法：不留 registry" test ! -e "$DRELAY/agents/r3.json"
-
-# 23e. 交接檔路徑的防線：不存在／是目錄／含單引號。
-# 三道都必須在建 pane 之前擋下——pane 落地後才 die 會留下佔 cap 的孤兒。
-#
-# 關於「夾帶的命令未被執行」那條斷言的實測結果（破壞驗證 M6，值得記下來）：
-# 把 cmd_relay 與 relay_prompt_arg 兩道單引號檢查都拆掉後，紅的是「非零退出」
-# 「訊息指出單引號」「不建 pane」三條，**注入斷言本身沒紅**。另以獨立小腳本
-# 確認：同一個 payload 直接餵給 `sh -c` 時 touch 確實會執行（注入得手），
-# 所以純 shell 層的危險是真的；但經過 tmux split-window 這一層之後它沒有落地，
-# 原因未查明。故這條斷言在此路徑上只當「真的被注入時的最後保險」，
-# **實際鎖住防線的是前三條**——別把它當成注入防線的主要證據。
-before_ho="$(pane_count)"
-env AGENT_BRIDGE_DATA="$DRELAY" AGENT_BRIDGE_READY_TIMEOUT=0 PATH="$SHIM:$PATH" \
-  "$BRIDGE" relay r4 --runtime codex --handoff "$TESTROOT/no-such-handoff.md" \
-  >/dev/null 2>"$TESTROOT/ho1.err"; rc=$?
-assert "交接檔不存在：非零退出" test "$rc" -ne 0
-assert "交接檔不存在：訊息指出交接檔問題" grep -q '交接檔' "$TESTROOT/ho1.err"
-assert "交接檔不存在：不建 pane" test "$(pane_count)" -eq "$before_ho"
-assert "交接檔不存在：不留 registry" test ! -e "$DRELAY/agents/r4.json"
-
-env AGENT_BRIDGE_DATA="$DRELAY" AGENT_BRIDGE_READY_TIMEOUT=0 PATH="$SHIM:$PATH" \
-  "$BRIDGE" relay r5 --runtime codex --handoff "$TESTROOT" \
-  >/dev/null 2>"$TESTROOT/ho2.err"; rc=$?
-assert "交接檔是目錄：非零退出" test "$rc" -ne 0
-assert "交接檔是目錄：訊息指出不是普通檔案" \
-  grep -q '不是可讀的普通檔案' "$TESTROOT/ho2.err"
-assert "交接檔是目錄：不建 pane" test "$(pane_count)" -eq "$before_ho"
-
-HO_MARK="$TESTROOT/relay-injected.txt"
-rm -f "$HO_MARK"
-# 這個惡意路徑必須真的存在，否則前一道 -f 檢查就把它擋下來，測例會變成在測
-# 「檔案不存在」而不是單引號防線——拿掉單引號檢查也照樣綠（22c 踩過同一個坑）。
-# payload 含絕對路徑 → 「檔名」帶斜線、實為多層路徑，父目錄要先建
-HO_INJ="$TESTROOT/x'; touch $HO_MARK; '.md"
-mkdir -p "$(dirname "$HO_INJ")"
-printf 'x\n' > "$HO_INJ"
-env AGENT_BRIDGE_DATA="$DRELAY" AGENT_BRIDGE_READY_TIMEOUT=0 PATH="$SHIM:$PATH" \
-  "$BRIDGE" relay r6 --runtime codex \
-  --handoff "$HO_INJ" >/dev/null 2>"$TESTROOT/ho3.err"; rc=$?
-assert "交接檔路徑含單引號：非零退出" test "$rc" -ne 0
-assert "交接檔路徑含單引號：訊息指出是單引號的問題" \
-  grep -q '單引號' "$TESTROOT/ho3.err"
-assert "交接檔路徑含單引號：路徑裡夾帶的命令未被執行（注入防線）" \
-  test ! -e "$HO_MARK"
-assert "交接檔路徑含單引號：不建 pane" test "$(pane_count)" -eq "$before_ho"
-
-# 23f. 參數缺漏
-assert_fails "relay 缺 --handoff 被拒" \
-  env AGENT_BRIDGE_DATA="$DRELAY" AGENT_BRIDGE_READY_TIMEOUT=0 PATH="$SHIM:$PATH" \
-  "$BRIDGE" relay r7 --runtime codex
-assert "relay 缺 --handoff：不留 registry" test ! -e "$DRELAY/agents/r7.json"
-
-# 23g. 接手者 brief 讀不到 → fail-closed（同 22b，但走 relay 這條路徑）
-env AGENT_BRIDGE_DATA="$DRELAY" AGENT_BRIDGE_READY_TIMEOUT=0 PATH="$SHIM:$PATH" \
-    AGENT_BRIDGE_SUCCESSOR_BRIEF="$TESTROOT/no-such-sbrief.md" \
-  "$BRIDGE" relay r8 --runtime codex --handoff "$HANDOFF" \
-  >/dev/null 2>"$TESTROOT/sb.err"; rc=$?
-assert "接手者 brief 缺失：非零退出" test "$rc" -ne 0
-assert "接手者 brief 缺失：訊息指出讀不到接手者 brief" \
-  grep -q '接手者 brief' "$TESTROOT/sb.err"
-assert "接手者 brief 缺失：不建 pane" test "$(pane_count)" -eq "$before_ho"
-assert "接手者 brief 缺失：不留 registry" test ! -e "$DRELAY/agents/r8.json"
-
-# 23h. 接力鏈深度上限。接手者守則明文鼓勵「context 吃緊就再交棒」，沒有上界就是
-# 無界遞迴——無人值守時一路接下去，燒掉的額度沒有天花板。深度靠
-# AGENT_BRIDGE_RELAY_DEPTH 逐棒下傳，人工起的第一棒沒有這個變數＝深度 0。
-# 獨立資料目錄＋放大 MAX_SPAWN：本段連開數個接手者，不想撞到與本主題無關的 cap。
-DDEPTH="$TESTROOT/ddepth"
-env AGENT_BRIDGE_DATA="$DDEPTH" AGENT_BRIDGE_READY_TIMEOUT=0 PATH="$SHIM:$PATH" \
-    AGENT_BRIDGE_MAX_SPAWN=20 \
-  "$BRIDGE" relay rd1 --runtime codex --handoff "$HANDOFF" --no-select >/dev/null 2>&1; rc=$?
-assert "relay 首棒（呼叫端未設深度）：exit 0" test "$rc" -eq 0
-rd1_cmd="$(tmx display -pt "$(jq -r .pane_id "$DDEPTH/agents/rd1.json")" '#{pane_start_command}')"
-assert "首棒下傳深度 1，且深度是 exec 前最後一個 env" \
-  bash -c "c=${rd1_cmd@Q}; [[ \"\$c\" == *' AGENT_BRIDGE_RELAY_DEPTH=1 exec '* ]]"
-
-env AGENT_BRIDGE_DATA="$DDEPTH" AGENT_BRIDGE_READY_TIMEOUT=0 PATH="$SHIM:$PATH" \
-    AGENT_BRIDGE_MAX_SPAWN=20 AGENT_BRIDGE_RELAY_DEPTH=3 \
-  "$BRIDGE" relay rd2 --runtime codex --handoff "$HANDOFF" --no-select >/dev/null 2>&1
-rd2_cmd="$(tmx display -pt "$(jq -r .pane_id "$DDEPTH/agents/rd2.json")" '#{pane_start_command}')"
-assert "深度逐棒遞增（3 → 4）" \
-  bash -c "c=${rd2_cmd@Q}; [[ \"\$c\" == *' AGENT_BRIDGE_RELAY_DEPTH=4 exec '* ]]"
-
-# 達預設上限（10）：必須在建 pane 之前擋下，否則留一個佔 cap 的孤兒
-before_d="$(pane_count)"
-env AGENT_BRIDGE_DATA="$DDEPTH" AGENT_BRIDGE_READY_TIMEOUT=0 PATH="$SHIM:$PATH" \
-    AGENT_BRIDGE_MAX_SPAWN=20 AGENT_BRIDGE_RELAY_DEPTH=10 \
-  "$BRIDGE" relay rd3 --runtime codex --handoff "$HANDOFF" --no-select \
-  >/dev/null 2>"$TESTROOT/rd.err"; rc=$?
-assert "達接力上限：非零退出" test "$rc" -ne 0
-assert "達接力上限：訊息點明需要人介入" grep -q '人介入' "$TESTROOT/rd.err"
-assert "達接力上限：不建 pane" test "$(pane_count)" -eq "$before_d"
-assert "達接力上限：不留 registry" test ! -e "$DDEPTH/agents/rd3.json"
-
-assert_fails "自訂上限同樣生效（MAX=2、已在第 2 棒）" \
-  env AGENT_BRIDGE_DATA="$DDEPTH" AGENT_BRIDGE_READY_TIMEOUT=0 PATH="$SHIM:$PATH" \
-      AGENT_BRIDGE_MAX_SPAWN=20 AGENT_BRIDGE_RELAY_DEPTH=2 AGENT_BRIDGE_MAX_RELAY_DEPTH=2 \
-    "$BRIDGE" relay rd4 --runtime codex --handoff "$HANDOFF" --no-select
-
-# 0 ＝ 解除限制（逃生門：人確認過這條鏈該繼續）
-env AGENT_BRIDGE_DATA="$DDEPTH" AGENT_BRIDGE_READY_TIMEOUT=0 PATH="$SHIM:$PATH" \
-    AGENT_BRIDGE_MAX_SPAWN=20 AGENT_BRIDGE_RELAY_DEPTH=99 AGENT_BRIDGE_MAX_RELAY_DEPTH=0 \
-  "$BRIDGE" relay rd5 --runtime codex --handoff "$HANDOFF" --no-select >/dev/null 2>&1; rc=$?
-assert "MAX_RELAY_DEPTH=0：不設限，深度 99 仍可交棒" test "$rc" -eq 0
-rd5_cmd="$(tmx display -pt "$(jq -r .pane_id "$DDEPTH/agents/rd5.json")" '#{pane_start_command}')"
-assert "解除限制時深度仍照常遞增（99 → 100）" \
-  bash -c "c=${rd5_cmd@Q}; [[ \"\$c\" == *' AGENT_BRIDGE_RELAY_DEPTH=100 exec '* ]]"
-
-assert_fails "深度非數值被拒（不默默當 0 放行）" \
-  env AGENT_BRIDGE_DATA="$DDEPTH" AGENT_BRIDGE_READY_TIMEOUT=0 PATH="$SHIM:$PATH" \
-      AGENT_BRIDGE_MAX_SPAWN=20 AGENT_BRIDGE_RELAY_DEPTH=abc \
-    "$BRIDGE" relay rd6 --runtime codex --handoff "$HANDOFF" --no-select
-assert_fails "上限非數值被拒" \
-  env AGENT_BRIDGE_DATA="$DDEPTH" AGENT_BRIDGE_READY_TIMEOUT=0 PATH="$SHIM:$PATH" \
-      AGENT_BRIDGE_MAX_SPAWN=20 AGENT_BRIDGE_MAX_RELAY_DEPTH=x \
-    "$BRIDGE" relay rd7 --runtime codex --handoff "$HANDOFF" --no-select
-
-# 邊界：空字串必須與非數值同樣 fail-closed。`${VAR:-default}` 會把「已設但為空」
-# 吃成預設值，深度於是被靜默重置為 0、cap 形同虛設——獨立複核（2026-07-25）以
-# 對抗重跑抓到這條，故實作改用 `${VAR-default}`，這裡鎖住行為不回退
-assert_fails "深度為空字串被拒（不得靜默重置成 0）" \
-  env AGENT_BRIDGE_DATA="$DDEPTH" AGENT_BRIDGE_READY_TIMEOUT=0 PATH="$SHIM:$PATH" \
-      AGENT_BRIDGE_MAX_SPAWN=20 AGENT_BRIDGE_RELAY_DEPTH= \
-    "$BRIDGE" relay rd8 --runtime codex --handoff "$HANDOFF" --no-select
-assert "深度空字串被拒：不留 registry" test ! -e "$DDEPTH/agents/rd8.json"
-assert_fails "上限為空字串被拒（不得靜默回到預設 10）" \
-  env AGENT_BRIDGE_DATA="$DDEPTH" AGENT_BRIDGE_READY_TIMEOUT=0 PATH="$SHIM:$PATH" \
-      AGENT_BRIDGE_MAX_SPAWN=20 AGENT_BRIDGE_MAX_RELAY_DEPTH= \
-    "$BRIDGE" relay rd9 --runtime codex --handoff "$HANDOFF" --no-select
-assert_fails "深度為負數被拒" \
-  env AGENT_BRIDGE_DATA="$DDEPTH" AGENT_BRIDGE_READY_TIMEOUT=0 PATH="$SHIM:$PATH" \
-      AGENT_BRIDGE_MAX_SPAWN=20 AGENT_BRIDGE_RELAY_DEPTH=-1 \
-    "$BRIDGE" relay rd10 --runtime codex --handoff "$HANDOFF" --no-select
-assert_fails "深度超出 9 位數被拒（格式上限，不是溢位後才發現）" \
-  env AGENT_BRIDGE_DATA="$DDEPTH" AGENT_BRIDGE_READY_TIMEOUT=0 PATH="$SHIM:$PATH" \
-      AGENT_BRIDGE_MAX_SPAWN=20 AGENT_BRIDGE_RELAY_DEPTH=1000000000 \
-    "$BRIDGE" relay rd11 --runtime codex --handoff "$HANDOFF" --no-select
-# 前導零合法（與 AGENT_BRIDGE_POLL_INTERVAL 等既有數值參數同慣例），且要以
-# 十進位解析——沒有 10# 前綴的話 008/009 會被當八進位而報錯
-env AGENT_BRIDGE_DATA="$DDEPTH" AGENT_BRIDGE_READY_TIMEOUT=0 PATH="$SHIM:$PATH" \
-    AGENT_BRIDGE_MAX_SPAWN=20 AGENT_BRIDGE_RELAY_DEPTH=008 \
-  "$BRIDGE" relay rd12 --runtime codex --handoff "$HANDOFF" --no-select >/dev/null 2>&1; rc=$?
-assert "前導零深度合法且以十進位解析：exit 0" test "$rc" -eq 0
-rd12_cmd="$(tmx display -pt "$(jq -r .pane_id "$DDEPTH/agents/rd12.json")" '#{pane_start_command}')"
-assert "前導零 008 解析為 8，下傳 9（非八進位）" \
-  bash -c "c=${rd12_cmd@Q}; [[ \"\$c\" == *' AGENT_BRIDGE_RELAY_DEPTH=9 exec '* ]]"
-
-# 收乾淨：pane 是跨測試段共享的資源（registry 各自獨立，pane 不是），本段開的
-# 接手者若留著，後面 idle／evict 那些以 pane 佈局為前提的段落會被推歪
-for rdn in rd1 rd2 rd5 rd12; do
-  assert "23h 收尾：despawn $rdn（pane 還回共享池）" ab "$DDEPTH" despawn "$rdn"
-done
-
-# 23i. CLI-RELAY-4：手動呼叫者（無 spawn tag）→ stderr 恰一行盯守提醒；
-# spawn 出身（有 tag）→ 不印。手動 session 的權限框無從偵測（tag
-# `pre-trim-2026-09` 的 docs/tui-design.md §1 known gap），這行是唯一緩解，兩個方向都要釘死才不會（a）靜默消失或
-# （b）對 spawn 出身的接手者洗版。env -u／顯式設值缺一不可：套件本身可能
-# 由任一種身分執行（人工終端無 tag、spawn 出身的協調者有 tag），不控變數
-# 這兩條會隨執行者身分假綠
-RHERR="$TESTROOT/relay-hint-manual.err"
-env -u AGENT_BRIDGE_SPAWN_TAG AGENT_BRIDGE_DATA="$DRELAY" AGENT_BRIDGE_READY_TIMEOUT=0 \
-  PATH="$SHIM:$PATH" \
-  "$BRIDGE" relay rh1 --runtime codex --handoff "$HANDOFF" --no-select \
-  >/dev/null 2>"$RHERR"; rc=$?
-assert "手動呼叫者 relay：exit 0（提醒不影響成功契約）" test "$rc" -eq 0
-assert "手動呼叫者：stderr 有盯守提醒" grep -q '手動起' "$RHERR"
-assert "提醒恰一行（不得洗版）" \
-  bash -c "test \"\$(grep -c '手動起' '$RHERR')\" -eq 1"
-RHERR2="$TESTROOT/relay-hint-spawned.err"
-env AGENT_BRIDGE_SPAWN_TAG='ab-spawn-rhx-1-0123456789ab' \
-  AGENT_BRIDGE_DATA="$DRELAY" AGENT_BRIDGE_READY_TIMEOUT=0 PATH="$SHIM:$PATH" \
-  "$BRIDGE" relay rh2 --runtime codex --handoff "$HANDOFF" --no-select \
-  >/dev/null 2>"$RHERR2"; rc=$?
-assert "spawn 出身呼叫者 relay：exit 0" test "$rc" -eq 0
-assert_fails "spawn 出身呼叫者：不印提醒" grep -q '手動起' "$RHERR2"
-for rhn in rh1 rh2; do
-  assert "23i 收尾：despawn $rhn（pane 還回共享池）" ab "$DRELAY" despawn "$rhn"
-done
-
-fi  # end grp 23
 # ---- 24. disposable：worker 自報脈絡無殘值（orchestrator Phase 1） ----
 if grp 24; then
 # spec: CLI-DISPOSABLE-1
@@ -3303,7 +3003,7 @@ chmod 600 "$BAD31"
 fi  # end grp 31
 # ---- 32. spawn 落點：--here／auto／--window＋owner/actor 審計（2026-07-25，P3 2026-08-04）----
 if grp 32; then
-# spec: CLI-SPAWN-5 CLI-SPAWN-6 ENV-HERE-1 CLI-RELAY-1 CLI-RELAY-3
+# spec: CLI-SPAWN-5 CLI-SPAWN-6 ENV-HERE-1
 # 前面所有測例都在 tmux 外呼叫 spawn（TMUX 已 unset）→ 舊行為（目前視窗
 # split），上面已覆蓋。本節驗「orchestrator 本身在 pane 內」的新路徑：
 # worker 落進 owner 的 worker window（不交給 tmux 的 client 焦點解析）、
@@ -3319,7 +3019,7 @@ if grp 32; then
 # AGENT_BRIDGE_SPAWN_TAG（模擬「spawn 出身呼叫者」），把它們留在原本要測的
 # 路徑上；--window 不適用（那是專屬視窗，不是 worker window）。32j 起是
 # P3 新增：人工呼叫者預設 here、顯式 --here、互斥、layout 值域、layout
-# 只在 here 路徑驗證、relay 共用同一套解析。
+# 只在 here 路徑驗證。
 FAKE_CALLER_TAG="ab-spawn-orc-99999-aaaaaaaaaaaa"  # 語法合 ENV-TAG-1 即可：
 # caller_is_manual 只看「有沒有設」，不驗文法；只是要讓 auto 判為非人工
 D32="$TESTROOT/d32"
@@ -3619,30 +3319,6 @@ assert "32o tmux 內 tag-present auto＋壞 layout：spawn 成功（exit 0，不
   grep -q 'rc=0' "$TESTROOT/w32o2.done"
 W32O2_PANE="$(cat "$TESTROOT/w32o2.out" 2>/dev/null || true)"
 assert "32o tmux 內 tag-present auto＋壞 layout：worker pane 存活" pane_alive "$W32O2_PANE"
-
-# 32p. relay 共用同一套落點解析（CLI-RELAY-1）：人工呼叫者預設 here，
-# 接棒 pane 落呼叫者當前 window
-RELAY_HANDOFF32="$TESTROOT/relay-handoff-32.md"
-printf '# handoff\n下一步：無。\n' > "$RELAY_HANDOFF32"
-tmx send-keys -t "$ORC_PANE" \
-  "AGENT_BRIDGE_MAX_SPAWN=32 agent-bridge relay wrelay32 --runtime codex --handoff $RELAY_HANDOFF32 --no-select >$TESTROOT/wrelay32.out 2>/dev/null; echo rc=\$? >$TESTROOT/wrelay32.done" Enter
-wait_for 20 test -f "$TESTROOT/wrelay32.done"
-WRELAY32_PANE="$(cat "$TESTROOT/wrelay32.out" 2>/dev/null || true)"
-WRELAY32_WIN=""
-[[ -n "$WRELAY32_PANE" ]] && WRELAY32_WIN="$(tmx display-message -p -t "$WRELAY32_PANE" '#{window_id}' 2>/dev/null || true)"
-assert "32p relay 人工呼叫者預設 here：接棒 pane 落呼叫者 window" \
-  test -n "$WRELAY32_WIN" -a "$WRELAY32_WIN" = "$ORC_WIN"
-assert "32p relay here：registry worker_window 留空" \
-  jq -e '.worker_window == ""' "$D32/agents/wrelay32.json"
-assert "32p agents.log relayed 尾欄記 actor＝owner（與 32a 的 spawned 同形）" \
-  grep -qE "Z relayed wrelay32 [^ ]+ codex orc:@[0-9]+\$" "$D32/agents.log"
-# CLI-RELAY-3：--no-select 的契約是「不改 active pane」（不是「畫面完全
-# 不變」——here 的 layout 重排可能動版面，這裡只鎖 active pane 不變）。
-# split-window 帶 -d 本就不搶焦點，--no-select 是「不額外再切一次」，
-# ORC_WIN 目前的 active pane 應仍是原本送指令進去的 ORC_PANE
-ORC_ACTIVE_AFTER_RELAY="$(tmx display-message -p -t "$ORC_WIN" '#{pane_id}' 2>/dev/null || true)"
-assert "32p relay --no-select：ORC_PANE 仍是 active pane（CLI-RELAY-3）" \
-  test "$ORC_ACTIVE_AFTER_RELAY" = "$ORC_PANE"
 
 # 32q. 顯式 --here 且 tmux 外（無可解析呼叫者）：退回 current-window split
 # fallback，不視為錯誤；壞 AGENT_BRIDGE_HERE_LAYOUT 用不到這條路徑，不得

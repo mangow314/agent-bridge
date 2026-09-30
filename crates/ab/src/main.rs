@@ -6,7 +6,6 @@
 use std::ffi::OsString;
 use std::process::ExitCode;
 
-use ab_core::config;
 use ab_core::error::{Error, Result};
 use ab_core::evict;
 use ab_core::hook::{self, HookOutcome};
@@ -17,8 +16,7 @@ use ab_core::registry;
 use ab_core::send;
 use ab_core::spawn;
 use ab_core::task::{self, MessageSource, TaskState};
-use ab_core::tmux::{SubprocessTmux, TmuxClient};
-use ab_core::validate::is_valid_name;
+use ab_core::tmux::SubprocessTmux;
 
 // 逐字對齊 bash `usage()`:84（bin/agent-bridge）的 heredoc 內容。
 const USAGE: &str = r#"用法：
@@ -54,8 +52,6 @@ const USAGE: &str = r#"用法：
                                                 落點：人工 session 預設 --here（切進當前 window、套
                                                 AGENT_BRIDGE_HERE_LAYOUT，預設 main-vertical）；
                                                 spawn 出身呼叫者預設 worker window；--window 開專屬視窗
-  agent-bridge relay <name> --runtime <codex|claude|agy> [--model <model>] --handoff <path> [--here|--window] [--no-select] [--self-exit <my-name>]
-                                                把主導權交給新 session（注入接手者守則＋交接檔）；stdout 只印 pane-id
   agent-bridge despawn <name>                   回收 spawn 出身的 worker（kill pane＋除名；人工註冊拒殺）
   agent-bridge ready <name>                     （worker）回報就緒；僅限 spawned agent
   agent-bridge disposable <name>                （worker）宣告本輪脈絡已無殘值，可即時回收
@@ -101,7 +97,7 @@ fn err_line(msg: &str) {
 // 隱藏內省（非 spec 契約面）：一行一個「已完整實作」的契約子指令。
 // 用途：里程碑 gate 的 capability 核對，堵「純 assert_fails 分組靠
 // unknown-command fallback 假綠」。M2 起 hook 就位；spawn 生命週期群
-// （spawn/relay/despawn/ready/disposable/idle/evict）屬 M3，
+// （spawn/despawn/ready/disposable/idle/evict）屬 M3，
 // 未實作前不列——列入等於宣稱可用。
 fn print_implemented_commands() {
     for cmd in [
@@ -120,7 +116,6 @@ fn print_implemented_commands() {
         "ready",
         "receive",
         "register",
-        "relay",
         "reply",
         "send",
         "spawn",
@@ -246,7 +241,6 @@ fn main() -> ExitCode {
         "await" => cmd_await(&paths, rest),
         "gc" => cmd_gc(&paths, rest),
         "spawn" => cmd_spawn(&paths, rest),
-        "relay" => cmd_relay(&paths, rest),
         "despawn" => cmd_despawn(&paths, rest),
         "ready" => cmd_ready(&paths, rest),
         "disposable" => cmd_disposable(&paths, rest),
@@ -1003,7 +997,7 @@ fn cmd_gc(paths: &Paths, args: &[String]) -> Result<()> {
 
 /// cmd_spawn:1063 的 argv 解析。**`--model`／`--profile` 在解析點就驗**（不等到
 /// 用時）：這兩個值會進 pane 啟動命令字串，不合法就必須在建 pane 之前死掉。
-fn parse_spawn_args(args: &[String], relay: Option<spawn::Relay>) -> Result<spawn::SpawnRequest> {
+fn parse_spawn_args(args: &[String]) -> Result<spawn::SpawnRequest> {
     if args.is_empty() {
         return Err(Error::new(
             "用法：agent-bridge spawn <name> --runtime <codex|claude|agy> [--model <model>] [--profile <profile>] [--here|--window]",
@@ -1061,150 +1055,13 @@ fn parse_spawn_args(args: &[String], relay: Option<spawn::Relay>) -> Result<spaw
         profile,
         use_window,
         here,
-        relay,
     })
 }
 
 /// cmd_spawn:1063
 fn cmd_spawn(paths: &Paths, args: &[String]) -> Result<()> {
-    let req = parse_spawn_args(args, None)?;
+    let req = parse_spawn_args(args)?;
     spawn::spawn(paths, &SubprocessTmux, &req)?;
-    Ok(())
-}
-
-/// cmd_relay:1391 — 把主導權交給新 session。與 spawn 的差別只有三處：注入
-/// 接手者守則、把焦點切過去、以及（可選）請接手者回收前一棒；cap／tag／回滾／
-/// 夭折偵測／registry 全部共用 `spawn::spawn`。
-///
-/// `--self-exit` 不是「自殺」：它把回收工作寫進接手者的 prompt，由 B 在 ready
-/// 之後 `despawn A`。既有 despawn 的順序是「kill pane → 確認已死 → 清 registry
-/// → 寫審計」，A 若殺自己的 pane，執行中的 process 會被 SIGHUP 帶走，永遠走不
-/// 到後兩步。
-fn cmd_relay(paths: &Paths, args: &[String]) -> Result<()> {
-    const USAGE_RELAY: &str = "用法：agent-bridge relay <name> --runtime <codex|claude|agy> [--model <model>] --handoff <path> [--here|--window] [--no-select] [--self-exit <my-name>]";
-    if args.is_empty() {
-        return Err(Error::new(USAGE_RELAY));
-    }
-    let name = args[0].clone();
-    let mut runtime = String::new();
-    let mut model = String::new();
-    let mut handoff = String::new();
-    let mut prev = String::new();
-    let mut use_window = false;
-    let mut here = false;
-    let mut no_select = false;
-    let mut it = args[1..].iter();
-    while let Some(a) = it.next() {
-        match a.as_str() {
-            "--runtime" => {
-                runtime = it
-                    .next()
-                    .ok_or_else(|| Error::new("--runtime 需要參數"))?
-                    .clone();
-            }
-            // 只收值、不在這裡驗：驗證的正本在 spawn 的解析點（同一條 MODEL_RE）
-            "--model" => {
-                model = it
-                    .next()
-                    .ok_or_else(|| Error::new("--model 需要參數"))?
-                    .clone();
-            }
-            // relay 凍結（docs/scope-2026-09.md）：spawn 的 `--profile` 刻意不開給 relay，
-            // 未知參數照常拒絕（使用者裁定 2026-09-28，sdlc codex-profile-flag Concern 5）
-            "--handoff" => {
-                handoff = it
-                    .next()
-                    .ok_or_else(|| Error::new("--handoff 需要參數"))?
-                    .clone();
-            }
-            "--self-exit" => {
-                prev = it
-                    .next()
-                    .ok_or_else(|| Error::new("--self-exit 需要參數（你自己的 agent 名稱）"))?
-                    .clone();
-            }
-            "--window" => use_window = true,
-            "--here" => here = true,
-            "--no-select" => no_select = true,
-            other => return Err(Error::new(format!("未知參數：{other}"))),
-        }
-    }
-    if handoff.is_empty() {
-        return Err(Error::new("relay 需要 --handoff <path>（要交棒的交接檔）"));
-    }
-    if !prev.is_empty() && !is_valid_name(&prev) {
-        return Err(Error::new(format!(
-            "--self-exit 的 agent 名稱不合法（僅允許 [A-Za-z0-9_-]+）：{prev}"
-        )));
-    }
-    // 交接檔的兩道檢查都必須在建 pane 之前，理由同 brief：pane 落地後才 die
-    // 會留下佔 cap 的孤兒。-f 一併擋掉目錄與 FIFO
-    if handoff.contains('\'') {
-        return Err(Error::new(format!("交接檔路徑不可含單引號：{handoff}")));
-    }
-    let hp = std::path::Path::new(&handoff);
-    if !hp.is_file() || std::fs::File::open(hp).is_err() {
-        return Err(Error::new(format!("交接檔不是可讀的普通檔案：{handoff}")));
-    }
-
-    // 接力鏈深度上限：這條鏈設計上鼓勵「context 吃緊就再交棒」，沒有上界就是
-    // 無界遞迴。深度靠 AGENT_BRIDGE_RELAY_DEPTH 逐棒下傳——人工起的第一棒沒有
-    // 這個變數＝深度 0，其後每 relay 一次 +1。已知限制：pane 內可自行改寫這個
-    // 變數繞過（與 registry 同屬 worker 可寫面）；這道 cap 擋的是失控迴圈。
-    let depth = config::relay_depth()?;
-    let max_depth = config::max_relay_depth()?;
-    if max_depth > 0 && depth >= max_depth {
-        return Err(Error::new(format!(
-            "已達接力上限（{}={max_depth}，本 session 是第 {depth} 棒）：這條鏈需要人介入確認後才該繼續。確認後可調高上限，或設 0 解除限制。",
-            config::ENV_MAX_RELAY_DEPTH
-        )));
-    }
-
-    let relay = spawn::Relay {
-        handoff,
-        prev: prev.clone(),
-        depth_next: depth + 1,
-    };
-    let mut spawn_args: Vec<String> = vec![name, "--runtime".into(), runtime];
-    if !model.is_empty() {
-        spawn_args.push("--model".into());
-        spawn_args.push(model);
-    }
-    if use_window {
-        spawn_args.push("--window".into());
-    }
-    if here {
-        spawn_args.push("--here".into());
-    }
-    let req = parse_spawn_args(&spawn_args, Some(relay))?;
-    let tmux = SubprocessTmux;
-    let pane = spawn::spawn(paths, &tmux, &req)?;
-
-    // 切焦點：orchestrator 驅動時沒有人在看畫面，--no-select 是那條路徑的常態。
-    // 失敗不致命——relay 主體（pane＋registry＋審計）此時已經成功落地
-    if !no_select {
-        let _ = tmux.exec(&["select-window", "-t", &pane]);
-        let _ = tmux.exec(&["select-pane", "-t", &pane]);
-    }
-    // CLI-RELAY-4：手動起的 session（呼叫者環境無 spawn tag）是接力鏈上唯一
-    // 會彈權限框的形狀，而那個框沒有任何機制偵測得到（偵測＝常駐輪詢，已裁定
-    // 不做；tag `pre-trim-2026-09` 的 docs/tui-design.md §1 known gap）。
-    // 這一行提醒就是該 gap 的全部緩解。
-    // 判準與 spawn 落點的 auto 規則共用同一個 helper：三態語意（unset／空
-    // ＝人工；非 UTF-8＝視為在場）兩路必須一致（P4 審查 CONFIRMED 1）
-    if config::caller_is_manual() {
-        eprintln!(
-            "提醒：本 session 為手動起（非 spawn 出身）。手動 session 的權限框不會被任何機制偵測，鏈上若仍有手動 pane 請自行盯守（spawn 出身的接手者不受影響）。"
-        );
-    }
-    if prev.is_empty() {
-        eprintln!(
-            "已交棒給 '{}'（前一棒未指定自動回收，請自行收尾）",
-            req.name
-        );
-    } else {
-        eprintln!("已交棒給 '{}'；'{prev}' 將由對方在接手後回收", req.name);
-    }
     Ok(())
 }
 

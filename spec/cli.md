@@ -1,4 +1,4 @@
-# CLI 契約（22 個子指令）
+# CLI 契約（21 個子指令）
 
 ## 共通慣例
 
@@ -264,8 +264,8 @@ token（tag 文法見 ENV-TAG-1，含 48 位熵與 agent 名）；tag 同時寫�
 registry 的 `spawn_tag` 欄。它是 despawn／回滾辨識 pane 出身的唯一證據。
 呼叫者環境的標準 proxy 變數 MUST 穿透給 worker；`AGENT_BRIDGE_PASS_ENV`
 指名的變數 MUST 只在「已設」時穿透（不塞空值），且 **reserved 變數
-（`AGENT_BRIDGE_SPAWN_TAG`／`AGENT_BRIDGE_RELAY_DEPTH`）MUST 剔除**——它們
-的 assignment 會排在 spawn 自己那一個之後而覆蓋它（詳 ENV-PASS-1）。
+（`AGENT_BRIDGE_SPAWN_TAG`）MUST 剔除**——它的
+assignment 會排在 spawn 自己那一個之後而覆蓋它（詳 ENV-PASS-1）。
 Source: cmd_spawn
 
 ### CLI-SPAWN-5 [tested: 32]
@@ -273,7 +273,7 @@ Source: cmd_spawn
 壞值（ENV-HERE-1），MUST 在建 pane 前拒絕。`--window` MUST 開專屬視窗且
 不被後續 spawn 共用。`--here`（有可解析 tmux 呼叫者時）與 auto 規則判定
 「呼叫者是人工 session」（`AGENT_BRIDGE_SPAWN_TAG` 未設定或空字串，三態
-語意見 ENV-TAG-1，與 CLI-RELAY-4 盯守提醒共用同一判準）落同一解：切進呼叫者（owner）當前 window，split 後依
+語意見 ENV-TAG-1）落同一解：切進呼叫者（owner）當前 window，split 後依
 `AGENT_BRIDGE_HERE_LAYOUT` 重排（`none`＝只 split 不重排）；此落點 MUST NOT
 查或寫 worker-window reuse 的信任根（`@ab_owner`），registry 的
 `worker_window` 欄 MUST 留空。auto 規則判定「呼叫者是 spawn 出身」時維持
@@ -292,55 +292,16 @@ Source: cmd_spawn / caller_owner / config::here_layout
 spawn／despawn／evict／disposable MUST 追加審計行至 `<data>/agents.log`，
 固定 6 欄空白分隔：`<ts> <action> <name> <pane> <runtime> <actor>`；欄值
 MUST 摺疊空白、空值以 `-` 補（欄位安全在寫入點保證，不倚賴上游）。actor
-是 provenance 非認證。action 值域：`spawned`｜`relayed`｜`despawned`｜
+是 provenance 非認證。action 值域：`spawned`｜`despawned`｜
 `despawned-unsaved`｜`despawn-stale`｜`evicted`｜`evicted-unfinished`｜
-`evicted-timeout`｜`disposable`——relay 開出的接手者記 `relayed`（其餘生命
-週期與 spawn 同，CLI-RELAY-1），spawn 總數＝`spawned`＋`relayed`。
+`evicted-timeout`｜`disposable`。
 Source: log_agent_event / cmd_spawn
 
 ### CLI-SPAWN-7 [tested: 22, 27]
-worker／接手者 brief 正本（share/worker-brief.md、share/successor-brief.md）
-的策略不變量是契約的一部分：worker 守則 MUST 教導「等 receive、單行
-agent-bridge 文字是命令不是聊天、receive→work→reply/fail」；接手者守則
-MUST 教導「讀交接檔即開工、不等派工」。brief 內容變更視為契約變更。
-Source: share/worker-brief.md / share/successor-brief.md（引用不搬家）
-
-## `relay`
-
-### CLI-RELAY-1 [tested: 23, 32]
-`relay <name> --runtime <r> [--model <m>] --handoff <path> [--here|--window]
-[--no-select] [--self-exit <my-name>]`：以接手者 brief（ENV-BRIEF-2）spawn
-一個接棒 session。`--handoff` 必填，MUST 在建 pane 前驗證為可讀普通檔案且
-路徑不含單引號。除 brief 與焦點切換外，cap／tag／回滾／夭折偵測／registry／
-落點解析（CLI-SPAWN-5，`--here` 同適用）不變量 MUST 與 spawn 完全一致
-（同一實作路徑，不得複製第二份）。
-Source: cmd_relay
-
-### CLI-RELAY-2 [tested: 23]
-接力鏈深度：本棒深度取 `AGENT_BRIDGE_RELAY_DEPTH`（ENV-DEPTH-1），達上限
-（ENV-DEPTH-2）MUST 在建 pane 前拒絕；接手者環境的深度 MUST 為本棒＋1。
-非 relay 的 spawn MUST NOT 下傳深度變數。
-Source: cmd_relay / cmd_spawn
-
-### CLI-RELAY-3 [tested: 23, 32]
-`--self-exit <my-name>` MUST 以「接手者 ready 後執行 `despawn <my-name>`」
-寫入接手者 prompt，MUST NOT 由前一棒自殺（自殺會斷 despawn 的
-kill→確認→清 registry→審計順序）。預設把 tmux 焦點切至新 pane；
-`--no-select` 不切；焦點切換失敗 MUST NOT 影響 relay 成功。`--no-select`
-的契約是「不改 active pane」，不是「畫面完全不變」——here 落點的 layout
-重排（CLI-SPAWN-5）可能改變版面。
-Source: cmd_relay / relay_prompt_arg
-
-### CLI-RELAY-4 [tested: 23]
-呼叫者環境判為人工 session（`AGENT_BRIDGE_SPAWN_TAG` 未設定或空字串——
-三態語意見 ENV-TAG-1，與 CLI-SPAWN-5 auto 規則共用同一判準，手動起的
-session 多為接力鏈第一棒）時，relay 成功後 MUST 在 stderr 印**恰一行**
-盯守提醒；判為 spawn 出身（該變數有非空值，含非 UTF-8）時 MUST NOT 印。
-理由：手動 session 的權限框沒有任何機制偵測得到（spawn 出身的 worker 帶
-skip-permission 設定不彈框；偵測＝常駐輪詢，已裁定不做——
-tag `pre-trim-2026-09` 的 docs/tui-design.md §1 known gap），此行是該 gap 的唯一緩解。此行 MUST NOT 改變 relay 的
-exit code 與 stdout 契約。
-Source: cmd_relay
+worker brief 正本（share/worker-brief.md）的策略不變量是契約的一部分：
+worker 守則 MUST 教導「等 receive、單行 agent-bridge 文字是命令不是聊天、
+receive→work→reply/fail」。brief 內容變更視為契約變更。
+Source: share/worker-brief.md（引用不搬家）
 
 ## `despawn`
 

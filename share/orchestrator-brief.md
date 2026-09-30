@@ -63,7 +63,7 @@ authorize a direct `despawn`.
 
 ## Specify --model at spawn: don't let workers inherit your model
 
-When `spawn`/`relay` gets no `--model`, the worker inherits that CLI's
+When `spawn` gets no `--model`, the worker inherits that CLI's
 **user-default model**. You are the orchestrator — your layer usually
 runs the most expensive model, and once the default follows you, the
 cost split of "plan on top, execute below" silently dissolves, **with no
@@ -220,7 +220,7 @@ back empty.
   cross-session messaging; the routing rule lives in
   `share/vehicle-routing.md`.
 - **Plan-stage second opinions: forbid reading other task dirs in the brief.** The mailbox `~/.local/share/agent-bridge/tasks/` is visible to every worker; write "do not read any task directory other than your own" into the brief, or the second opinion collapses into the first. Wording is owned by `share/review-overlay.md`.
-- **A worker that never received a task (relay successor, probe,
+- **A worker that never received a task (probe,
   coordinator) is despawned directly — do not evict it.** There are no
   notes to land. The audit line will read `despawned-unsaved`; for
   these panes that is the expected record, not a discipline failure
@@ -271,4 +271,3 @@ back empty.
 
 - The worker-side contract: `share/worker-brief.md` (auto-injected at
   spawn)
-- The successor (relay) contract: `share/successor-brief.md`
