@@ -1710,7 +1710,7 @@ fn merged(o: &crate::tmux::TmuxOutput) -> String {
         .to_string()
 }
 
-/// `info()`:82 — 無前綴、走 stderr。寫不出去不翻盤（spawn 成功後的輸出失敗
+/// `info()` — 無前綴、走 stderr。寫不出去不翻盤（spawn 成功後的輸出失敗
 /// 不該讓呼叫端以為失敗）。
 fn writeln_stderr(s: &str) -> std::io::Result<()> {
     use std::io::Write;
