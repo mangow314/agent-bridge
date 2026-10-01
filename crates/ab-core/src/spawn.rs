@@ -2362,4 +2362,90 @@ mod tests {
         );
         let _ = std::fs::remove_dir_all(&paths.data_dir);
     }
+
+    fn idle_test_paths(tag: &str) -> Paths {
+        let data_dir = std::env::temp_dir().join(format!("ab_{tag}_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&data_dir);
+        let paths = Paths {
+            agents_dir: data_dir.join("agents"),
+            tasks_dir: data_dir.join("tasks"),
+            locks_dir: data_dir.join("locks"),
+            state_dir: data_dir.join("state"),
+            data_dir,
+        };
+        paths.ensure_dirs().unwrap();
+        paths
+    }
+
+    fn write_spawned_registry(paths: &Paths, name: &str, time_fields: &str) {
+        std::fs::write(
+            paths.agents_dir.join(format!("{name}.json")),
+            format!(
+                r#"{{"name":"{name}","pane_id":"%1","spawned":true,"ready":true,{time_fields}}}"#
+            ),
+        )
+        .unwrap();
+    }
+
+    fn write_task_to(paths: &Paths, id: &str, to: &str, created_at: &str) {
+        let d = paths.tasks_dir.join(id);
+        std::fs::create_dir_all(&d).unwrap();
+        std::fs::write(
+            d.join("metadata.json"),
+            format!(r#"{{"to":"{to}","created_at":"{created_at}"}}"#),
+        )
+        .unwrap();
+    }
+
+    fn idle_secs_by_name(paths: &Paths) -> HashMap<String, String> {
+        idle(paths)
+            .into_iter()
+            .map(|r| (r.name, r.idle_secs))
+            .collect()
+    }
+
+    /// CLI-LIST-2 的 IDLE：取「最後派工」與「pane 誕生」兩者較晚者。名字重用時，
+    /// 舊實例的派工不得讓新 pane 看起來早就閒著。
+    #[test]
+    fn idle_secs_takes_later_of_last_task_and_pane_birth() {
+        let paths = idle_test_paths("idle_later");
+        let recent = crate::time::format_epoch((crate::time::now_epoch() - 100) as u64);
+        let old = "2020-01-01T00:00:00Z";
+        // reborn：派工在誕生之前 → 以誕生為準
+        write_spawned_registry(&paths, "reborn", &format!(r#""spawned_at":"{recent}""#));
+        write_task_to(&paths, "20200101T000000Z-aaaa", "reborn", old);
+        // busy：誕生很久、剛派過工 → 以派工為準
+        write_spawned_registry(&paths, "busy", &format!(r#""spawned_at":"{old}""#));
+        write_task_to(&paths, "20200101T000000Z-bbbb", "busy", &recent);
+
+        let rows = idle_secs_by_name(&paths);
+        for name in ["reborn", "busy"] {
+            let secs: i64 = rows[name]
+                .parse()
+                .unwrap_or_else(|_| panic!("{name} 的 idle 應為秒數：{}", rows[name]));
+            assert!(
+                (100..160).contains(&secs),
+                "{name} 應以較晚的時間點起算（約 100 秒），實得 {secs}"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&paths.data_dir);
+    }
+
+    /// CLI-LIST-2 的 IDLE：時間無法解析印 `-`，不印 0；`spawned_at` 為空字串時
+    /// 停在空字串、不往 `registered_at` 掉。
+    #[test]
+    fn idle_secs_prints_dash_when_time_unparseable() {
+        let paths = idle_test_paths("idle_dash");
+        write_spawned_registry(&paths, "garbled", r#""spawned_at":"not-a-time""#);
+        write_spawned_registry(
+            &paths,
+            "blank",
+            r#""spawned_at":"","registered_at":"2020-01-01T00:00:00Z""#,
+        );
+
+        let rows = idle_secs_by_name(&paths);
+        assert_eq!(rows["garbled"], "-");
+        assert_eq!(rows["blank"], "-");
+        let _ = std::fs::remove_dir_all(&paths.data_dir);
+    }
 }
