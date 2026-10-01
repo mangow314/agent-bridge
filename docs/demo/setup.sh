@@ -22,7 +22,7 @@ cat > "$ROOT/orc-rc" <<'RC'
 PROMPT_COMMAND=   # 系統 bashrc 的 title escape 會蓋掉 pane 標題，關掉
 PS1='\[\e[1;35m\]orchestrator\[\e[0m\] ❯ '
 RC
-# worker/successor 共用 rc：名字從 pane title 動態取，同一個 stub 才能服務
+# worker rc：名字從 pane title 動態取，同一個 stub 才能服務
 # 不同名字的情境。bridge 設 title（「<name> (codex)」）約在 spawn 後 0.8s，
 # 與 rc 執行時間點競態——短輪詢等到帶括號的 title 出現（hostname 沒有括號）
 cat > "$ROOT/worker-rc" <<'RC'
@@ -38,7 +38,7 @@ PS1="\[\e[1;36m\]$_n\[\e[0m\] \[\e[2m\](codex stub)\[\e[0m\] ❯ "
 RC
 
 # demo 用 codex stub：印一行誠實 banner（自報是 stand-in、報 brief 注入長度；
-# spawn 注入 worker brief、relay 注入 successor brief，措辭通用），
+# spawn 注入 worker brief，措辭通用），
 # 啟動期吞 1 秒輸入模擬 REPL 起步（首發 ready 探針被吃、由重送覆蓋），
 # 之後以 bash 當 REPL——探針與通知都會真的執行，只有「智能回覆」由
 # driver 編排。形狀沿用 tests/run-tests.sh 的 runtime shim。

@@ -32,7 +32,7 @@ wait_status() {
   return 1
 }
 
-# 等 agent 註冊檔出現（relay／spawn 完成的檔案系統證據）
+# 等 agent 註冊檔出現（spawn 完成的檔案系統證據）
 wait_agent() {
   for _ in $(seq 1 240); do
     [[ -f "$DATA/agents/$1.json" ]] && return 0

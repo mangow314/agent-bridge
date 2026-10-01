@@ -28,34 +28,21 @@
 
 | 檔 | 內容 |
 |---|---|
-| [rust/architecture.md](rust/architecture.md) | Rust 側怎麼組織（ab-core／ab／ab-tui）。**結構錨**；行為疑義一律回 spec |
+| [rust/architecture.md](rust/architecture.md) | Rust 側怎麼組織（ab-core／ab）。**結構錨**；行為疑義一律回 spec |
 | [rust/flow-spawn.md](rust/flow-spawn.md) | spawn 生命週期：cap／ready 探針／原子回滾／出身防護 |
 | [rust/flow-notify.md](rust/flow-notify.md) | 通知鏈：send → notify_or_defer → hook 的決策全圖 |
 | [rust/flow-ttl.md](rust/flow-ttl.md) | state 通道 TTL：單一寫者／owner gate／通知端新鮮度三視角 |
-| [lifecycle-safety.md](lifecycle-safety.md) | spawn／despawn／evict／gc 安全不變量的完整論證（反例、TOCTOU 取捨、審計記號設計理由）；結論式摘要在 README.zh-TW.md |
+| [lifecycle-safety.md](lifecycle-safety.md) | spawn／despawn／evict 安全不變量的完整論證（反例、TOCTOU 取捨、審計記號設計理由） |
 | [testing-policy.md](testing-policy.md) | 測試執行政策：哪些情形跑全套、哪些跑分組 |
 
-## 進行中
+## 範圍裁定
 
 | 檔 | 狀態 |
 |---|---|
-| [scope-2026-09.md](scope-2026-09.md) | **現行範圍裁定**：收斂到跨廠任務信箱，`ui`／`scan`／`gc`／`relay` 凍結；逐命令 keep／support／freeze 表由 `check-contract.sh 5` 機器核對 |
-
-## 歷史決策記錄
-
-已執行完畢的提案與計畫。留著是為了回答「當初為什麼這樣設計」，不是現行說明；
-落地形狀一律以 `spec/` 與 `docs/rust/architecture.md` 為準。
-
-| 檔 | 結果 |
-|---|---|
-| [agent-spawn-proposal.md](agent-spawn-proposal.md) | spawn 的範圍與設計題盤點（2026-07-22）→ 已採納 |
-| [spawn-plan.md](spawn-plan.md) | 依上案的實作計畫（第三輪）→ 已實作 |
-| [orchestrator-plan.md](orchestrator-plan.md) | orchestrator 層實作計畫 → 五個 phase 全數完成，含真鏈驗收記錄 |
-| [codex-worker-approval-proposal.md](codex-worker-approval-proposal.md) | codex worker 的核准放寬（agent-worker profile）→ 已落地驗收 |
-| [owner-gate-boundary-assessment.md](owner-gate-boundary-assessment.md) | owner gate 兩個殘餘窗的評估（2026-07-29）→ 結論：關閉手段留給 Rust 期 |
-| [rust/m5-proposal.md](rust/m5-proposal.md) | M5 兩個殘餘窗的關閉手段 → 已實作；經跨廠複核後其中一條被推翻 |
+| [scope-2026-09.md](scope-2026-09.md) | **現行範圍裁定**：收斂到跨廠任務信箱；逐命令分類表由 `check-contract.sh 5` 機器核對 |
 
 ## 其他
 
-- [demo/](demo/) — 頂層 README 那張 gif 的錄製腳本（stub runtime，不打真實 API）
+- [demo/](demo/) — README 各張 gif 的錄製腳本（`real-*` 為真 agent 版，其餘為 stub runtime，不打真實 API）
 - [assets/](assets/) — 圖檔
+- 已執行完畢的提案與計畫（spawn、orchestrator、codex worker approval、owner gate、M5 等）已移出 HEAD，在 tag `pre-trim-2026-09`（`git show pre-trim-2026-09:docs/<檔名>`）。

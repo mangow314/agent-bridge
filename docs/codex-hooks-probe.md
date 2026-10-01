@@ -181,8 +181,8 @@ session 裡再啟動一個**自己也載入了 agent-bridge hooks** 的 agent ru
 自身 session id 變動（例如 `/clear`）後的所有權交還路徑，自癒上限＝TTL。缺
 `session_id` 的 payload 不參與 state 通道（不寫、不 block），失效方向仍是安全的
 降級鏈（state 停更 → TTL 過期 → 退回 legacy 送鍵）。殘餘邊界（/clear 後最長一個
-TTL 的降級窗、長壽巢狀 session 越過 TTL 的奪權可能）詳見 README.zh-TW.md
-已知限制節。回歸測試：run-tests.sh 34.5–34.13。
+TTL 的降級窗、長壽巢狀 session 越過 TTL 的奪權可能）詳見 spec/hooks.md 的
+HOOK-OWNER 條款。回歸測試：run-tests.sh 34.5–34.13。
 
 ## 未驗的部分
 
@@ -288,7 +288,7 @@ hook 又被擋著不發 block，**任務會卡在 mailbox 直到 TTL 過期**—
 
 上一節的窗已由 launcher 形擴充收掉（HOOK-OWNER-5 現行文、architecture
 §11.7；落地時「有界祖先鏈＋中間不夾 runtime」的草案規則被收窄成逐 runtime
-白名單形狀——草案版對本檔 m5-proposal §1 的實測巢狀鏈會誤放行）。落地後
+白名單形狀——草案版對 tag `pre-trim-2026-09` 的 m5-proposal §1 實測巢狀鏈會誤放行）。落地後
 以同一支 shim 探針復量（worker `m6canary`，事件只記 PPID 不碰 stdin）：
 
 ```

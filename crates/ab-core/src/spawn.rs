@@ -151,7 +151,7 @@ pub struct SpawnRequest {
     pub profile: String,
     pub use_window: bool,
     /// `--here`：顯式要求落在呼叫者當前 window。與 `use_window` 互斥；
-    /// 兩者皆 false 時走 auto 規則（docs/spawn-here-plan.md）。
+    /// 兩者皆 false 時走 auto 規則（tag `pre-trim-2026-09` 的 docs/spawn-here-plan.md）。
     pub here: bool,
 }
 
@@ -420,7 +420,7 @@ pub fn spawn(paths: &Paths, tmux: &dyn TmuxClient, req: &SpawnRequest) -> Result
     let (ready_timeout, _) = config::ready_opts()?;
     let max = config::max_spawn()?;
 
-    // here 落點解析（prototype；設計正本 docs/spawn-here-plan.md）。
+    // here 落點解析（prototype；設計正本 tag `pre-trim-2026-09` 的 docs/spawn-here-plan.md）。
     // 互斥與壞 layout 值都在建 pane 前拒絕（CLI-SPAWN-2 的 precheck 紀律）；
     // auto＝人工 session（環境無 spawn tag）在 tmux 內就落在呼叫者 window，
     // spawn 出身的呼叫者維持 worker window——第三層 fan-out 不該堆進人類視窗

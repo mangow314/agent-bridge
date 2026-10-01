@@ -37,7 +37,7 @@ cat > "$ROOT/project/docs/notes.md" <<'MD'
 
 ## Highlights
 
-- `spawn` and `relay` accept mutually exclusive `--here|--window` flags.
+- `spawn` accepts mutually exclusive `--here|--window` flags.
   Manual sessions now split the worker into the caller's current window
   (main-vertical by default); spawn-born callers keep the old
   dedicated-window behavior; explicit flags override the auto rule.
@@ -92,12 +92,6 @@ panes in tmux). When asked to delegate work to a worker, run:
 
 Workers keep their pane context: a follow-up question goes to the SAME
 worker with another `send` — never spawn a second worker for a follow-up.
-
-If asked to hand coordination to a successor session: send the task first
-(do not await), write a short handoff note to `handoff.md` (task id, current
-state, what the successor should do), then run
-`agent-bridge relay successor --runtime claude --handoff handoff.md --self-exit main`
-and end your turn — the successor session takes over from there.
 
 Keep it lean: no progress files, no extra exploration — delegate right away.
 This pane is already registered as `main`.

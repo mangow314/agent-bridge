@@ -1,11 +1,11 @@
 # lifecycle 安全設計：完整論證
 
-> 這裡收的是 spawn／despawn／evict／gc 安全不變量的完整論證——反例、取捨、
-> TOCTOU 分析、被獨立複核推翻又補回來的過程。結論式摘要在
-> [README.zh-TW.md](../README.zh-TW.md) 的生命週期各章；本檔回答「為什麼是
-> 這樣設計」。行為正典在 [spec/cli.md](../spec/cli.md) 與 `tests/run-tests.sh`，
-> 與本檔衝突時以正典為準。（2026-08-04 自 README.zh-TW.md 搬入，僅重排與
-分節，實質語意未變。）
+> 這裡收的是 spawn／despawn／evict 安全不變量的完整論證——反例、取捨、
+> TOCTOU 分析、被獨立複核推翻又補回來的過程；本檔回答「為什麼是這樣設計」。
+> 行為正典在 [spec/cli.md](../spec/cli.md) 與 `tests/run-tests.sh`，與本檔
+> 衝突時以正典為準。（2026-08-04 自舊版 README.zh-TW.md 搬入，僅重排與
+> 分節，實質語意未變；relay、gc 與 disposable 宣告的段落已隨該功能刪除，
+> 見 tag `pre-trim-2026-09`。）
 
 ## spawn cap 與並行
 
@@ -99,63 +99,22 @@ cap 的半殘 worker。
 「非零退出」是不夠的，畸形路徑多半會讓 sh 語法錯誤而被夭折偵測擋下，
 看起來像 fail-closed 卻什麼也沒鎖住。
 
-## relay --self-exit 為什麼不是自殺
-
-既有 `despawn` 的順序是「kill pane → 確認已死 → 清 registry → 寫審計」，
-A 若殺自己的 pane，執行中的 process 會被 SIGHUP 帶走，永遠走不到後兩步——
-registry 殘留、審計線斷掉。交給活著的 B 執行，順序不變量原封不動。接力鏈
-第一棒的人工閘門是免費的：第一棒是人工開的 session，B 去 despawn 它會被
-既有的「非 spawn 出身，despawn 拒絕」擋下；接手者守則明說看到這個訊息是
-正常的、不要繞過，也不要改用 tmux 直接殺對方的 pane。交接檔路徑來自命令
-列，暴露面比內部常數大一級，因此走與 brief 相同的三道防線（單引號
-fail-closed、`-f && -r`、`cat --`），且全部在建 pane 之前。
-
 ## evict：三步不包在一把鎖裡
 
 `LOCK_DIR` 是單值，同時持有兩把鎖時 `release_lock` 只放得掉一把。分段的
 兩個中斷點失效方向都是「多留一個佔 cap」，而不是「刪掉還沒落地的脈絡」——
 後者是分段時唯一不可接受的失效。
 
-## idle_secs 的取值
+## IDLE 欄的取值
 
-`idle_secs` 取「最後任務」與「pane 誕生」兩者較晚者：agent 名稱可以重用，
+`list --long` 的 IDLE 欄（`idle_secs`）取「最後任務」與「pane 誕生」兩者較晚者：agent 名稱可以重用，
 而 tasks/ 是長期累積的，只認名字會讓剛 spawn 的 worker 繼承前一個同名
 pane 的活動時間，在報表上看起來閒置好幾小時（真鏈驗收實地踩到：spawn 39
 秒顯示 21686）。
-
-## gc 的三道保留線與證據保全
-
-`tasks/` 原本只增不減。這不只是磁碟問題——`idle` 的回收決策直接掃這個目錄
-（`last_task_at`），資料越髒決策越不可信，而且那是 O(task 數) 的掃描。
-「同名前一個 pane 的任務讓新 worker 看起來閒置六小時」那個 bug 的根因就在
-這裡。三道保留線的失效方向一律是「留著」而不是「刪掉」：
-
-1. **未完成的不刪**（queued／delivered／running）。這條有兩層：掃描時擋
-   一次，取鎖後真刪之前再驗一次狀態（等鎖那段時間裡它可能被 `receive`／
-   `reply` 動過）。
-2. **evict 的收尾筆記不刪**（metadata 帶 `pinned: true`），除非明確加
-   `--include-notes`。那些筆記是這一層刻意留下來的脈絡；會被 GC 靜靜清掉
-   的話，「上下文不會憑空消失」就只是延後兌現。
-3. **判不出年紀的不刪**：`created_at` 缺失或無法解析就留著。年齡看
-   metadata 的 `created_at` 而非目錄 mtime——mtime 會被備份、rsync、檔案
-   系統操作改掉。
-
-外加三條：預設是**試算**，`--apply` 才會刪；只碰 `send` 生成的目錄名形狀
-（UTC 時間戳＋4 hex，不是寬鬆的公開 task-id 格式——這是唯一會 `rm` 的
-路徑）；以及**「宣告已失效」的證據不刪**。
-
-最後那條不直覺但要緊：`idle` 判斷一個 `disposable` 宣告有沒有被後續任務
-推翻，靠的就是掃 `tasks/` 找晚於 `disposable_at` 的任務。那個任務一旦被
-清掉，證據跟著消失，宣告會從 `expired` **復活成 `yes`**，orchestrator 據此
-直接回收一個其實已有新脈絡的 worker。所以只要 registry 裡還掛著某個宣告，
-晚於它的任務就一律保留。
 
 ## 審計記號為什麼不擋 despawn
 
 `despawn` 是公開指令，機制上**不阻止**你直接回收一個有殘值的 worker——
 擋下來只會逼出一個 `--force`，而習慣性加旗標等於沒有防線。改成讓它在審計
 線上看得出來（`despawned-unsaved`）。走 `evict` 的回收不會記 `unsaved`
-（收尾流程已經跑過）。`disposable` 同樣是建議不是保護：registry 位在
-worker 可寫的目錄，worker 大可自己改；但 `despawn` 認的是 `spawn_tag`
-不是這個欄位，所以賴不掉。宣告後又被派新任務時自動轉 `expired`
-（`disposable_at` 存在的唯一理由）。
+（收尾流程已經跑過）。

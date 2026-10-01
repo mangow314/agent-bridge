@@ -12,7 +12,7 @@ flowchart TD
         S4 -- 否 --> S5["die settings 缺失"]
         S3 -- 否 --> S6["caller_owner (line 884)\n取得 owner (session_name:@window_id)"]
         S4 -- 是 --> S6
-        S6 --> S7{"WORKER_BRIEF (或 SUCCESSOR_BRIEF)\n為可讀普通檔?"}
+        S6 --> S7{"WORKER_BRIEF\n為可讀普通檔?"}
         S7 -- 否 --> S8["die brief 缺失"]
         S7 -- 是 --> S9["validate_ready_opts (line 988)\n驗證 ready timeout & probe interval"]
         S9 --> S10["acquire_lock agents-registry"]
@@ -97,7 +97,7 @@ flowchart TD
         D16 --> D17{"tmux list-panes 確認 pane 是否真的消失?"}
         D17 -- 查詢失敗 (line 1563-1567) --> D18b["die 無法確認 pane 狀態，保留 registry"]
         D17 -- 否 ( kill 失敗 ) --> D18["die 無法關閉 pane，保留 registry"]
-        D17 -- 是 --> D19{"disposable_effective (line 444)\n判定可拋?"}
+        D17 -- 是 --> D19{"走過 evict 收尾流程\n(notes_handled)?"}
         D19 -- 是 --> D20["ev = despawned"]
         D19 -- 否 --> D21["ev = despawned-unsaved"]
         D20 --> D22["rm -f 刪除 registry\nlog_agent_event $ev"]

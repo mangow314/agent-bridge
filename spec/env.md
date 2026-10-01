@@ -20,7 +20,7 @@ Source: 全域初始化（DATA_DIR）
 `AGENT_BRIDGE_WORKER_BRIEF`：spawn 注入的 worker 守則檔。預設
 `<repo>/share/worker-brief.md`。spawn MUST 在建立 pane 之前預檢此檔為可讀的
 普通檔案，否則以錯誤終止（不得產生無守則的 worker）。
-Note: 預檢之後、pane 內實際讀取之前存在 TOCTOU 空隙，屬已知限制（README）。
+Note: 預檢之後、pane 內實際讀取之前存在 TOCTOU 空隙，屬已知限制（`docs/lifecycle-safety.md`）。
 Source: cmd_spawn（WORKER_BRIEF 預檢）
 
 ### ENV-HOOKS-1 [tested: 16]

@@ -101,7 +101,7 @@ runtime 的祖先鏈必然包含本尊（HOOK-OWNER-4 Note 的否決理由，該
 有效）。本條與該否決的界線：這裡確認的是 runtime **自有啟動鏈的實測形狀**
 （hook 是被 worker 自己的啟動鏈 fork 的），不是「鏈上找不找得到本尊」。
 同理 MUST NOT 放寬成「鏈上沒有夾另一個 runtime 形狀的行程即可」或「直接
-PPID 豁免檢查」：實測的巢狀鏈（`docs/rust/m5-proposal.md` §1）是
+PPID 豁免檢查」：實測的巢狀鏈（tag `pre-trim-2026-09` 的 `docs/rust/m5-proposal.md` §1）是
 hook → 巢狀 claude → bash → 本尊——巢狀 runtime 正是 hook 的直接 PPID、
 其餘中介只有 bash，上述兩種寫法都會把它誤認成本尊。誤認在本條的代價是
 **立即奪權**（不經 TTL），是唯一比未實作更糟的失效方向，故形狀表 MUST
@@ -112,7 +112,7 @@ Note: PPID／鏈形不符不足以推出冒名——合法中介一樣不符：r
 比未實作更糟（codex 複核 2026-07-31）。代價是本條不提供「冒名者過 TTL 仍
 擋」這種保證：巢狀 runtime 的暴露面維持 HOOK-OWNER-2 的原狀。
 Note: 兩個形狀都是 2026-07-31 本機實測（claude 直接 fork：`docs/rust/
-m5-proposal.md` §1；codex 為 npm node launcher fork 原生執行檔、原生執行檔
+m5-proposal.md` §1（tag `pre-trim-2026-09`）；codex 為 npm node launcher fork 原生執行檔、原生執行檔
 才 fork hook：`docs/codex-hooks-probe.md` 補測節），不是介面承諾。故本條的
 價值只在命中時的即時自癒，落回路徑是常態而非例外處置。
 Note: 取樣順序 MUST 是先讀自身 PPID、再走中介（如有）、最後驗 `worker_pid`

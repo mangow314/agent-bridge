@@ -1,4 +1,4 @@
-# Rust 遷移架構設計（ab-core / ab / ab-tui）
+# Rust 遷移架構設計（ab-core / ab）
 
 - 地位：**結構錨**。行為錨是 `spec/`＋`tests/run-tests.sh`；本文件回答「Rust 側
   怎麼組織」，行為疑義一律回 `spec/`（唯一契約正本），實作疑義回 Rust source。
@@ -12,7 +12,6 @@
 |---|---|---|
 | `ab-core` | 領域邏輯庫：狀態、儲存、hook 核心、tmux client | `serde_json`（`preserve_order`，M1 起；使用者裁決 2026-07-31）外不引入依賴 |
 | `ab` | CLI binary：argv 解析、輸出格式化、dispatch | `ab-core`＋`libc`（M2 起，僅為 §5 的 `signal(SIGPIPE, SIG_DFL)` 一行；零傳遞依賴） |
-| `ab-tui` | `agent-bridge ui` 的 alternate-screen dashboard（WORKERS｜TASKS｜DETAIL 三欄；設計正本 `docs/tui-design.md`、條款 CLI-UI-1）：lib crate，由 `ab` 的 `ui` 子指令呼叫 `run()` | `ab-core`＋`ratatui`＋`crossterm`（`docs/tui-design.md` §6 的**依賴上限**，僅此三項；不上 async runtime／daemon／clipboard crate） |
 
 ## 2. ab-core 模組對映表（模組 ↔ spec 域 ↔ bash 函式群）
 
@@ -27,10 +26,10 @@
 | `fsio` | `atomic_write`（tmp＋rename 同目錄）、payload byte 流原樣搬運 | state.md STATE-GEN-2 | `atomic_write`、`write_message` |
 | `lock` | mkdir 鎖：佔用重試＋「非佔用即權限」die 分流；RAII guard 只是便利層，**語意不依賴 Drop**（SIGKILL 殘鎖行為＝bash 現況；stale 回收是 M5 行為變更，parity 期禁做） | state.md STATE-LOCK-* | `acquire_lock`、`release_lock` |
 | `registry` | agent 註冊表 CRUD、pane 解析、owner/actor 審計欄位 | state.md STATE-AGENT-* | `cmd_register` 核心、`is_spawned`、`caller_owner`、`log_agent_event` |
-| `task` | task 目錄結構、id 生成/驗證、狀態機轉換（queued→delivered→running→終態）、events.log、殘缺 task 目錄清理、**gc（終態 task 清理）** | state.md STATE-TASK-*、cli.md 轉換條款 | `write_message`、`log_event`、`update_meta_status`、`check_task_id`、`last_task_at`、`send_rollback`（清 metadata/status 未寫齊的殘缺 task 目錄，屬 task 寫入交易邊界；交易背景寫在該函式前的註解）、`cmd_gc` |
+| `task` | task 目錄結構、id 生成/驗證、狀態機轉換（queued→delivered→running→終態）、events.log、殘缺 task 目錄清理 | state.md STATE-TASK-*、cli.md 轉換條款 | `write_message`、`log_event`、`update_meta_status`、`check_task_id`、`last_task_at`、`send_rollback`（清 metadata/status 未寫齊的殘缺 task 目錄，屬 task 寫入交易邊界；交易背景寫在該函式前的註解） |
 | `notify` | 送鍵通知：權限框雙掃、失敗語意（notify-failed 可復原）、`notify_or_defer` 的 TTL/state 新鮮度 gate | hooks.md HOOK-NOTIFY-*、env.md ENV-TTL-1/2、ENV-NOTIFY-1 | `notify_pane`、`screen_has_prompt`、`notify_or_defer` |
 | `hook` | hook 三事件核心：身分解析、state 單一寫者、owner gate（session_id 所有權）、oldest-queued；**失敗一律就地吞掉（不上拋 `Result`）**，`run()` 回 `HookOutcome{Silent,Block}`；exit 0 與 panic 兜底在 `ab` dispatch 層（M2 修正，見 §4） | hooks.md 14 條、state.md STATE-CHAN-* | `hook_agent_name`、`hook_write_state`、`hook_owner_gate`、`hook_oldest_queued`、`cmd_hook` |
-| `spawn` | worker 生命週期：cap、pane 建立、brief 注入、ready 探針、原子回滾、出身防護（tag）、idle/disposable（**evict 的三段式編排在 `ab` CLI 層**，見 §9） | cli.md spawn 群、env.md ENV-SPAWN/READY/TAG | `cmd_spawn`、`spawn_rollback`、`rb_kill_tagged`、`spawn_wait_ready`、`worker_prompt_arg`、`relay_prompt_arg`、`cmd_despawn`、`cmd_ready`、`cmd_disposable`、`cmd_idle`、`disposable_effective` |
+| `spawn` | worker 生命週期：cap、pane 建立、brief 注入、ready 探針、原子回滾、出身防護（tag）；**evict 的三段式編排在 `ab` CLI 層**，見 §9 | cli.md spawn 群、env.md ENV-SPAWN/READY/TAG | `cmd_spawn`、`spawn_rollback`、`rb_kill_tagged`、`spawn_wait_ready`、`worker_prompt_arg`、`cmd_despawn`、`cmd_ready` |
 | `tmux` | `TmuxClient` trait＋`SubprocessTmux` 實作；**以裸名 `tmux` 經 PATH spawn**（測試 shim 攔截前提，tests/run-tests.sh:91-93）；argv 陣列傳參 | （載具，無獨立 spec 域） | `tmux` token 91 次（command-shaped 呼叫約 65；分佈於 notify/spawn/despawn/registry 各函式群） |
 | `time` | ISO 8601 UTC 時戳（`now_iso`）、epoch 換算、TTL 新鮮度；顯式 UTC、不受 locale/TZ | state.md ts 格式 | `now_iso`、TTL epoch 比對段 |
 
@@ -77,7 +76,7 @@ ab-core 對應模組）、`err/die/info/usage` 屬 `ab` 輸出層、其餘 helpe
       每個失敗路徑就地收斂，`run()` 不回 `Result`。
     - dispatch 層兜底保留兩層：無條件 `ExitCode::from(0)`，外加 `catch_unwind`
       讓 panic 不會變成 101（panic 訊息照樣進 stderr，同 bash 出錯有輸出）。
-  - 唯讀豁免：`status|await|idle|list|hook` 不建目錄；目錄缺失時以「找不到」
+  - 唯讀豁免：`status|await|list|hook` 不建目錄；目錄缺失時以「找不到」
     語意收場（對齊已退役 bash 正本 `main` 的 dispatch 分流，見 git history）。
 - `panic!` 視為 bug：release 建置 `panic = "abort"` 候選（M1 定案），嚴禁把
   panic 當錯誤路徑。
@@ -208,7 +207,7 @@ BRIDGE=$PWD/.gate/ab bash tests/run-tests.sh
 
 ### 9.3 審計失敗在 spawn 必須翻盤
 
-`log_agent_event` 在 despawn／disposable／evict 是「只揭露不翻盤」（不可逆
+`log_agent_event` 在 despawn／evict 是「只揭露不翻盤」（不可逆
 動作已完成），但在 **spawn 的 registry 寫入之後、回滾解除之前**必須上拋
 （bash 在 `set -e` 下由 EXIT trap 完成回滾）。吞掉會留下一個沒有審計線、卻
 佔著 cap 的 worker，而呼叫端看到成功。分組 19c/19c'/19d/19e 是這條的錨。
@@ -246,7 +245,7 @@ rubric 六條判定 REJECTED／CONFIRMED／REJECTED／REJECTED／CONFIRMED／CON
 |---|---|---|
 | blocker：despawn 謊報成功 | `remove_file` 的錯誤被吞，仍寫審計＋印「已 despawn」 | 上拋（`NotFound` 視為成功）；bash `cmd_despawn` 的裸 `rm -f` 在 `set -e` 下同樣帶走整支 |
 | blocker：poll interval 非 UTF-8 | `env::var().unwrap_or_default()` 把它壓成「未設定」→退 1.0，evict 因此把 config 錯誤誤判成真逾時 | 改 `var_os`＋三態；非 UTF-8 走「值不合法」 |
-| `//` 的空字串語意 | `jq_raw_field` 把 `""` 併進 None，鏈式 fallback 會多掉一層（idle 對 `spawned_at: ""` 印秒數，bash 印 `-`） | 新增 `json::jq_alt`（逐字 `//`），idle／`read_field`／`disposable_effective` 改用它；`jq_raw_field` 維持 `// empty` 形狀給 M2 的 hook 欄位 |
+| `//` 的空字串語意 | `jq_raw_field` 把 `""` 併進 None，鏈式 fallback 會多掉一層（idle 對 `spawned_at: ""` 印秒數，bash 印 `-`） | 新增 `json::jq_alt`（逐字 `//`），idle／`read_field` 改用它；`jq_raw_field` 維持 `// empty` 形狀給 M2 的 hook 欄位 |
 | `printf %q` 只吃 `&str` | proxy／PASS_ENV 值與 hooks 路徑先 lossy 再引號化，非 UTF-8 位元組變 U+FFFD | `shell_quote` 改收 `&[u8]`（`$'\NNN'` 產物是純 ASCII，故不必把啟動指令改成 bytes）；brief 路徑因為是**單引號字面值**無法跳脫，改 fail-closed 拒絕（相對 bash 的刻意偏離，方向是大聲失敗而非靜默注入錯誤守則） |
 | ready interval 可 panic | `Duration::from_secs_f64(inf)` 在「registry 已寫、回滾已解除」之後 panic | 改 `try_from_secs_f64`，不可表示時退 `Duration::MAX`（＝bash 把超大值交給 `sleep` 的同一終態） |
 | spawn tag 的熵可預測 | 沿用 `task::rand_suffix`，`/dev/urandom` 失敗時退回 pid⊕nanos——但 tag 是 despawn 的殺人依據 | 另立 `secure_hex12()`，讀不到熵直接 `Err`（bash 也是在建 pane 前死） |
@@ -352,9 +351,9 @@ check 3 之所以不動：它的比對對象只有 spec。`hook_*` 這四個名�
 
 ## 11. M5：行程身分閘門（窗 1 關閉）
 
-提案與量測數據：`docs/rust/m5-proposal.md`。條款：HOOK-OWNER-5、STATE-AGENT-4。
+提案與量測數據：tag `pre-trim-2026-09` 的 `docs/rust/m5-proposal.md`。條款：HOOK-OWNER-5、STATE-AGENT-4。
 分組 35（17 條斷言）。**只關窗 1**（`/clear` 後的 TTL 降級窗）；窗 2（無鎖
-先到先得的認領競態）維持現狀，論證見 `docs/owner-gate-boundary-assessment.md`。
+先到先得的認領競態）維持現狀，論證見 tag `pre-trim-2026-09` 的 `docs/owner-gate-boundary-assessment.md`。
 
 ### 11.1 為什麼不是 daemon
 
@@ -493,7 +492,7 @@ codex-hooks-probe.md` canary 節：`/new` 後 51 秒新鮮的 state 被當場接
 - 其餘一律落回。
 
 **為什麼不是「祖先鏈走得到本尊、中間沒夾 runtime 形狀就確認」**（立案時的
-草案規則）：那條規則對本專案自己量過的巢狀鏈是錯的。`m5-proposal.md` §1 的
+草案規則）：那條規則對本專案自己量過的巢狀鏈是錯的。tag `pre-trim-2026-09` 的 `m5-proposal.md` §1 的
 實測巢狀鏈是 `hook → 巢狀 claude → bash → 本尊`——巢狀 runtime 正是 hook 的
 直接 PPID（任何「中間」檢查天然豁免它），其餘中介只有 bash（不是 runtime
 形狀）。草案規則會把它**確認成本尊**。而本案第一次讓誤判可以比 M4 更糟：

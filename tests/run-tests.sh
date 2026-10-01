@@ -985,7 +985,7 @@ assert "pane_start_command 剝前導引號後以 spawn tag 前綴開頭（tmux �
 #   - `--permission-mode auto` 換成 bypassPermissions 是安全降級：官方把後者
 #     定位為僅限隔離容器／VM，而 worker pane 跑在本機、與主 session 共用檔案
 #     系統與憑證。（理由到此為止——bypass 並不停用 hooks，deny 與 explicit ask
-#     也仍適用；詳見 README.zh-TW.md，那段因果曾兩度寫錯）
+#     也仍適用；詳見 tag `pre-trim-2026-09` 的 README.zh-TW.md，那段因果曾兩度寫錯）
 #   - 混進 -p/--print 會讓 pane 跑完即退，worker 根本不存在
 #   - 混進 --setting-sources 會讓 worker 脫離使用者的全域安全設定（--settings
 #     不算違反這條：hooks 分層是合併不是覆蓋，全域規則原樣生效，只是外加一份
@@ -2715,7 +2715,7 @@ if grp 32; then
 # 測試環境沒有 attached client，無從重現「落到使用者焦點視窗」的原始故障；
 # 能驗的是落點已被顯式錨定到 owner。
 #
-# P3（docs/spawn-here-plan.md）翻轉了 auto 預設：ORC_PANE 是人工呼叫者
+# P3（tag `pre-trim-2026-09` 的 docs/spawn-here-plan.md）翻轉了 auto 預設：ORC_PANE 是人工呼叫者
 # （環境無 AGENT_BRIDGE_SPAWN_TAG），auto 現在解到 here，不再是
 # per-owner worker window。32a/32b/32e/32g/32i 驗的正是 worker-window 那條
 # 路徑（沿用／confused-deputy／印記回滾），故對這幾例的 spawn 呼叫端注入
@@ -2884,7 +2884,7 @@ W32I_SURVIVORS="$(tmx list-panes -a -F '#{pane_start_command}' 2>/dev/null | gre
 assert "32i 回滾：無 w32i pane 殘留" test "$W32I_SURVIVORS" -eq 0
 assert "32i 回滾：pane 數回到 spawn 前" test "$(pane_count)" -eq "$PANES_BEFORE_32I"
 
-# ---- P3 新增：--here／auto 人工預設／layout 值域（docs/spawn-here-plan.md）----
+# ---- P3 新增：--here／auto 人工預設／layout 值域（tag `pre-trim-2026-09` 的 docs/spawn-here-plan.md）----
 # 從這裡起累計的 spawned registry（32a/32b/32e/g 的真實 agent＋evil-a/b/c/d
 # 的注入 fixture）已逼近預設 cap（4），故凡是會真的落地 registry 的呼叫都
 # 帶寬鬆的 AGENT_BRIDGE_MAX_SPAWN 覆蓋——這裡要驗的是落點，不是 cap。
@@ -3498,7 +3498,7 @@ if grp 35; then
 # **只有相符是結論**。PPID 不符不代表冒名——合法中介（runtime fork 新主行程、
 # 或使用者用 AGENT_BRIDGE_CLAUDE_HOOKS 指定 wrapper）一樣不符，當成冒名會把
 # 本尊永久擋死，連 TTL 自癒都到不了。故不符一律落回 M4 的 session_id＋TTL。
-# 設計依據與實測：docs/rust/m5-proposal.md。
+# 設計依據與實測：tag `pre-trim-2026-09` 的 docs/rust/m5-proposal.md。
 
 # hookcall 的 pipeline 右段由當前 shell fork，故受測 hook 行程的直接父行程
 # 就是這個 shell——$BASHPID 即「本尊」該有的 pid
@@ -3673,7 +3673,7 @@ if grp 36; then
 #
 # **本組的主要斷言是「巢狀不被誤放行」，不是「codex 本尊會綠」**：誤放行＝
 # 立即奪權（不經 TTL），是身分閘門唯一比 M4 更糟的失效方向。實測巢狀鏈
-# （m5-proposal §1）是 hook → 巢狀 claude → bash → 本尊——巢狀正是 hook 的
+# （tag `pre-trim-2026-09` 的 m5-proposal §1）是 hook → 巢狀 claude → bash → 本尊——巢狀正是 hook 的
 # 直接 PPID，任何「祖先鏈走得到本尊」「鏈上沒夾別的 runtime」式的放寬都會
 # 把它確認成本尊（architecture §11.7）。中介一律用**真的行程**構造（argv 形
 # 狀由 script 名決定），不是 registry 捏的假資料。

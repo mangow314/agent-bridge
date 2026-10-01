@@ -22,11 +22,12 @@ hits the busy-worker path: the notification is deferred and the worker's
 Stop hook collects the task from the mailbox. Recorded live (agents reply
 in Traditional Chinese); waiting time is folded in post
 ([tapes and scripts](docs/demo/), `real-*`; the stub-runtime tapes remain
-for reproducible, API-free recordings).*
+for reproducible, API-free recordings). Recorded on an earlier release: the
+sample notes on screen may still mention the since-removed `relay`.*
 
 <details>
 <summary><b>More recordings</b> — multi-round discussion · cross-vendor
-review · relay handoff (live sessions, recorded the same way)</summary>
+review (live sessions, recorded the same way)</summary>
 
 ### Multi-round discussion — the pane keeps its context
 
@@ -42,21 +43,10 @@ worker's context lives in its pane, not in your session window.
 The orchestrating session delegates the audit to a pane from another vendor;
 the verdict comes back as a durable task record, not a scrollback memory.
 
-### Relay — hand leadership forward
-
-![demo: relay a successor pane while a task is still in flight; the successor collects the reply](docs/assets/relay.gif)
-
-When the coordinating session's context runs tight: dispatch work, then
-write a handoff file and `relay` a successor while the task is still in
-flight. The successor reads the handoff, checks the task's `status`, and
-collects a reply the predecessor never saw — workers and tasks survive
-the baton pass in place.
-
 </details>
 
-> 完整正典文件：[README.zh-TW.md](README.zh-TW.md)（含設計取捨與完整已知限制）
-> — the Traditional Chinese README is the canonical, in-depth manual; this
-> file is a condensed overview. Interface contracts live in [spec/](spec/).
+> 繁體中文版：[README.zh-TW.md](README.zh-TW.md) — the Traditional Chinese
+> translation of this file. Interface contracts live in [spec/](spec/).
 
 ## Use agent-bridge when…
 
@@ -69,8 +59,7 @@ a proposal that serves none of them does not belong here):
 2. **Observable and interruptible** — a worker runs in a real tmux pane:
    watch it, jump in, correct it. A subagent only hands back its final answer.
 3. **Outlives the main session** — a worker's context lives in its own pane,
-   untouched when the main session is cleared, compacted, or restarted — and
-   `relay` extends that survival to the coordinating role itself (below).
+   untouched when the main session is cleared, compacted, or restarted.
 4. **Third-layer delegation** — an authorized worker can spawn bridge
    workers of its own, so the next layer down is still cross-vendor and
    observable — not a same-vendor black box reporting summaries upward.
@@ -79,7 +68,7 @@ a proposal that serves none of them does not belong here):
 | --- | --- | --- |
 | Built-in subagents | same vendor, inside your session; result lands straight in your context | reply enters context only when you `read` it |
 | Agent multiplexers | unit is the pane; "looks busy" via screen-scraping ([measured](docs/herdr-probe.md)) | unit is the task: who asked what, exact state, exact reply |
-| Claude Code agent teams ([docs](https://code.claude.com/docs/en/agent-teams)) | rich same-vendor collaboration; lead fixed for life, in-process teammates don't survive `/resume` | independent CLI sessions; `relay` hands leadership on |
+| Claude Code agent teams ([docs](https://code.claude.com/docs/en/agent-teams)) | rich same-vendor collaboration; lead fixed for life, in-process teammates don't survive `/resume` | independent CLI sessions, cross-vendor, hanging off no lead |
 | Claude Code cross-session messaging ([docs](https://code.claude.com/docs/en/cross-session-messaging)) | message any peer Claude session by name (v2.1.224+, cross-machine via Remote Control); Claude-only; a message, not a task — no state, no durable reply | cross-vendor; every dispatch is a task record with a state machine and a reply on disk. For plain Claude-to-Claude chatter, use the built-in |
 | MCP cross-calls | synchronous — your turn blocks, full reply enters context | `send` returns at once; reply waits in the mailbox |
 | API frameworks | orchestrate API calls; you manage keys and tools | orchestrates the CLIs you already use, settings included |
@@ -125,19 +114,20 @@ agent-bridge despawn researcher
 
 Workers see `agent-bridge receive <task-id>` in their pane, then answer with
 `reply` — or `fail`, because an honest failure beats a fake completion. Panes
-you opened yourself can join via `register <name> <tmux-target>`. To watch the
-whole pool, `agent-bridge ui` is an optional dashboard (`q` to leave).
+you opened yourself can join via `register <name> <tmux-target>`.
 
-## Surviving session boundaries
+## Commands
 
-The semi-autonomous pattern agent-bridge is built for: one session acts as
-the coordinator — it plans, delegates, verifies — spending its own context on
-judgment rather than raw output. When that context runs tight, the
-coordinating role does not die with its window: `relay` opens a successor
-pane, injects the successor brief plus the path to a handoff file, and hands
-leadership forward. Workers remain in their panes; tasks and replies remain
-on disk. A depth cap keeps unattended relay chains bounded (details
-in the [canonical manual](README.zh-TW.md)).
+Eighteen subcommands in all; exact argv and MUST semantics are in
+[spec/cli.md](spec/cli.md). stdout carries only the machine-readable result
+(task-id, pane-id, bare state word); everything else goes to stderr.
+
+| Role | Commands |
+| --- | --- |
+| Sender | `send`, `ask` (send → await → read), `await`, `status`, `read`, `cancel` |
+| Worker | `receive`, `start` (optional), `reply`, `fail`, `ready` |
+| Pool | `spawn`, `despawn`, `evict` (closing task → notes land → despawn), `register`, `unregister`, `list [--long]` |
+| Internal | `hook` — the entry point the runtime hooks call |
 
 ## Install
 
@@ -177,26 +167,38 @@ Optional: load the delegation skill into Claude Code with
   `reply`; raise questions by reverse-sending a task. [spec/](spec/) pins the
   interface shape, cross-checked by the test suite.
 - **Lifecycle safety** — spawn cap, atomic rollback on failed spawn,
-  tag-bound `despawn`, graceful `evict`, `gc` for old task files, and an
-  append-only audit log. On top sit `ui` (a dashboard over the same files)
-  and `scan` (paging: a durable event plus at-most-once push when a human is
-  needed now).
-- **Placement is automatic** — a manual session's `spawn`/`relay` defaults to
-  a same-window split (layout via `AGENT_BRIDGE_HERE_LAYOUT`, default
+  tag-bound `despawn`, graceful `evict`, and an append-only audit log; the
+  full reasoning is in [docs/lifecycle-safety.md](docs/lifecycle-safety.md).
+- **Placement is automatic** — a manual session's `spawn` defaults to a
+  same-window split (layout via `AGENT_BRIDGE_HERE_LAYOUT`, default
   `main-vertical`); a spawn-origin caller keeps its own dedicated worker
-  window (the old behavior). `--here`/`--window` override explicitly.
+  window. `--here`/`--window` override explicitly.
 
 ## Trust model & known limits
 
-- Everything runs as **one OS user on one machine**; tmux panes share one
-  trust domain. The bridge defends against accidents — mis-delivered
-  notifications, double replies, stale registrations — not against a
-  malicious local process.
-- Notification guards match the CLI dialogs of tested versions; they fail
-  open when UI copy changes.
+- Everything runs as **one OS user on one machine**; tmux panes and the data
+  directory share one trust domain. The bridge defends against accidents —
+  mis-delivered notifications, double replies, stale registrations — not
+  against a malicious local process.
+- A request is untrusted input for its receiver: data, not instructions.
+- A send-keys Enter could land on the peer's permission dialog. Guards scan
+  the screen before typing and before Enter, but they match the visible text
+  of tested CLI versions: they fail open when UI copy changes, and a tiny
+  race remains.
+- codex hooks need a one-time interactive trust; until granted codex skips
+  them silently and notifications fall back to send-keys
+  ([measured](docs/codex-hooks-probe.md)).
 - `cancel` is non-preemptive: it flips state and notifies, nothing more.
-- The relay depth cap stops runaway loops, not deliberate evasion.
-- Full list: [README.zh-TW.md](README.zh-TW.md) « 已知限制 ».
+- `ready` is a self-report, not a health check. A lock left behind by
+  SIGKILL or power loss is deliberately not auto-reclaimed: confirm nothing
+  is running, then delete it by hand.
+- After a tmux server restart every pane id is stale: `register` again and
+  clear leftover spawned entries with `despawn`.
+- A runtime sandbox must allow writes to the data directory (codex
+  `workspace-write` needs it in `writable_roots`) and may block the socket
+  that notifications use; have the sender `await` instead of relying on them.
+- The earlier long-form manual, with the complete known-limits list, is
+  `README.zh-TW.md` at tag `pre-trim-2026-09`.
 
 ## Tests
 
@@ -206,15 +208,15 @@ bash tests/run-tests.sh   # isolated tmux socket + stub runtimes; no real API ca
 
 ## Docs
 
-- [README.zh-TW.md](README.zh-TW.md) — canonical manual: design trade-offs,
-  full command walk-throughs, complete known limits.
+- [README.zh-TW.md](README.zh-TW.md) — Traditional Chinese translation of
+  this README.
 - [spec/](spec/) — authoritative interface contracts (CLI, env, state, hooks).
-- [share/](share/) — the protocol contracts: orchestrator / worker /
-  successor / review briefs; [SKILL.md](SKILL.md) loads them into Claude Code.
+- [share/](share/) — the protocol contracts: orchestrator and worker briefs,
+  review overlay, vehicle routing; [SKILL.md](SKILL.md) loads them into
+  Claude Code.
 - [docs/](docs/) — engineering evidence: hands-on probes of the runtimes and
-  a comparable tool, design notes, decision records
-  ([index](docs/README.md)); the TUI/paging notes flag which acceptance
-  rounds have *not* passed yet.
+  a comparable tool, design notes ([index](docs/README.md)); retired
+  proposals and plans live at tag `pre-trim-2026-09`.
 
 ## License
 

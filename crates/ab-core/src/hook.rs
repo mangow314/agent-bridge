@@ -179,7 +179,7 @@ pub fn owner_gate(file: &Path, sid: &str, reg_file: &Path) -> bool {
 /// `worker_pid`，claude 實測）對所有 runtime 都試；launcher 形（PPID 的父行程
 /// == `worker_pid` 且 PPID 命中 codex argv 形，恰好一層）只在 registry
 /// `runtime=codex` 時試。MUST NOT 放寬成「祖先鏈走得到 worker_pid」或「鏈上
-/// 沒夾別的 runtime 形狀」：實測巢狀鏈（m5-proposal §1）是 hook → 巢狀
+/// 沒夾別的 runtime 形狀」：實測巢狀鏈（tag `pre-trim-2026-09` 的 m5-proposal §1）是 hook → 巢狀
 /// claude → bash → 本尊——巢狀正是 hook 的直接 PPID、其餘中介只有 bash，兩種
 /// 放寬都會把它確認成本尊，而誤認在本函式的代價是**立即奪權**（不經 TTL），
 /// 是唯一比 M4 更糟的失效方向（architecture §11.7）。
