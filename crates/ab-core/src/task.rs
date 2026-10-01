@@ -1,7 +1,7 @@
 //! task 目錄結構、id 生成／驗證、狀態機轉換與 events.log（state.md STATE-TASK-*、
-//! cli.md 轉換條款）。對映 bash `write_message`:276、`log_event`:251、
-//! `update_meta_status`:261、`check_task_id`:420、`send_rollback`:202、
-//! `cmd_send`:536 的 task 建立段。
+//! cli.md 轉換條款）。對映 bash `write_message`、`log_event`、
+//! `update_meta_status`、`check_task_id`、`send_rollback`、
+//! `cmd_send` 的 task 建立段。
 
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -62,7 +62,7 @@ pub enum MessageSource {
     Stdin,
 }
 
-/// check_task_id:420 — 文法不合即 die，訊息逐字對齊。
+/// check_task_id — 文法不合即 die，訊息逐字對齊。
 pub fn check_task_id(id: &str) -> Result<()> {
     if is_valid_task_id(id) {
         Ok(())
@@ -85,7 +85,7 @@ pub fn require_task_dir(paths: &Paths, id: &str) -> Result<PathBuf> {
     }
 }
 
-/// 讀裸 status 檔。**裸 status 是操作上的權威**（update_meta_status:265-270 的
+/// 讀裸 status 檔。**裸 status 是操作上的權威**（update_meta_status 的
 /// 寫入順序註記），狀態機與 await 全數讀它，不讀 metadata.status。
 pub fn read_status(dir: &Path) -> Result<String> {
     let raw = std::fs::read_to_string(dir.join("status"))
@@ -93,7 +93,7 @@ pub fn read_status(dir: &Path) -> Result<String> {
     Ok(raw.trim_end_matches('\n').to_string())
 }
 
-/// log_event:251 — append-only events.log，行格式 `<iso> <event>[ <detail>]`。
+/// log_event — append-only events.log，行格式 `<iso> <event>[ <detail>]`。
 pub fn log_event(paths: &Paths, id: &str, event: &str, detail: &str) -> Result<()> {
     use std::io::Write;
     let mut line = format!("{} {event}", now_iso());
@@ -112,8 +112,8 @@ pub fn log_event(paths: &Paths, id: &str, event: &str, detail: &str) -> Result<(
         .map_err(|e| Error::new(format!("無法寫入 events.log {}：{e}", path.display())))
 }
 
-/// update_meta_status:261 — 同步更新 metadata.json 與裸 status 檔。
-/// **寫入順序不可對調**：先裸 status、後 metadata（bash:265-273 的論證——中途
+/// update_meta_status — 同步更新 metadata.json 與裸 status 檔。
+/// **寫入順序不可對調**：先裸 status、後 metadata（bash 的論證——中途
 /// 被 SIGKILL 時，殘留分歧只會是 metadata.status 落後一步的展示性資訊；反過來
 /// 則是終態轉換可被重放）。
 pub fn update_meta_status(dir: &Path, new: TaskState) -> Result<()> {
@@ -146,7 +146,7 @@ pub fn update_meta_status(dir: &Path, new: TaskState) -> Result<()> {
     atomic_write(&meta_path, doc.as_bytes())
 }
 
-/// write_message:276 — payload 走 byte 流原樣搬運（分組 6 驗 byte-for-byte
+/// write_message — payload 走 byte 流原樣搬運（分組 6 驗 byte-for-byte
 /// 保真，架構 §3）。`Text` 模式比照 `printf '%s\n'` 補一個換行；檔案／stdin
 /// 模式原樣搬，不補不刪。
 pub fn write_message(dest: &Path, src: &MessageSource) -> Result<()> {
@@ -164,7 +164,7 @@ pub fn write_message(dest: &Path, src: &MessageSource) -> Result<()> {
             b
         }
         MessageSource::File(p) => {
-            // 第二道存在性檢查（cmd_send:559-562 的註記：預檢與此處之間的
+            // 第二道存在性檢查（cmd_send 的註記：預檢與此處之間的
             // TOCTOU 空隙內檔案可能被刪），訊息逐字對齊。
             if !p.is_file() {
                 return Err(Error::new(format!("找不到訊息檔：{}", p.display())));
@@ -210,7 +210,7 @@ pub fn meta_str(dir: &Path, key: &str) -> Result<String> {
     }
 }
 
-/// `last_task_at`:457 — 最後一個派給該 agent 的任務建立時間（ISO），從未被
+/// `last_task_at` — 最後一個派給該 agent 的任務建立時間（ISO），從未被
 /// 派工則回空字串。掃 `tasks/` 而不是在 send 時記進 registry：send 是核心
 /// 路徑，加一次「取鎖＋寫入」會擴大它的失敗面，而這資訊只有回收決策要用。
 ///
@@ -246,7 +246,7 @@ pub fn last_task_at(paths: &Paths, who: &str) -> String {
     latest
 }
 
-/// rand_suffix:146 — `head -c 2 /dev/urandom | od -An -tx1`：2 bytes 轉 4 位
+/// rand_suffix — `head -c 2 /dev/urandom | od -An -tx1`：2 bytes 轉 4 位
 /// 小寫 hex。std-only（架構 §1），直接讀 `/dev/urandom`；讀不到時退回
 /// pid＋奈秒混合值——task-id 的隨機尾綴只為避免同秒碰撞，不是安全用途，
 /// 且 `cmd_send` 本來就有碰撞重試迴圈兜底。
@@ -265,7 +265,7 @@ pub(crate) fn rand_suffix() -> String {
 }
 
 /// task 目錄建立到「完整形狀」（metadata＋status 都寫齊）之間的守衛。
-/// 對映 bash 的 `SEND_RB_DIR`＋EXIT trap（send_rollback:202）：中途任何失敗都
+/// 對映 bash 的 `SEND_RB_DIR`＋EXIT trap：中途任何失敗都
 /// 要把殘缺目錄收走——沒有 metadata/status 的目錄不屬於任何狀態，
 /// 留下就是永久孤兒。`commit()` 之後才解除。
 struct SendRollback {
@@ -291,7 +291,7 @@ impl Drop for SendRollback {
     }
 }
 
-/// cmd_send:576-611 的 task 建立段：碰撞重試建目錄 → 寫 request → 寫
+/// cmd_send 的 task 建立段：碰撞重試建目錄 → 寫 request → 寫
 /// metadata → 寫 status → 記 created 事件。回傳 task-id。
 ///
 /// 這裡的回滾用 `Drop`（與架構 §6 對鎖的紅線不同）是有意的：鎖的紅線是
@@ -324,7 +324,7 @@ pub fn create_task(paths: &Paths, from: &str, to: &str, src: &MessageSource) -> 
         dir: Some(dir.clone()),
     };
 
-    // die 文字**逐字**對齊 bash:593-594／606-609，不得附加底層錯誤原因：
+    // die 文字**逐字**對齊 bash，不得附加底層錯誤原因：
     // 這三句是 CLI 契約面，尾巴多一個「：{io error}」就不是同一句話了。
     write_message(&dir.join("request.md"), src)
         .map_err(|_| Error::new("send 無法寫入 request（殘缺目錄已回滾）"))?;
@@ -334,7 +334,7 @@ pub fn create_task(paths: &Paths, from: &str, to: &str, src: &MessageSource) -> 
         .map(|p| p.display().to_string())
         .unwrap_or_default();
     // 欄位序逐字對齊 bash `jq -n '{version, task_id, from, to, created_at,
-    // updated_at, working_directory, status}'`（cmd_send:599-604）；
+    // updated_at, working_directory, status}'`；
     // `preserve_order` 下 Map 依插入序輸出。
     let mut fields = Map::new();
     fields.insert("version".into(), Value::from(1));
@@ -385,7 +385,7 @@ pub struct CancelOutcome {
     pub notify: Option<crate::notify::NotifyOutcome>,
 }
 
-/// cmd_cancel:744 的完整語意（鎖／轉態／事件／通知）的**單一正本**（審查 F6）。
+/// cmd_cancel 的完整語意（鎖／轉態／事件／通知）的**單一正本**（審查 F6）。
 ///
 /// **函式內不印任何字**：呈現層由呼叫端決定（CLI 印 stderr，審查 F7）。
 pub fn cancel_task(
@@ -504,7 +504,7 @@ pub struct ReadHeader {
     pub to: String,
 }
 
-/// cmd_read:784 的完整語意（鎖／狀態驗證／read 事件／payload 呈現）的**單一
+/// cmd_read 的完整語意（鎖／狀態驗證／read 事件／payload 呈現）的**單一
 /// 正本**——分家就會漂移（審查 F6，同 `cancel_task` 的處置）。
 ///
 /// **持鎖到呼叫端把 payload 處理完為止**，故走 callback 而不是「先讀成
@@ -687,7 +687,7 @@ impl BlockerTracker {
     }
 }
 
-/// cmd_await:822 的等待主體（唯讀輪詢 status 檔，不寫 events、不取鎖）。
+/// cmd_await 的等待主體（唯讀輪詢 status 檔，不寫 events、不取鎖）。
 /// CLI 的 `await` 與 evict 的第二段共用同一份（審查 F6：分家就會漂移）。
 ///
 /// 簽名保持不變的薄殼：evict 的呼叫端**顯式不帶 watch**（evict 的逾時語意
@@ -804,7 +804,7 @@ fn poll_sleep(interval: f64) -> std::time::Duration {
     std::time::Duration::try_from_secs_f64(interval).unwrap_or(std::time::Duration::MAX)
 }
 
-/// 精確翻譯 bash `^([0-9]+|[0-9]*\.[0-9]+)$`（bin/agent-bridge:847-848）：
+/// 精確翻譯 bash `^([0-9]+|[0-9]*\.[0-9]+)$`：
 /// 小數點後**至少一位數字**。`1.` 在 bash 被拒，Rust 的 `parse::<f64>` 卻
 /// 收得下——不特別擋就會多接受一種 bash 判為設定錯誤的值。
 fn poll_interval_shape_ok(raw: &str) -> bool {
@@ -1035,7 +1035,7 @@ mod tests {
     }
 
     /// 訊息來源檔在預檢後消失時，MUST NOT 留下沒有 metadata/status 的殘缺
-    /// 目錄（send_rollback:195-207 的孤兒目錄問題）。
+    /// 目錄（send_rollback 的孤兒目錄問題）。
     #[test]
     fn failed_create_rolls_back_partial_dir() {
         let d = Dir::new("ab-core-task-rb");

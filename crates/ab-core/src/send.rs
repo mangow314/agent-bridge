@@ -78,7 +78,7 @@ pub fn notify_send(
     to: &str,
     task_id: &str,
 ) -> Result<NotifyReport> {
-    // 通知前重讀 pane（cmd_send:613-619）：從參數檢查到這裡隔著建目錄＋三次
+    // 通知前重讀 pane：從參數檢查到這裡隔著建目錄＋三次
     // 寫檔，期間同名 agent 可能被 unregister＋register 換到別的 pane——舊 pane
     // 若已屬別人的 session，這行 command＋Enter 就打進無辜視窗。重讀把窗口縮到
     // 次毫秒級；徹底關閉需要「讀 registry 與 send-keys」原子化，tmux 給不了。

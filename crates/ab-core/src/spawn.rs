@@ -1,9 +1,9 @@
 //! worker 生命週期：cap、pane 建立、brief 注入、ready 探針、原子回滾、
 //! 出身防護（tag）、despawn／evict，以及 `list --long` 的 ready／idle 計算（架構 §2 的 `spawn` 列）。
 //!
-//! 對映 bash：`cmd_spawn`:1063、`spawn_rollback`:940、`rb_kill_tagged`:928、
-//! `spawn_wait_ready`:1038、`worker_prompt_arg`:1007、
-//! `cmd_despawn`:1476、`cmd_ready`:1594。
+//! 對映 bash：`cmd_spawn`、`spawn_rollback`、`rb_kill_tagged`、
+//! `spawn_wait_ready`、`worker_prompt_arg`、
+//! `cmd_despawn`、`cmd_ready`。
 //!
 //! evict 的三段式編排（send → await → despawn）留在 `ab` CLI 層：它由三個
 //! 既有子指令組成，核心邏輯分別已在 `task`／`spawn` 就位。
@@ -23,17 +23,17 @@ use crate::time::now_iso;
 use crate::tmux::TmuxClient;
 use serde_json::Value;
 
-/// `PANE_RE='^%[0-9]+$'`（bin/agent-bridge:30）。
+/// `PANE_RE='^%[0-9]+$'`。
 pub fn is_valid_pane(s: &str) -> bool {
     crate::notify::is_valid_pane(s)
 }
 
-/// `WINDOW_RE='^@[0-9]+$'`（bin/agent-bridge:33）。
+/// `WINDOW_RE='^@[0-9]+$'`。
 pub fn is_valid_window(s: &str) -> bool {
     s.len() > 1 && s.starts_with('@') && s[1..].bytes().all(|b| b.is_ascii_digit())
 }
 
-/// `MODEL_RE='^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$'`（bin/agent-bridge:38）。
+/// `MODEL_RE='^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$'`。
 /// 這個值會被展開進 pane 啟動命令字串，故在解析點就驗。
 /// `spawn --model` 與 `--profile` 共用這條文法，理由相同：值會原樣進 pane 的
 /// 啟動命令字串，必須擋掉分隔符、空白與旗標走私（`-` 起首）。
@@ -155,7 +155,7 @@ pub struct SpawnRequest {
     pub here: bool,
 }
 
-/// `worker_prompt_arg`:1007 — brief 檔＋動態尾巴組成 runtime 的 initial prompt
+/// `worker_prompt_arg` — brief 檔＋動態尾巴組成 runtime 的 initial prompt
 /// 參數（單一 shell word）。**brief 全文刻意不進命令列**：讓 tmux 的 `sh -c`
 /// 在 pane 內展開 `$(cat ...)`，啟動指令因此維持短、`pane_start_command` 仍
 /// 可讀。`cat --` 的 option terminator 不可省：brief 路徑是公開覆蓋介面，
@@ -173,7 +173,7 @@ fn worker_prompt_arg(name: &str, brief: &str) -> Result<String> {
     ))
 }
 
-/// spawn 失敗回滾（`spawn_rollback`:940 的 EXIT trap 等價物）。
+/// spawn 失敗回滾（`spawn_rollback` 的 EXIT trap 等價物）。
 ///
 /// **解除回滾靠單一旗標**（`done`）而非逐一清空三個欄位：訊號可能落在兩次
 /// 賦值之間，讓回滾看到「有 tag、沒有 registry 路徑」這種半清空狀態，於是
@@ -194,7 +194,7 @@ impl SpawnRollback<'_> {
         self.done = true;
     }
 
-    /// `rb_kill_tagged`:928 — 原子地「驗 tag 才殺」，並確認 pane 真的消失。
+    /// `rb_kill_tagged` — 原子地「驗 tag 才殺」，並確認 pane 真的消失。
     /// 回 `true`＝已不存在。**查詢失敗要回報「無法確認」而不是「已消失」**：
     /// 把 tmux 掛掉當成 pane 不見了，正是 despawn 那條被揪出來的錯誤方向。
     fn kill_tagged(&self, pane: &str) -> bool {
@@ -275,7 +275,7 @@ impl Drop for SpawnRollback<'_> {
     }
 }
 
-/// `cmd_spawn`:1063 — 建立 worker pane 並註冊，回傳 pane id。
+/// `cmd_spawn` — 建立 worker pane 並註冊，回傳 pane id。
 ///
 /// 檢查順序逐條對齊 bash，因為那個順序本身就是契約：**所有會 die 的前提都
 /// 必須在建 pane 之前**（brief、hooks settings、readiness 參數、cap），pane
@@ -294,7 +294,7 @@ pub fn spawn(paths: &Paths, tmux: &dyn TmuxClient, req: &SpawnRequest) -> Result
     }
 
     // runtime 表：指令 ＋ 守則注入方式。三個 runtime 都走「initial prompt
-    // 位置參數」。claude 的旗標選擇理由見 bin/agent-bridge:1093-1110，不複製。
+    // 位置參數」。claude 的旗標選擇理由見 bin/agent-bridge，不複製。
     //
     // agy（Antigravity CLI）的旗標選擇（量測正本 docs/agy-probe.md）：
     // agy 沒有 codex `--profile` 那種細粒度權限路線，也沒有 `--settings` 可讓
@@ -801,8 +801,8 @@ fn spawn_locked(
         }
         Ok(p)
     } else if !worker_win.is_empty() {
-        // 先取 pane 再重排：bash 的 `select-layout` 在 `|| die` 之後才執行
-        // （:1299-1301），split 失敗時根本不會走到
+        // 先取 pane 再重排：bash 的 `select-layout` 在 `|| die` 之後才執行，
+        // split 失敗時根本不會走到
         let p = tmux
             .exec(&[
                 "split-window",
@@ -983,7 +983,7 @@ fn new_window(tmux: &dyn TmuxClient, opts: &[&str], cmd: &str) -> Result<String>
         .ok_or_else(|| Error::new("tmux new-window 失敗"))
 }
 
-/// 回查同 owner 可沿用的 worker window（cmd_spawn:1262-1288）。
+/// 回查同 owner 可沿用的 worker window。
 ///
 /// **反 confused-deputy**：registry 對每個 worker 可寫，`@id` 語法合法、window
 /// 存在都冒充得了。信任根源放在攻擊面之外——建窗時把 owner 印記寫進 tmux 視窗
@@ -1053,7 +1053,7 @@ fn find_worker_window(paths: &Paths, tmux: &dyn TmuxClient, owner: &str) -> Stri
     String::new()
 }
 
-/// `spawn_wait_ready`:1038 — 間隔重送探針（`agent-bridge ready <name>`）直到
+/// `spawn_wait_ready` — 間隔重送探針（`agent-bridge ready <name>`）直到
 /// registry 翻 ready 或逾時。REPL 啟動期吃掉的按鍵靠重送覆蓋；**逾時不回滾、
 /// 僅警告**，pane 留用供人工診斷。
 fn spawn_wait_ready(paths: &Paths, tmux: &dyn TmuxClient, name: &str, pane: &str, timeout: u64) {
@@ -1107,7 +1107,7 @@ pub struct DespawnCtx {
     pub notes_handled: bool,
 }
 
-/// `cmd_despawn`:1476 — 回收 spawn 出身的 worker（kill pane＋除名）。
+/// `cmd_despawn` — 回收 spawn 出身的 worker（kill pane＋除名）。
 ///
 /// 出身檢查、generation 比對、kill 全在 registry 鎖內：檢查與 kill-pane 之間
 /// 若 registry 被同名 register 換掉，鎖外檢查會拿舊紀錄放行、卻殺到新的人工
@@ -1274,7 +1274,7 @@ fn despawn_locked(
         "despawned"
     };
     // **刪不掉不得謊報成功**（codex 複核 2026-07-31 blocker）：bash 這行是裸的
-    // `rm -f -- "$f"`（:1580），失敗在 `set -e` 下直接把 despawn 帶成非零，
+    // `rm -f -- "$f"`，失敗在 `set -e` 下直接把 despawn 帶成非零，
     // 不會寫審計、也不會印「已 despawn」。吞掉的話會留下一筆仍佔 cap、也擋住
     // 同名 spawn 的殭屍 registry，而呼叫端（含 evict）以為收乾淨了。
     // `rm -f` 對「本來就不存在」是成功，故 NotFound 照樣往下走。
@@ -1337,7 +1337,7 @@ fn tag_shape_ok(tag: &str, name: &str) -> bool {
             .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
 }
 
-/// `cmd_ready`:1594 — worker 自報就緒；僅限 spawned agent。
+/// `cmd_ready` — worker 自報就緒；僅限 spawned agent。
 pub fn ready(paths: &Paths, name: &str) -> Result<()> {
     with_spawned_registry(paths, name, "ready", |f| set_bool_field(f, "ready", true))?;
     let _ = writeln_stderr(&format!("agent '{name}' 已回報就緒（ready）"));

@@ -103,7 +103,7 @@ pub fn state_ttl_strict() -> Result<i64> {
     parse_ttl(&raw).ok_or_else(|| Error::new(format!("{ENV_STATE_TTL} 需為非負整數：{raw}")))
 }
 
-/// hook_owner_gate 用（bash:2074）：壞值**或 0** 一律退預設、不得 die。
+/// hook_owner_gate 用：壞值**或 0** 一律退預設、不得 die。
 ///
 /// 0 在這裡不能照收：TTL=0 時通知端通道雖關，stop 的 block 輸出仍活著（冒名
 /// 攻擊面仍在），gate 必須繼續用預設窗運作——「永遠可接管」等於沒有 gate。
@@ -177,7 +177,7 @@ fn parse_tmux_timeout(raw: Option<&str>) -> Option<std::time::Duration> {
     }
 }
 
-/// bash `REPO_ROOT="$(dirname "$(dirname "$SCRIPT_PATH")")"`（bin/agent-bridge:45-46），
+/// bash `REPO_ROOT="$(dirname "$(dirname "$SCRIPT_PATH")")"`，
 /// 其中 `SCRIPT_PATH` 是 `readlink -f` 後的實體路徑。Rust 這邊
 /// `current_exe()` 在 Linux 讀 `/proc/self/exe`，同樣是解析完符號連結的實體
 /// 路徑——測試把 `$SHIM/agent-bridge` symlink 到執行檔，兩邊都會解析到本尊。
@@ -215,7 +215,7 @@ pub fn claude_hooks_settings() -> std::path::PathBuf {
     path_env_or(ENV_CLAUDE_HOOKS, "share/claude-worker-hooks.json")
 }
 
-/// bash `[[ "$max" =~ ^[0-9]{1,9}$ ]]`（cmd_spawn:1180）：壞值致命。
+/// bash `[[ "$max" =~ ^[0-9]{1,9}$ ]]`：壞值致命。
 pub fn max_spawn() -> Result<i64> {
     match read_env(ENV_MAX_SPAWN) {
         EnvValue::Unset => Ok(4),
@@ -228,7 +228,7 @@ pub fn max_spawn() -> Result<i64> {
     }
 }
 
-/// `validate_ready_opts`:988 — 兩個 readiness 參數**必須在建 pane 之前**驗完；
+/// `validate_ready_opts` — 兩個 readiness 參數**必須在建 pane 之前**驗完；
 /// 回傳 `(timeout_secs, probe_interval_secs)`。
 pub fn ready_opts() -> Result<(u64, f64)> {
     let t_raw = match read_env(ENV_READY_TIMEOUT) {
@@ -275,7 +275,7 @@ fn decimal_shape_ok(raw: &str) -> bool {
     }
 }
 
-/// `AGENT_BRIDGE_PASS_ENV`（cmd_spawn:1238-1246）：逗號分隔的變數名清單，
+/// `AGENT_BRIDGE_PASS_ENV`：逗號分隔的變數名清單，
 /// 逐個驗 `^[A-Za-z_][A-Za-z0-9_]*$`，空段落跳過；不合法即 die。
 pub fn pass_env_names() -> Result<Vec<String>> {
     let raw = match read_env(ENV_PASS_ENV) {

@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use crate::error::{Error, Result};
 
 /// 資料目錄佈局（`agents/` `tasks/` `state/` `locks/`）與 `AGENT_BRIDGE_DATA`
-/// 解析（ENV-DATA-1）。對映 bash：全域初始化（DATA_DIR）與 `ensure_dirs`:148。
+/// 解析（ENV-DATA-1）。對映 bash：全域初始化（DATA_DIR）與 `ensure_dirs`。
 #[derive(Clone)]
 pub struct Paths {
     pub data_dir: PathBuf,
@@ -35,7 +35,7 @@ impl Paths {
         }
     }
 
-    /// ensure_dirs:148 — 非唯讀指令進場時補建四個子目錄；唯讀指令
+    /// ensure_dirs — 非唯讀指令進場時補建四個子目錄；唯讀指令
     /// （status/await/idle/list/hook）MUST NOT 呼叫本函式（CLI-RO-1，
     /// 由 `ab` dispatch 層的豁免表保證，不在此處判斷）。
     pub fn ensure_dirs(&self) -> Result<()> {

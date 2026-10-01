@@ -15,7 +15,7 @@ pub struct LockGuard {
 }
 
 impl LockGuard {
-    /// 顯式釋放；比照 bash `release_lock`:217——rmdir 失敗（非空／權限）只
+    /// 顯式釋放；比照 bash `release_lock`——rmdir 失敗（非空／權限）只
     /// 警告到 stderr，不視為呼叫端錯誤（STATE-LOCK-2：殘留鎖會擋住後續操作，
     /// 這個警告訊息本身就是唯一的救援線索，不可吞掉）。
     pub fn release(mut self) {
@@ -41,11 +41,11 @@ impl Drop for LockGuard {
     }
 }
 
-/// acquire_lock:227 — mkdir 鎖：佔用短暫重試（25 次、每次 0.2s）；建鎖失敗但
+/// acquire_lock — mkdir 鎖：佔用短暫重試（25 次、每次 0.2s）；建鎖失敗但
 /// 鎖目錄不存在（權限／sandbox 問題）MUST 立即以真實原因終止，MUST NOT
 /// 誤報為「鎖佔用中」（state.md STATE-LOCK-1）。
 ///
-/// 非佔用分支比照 bash:234-238 補第二次 mkdir 嘗試：初次失敗且鎖目錄不存在
+/// 非佔用分支比照 bash 補第二次 mkdir 嘗試：初次失敗且鎖目錄不存在
 /// 時，瞬時性錯誤（例如短暫的檔案系統壓力）可能已在兩次呼叫之間消失——
 /// 只試一次就 die 對「瞬時錯誤已解除」的情形不是終態等價（會把 bash 版能
 /// 成功取鎖的呼叫誤判為失敗）。第二次仍失敗才以其錯誤原因終止。
@@ -122,7 +122,7 @@ mod tests {
     /// 非佔用分支：鎖路徑被一個普通檔案（非目錄）擋住時，兩次 mkdir 嘗試
     /// 都會失敗（阻擋物持續存在），錯誤訊息 MUST 落在「非鎖佔用」分支而非
     /// 「鎖佔用中」分支——快速失敗、不進 25 次重試迴圈。這間接驗證了
-    /// bash:234-238 的雙嘗試結構有被複製（若只驗證單次嘗試也會通過本測試，
+    /// bash 的雙嘗試結構有被複製（若只驗證單次嘗試也會通過本測試，
     /// 但訊息分流正確性是本次修復要保的不變量）。
     #[test]
     fn non_directory_blocker_reports_real_error_not_occupied() {

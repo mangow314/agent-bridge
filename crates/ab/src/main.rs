@@ -206,7 +206,7 @@ fn main() -> ExitCode {
     let rest_os = &raw[1..];
 
     let paths = Paths::resolve();
-    // 唯讀豁免（main dispatch:2262-2269／CLI-RO-1）：status/await/list/
+    // 唯讀豁免（CLI-RO-1）：status/await/list/
     // hook 不建目錄。本切片只實作 list 屬於這個豁免表；其餘四個尚未實作，
     // 一律落入下面的「未知指令」分支（不建目錄與否對它們無意義）。
     let readonly = matches!(cmd.as_str(), "status" | "await" | "list");
@@ -248,7 +248,7 @@ fn main() -> ExitCode {
     }
 }
 
-/// cmd_register:476
+/// cmd_register
 fn cmd_register(paths: &Paths, args: &[String]) -> Result<()> {
     if args.len() != 2 {
         return Err(Error::new(
@@ -263,7 +263,7 @@ fn cmd_register(paths: &Paths, args: &[String]) -> Result<()> {
     Ok(())
 }
 
-/// cmd_list:522 — 裸形無參數；`--long`／`-l` 走介入視圖（CLI-LIST-2）。
+/// cmd_list — 裸形無參數；`--long`／`-l` 走介入視圖（CLI-LIST-2）。
 /// bash 未檢查 `$#`（多餘參數靜默忽略），Rust 這裡改為顯式拒絕：`--long`
 /// 讓參數面有了意義，靜默忽略會把打錯的旗標變成「看起來成功的裸 list」。
 /// 損壞 registry 檔 MUST NOT 靜默略過（見 registry::list 文件）：`?` 把
@@ -292,7 +292,7 @@ fn cmd_list(paths: &Paths, args: &[String]) -> Result<()> {
     Ok(())
 }
 
-/// cmd_send:536 — 本切片只涵蓋分組 2「send 錯誤路徑」：引數解析、
+/// cmd_send — 本切片只涵蓋分組 2「send 錯誤路徑」：引數解析、
 /// `--from`/`--message`|`--message-file` 擇一驗證、名稱文法、收件者已註冊
 /// 檢查，逐項對齊 CLI-SEND-2/3 與 STATE-GEN-3。task 建立成功路徑（寫
 /// request/metadata/status、通知）留給下一階段，見 ab-core::registry
@@ -518,7 +518,7 @@ fn message_source(mode: &str, val: &OsString) -> MessageSource {
     }
 }
 
-/// parse_message_opts:664 — reply／fail 共用的 `--message`／`--message-file`
+/// parse_message_opts — reply／fail 共用的 `--message`／`--message-file`
 /// 解析。`cmdname` 只用在「需要訊息」那句 die 的措辭裡，逐字對齊 bash。
 fn parse_message_opts(cmdname: &str, args: &[OsString]) -> Result<MessageSource> {
     let mut mode = "";
@@ -555,7 +555,7 @@ fn parse_message_opts(cmdname: &str, args: &[OsString]) -> Result<MessageSource>
     Ok(message_source(mode, &val))
 }
 
-/// cmd_unregister:503
+/// cmd_unregister
 fn cmd_unregister(paths: &Paths, args: &[String]) -> Result<()> {
     if args.len() != 1 {
         return Err(Error::new("用法：agent-bridge unregister <agent>"));
@@ -565,7 +565,7 @@ fn cmd_unregister(paths: &Paths, args: &[String]) -> Result<()> {
     Ok(())
 }
 
-/// cmd_receive:626 — queued→delivered；delivered/running 可重複取件（re-receive）。
+/// cmd_receive — queued→delivered；delivered/running 可重複取件（re-receive）。
 /// 標頭走 stderr、request 原文走 stdout（byte 原樣，CLI-RECEIVE-1）。
 fn cmd_receive(paths: &Paths, args: &[String]) -> Result<()> {
     if args.len() != 1 {
@@ -600,7 +600,7 @@ fn cmd_receive(paths: &Paths, args: &[String]) -> Result<()> {
     write_payload(&dir.join("request.md"))
 }
 
-/// cmd_start:726 — 僅 delivered 可開工。
+/// cmd_start — 僅 delivered 可開工。
 fn cmd_start(paths: &Paths, args: &[String]) -> Result<()> {
     if args.len() != 1 {
         return Err(Error::new("用法：agent-bridge start <task-id>"));
@@ -626,7 +626,7 @@ fn cmd_start(paths: &Paths, args: &[String]) -> Result<()> {
     Ok(())
 }
 
-/// respond_task:686 — reply／fail 的共用主體：寫 response.md、轉終態、
+/// respond_task — reply／fail 的共用主體：寫 response.md、轉終態、
 /// 通知 sender 讀回覆。
 fn respond_task(
     paths: &Paths,
@@ -672,7 +672,7 @@ fn respond_task(
     Ok(())
 }
 
-/// cmd_reply:708
+/// cmd_reply
 fn cmd_reply(paths: &Paths, args: &[OsString]) -> Result<()> {
     if args.is_empty() {
         return Err(Error::new(
@@ -687,7 +687,7 @@ fn cmd_reply(paths: &Paths, args: &[OsString]) -> Result<()> {
     Ok(())
 }
 
-/// cmd_fail:717
+/// cmd_fail
 fn cmd_fail(paths: &Paths, args: &[OsString]) -> Result<()> {
     if args.is_empty() {
         return Err(Error::new(
@@ -702,7 +702,7 @@ fn cmd_fail(paths: &Paths, args: &[OsString]) -> Result<()> {
     Ok(())
 }
 
-/// cmd_cancel:744 — queued/delivered/running 皆可取消；通知失敗不影響取消本身。
+/// cmd_cancel — queued/delivered/running 皆可取消；通知失敗不影響取消本身。
 /// 轉態／通知的正本在 `ab_core::task::cancel_task`（審查 F6）；
 /// 這裡只負責 CLI 呈現層——三行 stderr 文案逐字沿用 bash 正本。
 fn cmd_cancel(paths: &Paths, args: &[String]) -> Result<()> {
@@ -727,8 +727,8 @@ fn cmd_cancel(paths: &Paths, args: &[String]) -> Result<()> {
     Ok(())
 }
 
-/// cmd_status:770 — 印裸狀態字。唯讀（不建目錄、不取鎖、不寫 events）。
-/// status 檔讀取失敗 MUST 以非零收場，不得以 rc=0＋空輸出蒙混（cmd_status:776-780）。
+/// cmd_status — 印裸狀態字。唯讀（不建目錄、不取鎖、不寫 events）。
+/// status 檔讀取失敗 MUST 以非零收場，不得以 rc=0＋空輸出蒙混。
 fn cmd_status(paths: &Paths, args: &[String]) -> Result<()> {
     if args.len() != 1 {
         return Err(Error::new("用法：agent-bridge status <task-id>"));
@@ -746,7 +746,7 @@ fn cmd_status(paths: &Paths, args: &[String]) -> Result<()> {
     Ok(())
 }
 
-/// cmd_read:784 — 讀回覆（completed/failed 可）。
+/// cmd_read — 讀回覆（completed/failed 可）。
 /// 鎖／狀態驗證／read 事件的正本已下沉 `ab_core::task::with_response`
 /// （審查 F6）；這裡只剩呈現。
 ///
@@ -766,9 +766,9 @@ fn cmd_read(paths: &Paths, args: &[String]) -> Result<()> {
     })
 }
 
-/// cmd_await:822 — 唯讀輪詢 status 檔（不寫 events、不取鎖），在只讀 sandbox
+/// cmd_await — 唯讀輪詢 status 檔（不寫 events、不取鎖），在只讀 sandbox
 /// 內也能用。**逾時以專屬 exit 124 退出**，其他錯誤一律非 124——呼叫端要能把
-/// 「等到期限」與「await 自己壞掉」分開處置（cmd_await:866-871）。
+/// 「等到期限」與「await 自己壞掉」分開處置。
 ///
 /// blocker 探測（CLI-AWAIT-3／CLI-AWAIT-4）：`--on-blocker warn`（預設）在
 /// worker pane 確立停在權限框時印一次 stderr 警告續等；`return` 再加上
@@ -916,7 +916,7 @@ fn await_with_blocker(
     task::await_task_watched(paths, id, timeout, watch.as_ref())
 }
 
-/// cmd_spawn:1063 的 argv 解析。**`--model`／`--profile` 在解析點就驗**（不等到
+/// cmd_spawn 的 argv 解析。**`--model`／`--profile` 在解析點就驗**（不等到
 /// 用時）：這兩個值會進 pane 啟動命令字串，不合法就必須在建 pane 之前死掉。
 fn parse_spawn_args(args: &[String]) -> Result<spawn::SpawnRequest> {
     if args.is_empty() {
@@ -979,14 +979,14 @@ fn parse_spawn_args(args: &[String]) -> Result<spawn::SpawnRequest> {
     })
 }
 
-/// cmd_spawn:1063
+/// cmd_spawn
 fn cmd_spawn(paths: &Paths, args: &[String]) -> Result<()> {
     let req = parse_spawn_args(args)?;
     spawn::spawn(paths, &SubprocessTmux, &req)?;
     Ok(())
 }
 
-/// cmd_despawn:1476
+/// cmd_despawn
 fn cmd_despawn(paths: &Paths, args: &[String]) -> Result<()> {
     if args.len() != 1 {
         return Err(Error::new("用法：agent-bridge despawn <name>"));
@@ -1000,7 +1000,7 @@ fn cmd_despawn(paths: &Paths, args: &[String]) -> Result<()> {
     Ok(())
 }
 
-/// cmd_ready:1594
+/// cmd_ready
 fn cmd_ready(paths: &Paths, args: &[String]) -> Result<()> {
     if args.len() != 1 {
         return Err(Error::new("用法：agent-bridge ready <name>"));
@@ -1008,7 +1008,7 @@ fn cmd_ready(paths: &Paths, args: &[String]) -> Result<()> {
     spawn::ready(paths, &args[0])
 }
 
-/// cmd_evict:1866 的 argv 解析。編排的正本已下沉 `ab_core::evict::evict`
+/// cmd_evict 的 argv 解析。編排的正本已下沉 `ab_core::evict::evict`
 /// （審查 F6）；這裡只剩參數面與呈現層——core 不印字，
 /// 事件在這裡轉成 stderr（`Warn` 走 `agent-bridge: ` 前綴、`Info` 走裸行，
 /// 逐字對齊下沉前的行為），stdout 恰為收尾 task-id 一行（CLI-EVICT-1）。

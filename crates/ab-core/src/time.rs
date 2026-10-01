@@ -1,4 +1,4 @@
-/// now_iso:144 — 顯式 UTC ISO 8601（`YYYY-MM-DDTHH:MM:SSZ`），不受 locale/TZ
+/// now_iso — 顯式 UTC ISO 8601（`YYYY-MM-DDTHH:MM:SSZ`），不受 locale/TZ
 /// 影響（架構 §5「繼承環境」與 §1 std-only 的交集：不引入 chrono，自行以
 /// Howard Hinnant 的 civil_from_days 演算法換算曆法）。
 pub fn now_iso() -> String {
@@ -45,7 +45,7 @@ pub fn format_epoch_compact(epoch_secs: u64) -> String {
 /// 解析自家寫出的定長 ISO 8601 UTC 時戳（`YYYY-MM-DDTHH:MM:SSZ`）成 epoch 秒。
 /// 對映 bash `date -ud "$ts" +%s`；bash 的 `date` 接受的格式更寬鬆，但 state／
 /// metadata 的時戳都由本工具自己以 `now_iso` 寫出，形狀固定。解析失敗回
-/// `None`，呼叫端一律當「無狀態」處理（notify_or_defer:389-391 的失效方向：
+/// `None`，呼叫端一律當「無狀態」處理（notify_or_defer 的失效方向：
 /// 寧可多送一次鍵，不可因壞時戳把通知永久停掉）。
 pub fn parse_iso_to_epoch(s: &str) -> Option<i64> {
     let b = s.as_bytes();

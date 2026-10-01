@@ -1,5 +1,5 @@
-//! agent 註冊表 CRUD（state.md STATE-AGENT-*）。對映 bash `cmd_register`:476、
-//! `cmd_list`:522、`is_spawned`:153。
+//! agent 註冊表 CRUD（state.md STATE-AGENT-*）。對映 bash `cmd_register`、
+//! `cmd_list`、`is_spawned`。
 
 use std::path::Path;
 
@@ -13,7 +13,7 @@ use crate::tmux::TmuxClient;
 use crate::validate::is_valid_name;
 use serde_json::Value;
 
-/// is_spawned:153 的三態對映（STATE-AGENT-2）：`Spawned`／`Manual`／
+/// is_spawned 的三態對映（STATE-AGENT-2）：`Spawned`／`Manual`／
 /// `Undetermined`（非 object、JSON 損壞、讀不到檔案）。**`Undetermined`
 /// MUST fail-closed**：呼叫端一律拒絕動作，不得當成 `Manual` 覆寫或除名。
 pub enum Provenance {
@@ -42,8 +42,8 @@ pub fn read_provenance(path: &Path) -> Provenance {
 }
 
 /// 讀 registry 檔的 `pane_id`。讀不到／損壞回空字串——對映 bash
-/// `pane="$(jq -r '.pane_id' "$agent_file" 2>/dev/null)" || pane=""`
-/// （cmd_send:619）：空 pane 會被 `notify_pane` 的 PANE_RE 擋下，走既有的
+/// `pane="$(jq -r '.pane_id' "$agent_file" 2>/dev/null)" || pane=""`：
+/// 空 pane 會被 `notify_pane` 的 PANE_RE 擋下，走既有的
 /// notify-failed 降級，不是靜默送鍵到別人的視窗。
 pub fn read_pane(path: &Path) -> String {
     let content = match std::fs::read_to_string(path) {
@@ -58,7 +58,7 @@ pub fn read_pane(path: &Path) -> String {
     }
 }
 
-/// `jq -e '.spawned == true and .ready != true'`（cmd_send:571）：spawn 出身
+/// `jq -e '.spawned == true and .ready != true'`：spawn 出身
 /// 但尚未回報就緒。用於 send 的「通知可能延後」警告，判不出來一律回 `false`
 /// （只是少印一行提示，不影響任何狀態機不變量）。
 pub fn is_spawned_not_ready(path: &Path) -> bool {
@@ -103,7 +103,7 @@ pub fn read_bool(path: &Path, key: &str) -> bool {
     }
 }
 
-/// `caller_owner`:884 — 呼叫者定位 `"session_name:@window_id"`。
+/// `caller_owner` — 呼叫者定位 `"session_name:@window_id"`。
 /// 只認「`TMUX` 與 `TMUX_PANE` 同時存在，且 display-message 真的查得到」：
 /// `TMUX_PANE` 可能是繼承自已死 pane 或別台 server 的殘留值。
 pub fn caller_owner(tmux: &dyn TmuxClient) -> Option<String> {
@@ -125,7 +125,7 @@ pub fn caller_owner(tmux: &dyn TmuxClient) -> Option<String> {
     if out.contains(":@") { Some(out) } else { None }
 }
 
-/// `log_agent_event`:898 — 審計行寫進 `$DATA_DIR/agents.log`，空白分隔固定
+/// `log_agent_event` — 審計行寫進 `$DATA_DIR/agents.log`，空白分隔固定
 /// 6 欄 `<ts> <action> <name> <pane> <runtime> <actor>`。
 ///
 /// **欄位安全在這個唯一咽喉點保證**：name 以外的欄位可能取自 worker 可寫的
@@ -160,7 +160,7 @@ pub fn log_agent_event(
         .map_err(|e| Error::new(format!("無法寫入審計檔 {}：{e}", path.display())))
 }
 
-/// `: >> "$DATA_DIR/agents.log"`（cmd_despawn:1517）：以 append 模式實開一次
+/// `: >> "$DATA_DIR/agents.log"`：以 append 模式實開一次
 /// fd 驗證可寫，**不寫入位元組**。不可逆動作之前的預檢——事後才發現審計寫
 /// 不了，pane 已死、registry 已刪，呼叫端卻收到失敗而去重試。
 pub fn audit_writable(paths: &Paths) -> bool {
@@ -196,7 +196,7 @@ fn squash(v: &str) -> String {
     if s.is_empty() { "-".to_string() } else { s }
 }
 
-/// cmd_unregister:503 — 移除 agent 註冊（CLI-UNREGISTER-1）。**鎖內檢查出身**：
+/// cmd_unregister — 移除 agent 註冊（CLI-UNREGISTER-1）。**鎖內檢查出身**：
 /// 單純除名 spawned agent 會留下沒人認領的 pane，且讓 cap 少算一個；出身
 /// 不明（registry 損壞）同樣拒絕（fail-closed）。
 pub fn unregister(paths: &Paths, name: &str) -> Result<()> {
@@ -228,7 +228,7 @@ pub fn unregister(paths: &Paths, name: &str) -> Result<()> {
     outcome
 }
 
-/// cmd_register:476 — 註冊 agent 與其 tmux pane（CLI-REGISTER-1、
+/// cmd_register — 註冊 agent 與其 tmux pane（CLI-REGISTER-1、
 /// STATE-AGENT-1、STATE-AGENT-3）。成功回傳解析出的 pane id。
 pub fn register(paths: &Paths, tmux: &dyn TmuxClient, name: &str, target: &str) -> Result<String> {
     if !is_valid_name(name) {
@@ -282,7 +282,7 @@ pub fn register(paths: &Paths, tmux: &dyn TmuxClient, name: &str, target: &str) 
     Ok(pane)
 }
 
-/// cmd_list:522 — CLI-LIST-1。唯讀：`agents/` 目錄本身不存在時視為空集
+/// cmd_list — CLI-LIST-1。唯讀：`agents/` 目錄本身不存在時視為空集
 /// （CLI-RO-1／STATE-GEN-1 唯讀段：目錄缺失≠損壞，不報錯、不建目錄）。
 /// 回傳 `(name, pane_id, ready)` 三元組，依檔名排序（對齊 bash glob 的
 /// 字典序）。

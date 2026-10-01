@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 
 use crate::error::{Error, Result};
 
-/// atomic_write:172 — 同目錄暫存檔 + rename，保證讀者任何時點都看不到半寫檔案
+/// atomic_write — 同目錄暫存檔 + rename，保證讀者任何時點都看不到半寫檔案
 /// （state.md STATE-GEN-2）。payload 以 `&[u8]` 原樣搬運，不經 `String`／lossy
 /// 轉換（架構 §3：byte 流只在 fsio 邊界，request/response 保真靠這個）。
 pub fn atomic_write(dest: &Path, content: &[u8]) -> Result<()> {

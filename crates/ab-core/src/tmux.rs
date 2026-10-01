@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 
 /// 一次 tmux 子行程呼叫的結果。`status_ok` 對映 shell 的退出碼是否為 0；
 /// stdout／stderr 各自捕捉——despawn 的兩處查詢把 stderr 併進 die 訊息
-/// （`2>&1`，bin/agent-bridge:1523、1564），其餘一律丟棄。
+/// （`2>&1`），其餘一律丟棄。
 pub struct TmuxOutput {
     pub status_ok: bool,
     pub stdout: String,
@@ -53,12 +53,12 @@ pub trait TmuxClient {
     fn resolve_pane(&self, target: &str) -> Option<String>;
 
     /// 對齊 `tmux list-panes -a -F '#{pane_id}' | grep -Fx "$pane"`：pane 是否
-    /// 還活著。tmux 呼叫失敗一律回 `false`（notify_pane:334 的 fail-closed）。
+    /// 還活著。tmux 呼叫失敗一律回 `false`（notify_pane 的 fail-closed）。
     fn pane_exists(&self, pane: &str) -> bool;
 
     /// 對齊 `tmux capture-pane -pJ -t <pane>`（`-J` 把軟折行接回原樣）。
     /// **失敗回 `None`，呼叫端 MUST fail-closed**：capture 失敗＝無法確認 pane
-    /// 狀態，放行送鍵等於整條權限框防線被略過（notify_pane:339-341）。
+    /// 狀態，放行送鍵等於整條權限框防線被略過。
     fn capture_pane(&self, pane: &str) -> Option<String>;
 
     /// `tmux display -pt <pane> '#{pane_in_mode}'`：pane 是否停在 tmux 的

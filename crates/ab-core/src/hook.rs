@@ -1,6 +1,6 @@
 //! Claude Code hook 協定的落地端（spec/hooks.md HOOK-ID-*、HOOK-EVT-*、
-//! STATE-CHAN-*）。對映 bash `hook_agent_name`:2010、`hook_write_state`:2035、
-//! `hook_owner_gate`:2069、`hook_oldest_queued`:2098、`cmd_hook`:2131。
+//! STATE-CHAN-*）。對映 bash `hook_agent_name`、`hook_write_state`、
+//! `hook_owner_gate`、`hook_oldest_queued`、`cmd_hook`。
 //!
 //! **失效方向鐵律**：本模組任何一步出錯（stdin 非 JSON、state 寫入失敗、環境
 //! 變數缺失或格式不符）一律以「靜默放行」收場，`run()` 永遠回 `HookOutcome`
@@ -28,7 +28,7 @@ pub enum HookOutcome {
     Block(String),
 }
 
-/// hook_agent_name:2010 — 從 spawn tag 析出「我是誰」。
+/// hook_agent_name — 從 spawn tag 析出「我是誰」。
 ///
 /// tag 格式 `ab-spawn-<name>-<pid>-<12hex>`。name 本身允許連字號與底線
 /// （NAME_RE），故不能用第一個 `-` 切。bash 用 `^(.+)-[0-9]+-[0-9a-f]{12}$`
@@ -91,7 +91,7 @@ pub fn agent_name() -> Option<String> {
     agent_name_from_tag(&tag)
 }
 
-/// hook_write_state:2035 — state 通道的單一寫者操作（呼叫者是 worker 自己的
+/// hook_write_state — state 通道的單一寫者操作（呼叫者是 worker 自己的
 /// hook，不取 registry 鎖）。
 ///
 /// `last_delivered = None` 表示保留既有值不動（bash 的 `__KEEP__`）：
@@ -132,7 +132,7 @@ fn read_json_field(file: &Path, key: &str) -> Option<String> {
     json::jq_raw_field(&fields, key)
 }
 
-/// hook_owner_gate:2069 — state 檔所有權閘門，堵「巢狀 runtime 冒用 parent
+/// hook_owner_gate — state 檔所有權閘門，堵「巢狀 runtime 冒用 parent
 /// 身分」。回 `true`＝放行（無檔／無主舊格式／本人／可接管）；`false`＝異主
 /// 且 state 新鮮，呼叫端須靜默收場且無 stdout（stop 分支不發 block JSON，
 /// 巢狀 session 就不會被指使去 receive parent 的任務）。
@@ -277,7 +277,7 @@ fn launcher_hop_decision(
     }
 }
 
-/// hook_oldest_queued:2098 — 最舊一筆 `to == agent` 且狀態為 queued 的 task-id。
+/// hook_oldest_queued — 最舊一筆 `to == agent` 且狀態為 queued 的 task-id。
 ///
 /// task-id 以 UTC 時間戳起首，字典序即時間序，不必轉 epoch 排序。狀態一律讀
 /// 裸 status 檔而非 metadata 的 status 欄——status 檔是狀態機的權威，兩者短暫
@@ -361,7 +361,7 @@ fn read_stdin_bounded() -> String {
     }
 }
 
-/// cmd_hook:2131 — `hook <stop|prompt-submit|notification>` 的本體。
+/// cmd_hook — `hook <stop|prompt-submit|notification>` 的本體。
 /// 永遠回 `HookOutcome`（不回 `Err`）：呼叫端無條件 exit 0。
 pub fn run(paths: &Paths, args: &[String]) -> HookOutcome {
     let event = args.first().map(String::as_str).unwrap_or("");

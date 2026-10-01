@@ -174,7 +174,7 @@ fn audit_event(final_status: &str) -> &'static str {
     }
 }
 
-/// cmd_evict:1866 — 撞 cap 時的驅逐，但**不是直接殺**：先派一輪收尾任務，讓
+/// cmd_evict — 撞 cap 時的驅逐，但**不是直接殺**：先派一輪收尾任務，讓
 /// worker 把只存在於它 context 裡的關鍵事實寫下來，落地之後才 despawn。
 ///
 /// 三步（send → await → despawn）刻意**不包在一把鎖裡**：鎖是單值，同時持有

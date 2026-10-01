@@ -1,6 +1,6 @@
 //! 送鍵通知：權限框雙掃、通知失敗語意、`notify_or_defer` 的 state TTL gate
 //! （hooks.md HOOK-NOTIFY-*、env.md ENV-TTL-1/2、ENV-NOTIFY-1）。對映 bash
-//! `notify_pane`:330、`screen_has_prompt`:318、`notify_or_defer`:371。
+//! `notify_pane`、`screen_has_prompt`、`notify_or_defer`。
 //!
 //! 警告訊息直接 `eprintln!` 到 stderr（同 `lock::LockGuard::release` 的既有
 //! 先例）：它們是流程中的提示而非指令失敗，回不到 `ab` 的 `Err` 收斂層——
@@ -15,7 +15,7 @@ use crate::time::{now_epoch, parse_iso_to_epoch};
 use crate::tmux::TmuxClient;
 use serde_json::Value;
 
-/// PANE_RE `^%[0-9]+$`（bin/agent-bridge:30）。registry 的 pane_id 對本程式是
+/// PANE_RE `^%[0-9]+$`。registry 的 pane_id 對本程式是
 /// 不可信輸入且會餵給 tmux，`%1 ; kill-server` 這種值必須擋在送鍵之前。
 pub fn is_valid_pane(pane: &str) -> bool {
     let mut bytes = pane.bytes();
@@ -72,7 +72,7 @@ const TAIL_LINES: usize = 14;
 /// 上界是 `TAIL_LINES`——比它大就退化成「整個下緣區同屏比對」，鄰近條件失效。
 const PROXIMITY_LINES: usize = 12;
 
-/// screen_has_prompt:318 — 一屏可見文字裡是否有會被 Enter 誤批的確認對話框。
+/// screen_has_prompt — 一屏可見文字裡是否有會被 Enter 誤批的確認對話框。
 /// 前兩組特徵（claude 權限框／plan mode 退出框）依 bash 逐字。
 ///
 /// 第三組是 agy（Antigravity CLI）的權限框，**Rust 獨有**：bash 正本自 M4
@@ -292,7 +292,7 @@ pub fn probe_blocker(tmux: &dyn TmuxClient, pane: &str) -> PaneBlocker {
     }
 }
 
-/// notify_pane:330 — 先驗 pane 存活、過畫面關卡，再分兩次送鍵（文字、Enter）。
+/// notify_pane — 先驗 pane 存活、過畫面關卡，再分兩次送鍵（文字、Enter）。
 /// 任一關卡失敗都回 `false`（呼叫端走 notify-failed 降級：訊息仍在 mailbox，
 /// 可復原）。
 pub fn notify_pane(tmux: &dyn TmuxClient, pane: &str, cmd: &str) -> bool {
@@ -359,7 +359,7 @@ pub enum NotifyOutcome {
     Failed,
 }
 
-/// notify_or_defer:371 — send／respond_task／cancel 三個通知呼叫點共用的 gate。
+/// notify_or_defer — send／respond_task／cancel 三個通知呼叫點共用的 gate。
 ///
 /// state/<agent>.json 的語意是「建議非權威」：讀不到、解析失敗、或 ts 已超過
 /// `AGENT_BRIDGE_STATE_TTL` 秒都視為「未知」，直接落回 notify_pane 路徑。
