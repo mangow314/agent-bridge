@@ -147,8 +147,7 @@ not cover.
   was reclaimed", not a failed cleanup. Remove the obstacle and rerun;
   do not hand-delete the registry.
 - Every spawn/despawn is recorded in the append-only `agents.log` audit
-  file (in the data directory). When unsure who spawned a worker, check
-  it first.
+  file (in the data directory).
 
 ## Worker rules
 
