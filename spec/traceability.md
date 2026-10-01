@@ -35,8 +35,6 @@
 | 20b | readiness 參數建 pane 前驗 | CLI-SPAWN-2, ENV-READY-1, ENV-READY-2 |
 | 21 | 解鎖失敗不得靜默 | STATE-LOCK-2 |
 | 22 | worker brief 注入 | ENV-BRIEF-1, CLI-SPAWN-7 |
-| 24 | disposable | CLI-DISPOSABLE-1 |
-| 25 | idle 決策視圖 | CLI-IDLE-1, CLI-IDLE-2 |
 | 26 | evict 三段式 | CLI-EVICT-1, CLI-EVICT-2, CLI-EVICT-3 |
 | 27 | brief 正本策略不變量 | CLI-SPAWN-7 |
 | 29 | 第二輪複核修補 | CLI-EVICT-3 |

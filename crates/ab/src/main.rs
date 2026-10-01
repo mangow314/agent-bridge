@@ -23,7 +23,7 @@ const USAGE: &str = r#"用法：
   agent-bridge register <agent> <tmux-target>   註冊 agent 與其 tmux pane
   agent-bridge unregister <agent>               移除 agent 註冊
   agent-bridge list [--long]                    列出已註冊 agent（name<TAB>pane_id<TAB>ready）
-                                                --long：加 origin/位置/owner/disposable/idle 的介入視圖（首行為欄名）
+                                                --long：加 origin/位置/owner/idle 的介入視圖（首行為欄名）
   agent-bridge send <agent> --from <sender> (--message <text> | --message-file <path>)
                                                 委派任務；stdout 只印 task-id
   agent-bridge ask <agent> --from <sender> (--message <text> | --message-file <path>) [--timeout <secs>] [--on-blocker warn|return|off] [--blocker-grace <secs>]
@@ -54,10 +54,6 @@ const USAGE: &str = r#"用法：
                                                 spawn 出身呼叫者預設 worker window；--window 開專屬視窗
   agent-bridge despawn <name>                   回收 spawn 出身的 worker（kill pane＋除名；人工註冊拒殺）
   agent-bridge ready <name>                     （worker）回報就緒；僅限 spawned agent
-  agent-bridge disposable <name>                （worker）宣告本輪脈絡已無殘值，可即時回收
-                                                （預設是保留：沒宣告過的一律視為仍有殘值）
-  agent-bridge idle                             worker 池回收決策視圖；唯讀
-                                                （name<TAB>ready<TAB>disposable<TAB>idle_secs）
   agent-bridge evict <name> [--timeout <secs>] [--from <sender>]
                                                 驅逐 worker：派收尾任務 → 等筆記落地 → despawn
                                                 stdout 只印收尾 task-id；逾時仍 despawn（審計記 evicted-timeout）
@@ -94,7 +90,7 @@ fn err_line(msg: &str) {
 // 隱藏內省（非 spec 契約面）：一行一個「已完整實作」的契約子指令。
 // 用途：里程碑 gate 的 capability 核對，堵「純 assert_fails 分組靠
 // unknown-command fallback 假綠」。M2 起 hook 就位；spawn 生命週期群
-// （spawn/despawn/ready/disposable/idle/evict）屬 M3，
+// （spawn/despawn/ready/evict）屬 M3，
 // 未實作前不列——列入等於宣稱可用。
 fn print_implemented_commands() {
     for cmd in [
@@ -102,11 +98,9 @@ fn print_implemented_commands() {
         "await",
         "cancel",
         "despawn",
-        "disposable",
         "evict",
         "fail",
         "hook",
-        "idle",
         "list",
         "read",
         "ready",
@@ -212,10 +206,10 @@ fn main() -> ExitCode {
     let rest_os = &raw[1..];
 
     let paths = Paths::resolve();
-    // 唯讀豁免（main dispatch:2262-2269／CLI-RO-1）：status/await/idle/list/
+    // 唯讀豁免（main dispatch:2262-2269／CLI-RO-1）：status/await/list/
     // hook 不建目錄。本切片只實作 list 屬於這個豁免表；其餘四個尚未實作，
     // 一律落入下面的「未知指令」分支（不建目錄與否對它們無意義）。
-    let readonly = matches!(cmd.as_str(), "status" | "await" | "idle" | "list");
+    let readonly = matches!(cmd.as_str(), "status" | "await" | "list");
     if !readonly && let Err(e) = paths.ensure_dirs() {
         err_line(&e.message);
         return ExitCode::from(1);
@@ -238,8 +232,6 @@ fn main() -> ExitCode {
         "spawn" => cmd_spawn(&paths, rest),
         "despawn" => cmd_despawn(&paths, rest),
         "ready" => cmd_ready(&paths, rest),
-        "disposable" => cmd_disposable(&paths, rest),
-        "idle" => cmd_idle(&paths, rest),
         "evict" => cmd_evict(&paths, rest),
         _ => {
             print_usage();
@@ -290,15 +282,8 @@ fn cmd_list(paths: &Paths, args: &[String]) -> Result<()> {
             println!("{}", spawn::LIST_LONG_HEADER);
             for r in spawn::list_long(paths, &tmux) {
                 println!(
-                    "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
-                    r.name,
-                    r.pane,
-                    r.ready,
-                    r.origin,
-                    r.location,
-                    r.owner,
-                    r.disposable,
-                    r.idle_secs
+                    "{}\t{}\t{}\t{}\t{}\t{}\t{}",
+                    r.name, r.pane, r.ready, r.origin, r.location, r.owner, r.idle_secs
                 );
             }
         }
@@ -1021,25 +1006,6 @@ fn cmd_ready(paths: &Paths, args: &[String]) -> Result<()> {
         return Err(Error::new("用法：agent-bridge ready <name>"));
     }
     spawn::ready(paths, &args[0])
-}
-
-/// cmd_disposable:1629
-fn cmd_disposable(paths: &Paths, args: &[String]) -> Result<()> {
-    if args.len() != 1 {
-        return Err(Error::new("用法：agent-bridge disposable <name>"));
-    }
-    spawn::disposable(paths, &SubprocessTmux, &args[0])
-}
-
-/// cmd_idle:1800 — 唯讀四欄 TSV（name／ready／disposable／idle_secs）。
-fn cmd_idle(paths: &Paths, args: &[String]) -> Result<()> {
-    if !args.is_empty() {
-        return Err(Error::new("用法：agent-bridge idle（不接參數）"));
-    }
-    for r in spawn::idle(paths) {
-        println!("{}\t{}\t{}\t{}", r.name, r.ready, r.disposable, r.idle_secs);
-    }
-    Ok(())
 }
 
 /// cmd_evict:1866 的 argv 解析。編排的正本已下沉 `ab_core::evict::evict`

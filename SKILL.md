@@ -21,7 +21,7 @@ mechanics. Read the section for the role you are playing.
 
 ```bash
 agent-bridge list                     # delegable agents (name<TAB>pane_id<TAB>ready column: -/starting/ready)
-agent-bridge list --long              # human-intervention view: header row + name/pane/ready/origin/where/owner/disposable/idle
+agent-bridge list --long              # human-intervention view: header row + name/pane/ready/origin/where/owner/idle
                                       # where+owner resolved live to <session>:<window>; dead / owner-dead / ? (not queryable) are distinct
                                       # read-only: signals, not a "safe to delete" verdict — reclaiming stays despawn/evict
 agent-bridge register <name> <tmux-target>
@@ -35,7 +35,6 @@ agent-bridge spawn <name> --runtime <codex|claude|agy> [--model <model>] [--prof
                                       # it, reused across spawns, tiled); outside tmux it falls back to splitting
                                       # the current window; --here/--window override explicitly and are mutually exclusive
 agent-bridge despawn <name>           # reclaim a bridge-spawned worker (manually registered agents are refused)
-agent-bridge idle                     # (orchestrator) worker-pool reclaim view: name/ready/disposable/idle_secs
 agent-bridge evict <name> [--timeout <secs>] [--from <sender>]
                                       # (orchestrator) evict: dispatch a wrap-up task, wait for it to reach a
                                       # terminal state or time out, then despawn (a timeout still despawns —
@@ -60,7 +59,6 @@ agent-bridge fail <task-id> --message-file - <<'EOF'
 <failure reason>
 EOF
 agent-bridge read "$id"               # (sender) read the reply body (works for completed and failed)
-agent-bridge disposable <name>        # (worker, spawned only) declare this round's context has no residual value
 ```
 
 Multi-line content always goes through `--message-file -` (stdin heredoc),

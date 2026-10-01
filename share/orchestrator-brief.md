@@ -19,31 +19,24 @@ still hold things never written into a response — file:line it checked
 but didn't cite, dead ends it walked, assumptions it held. As long as
 those things might still be asked about, the pane has value.
 
-- **Keep by default.** A worker that never declared `disposable` is
-  treated as still holding residual value.
-- **The worker judges; you can override.** Only it knows what is left in
-  its head; but under cap pressure the final reclaim decision is yours.
+- **Keep by default.** Every worker is treated as still holding residual
+  value until it has been evicted.
+- **The reclaim decision is yours, but the worker holds the facts.** Under
+  cap pressure you decide what to reclaim; only the worker knows what is
+  left in its head, which is what the wrap-up round below is for.
 - **Land the notes before reclaiming.** You do not directly despawn a
   worker with residual value — you `evict` it: that first dispatches a
   wrap-up round, waits for the worker to write the facts it still
   remembers into a response, and only kills after the notes land.
 
-The failure direction is deliberate: a worker forgetting to declare
-`disposable` costs one extra cap slot, not context killed by mistake.
-**Do not invert this direction.**
+The failure direction is deliberate: keeping a pane too long costs one
+extra cap slot, not context killed by mistake. **Do not invert this
+direction.**
 
 ## When to reuse an existing worker vs spawn a new one
 
-Check the pool first with `agent-bridge idle`
-(`name / ready / disposable / idle_secs`).
-
-**`await` returning does not mean the worker finished wrapping up.** A
-worker replies first and declares `disposable` after; your `await`
-returns the moment the reply lands. Sampling `idle` right away shows a
-not-yet-updated `-`. A `-` only means "not declared at this instant",
-not "does not intend to declare" — give a just-replied worker a few
-seconds before sampling. (Stepped on in live verification 2026-07-22;
-nearly misjudged as the brief not taking effect.)
+Check the pool first with `agent-bridge list --long`
+(`NAME / PANE / READY / ORIGIN / WHERE / OWNER / IDLE`).
 
 **Reuse** — when the new task **shares context** with what a worker did
 last round. It has already read those files and stepped on those rakes;
@@ -99,7 +92,7 @@ never auto-evicts — kill-or-keep is always a separate, auditable
 decision that you initiate.
 
 ```bash
-agent-bridge idle                 # 1. check the pool
+agent-bridge list --long          # 1. check the pool
 agent-bridge evict <name>         # 2. pick one to evict (prints the wrap-up task-id)
 agent-bridge read <task-id>       # 3. read the notes it left behind
 agent-bridge spawn <new> ...      # 4. only now is there a slot
@@ -107,27 +100,24 @@ agent-bridge spawn <new> ...      # 4. only now is there a slot
 
 Picking order:
 
-1. Workers that already declared `disposable` — they said themselves
-   there is no residual value; collect them first.
-
-**Still go through `evict`; do not `despawn` directly just because you
-saw a `yes`.** `idle` is a lock-free read-only snapshot: between your
-glance and your action, that worker may well have been handed a new
-task and be accumulating fresh context, and the snapshot will not come
-back to tell you. The cost of one extra wrap-up round on a worker that
-truly has nothing is a few seconds and a "no residual value" reply; the
-cost of guessing wrong is killing context that never landed. The two
-sides are not symmetric, so do not gamble.
-
-2. Among the undeclared, pick **LRU** (largest `idle_secs`). The longer
+1. Pick **LRU** (largest `IDLE`). The longer
    the idle, the likelier auto-compact has already ground the context
    away, and the lower the real value of keeping it.
    Know LRU's counterintuitive edge though: **a worker that just
    finished a big round and was never dispatched again has the largest
-   `idle_secs`** — LRU often picks exactly the worker with the highest
+   `IDLE`** — LRU often picks exactly the worker with the highest
    residual value. That is not a broken sort; it is precisely why
    `evict` lands the notes first. Do not equate idle with empty.
-3. The one least related to your current main line of work.
+2. The one least related to your current main line of work.
+
+**Still go through `evict`; do not `despawn` directly just because a
+worker looks idle.** `list --long` is a lock-free read-only snapshot:
+between your glance and your action, that worker may well have been
+handed a new task and be accumulating fresh context, and the snapshot
+will not come back to tell you. The cost of one extra wrap-up round on a
+worker that truly has nothing is a few seconds and a "no residual value"
+reply; the cost of guessing wrong is killing context that never landed.
+The two sides are not symmetric, so do not gamble.
 
 `evict` writes three audit marks into `agents.log`; do not ignore them:
 

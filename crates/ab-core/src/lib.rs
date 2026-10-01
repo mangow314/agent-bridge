@@ -6,7 +6,7 @@
 //! M1 範圍：狀態機核心——registry CRUD、task 目錄與狀態機、最小 tmux
 //! 通知（notify_or_defer 的 TTL gate 含在內）。M2 補上 `hook`（Claude Code
 //! hook 協定）與 `config`（`AGENT_BRIDGE_*` 集中讀取）；M3 補上 `spawn`
-//! （worker 生命週期：spawn/despawn/ready/disposable/idle，evict 的
+//! （worker 生命週期：spawn/despawn/ready，evict 的
 //! 三段式編排留在 CLI 層）。見 architecture.md 的模組對映表。
 
 pub mod config;

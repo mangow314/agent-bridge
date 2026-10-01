@@ -154,7 +154,7 @@ declare -A GRP_NEEDS=(
   # 語意 fixture，變數掃描抓不到 manual-x 這種字串依賴）
   [17]="16" [18]="16"
 )
-GRP_KNOWN=" 1 2 3 4 5 6 7 8 8a 8b 9 10 11 12 13 14 15 16 17 18 18b 18c 19 20 20b 21 22 24 25 26 27 29 30 31 32 33 34 34.5+ 35 36 37 38 39 41 42 46 49 "
+GRP_KNOWN=" 1 2 3 4 5 6 7 8 8a 8b 9 10 11 12 13 14 15 16 17 18 18b 18c 19 20 20b 21 22 26 27 29 30 31 32 33 34 34.5+ 35 36 37 38 39 41 42 46 49 "
 GRP_SELECTED=""
 GRP_SKIPPED=0
 if [[ -n "${TEST_GROUPS:-}" ]]; then
@@ -1501,9 +1501,9 @@ ab "$DSPAWN" despawn w1 2>/dev/null; rc=$?
 assert "despawn spawned agent：exit 0" test "$rc" -eq 0
 assert_fails "despawn 後 pane 消失" pane_alive "$pane_w1"
 assert "despawn 後 registry 檔已刪" test ! -e "$DSPAWN/agents/w1.json"
-# 沒宣告過 disposable＝仍被視為有殘值，直接 despawn 等於繞過收尾流程。
+# 直接 despawn 沒走過 evict 的收尾流程，等於繞過它。
 # 機制上不擋，但審計要看得出這次回收沒有筆記（見 cmd_despawn 的 ev 判定）
-assert "agents.log 記 despawned-unsaved w1（未宣告 disposable，繞過了收尾）" \
+assert "agents.log 記 despawned-unsaved w1（沒走 evict 收尾流程，繞過了收尾）" \
   grep -qE "Z despawned-unsaved w1 ${pane_w1} codex -\$" "$DSPAWN/agents.log"
 assert_fails "despawn 未註冊 agent 報錯" ab "$DSPAWN" despawn w1
 assert_fails "despawn：名稱不合法被拒" ab "$DSPAWN" despawn "bad name"
@@ -1514,7 +1514,7 @@ tmx kill-pane -t "$pane_w7"
 ab "$DSPAWN" despawn w7 2>/dev/null; rc=$?
 assert "死 pane despawn：exit 0" test "$rc" -eq 0
 assert "死 pane despawn：registry 已清" test ! -e "$DSPAWN/agents/w7.json"
-assert "死 pane despawn：agents.log 記下這次回收（未宣告 disposable → unsaved）" \
+assert "死 pane despawn：agents.log 記下這次回收（未經 evict → unsaved）" \
   grep -qE "Z despawned-unsaved w7 " "$DSPAWN/agents.log"
 
 fi  # end grp 18
@@ -2015,8 +2015,6 @@ assert "損壞 registry：pane 仍在（沒被除名成孤兒）" pane_alive "$p
 assert_fails "損壞 registry：register 拒絕覆寫" ab "$DBAD" register bad1 "$PANE_A"
 assert_fails "損壞 registry：despawn 拒絕（出身不明不動 pane）" ab "$DBAD" despawn bad1
 assert_fails "損壞 registry：ready 拒絕" ab "$DBAD" ready bad1
-assert_fails "損壞 registry：disposable 拒絕（出身不明不得標記可回收）" \
-  ab "$DBAD" disposable bad1
 assert "損壞 registry：以上拒絕都不動 pane" pane_alive "$pane_bad"
 # cap 保守計入：上限 1 且已有一份損壞 registry → 不得再 spawn
 env AGENT_BRIDGE_DATA="$DBAD" AGENT_BRIDGE_MAX_SPAWN=1 AGENT_BRIDGE_READY_TIMEOUT=0 \
@@ -2206,158 +2204,6 @@ for kw in 'agent-bridge receive' 'agent-bridge reply' 'agent-bridge fail' \
 done
 
 fi  # end grp 22
-# ---- 24. disposable：worker 自報脈絡無殘值（orchestrator Phase 1） ----
-if grp 24; then
-# spec: CLI-DISPOSABLE-1
-# 語意刻意是單向宣告而非雙向旗標：預設保留，沒宣告過的一律視為仍有殘值。
-# 失效方向因此是「多留一個佔 cap」而不是「把還有用的脈絡殺掉」
-DDISP="$TESTROOT/ddisp"
-pane_dp1="$(absp "$DDISP" 0 spawn dp1 --runtime codex 2>/dev/null)"
-assert "disposable 預設不存在：剛 spawn 的 registry 沒有這個欄位（預設＝保留）" \
-  test "$(jq -r '.disposable // "absent"' "$DDISP/agents/dp1.json")" = absent
-ab "$DDISP" disposable dp1 2>/dev/null; rc=$?
-assert "disposable：exit 0" test "$rc" -eq 0
-assert "disposable：registry 翻 true" \
-  jq -e '.disposable == true' "$DDISP/agents/dp1.json"
-assert "disposable：寫下 disposable_at 時間戳（宣告可過期的依據）" \
-  jq -e '.disposable_at | test("^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$")' \
-  "$DDISP/agents/dp1.json"
-assert "disposable：不動 pane（只是宣告，不是回收）" pane_alive "$pane_dp1"
-assert "disposable：寫 agents.log 審計線（回收爭議的還原依據）" \
-  grep -qE "Z disposable dp1 " "$DDISP/agents.log"
-# 這欄位是建議不是保護：回收認的仍是 spawn_tag，故宣告不得動到 tag
-assert "disposable：spawn_tag 未被更動（回收仍認 tag，不認本欄位）" \
-  jq -e '.spawn_tag | startswith("AGENT_BRIDGE_SPAWN_TAG=")' "$DDISP/agents/dp1.json"
-assert "disposable：ready 狀態未被波及" \
-  jq -e 'has("ready")' "$DDISP/agents/dp1.json"
-ab "$DDISP" disposable dp1 2>/dev/null; rc=$?
-assert "disposable：重複宣告仍 exit 0（冪等）" test "$rc" -eq 0
-
-# 出身與輸入防護：形狀比照 ready
-ab "$DDISP" register manual-d "$PANE_A" >/dev/null 2>&1
-assert_fails "disposable：人工 agent 被拒（人工 pane 生命週期不歸 bridge 管）" \
-  ab "$DDISP" disposable manual-d
-assert "disposable：人工 agent 被拒後未寫入欄位" \
-  test "$(jq -r '.disposable // "absent"' "$DDISP/agents/manual-d.json")" = absent
-assert_fails "disposable：未註冊 agent 報錯" ab "$DDISP" disposable ghost
-assert_fails "disposable：名稱不合法被拒" ab "$DDISP" disposable "bad name"
-assert_fails "disposable：缺參數被拒" ab "$DDISP" disposable
-
-# is_spawned 的「無法判定」分支（rc=2）必須能被單獨證明。§20 那條走的是截斷成
-# 不合法 JSON 的路徑——那裡 jq 自己就會失敗、被 set -e 擋下，於是即使拆掉出身
-# 檢查測例照樣綠＝空綠（本 repo 第五次踩到同一個坑）。用「合法 JSON 但不是
-# object」才隔離得出 rc=2：jq 讀得動（null 取 field 回 null，`// "-"` 有預設值），
-# 只有 is_spawned 會擋
-printf 'null\n' > "$DDISP/agents/dp1.json"
-assert_fails "disposable：registry 是合法 JSON 但非 object → 拒絕（出身不明）" \
-  ab "$DDISP" disposable dp1
-assert "disposable：非 object registry 被拒後內容未被覆寫" \
-  test "$(tr -d '[:space:]' < "$DDISP/agents/dp1.json")" = null
-
-fi  # end grp 24
-# ---- 25. idle：worker 池回收決策視圖（orchestrator Phase 2） ----
-if grp 25; then
-# spec: CLI-IDLE-1 CLI-IDLE-2
-DIDLE="$TESTROOT/didle"
-
-# idle_field <data-dir> <agent> <欄位序號 1-4>
-# shellcheck disable=SC2329  # 經 assert 的 "$@" 間接呼叫
-idle_field() {
-  ab "$1" idle 2>/dev/null | awk -F'\t' -v n="$2" -v c="$3" '$1 == n {print $c; exit}'
-}
-# shellcheck disable=SC2329  # 經 assert 的 "$@" 間接呼叫
-is_num() { [[ "$1" =~ ^[0-9]+$ ]]; }
-
-absp "$DIDLE" 0 spawn id1 --runtime codex >/dev/null 2>&1
-assert "idle：tasks 目錄空時不崩（exit 0）" ab "$DIDLE" idle
-assert "idle：輸出四欄 TSV（欄位順序是對外契約，orchestrator 依它決策）" \
-  test "$(ab "$DIDLE" idle 2>/dev/null | awk -F'\t' 'NR==1{print NF}')" = 4
-assert "idle：未就緒 spawned agent → ready 欄 starting" \
-  test "$(idle_field "$DIDLE" id1 2)" = starting
-assert "idle：未宣告 → disposable 欄為 -（預設保留）" \
-  test "$(idle_field "$DIDLE" id1 3)" = "-"
-assert "idle：從未被派工過也算得出 idle_secs（退回 registry 登記時間）" \
-  is_num "$(idle_field "$DIDLE" id1 4)"
-
-ab "$DIDLE" ready id1 >/dev/null 2>&1
-assert "idle：ready 後欄位變 ready" test "$(idle_field "$DIDLE" id1 2)" = ready
-ab "$DIDLE" disposable id1 >/dev/null 2>&1
-assert "idle：宣告後 disposable 欄為 yes（可即時回收）" \
-  test "$(idle_field "$DIDLE" id1 3)" = yes
-
-# 宣告過期：這是 disposable_at 存在的唯一理由——worker 宣告後若又被派新任務，
-# 它已累積新脈絡，舊宣告不該再讓 orchestrator 覺得可以直接收。
-# 先測「明確晚於宣告」這個一般情形；同秒的邊界另有專門測例（見下）
-sleep 1
-ab "$DIDLE" send id1 --from alice --message "後續任務" >/dev/null 2>&1
-assert "idle：宣告後又被派工 → disposable 轉 expired（宣告失效，不得誤收）" \
-  test "$(idle_field "$DIDLE" id1 3)" = expired
-assert "idle：派工後 idle_secs 改以最後任務時間計" \
-  is_num "$(idle_field "$DIDLE" id1 4)"
-
-# 同秒邊界：宣告與新任務落在同一秒（worker 宣告完 orchestrator 立刻派工）。
-# 舊實作用嚴格大於，那一秒內 idle 仍報 yes，orchestrator 會直接 despawn 一個
-# 剛拿到新任務、正在累積新脈絡的 worker——不走 evict、不留筆記，語意基石反轉。
-# 這條原本被上面那個 sleep 1 繞過去了：測試迴避了缺陷而不是暴露它。
-# （獨立複核 2026-07-22 以重現實驗抓出）
-DSEC="$TESTROOT/dsamesec"
-mkdir -p "$DSEC"/{agents,tasks,locks}
-now_ts="$(date -u +%FT%TZ)"
-jq -n --arg ts "$now_ts" \
-  '{name:"samesec",pane_id:"%99",registered_at:$ts,spawned:true,runtime:"codex",
-    spawned_at:$ts,ready:true,disposable:true,disposable_at:$ts}' \
-  > "$DSEC/agents/samesec.json"
-mkdir -p "$DSEC/tasks/${now_ts//[:-]/}-aaaa"
-jq -n --arg ts "$now_ts" \
-  '{id:"x",from:"alice",to:"samesec",created_at:$ts,status:"queued"}' \
-  > "$DSEC/tasks/${now_ts//[:-]/}-aaaa/metadata.json"
-assert "idle：宣告與新任務同秒 → 仍須轉 expired（否則會誤殺已有新脈絡的 worker）" \
-  test "$(idle_field "$DSEC" samesec 3)" = expired
-
-# 名稱重用：tasks/ 是長期累積的，同一個名字可能有前一個
-# pane 留下的任務。idle_secs 若採信那個時間，剛 spawn 的 worker 會顯示成閒置
-# 好幾小時，LRU 就會優先驅逐一個還沒做過事的新 pane——決策視圖說謊。
-# 真鏈驗收 2026-07-22 實地踩到：w1 才 spawn 39 秒卻顯示 21686。
-ab "$DIDLE" send reborn --from alice --message "前世任務" >/dev/null 2>&1
-old_dirs=( "$DIDLE"/tasks/*/ )   # 目錄名是 UTC 時間戳，glob 的字典序＝時間序
-old_t="${old_dirs[-1]}"
-printf '{"id":"x","from":"alice","to":"reborn","created_at":"2020-01-01T00:00:00Z"}\n' \
-  > "$old_t/metadata.json"
-absp "$DIDLE" 0 spawn reborn --runtime codex >/dev/null 2>&1
-assert "idle：同名前一輪的舊任務不得讓新 pane 看起來閒置多年（LRU 會誤殺）" \
-  test "$(idle_field "$DIDLE" reborn 4)" -lt 3600
-ab "$DIDLE" despawn reborn >/dev/null 2>&1
-
-# 人工註冊：生命週期不歸 bridge 管，兩欄都必須是 -
-ab "$DIDLE" register manual-i "$PANE_A" >/dev/null 2>&1
-assert "idle：人工 agent ready 欄為 -" test "$(idle_field "$DIDLE" manual-i 2)" = "-"
-assert "idle：人工 agent disposable 欄為 -（不歸 bridge 回收）" \
-  test "$(idle_field "$DIDLE" manual-i 3)" = "-"
-# 即使被手動塞了 disposable 欄位，人工 agent 也不得顯示成可回收
-printf '{"name":"manual-i","pane_id":"%s","registered_at":"2026-01-01T00:00:00Z","disposable":true,"disposable_at":"2026-01-01T00:00:00Z"}\n' \
-  "$PANE_A" > "$DIDLE/agents/manual-i.json"
-assert "idle：人工 agent 被手塞 disposable 仍顯示 -（不因可寫 registry 而可回收）" \
-  test "$(idle_field "$DIDLE" manual-i 3)" = "-"
-
-# 損壞 registry：不能讓整份報表消失，也不能靜靜跳過——它照樣佔著 cap
-printf '{' > "$DIDLE/agents/broken.json"
-assert "idle：損壞 registry 不讓整份報表掛掉（exit 0）" ab "$DIDLE" idle
-assert "idle：損壞 registry 以 ? 標出（照樣佔 cap，不得靜靜跳過）" \
-  test "$(idle_field "$DIDLE" broken 2)" = "?"
-assert "idle：損壞 registry 不影響其他 agent 照常列出" \
-  test "$(idle_field "$DIDLE" id1 2)" = ready
-
-# 唯讀：orchestrator 可能跑在只讀 sandbox；查詢命令不該需要寫權限
-snap_before="$(find "$DIDLE" | sort)"
-ab "$DIDLE" idle >/dev/null 2>&1
-snap_after="$(find "$DIDLE" | sort)"
-assert "idle：唯讀——執行前後檔案清單完全一致（不寫任何檔）" \
-  test "$snap_before" = "$snap_after"
-assert "idle：不取鎖——執行後 locks/ 為空" \
-  test -z "$(ls -A "$DIDLE/locks")"
-assert_fails "idle：多給參數被拒" ab "$DIDLE" idle extra
-
-fi  # end grp 25
 # ---- 26. evict：驅逐前強制落地筆記（orchestrator Phase 3） ----
 if grp 26; then
 # spec: CLI-EVICT-1 CLI-EVICT-2 CLI-EVICT-3
@@ -2495,7 +2341,7 @@ assert_fails "evict：未 ready 的 worker 驅逐後 pane 已回收（pane_alive
 
 # 26f. generation 綁定：evict 是三段式的，await 與 despawn 之間同名 agent 可能
 # 已被換掉一代（另一次 evict、或 despawn＋重 spawn）。只憑名字 despawn 會殺掉
-# 那個沒收過收尾任務、也沒宣告 disposable 的新 worker——這一層唯一不可接受的
+# 那個沒收過收尾任務的新 worker——這一層唯一不可接受的
 # 失效。這裡用「回覆前先把 registry 的 spawn_tag 換掉」模擬換代。
 # （獨立複核 2026-07-22 以逐行可達路徑指出，此測例補上動態重現）
 # 換代用「真的 despawn 再 spawn 同名」而不是竄改 registry 的 tag：後者會讓
@@ -2527,7 +2373,7 @@ assert "evict：目標在等待期間被換代 → 非零退出（不確定收�
   test "$rc" -ne 0
 assert "evict：換代後新一代的 registry 保留（那是別人的 worker，不得除名）" \
   test -e "$DEV/agents/ev6.json"
-# ★ 核心斷言：G2 沒收過收尾任務、也沒宣告 disposable，它的 context 不可被丟掉
+# ★ 核心斷言：G2 沒收過收尾任務，它的 context 不可被丟掉
 assert "evict：換代後不得殺掉新一代的 pane（它沒收過收尾任務）" \
   pane_alive "$pane_ev6_gen2"
 assert_fails "evict：換代後不得寫 evicted 審計（沒收成就不能記成收了）" \
@@ -2538,7 +2384,7 @@ ab "$DEV" despawn ev6 >/dev/null 2>&1 || true
 tmx kill-pane -t "$pane_ev6" 2>/dev/null || true
 tmx kill-pane -t "$pane_ev6_gen2" 2>/dev/null || true
 
-# 26e. 損壞 registry：出身不明就不能收——同 despawn/disposable 的 fail-closed
+# 26e. 損壞 registry：出身不明就不能收——同 despawn 的 fail-closed
 absp "$DEV" 0 spawn ev4 --runtime codex >/dev/null 2>&1
 printf 'null\n' > "$DEV/agents/ev4.json"
 before_t4="$(task_count "$DEV")"
@@ -2557,14 +2403,14 @@ if grp 27; then
 # /clear 掉、脈絡連同 pane 一起消失才發現
 
 # 27a. worker-brief：新語意的正面斷言
-for kw in 'agent-bridge disposable' 'context is an asset' 'When a wrap-up task arrives' \
+for kw in 'context is an asset' 'When a wrap-up task arrives' \
           'Whether to delegate further down to subagents' 'exactly what I may be asked about later'; do
   assert "worker brief 含 Phase 4 條款：$kw" grep -q -- "$kw" "$REPO_BRIEF"
 done
 
 # 27b. worker-brief：「reply 後清 context」禁令必須在。
 # 「reply 後清空 context」與「保留脈絡供追問」直接矛盾——照做的話 reply 完
-# 脈絡就沒了，disposable 宣告與 evict 的收尾筆記全部失去意義。英譯後改守
+# 脈絡就沒了，evict 的收尾筆記失去意義。英譯後改守
 # 正面禁令字句（原中文舊條款的否定式 grep 對英文正文已是空轉）
 assert "worker brief 保留「不要清自己的 context」禁令" \
   grep -qF 'Do not clear your own context' "$REPO_BRIEF"
@@ -2575,7 +2421,7 @@ assert "worker brief 保留 no-/clear 待命條款" \
 # 27c. orchestrator-brief：存在 + 策略要點
 REPO_OBRIEF="$(dirname "$(dirname "$BRIDGE")")/share/orchestrator-brief.md"
 assert "orchestrator brief 正本存在於 repo" test -r "$REPO_OBRIEF"
-for kw in 'agent-bridge idle' 'agent-bridge evict' 'evicted-timeout' \
+for kw in 'agent-bridge list --long' 'agent-bridge evict' 'evicted-timeout' \
           'Keep by default' 'AGENT_BRIDGE_MAX_SPAWN' \
           'Do not call the AgentTool' \
           'untrusted external' 'Route by blast radius'; do
@@ -2589,21 +2435,13 @@ if grp 29; then
 DR2="$TESTROOT/drev2"
 mkdir -p "$DR2"/{agents,tasks,locks}
 
-# 29a. I1：直接 despawn 一個未宣告 disposable 的 worker，審計要看得出沒筆記。
+# 29a. I1：未經 evict 就直接 despawn 一個 worker，審計要看得出沒筆記。
 # 機制上不擋（擋了會逼出 --force，習慣性加旗標等於沒有防線），但審計線不能
 # 跟一次乾淨回收長得一模一樣
 absp "$DR2" 0 spawn r1 --runtime codex >/dev/null 2>&1
 ab "$DR2" despawn r1 >/dev/null 2>&1
-assert "I1：未宣告 disposable 就直接 despawn → 審計記 despawned-unsaved" \
+assert "I1：未經 evict 就直接 despawn → 審計記 despawned-unsaved" \
   grep -qE "Z despawned-unsaved r1 " "$DR2/agents.log"
-# 宣告過的則是一次乾淨的回收，不該被記成有損失
-absp "$DR2" 0 spawn r2 --runtime codex >/dev/null 2>&1
-ab "$DR2" disposable r2 >/dev/null 2>&1
-ab "$DR2" despawn r2 >/dev/null 2>&1
-assert "I1：宣告過 disposable 的 despawn 記 despawned（不是 unsaved）" \
-  grep -qE "Z despawned r2 " "$DR2/agents.log"
-assert_fails "I1：宣告過的不得被記成 unsaved（否則記號分不出真正的損失）" \
-  grep -qE "Z despawned-unsaved r2 " "$DR2/agents.log"
 # evict 走過收尾流程，筆記已處理，不該再記 unsaved
 absp "$DR2" 0 spawn r3 --runtime codex >/dev/null 2>&1
 ab "$DR2" evict r3 --timeout 1 >/dev/null 2>&1
@@ -2798,10 +2636,9 @@ assert_fails "read 在 task 鎖被佔用時不硬讀" ab "$D31D" read 20200101T0
 rmdir "$D31D/locks/20200101T000000Z-cccc.lock"
 assert "釋鎖後 read 正常" ab "$D31D" read 20200101T000000Z-cccc
 
-# 31h. F8：唯讀查詢（status/await/idle/list）不建資料目錄——「唯讀」宣稱
+# 31h. F8：唯讀查詢（status/await/list）不建資料目錄——「唯讀」宣稱
 # 落到實作，嚴格只讀 sandbox 下查詢不再無中生有
 D31E="$TESTROOT/d31e"
-ab "$D31E" idle >/dev/null 2>&1 || true
 ab "$D31E" list >/dev/null 2>&1 || true
 ab "$D31E" status 20200101T000000Z-dddd >/dev/null 2>&1 || true
 ab "$D31E" await 20200101T000000Z-dddd --timeout 1 >/dev/null 2>&1 || true
@@ -3018,16 +2855,6 @@ W32G_WIN=""
 [[ -n "$W32G_PANE" ]] && W32G_WIN="$(tmx display-message -p -t "$W32G_PANE" '#{window_id}' 2>/dev/null || true)"
 assert "32g 他 owner 印記的 ab: 窗不被沿用，仍用自己的窗" \
   test -n "$W32G_WIN" -a "$W32G_WIN" != "$EVIL32_WIN" -a "$W32G_WIN" = "$W32A_WIN"
-
-# 32h. 污染 registry 的 pane/runtime（含空白）流進 disposable 審計——寫入點
-# 必須摺疊，欄位安全不靠上游（獨立複核第二輪 8 欄實例）
-jq -n \
-  '{name:"evil-d",pane_id:"bad pane",registered_at:"t",spawned:true,
-    runtime:"co dex",model:"",spawned_at:"t",ready:false,spawn_tag:"x"}' \
-  > "$D32/agents/evil-d.json"
-assert "32h 污染 registry 的 disposable 仍成功" ab "$D32" disposable evil-d
-assert "32h 污染欄位寫入審計前被摺疊" \
-  grep -qE "Z disposable evil-d bad_pane co_dex -\$" "$D32/agents.log"
 
 # 32i. 新建窗的 @ab_owner 印記寫入失敗必須翻盤回滾（第三輪複核指出：
 # 靜默吞掉會做出 spawn 成功但永不可沿用的窗）。選擇性 shim：只讓帶
@@ -4158,19 +3985,19 @@ printf 'w38\t%s\t-\n' "$p38" > "$TESTROOT/l38-bare-want.txt"
 assert "38a 裸 list 輸出與期望逐位元組相同（不只是含某一列）" \
   cmp -s "$TESTROOT/l38-bare-want.txt" "$TESTROOT/l38-bare.txt"
 
-# 38b --long：標頭在第一行、欄數恰八
+# 38b --long：標頭在第一行、欄數恰七
 ab "$D38" list --long > "$TESTROOT/l38-long.txt" 2>/dev/null
 assert "38b --long 首行為欄名標頭" \
-  bash -c "head -1 '$TESTROOT/l38-long.txt' | grep -qFx 'NAME	PANE	READY	ORIGIN	WHERE	OWNER	DISPOSABLE	IDLE'"
-assert "38b --long 每列恰八個 TAB 分隔欄" \
-  bash -c "awk -F'\t' 'NF != 8 { bad = 1 } END { exit bad }' '$TESTROOT/l38-long.txt'"
+  bash -c "head -1 '$TESTROOT/l38-long.txt' | grep -qFx 'NAME	PANE	READY	ORIGIN	WHERE	OWNER	IDLE'"
+assert "38b --long 每列恰七個 TAB 分隔欄" \
+  bash -c "awk -F'\t' 'NF != 7 { bad = 1 } END { exit bad }' '$TESTROOT/l38-long.txt'"
 ab "$D38" list -l > "$TESTROOT/l38-short.txt" 2>/dev/null
-# 比 IDLE 以外的七欄：IDLE 是牆鐘秒數，兩次呼叫本來就可能差一秒——
+# 比 IDLE 以外的六欄：IDLE 是牆鐘秒數，兩次呼叫本來就可能差一秒——
 # 拿它比對會做出一條會隨機紅的斷言（flake 比漏測更糟）
-cut -f1-7 "$TESTROOT/l38-long.txt" > "$TESTROOT/l38-long7.txt"
-cut -f1-7 "$TESTROOT/l38-short.txt" > "$TESTROOT/l38-short7.txt"
+cut -f1-6 "$TESTROOT/l38-long.txt" > "$TESTROOT/l38-long6.txt"
+cut -f1-6 "$TESTROOT/l38-short.txt" > "$TESTROOT/l38-short6.txt"
 assert "38b -l 是 --long 的別名（除 IDLE 秒數外輸出相同）" \
-  cmp -s "$TESTROOT/l38-long7.txt" "$TESTROOT/l38-short7.txt"
+  cmp -s "$TESTROOT/l38-long6.txt" "$TESTROOT/l38-short6.txt"
 
 # 38c 人工註冊：origin=manual、owner 欄為 `-`（沒有 owner 概念，不是死了）
 row38c="$(grep '^w38	' "$TESTROOT/l38-long.txt")"
@@ -4212,8 +4039,8 @@ assert "38f tmux 不可用 → OWNER 為 ?（未知，不是 owner-dead）" \
 printf 'not json at all\n' > "$D38E/agents/w38bad.json"
 ab "$D38E" list --long > "$TESTROOT/l38-bad.txt" 2>/dev/null; rc=$?
 assert "38g 損壞 registry：exit 仍 0" test "$rc" -eq 0
-assert "38g 損壞 registry：整列七個狀態欄全為 ?、idle 為 -（不是只看兩欄）" \
-  bash -c "grep '^w38bad	' '$TESTROOT/l38-bad.txt' | grep -qFx \"\$(printf 'w38bad\t?\t?\t?\t?\t?\t?\t-')\""
+assert "38g 損壞 registry：整列五個狀態欄全為 ?、idle 為 -（不是只看兩欄）" \
+  bash -c "grep '^w38bad	' '$TESTROOT/l38-bad.txt' | grep -qFx \"\$(printf 'w38bad\t?\t?\t?\t?\t?\t-')\""
 assert "38g 損壞 registry：其餘列照常輸出（沒有一壞全倒）" \
   grep -q '^w38e	' "$TESTROOT/l38-bad.txt"
 
@@ -4222,15 +4049,13 @@ assert "38g 損壞 registry：其餘列照常輸出（沒有一壞全倒）" \
 # 跨廠複核 2026-07-31 指出）。可機器守的是**精確標頭＋各欄允許值域**：
 # 任何新欄位或新狀態字都必須先改這裡，那才是真正的閘門
 assert "38h 標頭逐字固定（新增欄位必須先改契約）" \
-  bash -c "head -1 '$TESTROOT/l38-long.txt' | grep -qFx 'NAME	PANE	READY	ORIGIN	WHERE	OWNER	DISPOSABLE	IDLE'"
+  bash -c "head -1 '$TESTROOT/l38-long.txt' | grep -qFx 'NAME	PANE	READY	ORIGIN	WHERE	OWNER	IDLE'"
 assert "38h READY 值域 ready|starting|-|?" \
   bash -c "tail -n +2 '$TESTROOT/l38-long.txt' | awk -F'\t' '\$3 !~ /^(ready|starting|-|\\?)\$/ { bad=1 } END { exit bad }'"
 assert "38h ORIGIN 值域 spawned|manual|?" \
   bash -c "tail -n +2 '$TESTROOT/l38-long.txt' | awk -F'\t' '\$4 !~ /^(spawned|manual|\\?)\$/ { bad=1 } END { exit bad }'"
-assert "38h DISPOSABLE 值域 yes|expired|-|?" \
-  bash -c "tail -n +2 '$TESTROOT/l38-long.txt' | awk -F'\t' '\$7 !~ /^(yes|expired|-|\\?)\$/ { bad=1 } END { exit bad }'"
 assert "38h IDLE 值域 非負整數|-" \
-  bash -c "tail -n +2 '$TESTROOT/l38-long.txt' | awk -F'\t' '\$8 !~ /^([0-9]+|-)\$/ { bad=1 } END { exit bad }'"
+  bash -c "tail -n +2 '$TESTROOT/l38-long.txt' | awk -F'\t' '\$7 !~ /^([0-9]+|-)\$/ { bad=1 } END { exit bad }'"
 
 # 38j registry 的 id 形狀壞掉 → invalid，**不是** dead：後者會讓人以為
 # 「東西曾經在、現在沒了」，前者才是實情（資料損壞）
@@ -4244,14 +4069,14 @@ assert "38j pane_id 形狀不合法 → WHERE 為 invalid（非 dead）" \
 assert "38j owner 的 @id 形狀不合法 → OWNER 為 invalid（非 owner-dead）" \
   bash -c "grep '^w38j	' '$TESTROOT/l38-invalid.txt' | awk -F'\t' '\$6 == \"invalid\" { exit 0 } { exit 1 }'"
 
-# 38k 欄值含 TAB／換行：合法 JSON string 塞一個 TAB 就能把一列變九欄，
-# 破壞「一 agent 一行、恰八欄」的承諾
+# 38k 欄值含 TAB／換行：合法 JSON string 塞一個 TAB 就能把一列變八欄，
+# 破壞「一 agent 一行、恰七欄」的承諾
 D38K="$TESTROOT/d38k"
 mkdir -p "$D38K/agents"
 jq -n '{name:"w38k\tINJECTED\tCOLS", pane_id:"%1", spawned:false}' > "$D38K/agents/w38k.json"
 ab "$D38K" list --long > "$TESTROOT/l38-tab.txt" 2>/dev/null
-assert "38k 欄值含 TAB 時每列仍恰八欄" \
-  bash -c "awk -F'\t' 'NF != 8 { bad = 1 } END { exit bad }' '$TESTROOT/l38-tab.txt'"
+assert "38k 欄值含 TAB 時每列仍恰七欄" \
+  bash -c "awk -F'\t' 'NF != 7 { bad = 1 } END { exit bad }' '$TESTROOT/l38-tab.txt'"
 assert "38k 註冊名裡的 TAB 被代換掉（不得原樣輸出）" \
   bash -c "! printf '%s' \"\$(tail -n +2 '$TESTROOT/l38-tab.txt')\" | grep -q 'w38k	INJECTED'"
 

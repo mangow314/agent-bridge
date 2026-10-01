@@ -1,10 +1,9 @@
 //! worker 生命週期：cap、pane 建立、brief 注入、ready 探針、原子回滾、
-//! 出身防護（tag）、despawn／evict／idle／disposable（架構 §2 的 `spawn` 列）。
+//! 出身防護（tag）、despawn／evict，以及 `list --long` 的 ready／idle 計算（架構 §2 的 `spawn` 列）。
 //!
 //! 對映 bash：`cmd_spawn`:1063、`spawn_rollback`:940、`rb_kill_tagged`:928、
 //! `spawn_wait_ready`:1038、`worker_prompt_arg`:1007、
-//! `cmd_despawn`:1476、`cmd_ready`:1594、`cmd_disposable`:1629、`cmd_idle`:1800、
-//! `disposable_effective`:444。
+//! `cmd_despawn`:1476、`cmd_ready`:1594。
 //!
 //! evict 的三段式編排（send → await → despawn）留在 `ab` CLI 層：它由三個
 //! 既有子指令組成，核心邏輯分別已在 `task`／`spawn` 就位。
@@ -1163,8 +1162,8 @@ fn despawn_locked(
     let tag = registry::read_field(f, "spawn_tag", "");
 
     // generation 綁定（evict 專用）：await 與 despawn 之間同名 agent 可能已經
-    // 換了一代。只憑名字就殺，會殺掉一個沒收過收尾任務、也沒宣告 disposable
-    // 的新 worker——那正是這一層唯一不可接受的失效
+    // 換了一代。只憑名字就殺，會殺掉一個沒收過收尾任務的新 worker
+    // ——那正是這一層唯一不可接受的失效
     if let Some(expect) = &ctx.expect_tag
         && !expect.is_empty()
         && &tag != expect
@@ -1267,9 +1266,9 @@ fn despawn_locked(
     }
 
     // 審計要看得出「這次回收有沒有丟掉東西」。despawn 是公開指令，任何人都能
-    // 繞過 evict 直接收掉一個沒宣告 disposable 的 worker——機制上不擋（擋了會
+    // 繞過 evict 直接收掉一個沒走過收尾流程的 worker——機制上不擋（擋了會
     // 逼出 --force），但不能讓審計線看起來跟一次乾淨的回收一模一樣
-    let ev = if !ctx.notes_handled && !disposable_effective(paths, name, f) {
+    let ev = if !ctx.notes_handled {
         "despawned-unsaved"
     } else {
         "despawned"
@@ -1345,42 +1344,7 @@ pub fn ready(paths: &Paths, name: &str) -> Result<()> {
     Ok(())
 }
 
-/// `cmd_disposable`:1629 — worker 宣告「本輪脈絡已無殘值」。
-///
-/// 語意刻意是**單向宣告**而非雙向旗標：預設保留。沒宣告過的一律當成仍有殘值，
-/// 失效方向因此安全——忘記宣告只是多佔一個 cap，而不是把有用的脈絡殺掉。
-/// 一併寫 `disposable_at`，讓宣告能「過期」（見 `disposable_effective`）。
-pub fn disposable(paths: &Paths, tmux: &dyn TmuxClient, name: &str) -> Result<()> {
-    // pane/runtime 在鎖內取：出鎖後 registry 可能已被換掉，審計就記到別人頭上
-    let (pane, runtime) = with_spawned_registry(paths, name, "disposable", |f| {
-        let pane = registry::read_field(f, "pane_id", "-");
-        let runtime = registry::read_field(f, "runtime", "-");
-        let content = std::fs::read_to_string(f)
-            .map_err(|e| Error::new(format!("無法讀取 {}：{e}", f.display())))?;
-        let Ok(Value::Object(mut fields)) = json::parse(&content) else {
-            return Err(Error::new(format!(
-                "registry 檔 {} 不是合法的 JSON 物件",
-                f.display()
-            )));
-        };
-        fields.insert("disposable".into(), Value::Bool(true));
-        json::set_str_field(&mut fields, "disposable_at", &now_iso());
-        let doc = format!("{}\n", json::render_pretty(&Value::Object(fields)));
-        atomic_write(f, doc.as_bytes())?;
-        Ok((pane, runtime))
-    })?;
-    // 宣告已落進 registry，審計 append 失敗只揭露不翻盤
-    if registry::log_agent_event(paths, tmux, "disposable", name, &pane, &runtime, None).is_err() {
-        eprintln!(
-            "agent-bridge: 警告：disposable 已寫入 registry，但審計未落地（agents.log append 失敗）"
-        );
-    }
-    let _ = writeln_stderr(&format!("agent '{name}' 已宣告可回收（disposable）"));
-    Ok(())
-}
-
-/// ready／disposable 共用的鎖內前置：名稱文法 → 取鎖 → 存在 → 出身三態。
-/// 兩者的拒絕訊息只差一句尾巴，故以 `kind` 分流（逐字對齊 bash）。
+/// ready 的鎖內前置：名稱文法 → 取鎖 → 存在 → 出身三態。
 fn with_spawned_registry<T>(
     paths: &Paths,
     name: &str,
@@ -1399,13 +1363,9 @@ fn with_spawned_registry<T>(
             return Err(Error::new(format!("未註冊的 agent：{name}")));
         }
         match registry::read_provenance(&f) {
-            Provenance::Manual => Err(Error::new(if kind == "ready" {
-                format!("agent '{name}' 非 spawn 出身，ready 僅限 spawned agent")
-            } else {
-                format!(
-                    "agent '{name}' 非 spawn 出身，disposable 僅限 spawned agent（人工 pane 的生命週期不歸 bridge 管）"
-                )
-            })),
+            Provenance::Manual => Err(Error::new(format!(
+                "agent '{name}' 非 spawn 出身，{kind} 僅限 spawned agent"
+            ))),
             Provenance::Undetermined => Err(Error::new(format!(
                 "agent '{name}' 的 registry 無法解析，{kind} 拒絕；請確認 {} 後手動處理",
                 f.display()
@@ -1431,49 +1391,20 @@ fn set_bool_field(f: &Path, key: &str, val: bool) -> Result<()> {
     atomic_write(f, doc.as_bytes())
 }
 
-/// `disposable_effective`:444 — 這個 agent 的「無殘值」宣告現在還算不算數。
-///
-/// **同秒也算過期**（`>=` 而非 `>`）：時間戳是秒精度，worker 宣告後
-/// orchestrator 立刻派工就會落在同一秒。判太嚴只是多派一輪收尾，判太鬆是殺掉
-/// 還有用的脈絡——兩個方向的代價不對等。
-pub fn disposable_effective(paths: &Paths, name: &str, f: &Path) -> bool {
-    let Ok(content) = std::fs::read_to_string(f) else {
-        return false;
-    };
-    let Ok(Value::Object(fields)) = json::parse(&content) else {
-        return false;
-    };
-    if !json::bool_field_is_true(&fields, "disposable") {
-        return false;
-    }
-    // 宣告了但沒有時間戳（缺欄位／null → jq 給 `"?"`，或欄位本身是空字串）：
-    // 無從判斷是否被後續任務推翻，當成無效（偏保守那邊）
-    let disp_at = json::jq_alt(&fields, "disposable_at").unwrap_or_else(|| "?".to_string());
-    if disp_at.is_empty() || disp_at == "?" {
-        return false;
-    }
-    let last_at = task::last_task_at(paths, name);
-    if last_at.is_empty() {
-        return true;
-    }
-    last_at < disp_at
+/// `list --long` 的 READY／IDLE 欄來源（CLI-LIST-2）的一列。
+struct IdleRow {
+    name: String,
+    ready: String,
+    idle_secs: String,
 }
 
-/// `cmd_idle`:1800 的一列。
-pub struct IdleRow {
-    pub name: String,
-    pub ready: String,
-    pub disposable: String,
-    pub idle_secs: String,
-}
-
-/// `cmd_idle`:1800 — worker 池的回收決策視圖。**唯讀**：不取鎖、不寫任何檔案
-/// （orchestrator 可能跑在只讀 sandbox 裡）。
+/// worker 池的 ready 狀態與閒置秒數，供 `list_long` 取 READY／IDLE 欄。
+/// **唯讀**：不取鎖、不寫任何檔案（orchestrator 可能跑在只讀 sandbox 裡）。
 ///
 /// `idle_secs` 取「最後任務」與「這個 pane 誕生」兩者較晚者：agent 名稱可以
 /// 重用，而 `last_task_at` 只認名字不認 pane 實例——閒置時間不該早於誕生時間。
 /// 無法解析時間時印 `-` 而不是 0（0 會被誤讀成「剛剛才用過」）。
-pub fn idle(paths: &Paths) -> Vec<IdleRow> {
+fn idle(paths: &Paths) -> Vec<IdleRow> {
     let now = crate::time::now_epoch();
     let mut rows = Vec::new();
     for f in registry_files(paths) {
@@ -1489,7 +1420,6 @@ pub fn idle(paths: &Paths) -> Vec<IdleRow> {
                 rows.push(IdleRow {
                     name: base_name,
                     ready: "?".into(),
-                    disposable: "?".into(),
                     idle_secs: "-".into(),
                 });
                 continue;
@@ -1507,25 +1437,6 @@ pub fn idle(paths: &Paths) -> Vec<IdleRow> {
         } else {
             "starting"
         };
-        // bash：`disp_at = if .disposable == true then (.disposable_at // "?") else ""`，
-        // 再以 `[[ "$spawned" != y || -z "$disp_at" ]]` 判 `-`。
-        // **`disposable_at` 是空字串時 jq 回空字串**（`//` 只對 null/false 生效），
-        // 於是那一列印 `-` 而不是 `expired`——用 `jq_alt` 才拿得到這個區別。
-        let disp_at = if json::bool_field_is_true(&fields, "disposable") {
-            json::jq_alt(&fields, "disposable_at").unwrap_or_else(|| "?".to_string())
-        } else {
-            String::new()
-        };
-        // 人工註冊的 pane 不歸 bridge 管生命週期，一律 `-`：即使有人手動塞了
-        // disposable 欄位，也不該讓它看起來可回收
-        let disposable = if !spawned || disp_at.is_empty() {
-            "-"
-        } else if disposable_effective(paths, &name, &f) {
-            "yes"
-        } else {
-            "expired"
-        };
-
         // `.spawned_at // .registered_at // ""` 的鏈式 fallback，同樣要逐字：
         // `spawned_at: ""` 時 bash 停在空字串（idle_secs 印 `-`），不會往
         // registered_at 掉（codex 複核 2026-07-31）
@@ -1545,7 +1456,6 @@ pub fn idle(paths: &Paths) -> Vec<IdleRow> {
         rows.push(IdleRow {
             name,
             ready: ready.into(),
-            disposable: disposable.into(),
             idle_secs,
         });
     }
@@ -1560,12 +1470,11 @@ pub struct LongRow {
     pub origin: String,
     pub location: String,
     pub owner: String,
-    pub disposable: String,
     pub idle_secs: String,
 }
 
 /// `list --long` 的欄名標頭。消費端跳過第一行（CLI-LIST-2）。
-pub const LIST_LONG_HEADER: &str = "NAME\tPANE\tREADY\tORIGIN\tWHERE\tOWNER\tDISPOSABLE\tIDLE";
+pub const LIST_LONG_HEADER: &str = "NAME\tPANE\tREADY\tORIGIN\tWHERE\tOWNER\tIDLE";
 
 /// 索引查得到 → 位置字面值；查了但不在 → `dead_label`；沒得查 → `?`；
 /// id 形狀不合法 → `invalid`。
@@ -1643,7 +1552,7 @@ fn owner_parts(owner: &str) -> Option<(&str, &str)> {
     }
 }
 
-/// 欄值不得含 TAB／換行／控制字元：輸出是「一 agent 一行、恰八欄」的 TSV，
+/// 欄值不得含 TAB／換行／控制字元：輸出是「一 agent 一行、恰七欄」的 TSV，
 /// 而 name／session 名等來自 registry 與 tmux，都是可被塞進怪字元的外部資料。
 /// 合法 JSON string 帶一個 TAB 就能把一列變兩欄（跨廠複核 2026-07-31）。
 fn sanitize_field(s: &str) -> String {
@@ -1688,8 +1597,8 @@ fn tmux_index(
 /// 判定 dead 也不順手清 registry（回收一律走 despawn／evict 的顯式動作）。
 ///
 /// 訊號與結論刻意分離：`origin` 是 provenance（manual 者 despawn 恆被拒），
-/// `location`／`owner` 是 liveness，`disposable`／`idle_secs` 是 worker 自己
-/// 留下的建議與閒置時間。沒有任何一欄是「可以安全刪除」——那是人的判斷。
+/// `location`／`owner` 是 liveness，`idle_secs` 是閒置時間。沒有任何一欄是
+/// 「可以安全刪除」——那是人的判斷。
 pub fn list_long(paths: &Paths, tmux: &dyn TmuxClient) -> Vec<LongRow> {
     let panes = tmux_index(tmux, "list-panes", "#{pane_id}");
     let windows = tmux_index(tmux, "list-windows", "#{window_id}");
@@ -1716,7 +1625,6 @@ pub fn list_long(paths: &Paths, tmux: &dyn TmuxClient) -> Vec<LongRow> {
                     origin: "?".into(),
                     location: "?".into(),
                     owner: "?".into(),
-                    disposable: "?".into(),
                     idle_secs: "-".into(),
                 });
                 continue;
@@ -1749,9 +1657,9 @@ pub fn list_long(paths: &Paths, tmux: &dyn TmuxClient) -> Vec<LongRow> {
             None => "?".to_string(),
         };
 
-        let (ready, disposable, idle_secs) = match idle_rows.get(&name) {
-            Some(r) => (r.ready.clone(), r.disposable.clone(), r.idle_secs.clone()),
-            None => ("?".to_string(), "?".to_string(), "-".to_string()),
+        let (ready, idle_secs) = match idle_rows.get(&name) {
+            Some(r) => (r.ready.clone(), r.idle_secs.clone()),
+            None => ("?".to_string(), "-".to_string()),
         };
         rows.push(LongRow {
             name,
@@ -1768,7 +1676,6 @@ pub fn list_long(paths: &Paths, tmux: &dyn TmuxClient) -> Vec<LongRow> {
             },
             location,
             owner,
-            disposable,
             idle_secs,
         });
     }
@@ -1886,7 +1793,7 @@ mod tests {
         assert_eq!(owner_parts("scratch:@"), None);
     }
 
-    /// 欄值不得含 TAB／換行／控制字元：一個 TAB 就能把一列變成九欄。
+    /// 欄值不得含 TAB／換行／控制字元：一個 TAB 就能把一列變成八欄。
     #[test]
     fn sanitize_field_protects_the_column_contract() {
         assert_eq!(sanitize_field("plain-name"), "plain-name");
@@ -2373,5 +2280,86 @@ mod tests {
             cmd.starts_with(&format!("{own} ")),
             "tag MUST 維持第一個 token（回滾／despawn 以此前綴比對）"
         );
+    }
+
+    /// `list-panes`／`list-windows` 一律成功且沒有任何 pane 的 tmux 替身：
+    /// despawn 因此走「pane 已不存在，僅清除註冊」分支。
+    struct EmptyPoolTmux;
+
+    impl TmuxClient for EmptyPoolTmux {
+        fn exec(&self, args: &[&str]) -> Option<crate::tmux::TmuxOutput> {
+            let ok = matches!(args.first(), Some(&"list-panes") | Some(&"list-windows"));
+            Some(crate::tmux::TmuxOutput {
+                status_ok: ok,
+                stdout: String::new(),
+                stderr: String::new(),
+            })
+        }
+        fn available(&self) -> bool {
+            true
+        }
+        fn resolve_pane(&self, _target: &str) -> Option<String> {
+            None
+        }
+        fn pane_exists(&self, _pane: &str) -> bool {
+            false
+        }
+        fn capture_pane(&self, _pane: &str) -> Option<String> {
+            None
+        }
+        fn pane_in_mode(&self, _pane: &str) -> Option<bool> {
+            None
+        }
+        fn send_keys(&self, _pane: &str, _keys: &str) -> bool {
+            false
+        }
+    }
+
+    /// 舊資料殘留的宣告欄位由泛型 JSON 讀取自然忽略：registry 仍可 list
+    /// （含 `list --long` 的七欄來源）與 despawn；despawn 只看 `notes_handled`，
+    /// 舊宣告不再讓審計降級成「已收尾」。
+    #[test]
+    fn legacy_disposable_fields_stay_listable_and_despawnable() {
+        let data_dir =
+            std::env::temp_dir().join(format!("ab_legacy_disposable_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&data_dir);
+        let paths = Paths {
+            agents_dir: data_dir.join("agents"),
+            tasks_dir: data_dir.join("tasks"),
+            locks_dir: data_dir.join("locks"),
+            state_dir: data_dir.join("state"),
+            data_dir,
+        };
+        paths.ensure_dirs().unwrap();
+        let base = r#"{"name":"old1","pane_id":"%99","runtime":"codex","spawned":true,"ready":true,"spawned_at":"2026-01-01T00:00:00Z""#;
+        let legacy_disposable = r#","disposable":true,"disposable_at":"2026-01-01T00:00:00Z"}"#;
+        let f = paths.agents_dir.join("old1.json");
+        std::fs::write(&f, format!("{base}{legacy_disposable}\n")).unwrap();
+
+        let listed = registry::list(&paths).unwrap();
+        assert_eq!(
+            listed,
+            vec![("old1".to_string(), "%99".to_string(), "ready".to_string())],
+            "legacy_disposable 欄位不得影響 list"
+        );
+        let rows = list_long(&paths, &EmptyPoolTmux);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].name, "old1");
+        assert_eq!(rows[0].ready, "ready");
+        assert!(
+            rows[0].idle_secs.bytes().all(|b| b.is_ascii_digit()) && !rows[0].idle_secs.is_empty(),
+            "legacy_disposable 欄位不得影響 idle 秒數：{}",
+            rows[0].idle_secs
+        );
+
+        let r = despawn(&paths, &EmptyPoolTmux, "old1", &DespawnCtx::default()).unwrap();
+        assert_eq!(r, DespawnResult::Absent);
+        assert!(!f.exists(), "despawn 後 registry 應已清除");
+        let log = std::fs::read_to_string(paths.data_dir.join("agents.log")).unwrap();
+        assert!(
+            log.contains(" despawned-unsaved old1 "),
+            "未走 evict 收尾的 despawn 一律記 unsaved（legacy_disposable 宣告不豁免）：{log}"
+        );
+        let _ = std::fs::remove_dir_all(&paths.data_dir);
     }
 }

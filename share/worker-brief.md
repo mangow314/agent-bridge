@@ -55,20 +55,8 @@ ask about. This pane is kept alive for those things. Clearing them turns
 the pane into an empty shell.
 
 After replying, stand by in place for the next notification.
-No `/clear`, no reset, and do not close your own pane.
-
-Declare only when there is truly nothing left:
-
-```bash
-agent-bridge disposable <your-name>   # this round's context has no residual value; may be reclaimed immediately
-```
-
-Declare it only when you are certain the reply already contains
-everything worth knowing — e.g. the task was just running one command and
-reading its output. **When unsure, do not declare**: forgetting to
-declare merely occupies one slot; declaring wrongly sends still-useful
-context to reclamation. This command is advice, not protection and not a
-self-destruct switch; the reclaim decision belongs to the orchestrator.
+No `/clear`, no reset, and do not close your own pane. The reclaim
+decision belongs to the orchestrator.
 
 ## When a wrap-up task arrives
 

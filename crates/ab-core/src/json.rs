@@ -57,7 +57,7 @@ pub fn jq_raw_field(fields: &Map<String, Value>, key: &str) -> Option<String> {
 ///
 /// 與 `jq_raw_field` 的分工：後者模擬的是 bash 慣用的 `.x // empty` 再配
 /// `[[ -n ]]` 判斷（M2 的 hook 欄位全走那個形狀），把空字串併進「沒有值」是
-/// 對的；但 `.spawned_at // .registered_at`、`.disposable_at // "?"` 這類
+/// 對的；但 `.spawned_at // .registered_at` 這類
 /// **鏈式 fallback** 不同——欄位是空字串時 bash 拿到空字串就停在那裡，
 /// 併進 None 會讓它繼續往後掉，於是 idle 對一份 `spawned_at: ""` 的 registry
 /// 印出 registered_at 算出來的秒數，bash 印 `-`（codex 複核 2026-07-31）。

@@ -1,4 +1,4 @@
-# CLI 契約（20 個子指令）
+# CLI 契約（18 個子指令）
 
 ## 共通慣例
 
@@ -48,17 +48,19 @@ Source: cmd_list
 
 ### CLI-LIST-2 [tested: 38]
 `list --long`（`-l` 為等價別名）：人可讀的介入視圖。首行 MUST 為欄名標頭
-`NAME\tPANE\tREADY\tORIGIN\tWHERE\tOWNER\tDISPOSABLE\tIDLE`，其後每 agent
-一行、TAB 分隔恰八欄。欄值 MUST NOT 含 TAB／換行／控制字元（`name`、
+`NAME\tPANE\tREADY\tORIGIN\tWHERE\tOWNER\tIDLE`，其後每 agent
+一行、TAB 分隔恰七欄。欄值 MUST NOT 含 TAB／換行／控制字元（`name`、
 session 名等來自 registry 與 tmux，是可被塞入怪字元的外部資料；一個 TAB 就
-能把一列變成九欄）——輸出前 MUST 逐欄代換。
+能把一列變成八欄）——輸出前 MUST 逐欄代換。
 
 各欄允許值域（可機器判定）：
 
 - `ORIGIN` ∈ `spawned|manual|?`——**provenance 與 liveness 分開呈現**，人工
   註冊者 despawn 恆被拒（CLI-DESPAWN-*），這一欄是那條規則的可見形。
-- `READY` ∈ `ready|starting|-|?`；`DISPOSABLE` ∈ `yes|expired|-|?`；
-  `IDLE` ∈ 非負整數｜`-`。語意同 `idle` 指令。
+- `READY` ∈ `ready|starting|-|?`。
+- `IDLE` ∈ 非負整數｜`-`。MUST 取「最後派工時間」與「本 pane 誕生時間」較晚者
+  起算（agent 名可重用，不得繼承同名前代的任務時間而誤判久閒）；時間無法
+  解析 MUST 印 `-` 而非 0（0 會被誤讀成「剛用過」）。
 - `WHERE`／`OWNER`：以 tmux 即時反查，顯示人看得懂的 `<session>:<window>`；
   registry 存的 `%id`／`@id` 是判定的根（不可變），名稱與 index 只是當下的
   人類標籤，MUST NOT 反過來當判定依據。失效 MUST 顯式降級為固定字面值、
@@ -75,13 +77,12 @@ session 名等來自 registry 與 tmux，是可被塞入怪字元的外部資料
   就順手清 registry（回收一律是 despawn／evict 的顯式動作）。因為不取鎖，
   tmux 索引、idle 訊號與 registry 是分次讀取的 best-effort snapshot，
   本指令**不承諾**列內或列間的原子一致。
-- registry 損壞 MUST NOT 讓整份報表終止：該列以 `?` 呈現後繼續（它照樣佔
-  著 cap，必須看得見）。
+- registry 損壞 MUST NOT 讓整份報表終止，也 MUST NOT 靜默跳過該列：該列以
+  `?` 呈現後繼續（NAME 取檔名、IDLE 為 `-`；它照樣佔著 cap，必須看得見）。
 
 設計原則（非規範，不可機器判定，故不寫成 MUST）：本視圖給的是**訊號不是
-結論**——`IDLE` 只說多久沒動、`DISPOSABLE` 只是 worker 自己留下的建議，
-兩者都不等於「可以安全刪除」。是否回收由人判斷；上面的值域限制是這條原則
-可機器守住的部分。
+結論**——`IDLE` 只說多久沒動，不等於「可以安全刪除」。是否回收由人判斷；
+上面的值域限制是這條原則可機器守住的部分。
 Source: cmd_list
 
 ## `send`
@@ -289,12 +290,12 @@ Note：`AGENT_BRIDGE_SPAWN_TAG` 在此只是落點 provenance 的訊號、不是
 Source: cmd_spawn / caller_owner / config::here_layout
 
 ### CLI-SPAWN-6 [tested: 32]
-spawn／despawn／evict／disposable MUST 追加審計行至 `<data>/agents.log`，
+spawn／despawn／evict MUST 追加審計行至 `<data>/agents.log`，
 固定 6 欄空白分隔：`<ts> <action> <name> <pane> <runtime> <actor>`；欄值
 MUST 摺疊空白、空值以 `-` 補（欄位安全在寫入點保證，不倚賴上游）。actor
 是 provenance 非認證。action 值域：`spawned`｜`despawned`｜
 `despawned-unsaved`｜`despawn-stale`｜`evicted`｜`evicted-unfinished`｜
-`evicted-timeout`｜`disposable`。
+`evicted-timeout`。
 Source: log_agent_event / cmd_spawn
 
 ### CLI-SPAWN-7 [tested: 22, 27]
@@ -324,8 +325,8 @@ Source: cmd_despawn
 tmux 查詢失敗（server 不可達）與「pane 不存在」MUST 區分：前者保留
 registry 並錯誤終止；後者清 registry 成功收場（absent）。審計 MUST 在動手
 前預檢可寫（不可寫則拒絕動手）；不可逆動作完成後審計落地失敗 MUST 只警告、
-不得以非零收場。回收無有效 disposable 宣告且未經 evict 收尾流程的 worker
-時，審計事件 MUST 記為 `despawned-unsaved`（機制不擋、審計留痕）。
+不得以非零收場。回收未經 evict 收尾流程的 worker 時，審計事件 MUST 記為
+`despawned-unsaved`（機制不擋、審計留痕）。
 Source: cmd_despawn
 
 ## `ready`
@@ -336,33 +337,6 @@ Source: cmd_despawn
 Source: cmd_ready
 
 ---
-
-## `disposable`
-
-### CLI-DISPOSABLE-1 [tested: 24]
-`disposable <name>`：worker 單向宣告「脈絡無殘值」，registry 寫
-`disposable: true` 與 `disposable_at` 時間戳。僅 spawn 出身可用。語意是
-給 orchestrator 的建議、不是保護；**預設保留**——未宣告的 worker 一律視為
-有殘值。宣告後若又被派新任務，宣告失效（由讀取端判定，見 CLI-IDLE-1，
-不清除欄位）。審計記 disposable 事件。
-Source: cmd_disposable / disposable_effective
-
-## `idle`
-
-### CLI-IDLE-1 [tested: 25]
-`idle`（無參數）：worker 池回收決策視圖。唯讀（不取鎖、不寫檔、不建目錄，
-只讀 sandbox 可用）。stdout 每 agent 一行 TAB 分隔四欄
-`<name>\t<ready>\t<disposable>\t<idle_secs>`。disposable 欄三值即決策：
-`yes`＝有效宣告可回收；`expired`＝宣告後又有較晚任務（失效）；`-`＝未宣告
-（預設保留）或人工註冊。
-Source: cmd_idle
-
-### CLI-IDLE-2 [tested: 25]
-idle_secs MUST 取「最後派工時間」與「本 pane 誕生時間」較晚者起算（agent
-名可重用，不得繼承同名前代的任務時間而誤判久閒）；時間無法解析 MUST 印
-`-` 而非 0（0 會被誤讀成「剛用過」）。損壞 registry MUST 以
-`<name>\t?\t?\t-` 一行呈現，MUST NOT 靜默跳過（它仍佔 cap）。
-Source: cmd_idle / last_task_at
 
 ## `evict`
 
@@ -420,7 +394,7 @@ Source: cmd_hook
 ## 唯讀指令的 sandbox 契約
 
 ### CLI-RO-1 [tested: 31]
-`status`／`await`／`idle`／`list` MUST 全程不寫檔、不建目錄；
+`status`／`await`／`list` MUST 全程不寫檔、不建目錄；
 `status` 與 `await` 另 MUST 不依賴 jq。`hook` 自理依賴檢查與目錄建立且失敗全吞
 （CLI-HOOK-1）。其餘指令啟動時自動補建資料目錄。
 Source: main（require_jq / ensure_dirs 豁免表）
