@@ -294,7 +294,7 @@ pub fn spawn(paths: &Paths, tmux: &dyn TmuxClient, req: &SpawnRequest) -> Result
     }
 
     // runtime 表：指令 ＋ 守則注入方式。三個 runtime 都走「initial prompt
-    // 位置參數」。claude 的旗標選擇理由見 bin/agent-bridge，不複製。
+    // 位置參數」。claude 的旗標選擇理由見 README.md「Worker runtimes」節，不複製。
     //
     // agy（Antigravity CLI）的旗標選擇（量測正本 docs/agy-probe.md）：
     // agy 沒有 codex `--profile` 那種細粒度權限路線，也沒有 `--settings` 可讓

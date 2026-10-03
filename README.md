@@ -148,6 +148,46 @@ sit in `bin/` — the default `share/` brief paths are derived from it.
 Optional: load the delegation skill into Claude Code with
 `ln -s ~/projects/agent-bridge ~/.claude/skills/agent-bridge`.
 
+## Worker runtimes
+
+`spawn --runtime` starts one of three CLIs in the worker pane:
+
+- **codex** → `codex --profile agent-worker`, which layers
+  `~/.codex/agent-worker.config.toml` on top of your base config. The repo
+  does not ship that file; create it yourself:
+
+  ```toml
+  # agent-bridge worker profile (codex --profile agent-worker)
+  approval_policy = "never"
+  sandbox_mode = "workspace-write"
+  ```
+
+  `never` turns off per-command approval prompts: the sender can neither see
+  nor answer them, so the task would just hang until `await` times out. A
+  command the sandbox blocks now fails straight back to the model. The
+  `workspace-write` sandbox is the remaining fence, so never use
+  `danger-full-access`, and leave `network_access` off. The data directory
+  must be in `[sandbox_workspace_write] writable_roots` (base config or
+  profile), or the worker cannot write its lock and task state.
+  `--profile <name>` swaps in another profile file, which then owns its
+  approval and sandbox posture; one without `approval_policy = "never"`
+  leaves the worker stuck on permission prompts.
+- **claude** → `claude --permission-mode auto --settings
+  share/claude-worker-hooks.json` (override the file with
+  `AGENT_BRIDGE_CLAUDE_HOOKS`).
+  - `auto` lets the worker run with no human in the loop; a classifier
+    reviews its actions instead. `bypassPermissions` is avoided because the
+    [docs](https://code.claude.com/docs/en/permission-modes) scope it to
+    isolated containers and VMs, while a worker pane shares your machine,
+    files, and credentials. Do not justify this with "bypass skips hooks":
+    `--bare` is what skips hooks, and deny rules apply in every mode.
+  - Never `-p/--print`: it answers once and exits, so no pane stays behind.
+  - No `--setting-sources`: settings layers merge, so the worker inherits
+    your global hooks and safety settings unchanged.
+- **agy** → `agy --dangerously-skip-permissions --sandbox …
+  --prompt-interactive`; it has no hooks, so notifications always use
+  send-keys ([measured](docs/agy-probe.md)).
+
 ## How it works
 
 - **Thin CLI** — `bin/agent-bridge`, a shim onto the Rust binary `bin/ab`;
@@ -197,6 +237,10 @@ Optional: load the delegation skill into Claude Code with
 - A runtime sandbox must allow writes to the data directory (codex
   `workspace-write` needs it in `writable_roots`) and may block the socket
   that notifications use; have the sender `await` instead of relying on them.
+- `AGENT_BRIDGE_PASS_ENV` copies the named variables into the worker's launch
+  command. Never use it for secrets: the values are visible in that command.
+  Only a trusted orchestrator should set the list — variables like `PATH` or
+  `LD_PRELOAD` can change how the runtime behaves.
 - The earlier long-form manual, with the complete known-limits list, is
   `README.zh-TW.md` at tag `pre-trim-2026-09`.
 

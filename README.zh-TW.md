@@ -139,6 +139,42 @@ command -v agent-bridge   # 應解析到 symlink
 預設路徑是從它反推的。選用：把委派 skill 載入 Claude Code：
 `ln -s ~/projects/agent-bridge ~/.claude/skills/agent-bridge`。
 
+## Worker runtime
+
+`spawn --runtime` 在 worker pane 裡啟動三種 CLI 之一：
+
+- **codex** → `codex --profile agent-worker`，會把
+  `~/.codex/agent-worker.config.toml` 疊在你的基底設定之上。本 repo 不附這個
+  檔，請自行建立：
+
+  ```toml
+  # agent-bridge worker profile（codex --profile agent-worker）
+  approval_policy = "never"
+  sandbox_mode = "workspace-write"
+  ```
+
+  `never` 關掉逐指令的核准提示：sender 既看不到也答不了，任務只會卡到
+  `await` 逾時。改成 sandbox 擋下的指令直接失敗、回給模型。剩下的圍欄是
+  `workspace-write` sandbox，所以絕不要用 `danger-full-access`，
+  `network_access` 也維持關閉。資料目錄必須在
+  `[sandbox_workspace_write] writable_roots` 裡（基底設定或 profile 皆可），
+  否則 worker 寫不了鎖與任務狀態。`--profile <name>` 改用別的 profile 檔，
+  approval 與 sandbox 姿態由該檔自行負責；沒有 `approval_policy = "never"`
+  的 profile 會讓 worker 卡在權限提示。
+- **claude** → `claude --permission-mode auto --settings
+  share/claude-worker-hooks.json`（檔案可用 `AGENT_BRIDGE_CLAUDE_HOOKS` 覆蓋）。
+  - `auto` 讓 worker 不需人介入就能執行，改由 classifier 代替人審查動作。
+    不用 `bypassPermissions`，因為[官方文件](https://code.claude.com/docs/en/permission-modes)
+    把它限定在隔離的 container 與 VM，而 worker pane 與你共用機器、檔案和
+    憑證。別把理由寫成「bypass 會略過 hooks」：略過 hooks 的是 `--bare`，
+    deny 規則在每個模式都生效。
+  - 不可用 `-p/--print`：它回答一次就退出，pane 留不下來。
+  - 不加 `--setting-sources`：各層設定是合併的，worker 原樣繼承你的全域
+    hooks 與安全設定。
+- **agy** → `agy --dangerously-skip-permissions --sandbox …
+  --prompt-interactive`；它沒有 hooks，通知恆走 send-keys
+  （[實測](docs/agy-probe.md)）。
+
 ## 運作方式
 
 - **薄 CLI**——`bin/agent-bridge` 是接到 Rust 執行檔 `bin/ab` 的 shim；
@@ -180,6 +216,9 @@ command -v agent-bridge   # 應解析到 symlink
 - runtime 的 sandbox 必須允許寫資料目錄（codex `workspace-write` 要把它加進
   `writable_roots`），也可能擋掉通知用的 socket；sender 端請用 `await`，
   別倚賴通知。
+- `AGENT_BRIDGE_PASS_ENV` 會把指名的變數拼進 worker 的啟動指令。不要拿來
+  傳秘密：值在那條指令裡看得到。白名單只能由可信的 orchestrator 設定——
+  `PATH`、`LD_PRELOAD` 這類變數足以改變 runtime 的行為。
 - 舊版長篇手冊（含完整已知限制清單）是 tag `pre-trim-2026-09` 的
   `README.zh-TW.md`。
 

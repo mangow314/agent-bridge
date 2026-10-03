@@ -4,9 +4,8 @@
 //!
 //! 1. **名稱字面字串**：每個 `AGENT_BRIDGE_*` 的名字以 `const` 出現一次，
 //!    其餘模組引用常數而非自行拼字串。`tests/check-contract.sh` check 1 是
-//!    對 `bin/agent-bridge` 與 `spec/env.md` 做集合比對（不掃 Rust），但同一
-//!    份名單在 Rust 側也必須以**字面字串**存在才 grep 得到——M4 cutover 後
-//!    正本換人時那道檢查要能原樣沿用。
+//!    grep `crates/**/*.rs` 與 `spec/env.md` 做集合比對，所以名單在 Rust 側
+//!    必須以**字面字串**存在才 grep 得到。
 //! 2. **同一個變數的兩套失效方向**：`AGENT_BRIDGE_STATE_TTL` 在通知端壞值
 //!    MUST 致命（ENV-TTL-1/2），在 hook 端壞值 MUST NOT 致命（hook 鐵律：
 //!    任何內部錯誤一律 exit 0）。兩者不是同一個函式加旗標能講清楚的事，

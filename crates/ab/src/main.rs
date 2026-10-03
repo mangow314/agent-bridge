@@ -18,7 +18,7 @@ use ab_core::spawn;
 use ab_core::task::{self, MessageSource, TaskState};
 use ab_core::tmux::SubprocessTmux;
 
-// 逐字對齊 bash `usage()`（bin/agent-bridge）的 heredoc 內容。
+// 最初逐字沿用已退役 bash 正本的 `usage()` heredoc；bash 退役後只在這裡維護。
 const USAGE: &str = r#"用法：
   agent-bridge register <agent> <tmux-target>   註冊 agent 與其 tmux pane
   agent-bridge unregister <agent>               移除 agent 註冊
