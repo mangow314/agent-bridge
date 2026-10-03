@@ -256,9 +256,8 @@ bash tests/run-tests.sh   # isolated tmux socket + stub runtimes; no real API ca
 - [README.zh-TW.md](README.zh-TW.md) — Traditional Chinese translation of
   this README.
 - [spec/](spec/) — authoritative interface contracts (CLI, env, state, hooks).
-- [share/](share/) — the protocol contracts: orchestrator and worker briefs,
-  review overlay, vehicle routing; [SKILL.md](SKILL.md) loads them into
-  Claude Code.
+- [share/](share/) — the protocol contracts: orchestrator and worker briefs;
+  [SKILL.md](SKILL.md) loads them into Claude Code.
 - [docs/](docs/) — engineering evidence: hands-on probes of the runtimes and
   a comparable tool, design notes ([index](docs/README.md)); retired
   proposals and plans live at tag `pre-trim-2026-09`.

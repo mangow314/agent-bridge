@@ -233,8 +233,8 @@ bash tests/run-tests.sh   # 獨立 tmux socket＋stub runtime；不打真實 API
 
 - [README.zh-TW.md](README.zh-TW.md)——本檔，README 的繁體中文對譯。
 - [spec/](spec/)——權威的介面契約（CLI、env、state、hooks）。
-- [share/](share/)——協定契約：orchestrator 與 worker brief、審查 overlay、
-  載具選擇；[SKILL.md](SKILL.md) 把它們載入 Claude Code。
+- [share/](share/)——協定契約：orchestrator 與 worker brief；
+  [SKILL.md](SKILL.md) 把它們載入 Claude Code。
 - [docs/](docs/)——工程佐證：對各 runtime 與同類工具的實測、設計筆記
   （[索引](docs/README.md)）；已退役的提案與計畫在 tag `pre-trim-2026-09`。
 

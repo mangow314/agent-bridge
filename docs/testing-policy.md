@@ -27,5 +27,10 @@ shell 測試曾單次吃掉 168 分鐘 wall-clock，是 commit 週期最大的�
 
 - 收案／merge 宣稱一律引用全套輸出；看到 `⚠ PARTIAL RUN` 字樣的輸出只能
   支持「該分組行為」的主張。
-- 審查 worker（codex sandbox 擋 tmux socket）不能重跑本套件：套件數字對
-  審查者永遠是 maker claim，此限制記錄於 `share/review-overlay.md`。
+- codex pane worker 的 sandbox 開不了本套件專用的 tmux socket，所以審查
+  worker 不能重跑本套件（2026-07-28 兩輪實測：建 socket 得
+  `Operation not permitted`，`tests/run-tests.sh` 早早死在
+  `PANES[0]: unbound variable`）。套件數字對審查者永遠是 maker claim：
+  審查 worker 只消費證據、不產生證據。派工方（主線或 `test-runner`
+  subagent）跑指令並交出證據包；證據包 manifest 裡沒有對應產物的驗收條，
+  審查者標 UNVERIFIABLE-BY-VEHICLE，不推論、也不從 diff 回填。
