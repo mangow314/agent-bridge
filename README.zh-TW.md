@@ -157,10 +157,10 @@ command -v agent-bridge   # 應解析到 symlink
   `await` 逾時。改成 sandbox 擋下的指令直接失敗、回給模型。剩下的圍欄是
   `workspace-write` sandbox，所以絕不要用 `danger-full-access`，
   `network_access` 也維持關閉。資料目錄必須在
-  `[sandbox_workspace_write] writable_roots` 裡（基底設定或 profile 皆可），
-  否則 worker 寫不了鎖與任務狀態。`--profile <name>` 改用別的 profile 檔，
-  approval 與 sandbox 姿態由該檔自行負責；沒有 `approval_policy = "never"`
-  的 profile 會讓 worker 卡在權限提示。
+  `[sandbox_workspace_write] writable_roots` 裡，否則 worker 寫不了鎖與任務
+  狀態；寫在基底設定的值在 profile 下仍然有效。`--profile <name>` 改用別的
+  profile 檔，approval 與 sandbox 姿態由該檔自行負責；沒有
+  `approval_policy = "never"` 的 profile 會讓 worker 卡在權限提示。
 - **claude** → `claude --permission-mode auto --settings
   share/claude-worker-hooks.json`（檔案可用 `AGENT_BRIDGE_CLAUDE_HOOKS` 覆蓋）。
   - `auto` 讓 worker 不需人介入就能執行，改由 classifier 代替人審查動作。
@@ -169,8 +169,9 @@ command -v agent-bridge   # 應解析到 symlink
     憑證。別把理由寫成「bypass 會略過 hooks」：略過 hooks 的是 `--bare`，
     deny 規則在每個模式都生效。
   - 不可用 `-p/--print`：它回答一次就退出，pane 留不下來。
-  - 不加 `--setting-sources`：各層設定是合併的，worker 原樣繼承你的全域
-    hooks 與安全設定。
+  - 不加 `--setting-sources`：它會限制載入哪些設定來源。不加的話，
+    `--settings` 指定的檔與其他各層設定合併（hooks 也是），worker 保有你的
+    全域 hooks 與安全設定。
 - **agy** → `agy --dangerously-skip-permissions --sandbox …
   --prompt-interactive`；它沒有 hooks，通知恆走 send-keys
   （[實測](docs/agy-probe.md)）。

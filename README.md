@@ -167,9 +167,9 @@ Optional: load the delegation skill into Claude Code with
   command the sandbox blocks now fails straight back to the model. The
   `workspace-write` sandbox is the remaining fence, so never use
   `danger-full-access`, and leave `network_access` off. The data directory
-  must be in `[sandbox_workspace_write] writable_roots` (base config or
-  profile), or the worker cannot write its lock and task state.
-  `--profile <name>` swaps in another profile file, which then owns its
+  must be in `[sandbox_workspace_write] writable_roots`, or the worker
+  cannot write its lock and task state; an entry in your base config still
+  applies under the profile. `--profile <name>` swaps in another profile file, which then owns its
   approval and sandbox posture; one without `approval_policy = "never"`
   leaves the worker stuck on permission prompts.
 - **claude** → `claude --permission-mode auto --settings
@@ -182,8 +182,9 @@ Optional: load the delegation skill into Claude Code with
     files, and credentials. Do not justify this with "bypass skips hooks":
     `--bare` is what skips hooks, and deny rules apply in every mode.
   - Never `-p/--print`: it answers once and exits, so no pane stays behind.
-  - No `--setting-sources`: settings layers merge, so the worker inherits
-    your global hooks and safety settings unchanged.
+  - No `--setting-sources`: it limits which settings sources load. Without
+    it, the `--settings` file merges with your other settings layers, hooks
+    included, so the worker keeps your global hooks and safety settings.
 - **agy** → `agy --dangerously-skip-permissions --sandbox …
   --prompt-interactive`; it has no hooks, so notifications always use
   send-keys ([measured](docs/agy-probe.md)).
