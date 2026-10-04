@@ -16,7 +16,7 @@ shell 測試曾單次吃掉 168 分鐘 wall-clock，是 commit 週期最大的�
 
 ## TEST_GROUPS 機制
 
-- `TEST_GROUPS=44,45 tests/run-tests.sh`：逗號分隔分組 id（`8a`、`34.5+` 這類
+- `TEST_GROUPS=46,49 tests/run-tests.sh`：逗號分隔分組 id（`8a`、`34.5+` 這類
   後綴形照原樣寫）。未知 id 直接 exit 1，不跑任何分組。
 - 選中組的**已知靜態跨組依賴**（`GRP_NEEDS` 表）會自動拉入；該表由靜態審計
   產出（變數＋函式的「定義組≠使用組」掃描），新分組引用他組狀態時必須同步
