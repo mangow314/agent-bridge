@@ -1,6 +1,6 @@
 # agent-bridge 介面契約規格
 
-本目錄是 agent-bridge 的**介面契約正本**：實作（ab-core/ab/ab-tui）必須逐條
+本目錄是 agent-bridge 的**介面契約正本**：實作（ab-core/ab）必須逐條
 滿足這裡的條款，並以測試套件（`tests/run-tests.sh`）全綠作為黑箱驗收。
 M4 之前這裡同時是 Rust 與 bash 兩套實作的 parity 判準；bash 正本退役後，
 判準的對象只剩一套，條款本身不變。
