@@ -14,6 +14,7 @@ pub mod error;
 pub mod evict;
 pub mod fsio;
 pub mod hook;
+pub mod identity;
 pub mod json;
 pub mod lock;
 pub mod notify;

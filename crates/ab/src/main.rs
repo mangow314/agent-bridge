@@ -9,6 +9,7 @@ use std::process::ExitCode;
 use ab_core::error::{Error, Result};
 use ab_core::evict;
 use ab_core::hook::{self, HookOutcome};
+use ab_core::identity;
 use ab_core::lock::acquire_lock;
 use ab_core::notify;
 use ab_core::paths::Paths;
@@ -353,7 +354,7 @@ fn cmd_send(paths: &Paths, args: &[OsString]) -> Result<()> {
         )));
     }
     let src = message_source(mode, &val);
-    let task_id = do_send(paths, &to, &from, &src)?;
+    let task_id = do_send(paths, "send", &to, &from, &src)?;
     println!("{task_id}");
     Ok(())
 }
@@ -442,7 +443,7 @@ fn cmd_ask(paths: &Paths, args: &[OsString]) -> Result<()> {
         )));
     }
     let src = message_source(mode, &val);
-    let id = do_send(paths, &to, &from, &src)?;
+    let id = do_send(paths, "ask", &to, &from, &src)?;
     eprintln!("task-id: {id}");
 
     let st = match await_with_blocker(paths, &id, timeout, &on_blocker, grace_secs)? {
@@ -493,7 +494,11 @@ fn os_bytes(s: &OsString) -> Vec<u8> {
 }
 
 /// cmd_send 的主體（名稱文法 → 收件者已註冊 → 建 task → 通知），回傳 task-id。
-fn do_send(paths: &Paths, to: &str, from: &str, src: &MessageSource) -> Result<String> {
+fn do_send(paths: &Paths, cmd: &str, to: &str, from: &str, src: &MessageSource) -> Result<String> {
+    // CALLER-BIND：from 文法不合時留給 create_send_task 報原本的錯
+    if ab_core::validate::is_valid_name(from) {
+        identity::check_caller_bound(paths, cmd, from, None)?;
+    }
     // 建 task／通知的正本已下沉 `ab_core::send`（evict 編排共用同一份，審查
     // F6）：core 不印字，警告與通知終態在這裡轉成 stderr（文案逐字沿用）。
     let task_id = send::create_send_task(paths, to, from, src, &mut |w| err_line(&w))?;
@@ -565,6 +570,12 @@ fn cmd_unregister(paths: &Paths, args: &[String]) -> Result<()> {
     Ok(())
 }
 
+/// CALLER-BIND：目標＝該 task metadata 的 `to`。
+fn check_task_caller(paths: &Paths, cmd: &str, id: &str, dir: &std::path::Path) -> Result<()> {
+    let to = task::meta_str(dir, "to")?;
+    identity::check_caller_bound(paths, cmd, &to, Some(id))
+}
+
 /// cmd_receive — queued→delivered；delivered/running 可重複取件（re-receive）。
 /// 標頭走 stderr、request 原文走 stdout（byte 原樣，CLI-RECEIVE-1）。
 fn cmd_receive(paths: &Paths, args: &[String]) -> Result<()> {
@@ -574,6 +585,7 @@ fn cmd_receive(paths: &Paths, args: &[String]) -> Result<()> {
     let id = &args[0];
     task::check_task_id(id)?;
     let dir = task::require_task_dir(paths, id)?;
+    check_task_caller(paths, "receive", id, &dir)?;
 
     let guard = acquire_lock(paths, id)?;
     let outcome = (|| -> Result<()> {
@@ -608,6 +620,7 @@ fn cmd_start(paths: &Paths, args: &[String]) -> Result<()> {
     let id = &args[0];
     task::check_task_id(id)?;
     let dir = task::require_task_dir(paths, id)?;
+    check_task_caller(paths, "start", id, &dir)?;
 
     let guard = acquire_lock(paths, id)?;
     let outcome = (|| -> Result<()> {
@@ -637,6 +650,7 @@ fn respond_task(
     src: &MessageSource,
 ) -> Result<()> {
     let dir = task::require_task_dir(paths, id)?;
+    check_task_caller(paths, cmdname, id, &dir)?;
 
     let guard = acquire_lock(paths, id)?;
     let outcome = (|| -> Result<()> {
@@ -1005,6 +1019,7 @@ fn cmd_ready(paths: &Paths, args: &[String]) -> Result<()> {
     if args.len() != 1 {
         return Err(Error::new("用法：agent-bridge ready <name>"));
     }
+    identity::check_caller_bound(paths, "ready", &args[0], None)?;
     spawn::ready(paths, &args[0])
 }
 

@@ -154,7 +154,7 @@ declare -A GRP_NEEDS=(
   # 語意 fixture，變數掃描抓不到 manual-x 這種字串依賴）
   [17]="16" [18]="16"
 )
-GRP_KNOWN=" 1 2 3 4 5 6 7 8 8a 8b 9 10 11 12 13 14 15 16 17 18 18b 18c 19 20 20b 21 22 26 27 29 30 31 32 33 34 34.5+ 35 36 37 38 39 41 42 46 49 "
+GRP_KNOWN=" 1 2 3 4 5 6 7 8 8a 8b 9 10 11 12 13 14 15 16 17 18 18b 18c 19 20 20b 21 22 26 27 29 30 31 32 33 34 34.5+ 35 36 37 38 39 41 42 46 49 50 "
 GRP_SELECTED=""
 GRP_SKIPPED=0
 if [[ -n "${TEST_GROUPS:-}" ]]; then
@@ -4657,6 +4657,52 @@ assert "49(timeout)：同 id 可接續 read" \
   test "$(ab "$D49" read "$id49t" 2>/dev/null)" = "晚到的答案"
 
 fi  # end grp 49
+# ---- 50. CALLER-BIND：呼叫者綁定三態（SPAWN_TAG 析出的 caller 須等於目標） ----
+if grp 50; then
+D50="$TESTROOT/d50"
+ab "$D50" register bob "$PANE_B" 2>/dev/null
+TAG_BOB="ab-spawn-bob-4242-0123456789ab"
+TAG_EVE="ab-spawn-eve-4243-0123456789ab"
+ab_tag() { local tag="$1" data="$2"; shift 2; env AGENT_BRIDGE_SPAWN_TAG="$tag" AGENT_BRIDGE_DATA="$data" PATH="$SHIM:$PATH" "$BRIDGE" "$@"; }
+
+id50="$(ab "$D50" send bob --from alice --message "任務" 2>/dev/null)"
+assert "50：建立測試 task" test -n "$id50"
+
+# (b) 異名：reply 非零、task 狀態不變、agents.log 有審計行
+assert_fails_with "50：異名 reply 被拒（非零＋stderr 含 caller/target/task）" \
+  "eve.*bob.*$id50" ab_tag "$TAG_EVE" "$D50" reply "$id50" --message "冒名"
+assert "50：agents.log 有 refused-identity" \
+  grep -q "refused-identity cmd=reply caller=eve target=bob task=$id50" "$D50/agents.log"
+assert "50：被拒後 response.md 不存在" test ! -e "$D50/tasks/$id50/response.md"
+assert_fails "50：異名 receive 被拒" ab_tag "$TAG_EVE" "$D50" receive "$id50"
+assert_fails "50：異名 start 被拒" ab_tag "$TAG_EVE" "$D50" start "$id50"
+assert_fails "50：異名 fail 被拒" ab_tag "$TAG_EVE" "$D50" fail "$id50" --message x
+assert_fails_with "50：異名 ready 被拒" "eve.*bob" ab_tag "$TAG_EVE" "$D50" ready bob
+assert "50：ready 拒絕有審計行" \
+  grep -q "refused-identity cmd=ready caller=eve target=bob task=-" "$D50/agents.log"
+assert_fails_with "50：異名 send --from 被拒" "eve.*alice" \
+  ab_tag "$TAG_EVE" "$D50" send bob --from alice --message hi
+assert "50：send 拒絕有審計行" \
+  grep -q "refused-identity cmd=send caller=eve target=alice" "$D50/agents.log"
+assert_fails "50：異名 ask --from 被拒" \
+  ab_tag "$TAG_EVE" "$D50" ask bob --from alice --message hi --timeout 1
+
+# (a) 同名放行
+assert "50：同名 receive 放行" ab_tag "$TAG_BOB" "$D50" receive "$id50"
+assert "50：同名 reply 放行" ab_tag "$TAG_BOB" "$D50" reply "$id50" --message "本尊"
+assert "50：同名 reply 後 completed" \
+  test "$(ab "$D50" await "$id50" --timeout 5 2>/dev/null)" = completed
+assert "50：同名 send --from 放行" \
+  ab_tag "$TAG_BOB" "$D50" send bob --from bob --message hi
+
+# (c) 無 tag／空字串／格式不符 → 放行
+id50b="$(ab "$D50" send bob --from alice --message "任務2" 2>/dev/null)"
+assert "50：無 tag receive 放行" ab "$D50" receive "$id50b"
+assert "50：空字串 tag start 放行" ab_tag "" "$D50" start "$id50b"
+assert "50：格式不符 tag reply 放行" ab_tag "not-a-spawn-tag" "$D50" reply "$id50b" --message ok
+assert "50：格式不符 tag 的 send --from 放行" \
+  ab_tag "ab-spawn-eve-xx-0123456789ab" "$D50" send bob --from alice --message hi
+fi  # end grp 50
 # ---- 總結 ----
 if [[ -n "$GRP_SELECTED" ]]; then
   printf '\n⚠ PARTIAL RUN（TEST_GROUPS=%s → 實跑:%s，跳過 %d 組）——不得作為收案／merge 證據\n' \

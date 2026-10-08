@@ -171,7 +171,7 @@ pub fn audit_writable(paths: &Paths) -> bool {
         .is_ok()
 }
 
-fn append_line(path: &Path, line: &str) -> std::io::Result<()> {
+pub(crate) fn append_line(path: &Path, line: &str) -> std::io::Result<()> {
     use std::io::Write;
     let mut f = std::fs::OpenOptions::new()
         .create(true)
@@ -182,7 +182,7 @@ fn append_line(path: &Path, line: &str) -> std::io::Result<()> {
 
 /// bash `${v//[[:space:]]/_}` 後 `[[ -n $v ]] || v="-"`。空白集合取 C locale
 /// 的 `[[:space:]]`（space／\t／\n／\v／\f／\r）。
-fn squash(v: &str) -> String {
+pub(crate) fn squash(v: &str) -> String {
     let s: String = v
         .chars()
         .map(|c| {
