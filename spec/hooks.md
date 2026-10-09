@@ -69,7 +69,8 @@ Note: 在**沒有**行程身分可用時（HOOK-OWNER-5 的落回路徑），hoo
 的新 session」與「巢狀 session」在環境與 payload 面不可區分，只能靠時間窗
 交還——PPID **祖先鏈**方案在此仍然無效（巢狀的祖先鏈必然包含本尊）。
 `receive` 端刻意不加驗：巢狀繼承同 SPAWN_TAG、tag 比對無效；門在 hook 端
-不發 block（cross-vendor 複核確認此裁定）。
+不發 block（cross-vendor 複核確認此裁定）。跨 worker 的綁定由 CLI-GEN-4 在
+CLI 端完成；巢狀 session 繼承同 tag 同名，依 (a) 放行。
 Source: hook_write_state / cmd_hook
 
 ### HOOK-OWNER-5 [tested: 35, 36]
@@ -157,11 +158,12 @@ Source: cmd_hook（stop 分支）
 ### HOOK-NOTIFY-1 [tested: 33, 34]
 通知端（send/reply/cancel 的共用 gate）讀 state 決定送鍵與否：**只有**
 明確讀到 `busy` 且新鮮（0 ≤ now−ts ≤ TTL）才不送鍵（defer，記
-notify-deferred 事件，交給 Stop hook 的 block 派工）；其餘一切——新鮮
+notify-deferred 事件，交給 Stop hook 的 block 派工；此限 receive）；其餘一切——新鮮
 `idle`、過期、**ts 落在未來**、缺檔、解析失敗、TTL=0——MUST 視為「未知」
 走 legacy 送鍵。未來 ts 不擋會讓 busy 永遠新鮮、通知永久停擺且 TTL 救
 不回，不可放寬。state 通道完全失效時系統 MUST 退化為純 legacy 行為，
-任務不遺失、餓不過 TTL。
+任務不遺失、餓不過 TTL。cancel 的延後通知不會由 Stop hook 補送（Stop 只撈
+queued），sender 以 await／status 取終態。
 Source: notify_or_defer
 
 ### HOOK-NOTIFY-2 [tested: 8a, 30]

@@ -53,6 +53,9 @@
 | 42 | evict 入口 CAS | CLI-EVICT-4, CLI-EVICT-3 |
 | 46 | await 的 blocker 探測（真 tmux） | CLI-AWAIT-3, CLI-AWAIT-4 |
 | 49 | ask：send→await→read 組合 | CLI-ASK-1, CLI-ASK-2 |
+| 50 | CALLER-BIND 呼叫者綁定三態 | CLI-GEN-4 |
+| 51 | DIR-MODE-0700 資料目錄 mode | STATE-GEN-1 |
+| 52 | META-NAME-REVALIDATE metadata 讀回重驗 | STATE-TASK-3 |
 
 ## `[untested]` 缺口處置（本輪只記錄，不補測）
 

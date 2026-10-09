@@ -4,11 +4,12 @@
 
 ## 通則
 
-### STATE-GEN-1 [tested: 1]
+### STATE-GEN-1 [tested: 1, 51]
 目錄佈局 MUST 為：`agents/`（registry）、`tasks/`（mailbox）、`state/`
 （worker 活動狀態）、`locks/`（鎖）。除唯讀指令（CLI-RO-1 豁免表）外的
 指令首次觸碰資料目錄時 MUST 能自行建立缺少的子目錄；唯讀指令 MUST NOT
-無中生有（目錄缺失時以空集／找不到收場）；`hook` 只自建 `state/`。
+無中生有（目錄缺失時以空集／找不到收場）；`hook` 只自建 `state/`。子目錄
+MUST 以 mode `0700` 建立；既有目錄 MUST NOT 變更其 mode。
 Source: ensure_dirs / main（豁免表）
 
 ### STATE-GEN-2 [untested]
@@ -135,9 +136,11 @@ Source: cmd_send（task_id 產生）
 append-only 事件日誌，行格式 `<ISO8601 時間戳> <event> [detail]`。
 Source: cmd_send / log_event
 
-### STATE-TASK-3 [tested: 4]
+### STATE-TASK-3 [tested: 4, 52]
 `metadata.json` 欄位：`{version: 1, task_id, from, to, created_at,
-updated_at, working_directory, status}`。
+updated_at, working_directory, status}`。讀回 `from`／`to` MUST 過 NAME_RE，
+缺欄位或不合法 MUST 以錯誤終止（訊息含 task id 與欄位名），不得退成字面
+null。
 Source: cmd_send
 
 ### STATE-TASK-4 [tested: 5, 7, 31]

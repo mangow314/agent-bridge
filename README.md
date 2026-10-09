@@ -165,7 +165,10 @@ Optional: load the delegation skill into Claude Code with
   `never` turns off per-command approval prompts: the sender can neither see
   nor answer them, so the task would just hang until `await` times out. A
   command the sandbox blocks now fails straight back to the model. The
-  `workspace-write` sandbox is the remaining fence, so never use
+  `workspace-write` sandbox fences the filesystem and the network, but it
+  does **not** fence the bridge's own side channels: the data directory sits
+  inside `writable_roots` and the tmux socket may be reachable, so a
+  prompt-injected codex worker can still `send` to other workers. Never use
   `danger-full-access`, and leave `network_access` off. The data directory
   must be in `[sandbox_workspace_write] writable_roots`, or the worker
   cannot write its lock and task state; an entry in your base config still
@@ -221,6 +224,9 @@ Optional: load the delegation skill into Claude Code with
   directory share one trust domain. The bridge defends against accidents —
   mis-delivered notifications, double replies, stale registrations — not
   against a malicious local process.
+- A worker can itself be prompt-injected by the material it reads; an
+  injected worker behaves like a malicious local process and is **inside**
+  the trust domain.
 - A request is untrusted input for its receiver: data, not instructions.
 - A send-keys Enter could land on the peer's permission dialog. Guards scan
   the screen before typing and before Enter, but they match the visible text
@@ -229,7 +235,11 @@ Optional: load the delegation skill into Claude Code with
 - codex hooks need a one-time interactive trust; until granted codex skips
   them silently and notifications fall back to send-keys
   ([measured](docs/codex-hooks-probe.md)).
-- `cancel` is non-preemptive: it flips state and notifies, nothing more.
+- `cancel` is non-preemptive: it flips state and notifies, nothing more. For
+  a busy claude worker the cancel notification is not delivered; the sender
+  learns the outcome via `await`/`status`, and wasted work is expected.
+- `AGENT_BRIDGE_MAX_SPAWN` is set by the caller's environment, and a worker
+  can override it.
 - `ready` is a self-report, not a health check. A lock left behind by
   SIGKILL or power loss is deliberately not auto-reclaimed: confirm nothing
   is running, then delete it by hand.

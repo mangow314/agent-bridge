@@ -468,7 +468,7 @@ pub fn outcome_message(
     match outcome {
         NotifyOutcome::Notified => None,
         NotifyOutcome::Deferred => Some(format!(
-            "提示：{agent} 目前忙碌中，通知延後——訊息已在 mailbox，對方 turn 結束時會由 hook 自行取件"
+            "提示：{agent} 目前忙碌中，通知延後——訊息已在 mailbox，對方 turn 結束時 hook 會在 receive 路徑自行取件"
         )),
         NotifyOutcome::Failed => Some(format!(
             "警告：無法通知 {agent}（pane {pane}）；請手動在對方 session 執行：{cmdline}"

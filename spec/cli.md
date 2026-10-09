@@ -23,6 +23,22 @@ Source: NAME_RE / TASK_ID_RE / check_task_id
 
 ---
 
+### CLI-GEN-4 [tested: 50]
+呼叫者綁定三態。呼叫者環境的 `AGENT_BRIDGE_SPAWN_TAG` 析出 caller 名，與
+指令的「目標身分」比對：
+(a) 同名 MUST 放行；
+(b) 異名 MUST 拒絕：以非零終止、stderr 含 caller／target（有 task 時含
+task-id）、`agents.log` 追加 `refused-identity cmd=<cmd> caller=<c>
+target=<t> task=<id|->` 審計行，且不得變更任何 task 狀態；
+(c) 無 tag、空字串、格式不符的 tag MUST 放行（人工呼叫與非 spawn 出身不受限）。
+套用點（目標身分）：`receive`／`start`／`reply`／`fail` 取 task 的 `to`；
+`ready` 取其引數名；`send`／`ask` 取 `--from` 的值。不套用點：`cancel`、
+`status`、`read`、`await`、`list`、`spawn`、`despawn`、`evict`、`register`、
+`unregister`、`hook`——這些不以呼叫者自身身分行事。
+Note: 巢狀 session 繼承同一 tag，依 (a) 放行（見 HOOK-OWNER-4）；本條防的是
+跨 worker 冒名，不防同名程序。
+Source: ab_core::identity::check_caller_bound / check_named
+
 ## `register`
 
 ### CLI-REGISTER-1 [tested: 1]
@@ -92,6 +108,7 @@ Source: cmd_list
 建立任務並通知收件者。`--from` 必填；`--message` 與 `--message-file` 恰取
 其一；`--message-file -` 讀 stdin。file／stdin 模式的內容 MUST byte-for-byte
 保真寫入 request；text 模式尾端補一個換行。成功時 stdout 恰為 task-id 一行。
+`--from` MUST 通過呼叫者綁定比對（CLI-GEN-4）。
 Source: cmd_send / write_message
 
 ### CLI-SEND-2 [tested: 2]
@@ -172,6 +189,7 @@ Source: cmd_read / ab_core::task::with_response
 一條指令依序完成 `send`、`await`、`read`。旗標語意、驗證文法、拒絕訊息與
 三者逐字相同（訊息裡的命令名詞隨指令，如 `ask 需要 --from <sender>`）；task 落盤形狀（request／metadata／events）MUST 與逐條執行
 `send; await; read` 位元相同，stdout MUST 恰為 response 內容（同 CLI-READ-1）。
+`--from` 比對同 `send`（CLI-GEN-4）。
 MUST 走與三者同一批實作（建 task／通知、輪詢／探測、鎖／read 事件），MUST NOT
 另養狀態或旁路。非唯讀（send 建 task、read 記事件）。不 spawn、不回收 worker：
 追問沿用同一個 worker（docs/scope-2026-09.md 立案依據）。
@@ -333,7 +351,7 @@ Source: cmd_despawn
 
 ### CLI-READY-1 [tested: 17]
 `ready <name>`：worker 自報就緒，registry `ready` 置 true。僅 spawn 出身
-可用；人工註冊／出身不明 MUST 拒絕。冪等（重複 ready 無害）。
+可用；人工註冊／出身不明 MUST 拒絕。冪等（重複 ready 無害）。呼叫者綁定：異名呼叫者 MUST 拒絕（CLI-GEN-4）。
 Source: cmd_ready
 
 ---

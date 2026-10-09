@@ -154,8 +154,10 @@ command -v agent-bridge   # 應解析到 symlink
   ```
 
   `never` 關掉逐指令的核准提示：sender 既看不到也答不了，任務只會卡到
-  `await` 逾時。改成 sandbox 擋下的指令直接失敗、回給模型。剩下的圍欄是
-  `workspace-write` sandbox，所以絕不要用 `danger-full-access`，
+  `await` 逾時。改成 sandbox 擋下的指令直接失敗、回給模型。`workspace-write`
+  sandbox 圍住檔案系統與網路，但**圍不住** bridge 的側向通道：資料目錄在
+  `writable_roots` 內、tmux socket 可能可達，被注入的 codex worker 仍可
+  `send` 給其他 worker。絕不要用 `danger-full-access`，
   `network_access` 也維持關閉。資料目錄必須在
   `[sandbox_workspace_write] writable_roots` 裡，否則 worker 寫不了鎖與任務
   狀態；寫在基底設定的值在 profile 下仍然有效。`--profile <name>` 改用別的
@@ -203,13 +205,17 @@ command -v agent-bridge   # 應解析到 symlink
 - 一切都以**一個 OS 使用者、一台機器**執行；tmux pane 與資料目錄同屬一個
   信任域。bridge 防的是意外——誤投遞的通知、重複回覆、過期註冊——不防
   惡意的本機程序。
+- worker 本身可能被它讀到的材料 prompt injection；被注入的 worker 行為等同
+  惡意的本機程序，且**在**信任域之內。
 - 請求對 receiver 是不可信輸入：是資料，不是指令。
 - send-keys 的 Enter 可能落在對方的權限對話框上。護欄在打字前與按 Enter 前
   各掃一次螢幕，但比對的是受測 CLI 版本的可見文字：文案改了就 fail-open，
   且仍有極小的 race。
 - codex 的 hook 需要人互動式授信一次；授信前 codex 會靜默略過，通知退回
   send-keys（[實測](docs/codex-hooks-probe.md)）。
-- `cancel` 不搶佔：只翻狀態並通知，僅此而已。
+- `cancel` 不搶佔：只翻狀態並通知，僅此而已。對忙碌中的 claude worker，取消
+  通知不會送達，sender 以 `await`／`status` 得知結果；預期會有白做的工。
+- `AGENT_BRIDGE_MAX_SPAWN` 由呼叫端環境決定，worker 可覆蓋。
 - `ready` 是自報到，不是健康檢查。SIGKILL 或斷電殘留的鎖刻意不自動回收：
   確認沒有東西在跑後，手動刪除。
 - tmux server 重啟後所有 pane id 都失效：重新 `register`，並用 `despawn`

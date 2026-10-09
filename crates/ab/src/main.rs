@@ -728,7 +728,7 @@ fn cmd_cancel(paths: &Paths, args: &[String]) -> Result<()> {
     let outcome = task::cancel_task(paths, &tmux, id)?;
     match outcome.notify {
         Some(notify::NotifyOutcome::Deferred) => eprintln!(
-            "agent-bridge: 提示：{} 目前忙碌中，通知延後——訊息已在 mailbox，對方 turn 結束時會由 hook 自行取件",
+            "agent-bridge: 提示：{} 目前忙碌中，取消通知不會送達，請以 await／status 取終態",
             outcome.to
         ),
         Some(notify::NotifyOutcome::Failed) => eprintln!(
