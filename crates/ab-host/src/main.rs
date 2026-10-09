@@ -143,10 +143,10 @@ fn locations_in_cwd(paths: &[PathBuf], cwd: &Path) -> bool {
         .all(|p| resolve_path(p).is_some_and(|r| r.starts_with(&root)))
 }
 
-const CODEX_ALLOWED_MODES: [&str; 2] = ["read-only", "workspace-write"];
+const CODEX_ALLOWED_MODES: [&str; 1] = ["read-only"];
 
 /// 執行中收到 `CurrentModeUpdate` 的判定：true＝不在允許集合（claude 只允許
-/// `default`；codex 只允許 read-only／workspace-write），host 須 fail-closed 停止。
+/// `default`；codex 只允許 read-only），host 須 fail-closed 停止。
 fn mode_drifted(runtime: &str, mode: &str) -> bool {
     if runtime == "claude" {
         mode != "default"
@@ -195,22 +195,15 @@ fn decide_mode(
     current: &str,
     available: &[&str],
 ) -> Result<Option<&'static str>, String> {
-    if runtime == "claude" {
-        let target = "default";
-        if !available.contains(&target) {
-            return Err(format!("availableModes 不含 {target}：{available:?}"));
-        }
-        Ok((current != target).then_some(target))
+    let target = if runtime == "claude" {
+        "default"
     } else {
-        const ALLOWED: [&str; 2] = CODEX_ALLOWED_MODES;
-        if ALLOWED.contains(&current) {
-            Ok(None)
-        } else {
-            Err(format!(
-                "codex 現行 mode 不在允許集合 {ALLOWED:?}：{current}"
-            ))
-        }
+        CODEX_ALLOWED_MODES[0]
+    };
+    if !available.contains(&target) {
+        return Err(format!("availableModes 不含 {target}：{available:?}"));
     }
+    Ok((current != target).then_some(target))
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -481,7 +474,6 @@ fn adapter(runtime: &str) -> AcpAgent {
                 "-y",
                 "@agentclientprotocol/codex-acp@2.1.1",
             ])
-            .env("INITIAL_AGENT_MODE", "workspace-write")
             .env("NO_BROWSER", "1")
     };
     AcpAgent::new(cfg)
@@ -1021,7 +1013,7 @@ mod tests {
     fn mode_drift_judgement() {
         assert!(!mode_drifted("claude", "default"));
         assert!(!mode_drifted("codex", "read-only"));
-        assert!(!mode_drifted("codex", "workspace-write"));
+        assert!(mode_drifted("codex", "workspace-write"));
         for m in ["bypassPermissions", "auto", "agent-full-access"] {
             assert!(mode_drifted("claude", m), "claude {m}");
             assert!(mode_drifted("codex", m), "codex {m}");
@@ -1092,8 +1084,15 @@ mod tests {
     fn mode_decision_codex() {
         let av = ["read-only", "workspace-write", "agent", "agent-full-access"];
         assert_eq!(decide_mode("codex", "read-only", &av), Ok(None));
-        assert_eq!(decide_mode("codex", "workspace-write", &av), Ok(None));
-        assert!(decide_mode("codex", "agent-full-access", &av).is_err());
-        assert!(decide_mode("codex", "agent", &av).is_err());
+        assert_eq!(
+            decide_mode("codex", "workspace-write", &av),
+            Ok(Some("read-only"))
+        );
+        assert!(decide_mode("codex", "workspace-write", &["workspace-write"]).is_err());
+        assert_eq!(
+            decide_mode("codex", "agent-full-access", &av),
+            Ok(Some("read-only"))
+        );
+        assert_eq!(decide_mode("codex", "agent", &av), Ok(Some("read-only")));
     }
 }
