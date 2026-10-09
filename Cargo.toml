@@ -3,7 +3,7 @@
 # （git 歷史仍可取回）。驗收 gate＝不帶 BRIDGE 跑 tests/run-tests.sh 全綠。
 [workspace]
 resolver = "3"
-members = ["crates/ab-core", "crates/ab"]
+members = ["crates/ab-core", "crates/ab", "crates/ab-host"]
 
 [workspace.package]
 edition = "2024"
