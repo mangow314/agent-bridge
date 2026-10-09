@@ -141,6 +141,9 @@ Source: cmd_send / log_event
 updated_at, working_directory, status}`。讀回 `from`／`to` MUST 過 NAME_RE，
 缺欄位或不合法 MUST 以錯誤終止（訊息含 task id 與欄位名），不得退成字面
 null。
+Note: 例外——`await`／`ask` 的 blocker 探測讀 `to` 只為找 pane；缺 `to` 時
+退化為不帶探測的純輪詢、不組路徑（await 的可用性不因 metadata 缺料而失效，
+見 CLI-AWAIT-4）。`to` 有值但不合法時仍 MUST 以錯誤終止。
 Source: cmd_send
 
 ### STATE-TASK-4 [tested: 5, 7, 31]
