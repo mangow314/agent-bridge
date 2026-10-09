@@ -190,6 +190,11 @@ pub fn write_message(dest: &Path, src: &MessageSource) -> Result<()> {
 /// metadata 本身讀不到或不是 object 則回 `Err`（bash 在 `set -e` 下由 jq
 /// 的非零退出達到同樣效果）。
 pub fn meta_str(dir: &Path, key: &str) -> Result<String> {
+    Ok(meta_opt(dir, key)?.unwrap_or_else(|| "null".to_string()))
+}
+
+/// 同 `meta_str`，但「欄位缺或為 null」回 `None`，不混進字面 `"null"`。
+fn meta_opt(dir: &Path, key: &str) -> Result<Option<String>> {
     let meta_path = dir.join("metadata.json");
     let content = std::fs::read_to_string(&meta_path).map_err(|e| {
         Error::new(format!(
@@ -199,14 +204,27 @@ pub fn meta_str(dir: &Path, key: &str) -> Result<String> {
     })?;
     match json::parse(&content) {
         Ok(Value::Object(fields)) => Ok(match fields.get(key) {
-            Some(Value::String(s)) => s.clone(),
-            None | Some(Value::Null) => "null".to_string(),
-            Some(_) => String::new(),
+            Some(Value::String(s)) => Some(s.clone()),
+            None | Some(Value::Null) => None,
+            Some(_) => Some(String::new()),
         }),
         _ => Err(Error::new(format!(
             "metadata.json 不是合法的 JSON 物件：{}",
             meta_path.display()
         ))),
+    }
+}
+
+/// 讀回 metadata 的 agent 名稱欄位（`from`／`to`），先過 `is_valid_name` 才可
+/// 拿去組 `agents/<name>.json` 路徑。欄位缺、null 或不合法皆為錯誤（訊息含
+/// task id 與欄位名）。
+pub fn meta_name(dir: &Path, id: &str, key: &str) -> Result<String> {
+    match meta_opt(dir, key)? {
+        Some(v) if crate::validate::is_valid_name(&v) => Ok(v),
+        Some(v) => Err(Error::new(format!(
+            "task {id} 的 metadata 欄位 {key} 不合法：{v:?}"
+        ))),
+        None => Err(Error::new(format!("task {id} 的 metadata 缺少欄位 {key}"))),
     }
 }
 
@@ -395,6 +413,7 @@ pub fn cancel_task(
 ) -> Result<CancelOutcome> {
     check_task_id(id)?;
     let dir = require_task_dir(paths, id)?;
+    let to = meta_name(&dir, id, "to")?;
 
     let guard = crate::lock::acquire_lock(paths, id)?;
     let outcome = (|| -> Result<()> {
@@ -411,7 +430,6 @@ pub fn cancel_task(
     outcome?;
 
     // 通知 worker 查狀態（會看到 cancelled）；worker 未註冊就只是不通知
-    let to = meta_str(&dir, "to")?;
     let cmdline = format!("agent-bridge status {id}");
     let agent_file = paths.agents_dir.join(format!("{to}.json"));
     let mut out = CancelOutcome {

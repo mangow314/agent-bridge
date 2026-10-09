@@ -572,7 +572,7 @@ fn cmd_unregister(paths: &Paths, args: &[String]) -> Result<()> {
 
 /// CALLER-BIND：目標＝該 task metadata 的 `to`。
 fn check_task_caller(paths: &Paths, cmd: &str, id: &str, dir: &std::path::Path) -> Result<()> {
-    let to = task::meta_str(dir, "to")?;
+    let to = task::meta_name(dir, id, "to")?;
     identity::check_caller_bound(paths, cmd, &to, Some(id))
 }
 
@@ -651,6 +651,7 @@ fn respond_task(
 ) -> Result<()> {
     let dir = task::require_task_dir(paths, id)?;
     check_task_caller(paths, cmdname, id, &dir)?;
+    let from = task::meta_name(&dir, id, "from")?;
 
     let guard = acquire_lock(paths, id)?;
     let outcome = (|| -> Result<()> {
@@ -668,7 +669,6 @@ fn respond_task(
     outcome?;
 
     // 通知 sender 來讀回覆；sender 未註冊（或已除名）就只是不通知，不是錯誤。
-    let from = task::meta_str(&dir, "from")?;
     let agent_file = paths.agents_dir.join(format!("{from}.json"));
     if agent_file.is_file() {
         let pane = registry::read_pane(&agent_file);
@@ -883,9 +883,12 @@ fn await_with_blocker(
     let tmux = SubprocessTmux;
     let mut watch_pane: Option<String> = None;
     if on_blocker != "off" {
+        // 缺 `to` 維持上述降級（測試鎖定）；有值但名稱不合法則非零，不組路徑
         if let Ok(dir) = task::require_task_dir(paths, id)
-            && let Ok(to) = task::meta_str(&dir, "to")
+            && let Ok(raw) = task::meta_str(&dir, "to")
+            && raw != "null"
         {
+            let to = task::meta_name(&dir, id, "to")?;
             let agent_file = paths.agents_dir.join(format!("{to}.json"));
             if agent_file.is_file() {
                 let pane = registry::read_pane(&agent_file);

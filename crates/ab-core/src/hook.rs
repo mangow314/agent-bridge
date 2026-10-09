@@ -375,7 +375,10 @@ pub fn run(paths: &Paths, args: &[String]) -> HookOutcome {
     };
 
     // 這一步在析名之後：無 tag 的呼叫不得留下任何痕跡（含 state/ 目錄本身）
-    if std::fs::create_dir_all(&paths.state_dir).is_err() {
+    if std::os::unix::fs::DirBuilderExt::mode(std::fs::DirBuilder::new().recursive(true), 0o700)
+        .create(&paths.state_dir)
+        .is_err()
+    {
         return HookOutcome::Silent;
     }
     let state_file = paths.state_dir.join(format!("{name}.json"));

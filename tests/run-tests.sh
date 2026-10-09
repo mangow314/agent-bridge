@@ -154,7 +154,7 @@ declare -A GRP_NEEDS=(
   # 語意 fixture，變數掃描抓不到 manual-x 這種字串依賴）
   [17]="16" [18]="16"
 )
-GRP_KNOWN=" 1 2 3 4 5 6 7 8 8a 8b 9 10 11 12 13 14 15 16 17 18 18b 18c 19 20 20b 21 22 26 27 29 30 31 32 33 34 34.5+ 35 36 37 38 39 41 42 46 49 50 "
+GRP_KNOWN=" 1 2 3 4 5 6 7 8 8a 8b 9 10 11 12 13 14 15 16 17 18 18b 18c 19 20 20b 21 22 26 27 29 30 31 32 33 34 34.5+ 35 36 37 38 39 41 42 46 49 50 51 52 "
 GRP_SELECTED=""
 GRP_SKIPPED=0
 if [[ -n "${TEST_GROUPS:-}" ]]; then
@@ -4703,6 +4703,35 @@ assert "50：格式不符 tag reply 放行" ab_tag "not-a-spawn-tag" "$D50" repl
 assert "50：格式不符 tag 的 send --from 放行" \
   ab_tag "ab-spawn-eve-xx-0123456789ab" "$D50" send bob --from alice --message hi
 fi  # end grp 50
+# ---- 51. DIR-MODE-0700：新建資料目錄 mode 0700（不 chmod 既有目錄） ----
+if grp 51; then
+D51="$TESTROOT/d51/nested"
+ab "$D51" register bob "$PANE_B" 2>/dev/null
+for d51 in "" /agents /tasks /locks /state; do
+  assert "51：${d51:-根目錄} mode 700" test "$(stat -c %a "$D51$d51")" = 700
+done
+fi  # end grp 51
+# ---- 52. META-NAME-REVALIDATE：metadata from/to 讀回後重驗 ----
+if grp 52; then
+D52="$TESTROOT/d52"
+ab "$D52" register bob "$PANE_B" 2>/dev/null
+id52="$(ab "$D52" send bob --from alice --message "任務" 2>/dev/null)"
+assert "52：建立測試 task" test -n "$id52"
+cp "$D52/tasks/$id52/metadata.json" "$D52/meta.bak"
+sed -i 's|"to": *"bob"|"to": "../x"|' "$D52/tasks/$id52/metadata.json"
+assert_fails_with "52：to=../x 時 cancel 非零且訊息含 task id 與欄位" \
+  "$id52.*to" ab "$D52" cancel "$id52"
+assert "52：cancel 被拒後狀態不變" \
+  test "$(ab "$D52" await "$id52" --timeout 1 2>/dev/null)" != cancelled
+assert_fails_with "52：to=../x 時 reply 非零且訊息含 task id" \
+  "$id52" ab "$D52" reply "$id52" --message x
+assert "52：未觸碰 agents 外的 x.json" test ! -e "$D52/x.json"
+cp "$D52/meta.bak" "$D52/tasks/$id52/metadata.json"
+sed -i 's|"from": *"alice",\?||' "$D52/tasks/$id52/metadata.json"
+assert_fails_with "52：from 欄位缺時 reply 非零且訊息含 task id 與欄位" \
+  "$id52.*from" ab "$D52" reply "$id52" --message x
+assert "52：未產生 agents/null.json" test ! -e "$D52/agents/null.json"
+fi  # end grp 52
 # ---- 總結 ----
 if [[ -n "$GRP_SELECTED" ]]; then
   printf '\n⚠ PARTIAL RUN（TEST_GROUPS=%s → 實跑:%s，跳過 %d 組）——不得作為收案／merge 證據\n' \

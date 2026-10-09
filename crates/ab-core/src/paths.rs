@@ -45,8 +45,13 @@ impl Paths {
             &self.locks_dir,
             &self.state_dir,
         ] {
-            std::fs::create_dir_all(d)
-                .map_err(|e| Error::new(format!("無法建立資料目錄 {}：{e}", d.display())))?;
+            // 新建目錄一律 0700；既有目錄不 chmod
+            std::os::unix::fs::DirBuilderExt::mode(
+                std::fs::DirBuilder::new().recursive(true),
+                0o700,
+            )
+            .create(d)
+            .map_err(|e| Error::new(format!("無法建立資料目錄 {}：{e}", d.display())))?;
         }
         Ok(())
     }
