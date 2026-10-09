@@ -143,6 +143,51 @@ fn locations_in_cwd(paths: &[PathBuf], cwd: &Path) -> bool {
         .all(|p| resolve_path(p).is_some_and(|r| r.starts_with(&root)))
 }
 
+const CODEX_ALLOWED_MODES: [&str; 2] = ["read-only", "workspace-write"];
+
+/// 執行中收到 `CurrentModeUpdate` 的判定：true＝不在允許集合（claude 只允許
+/// `default`；codex 只允許 read-only／workspace-write），host 須 fail-closed 停止。
+fn mode_drifted(runtime: &str, mode: &str) -> bool {
+    if runtime == "claude" {
+        mode != "default"
+    } else {
+        !CODEX_ALLOWED_MODES.contains(&mode)
+    }
+}
+
+/// raw_input 中可能放路徑的鍵。`file_path` 見 033 canary（claude Read）；
+/// `path`／`notebook_path` 為 Claude Code 內建 Grep／Glob／NotebookRead 的參數名
+/// （inferred：claude-agent-acp@0.88.0 的 session 未載入 Grep／Glob，無樣本）。
+const RAW_PATH_KEYS: [&str; 3] = ["file_path", "path", "notebook_path"];
+
+/// 從 raw_input 取出實際路徑（相對路徑以 `cwd` 為基準）。None＝拿不到任何已知
+/// 路徑鍵、鍵值非字串，或 pattern 自帶絕對路徑／`..`（可繞過 path 鍵）。
+fn raw_input_paths(raw: Option<&serde_json::Value>, cwd: &Path) -> Option<Vec<PathBuf>> {
+    let obj = raw?.as_object()?;
+    if let Some(pat) = obj.get("pattern") {
+        let pat = pat.as_str()?;
+        if pat.starts_with(['/', '~']) || pat.split('/').any(|s| s == "..") {
+            return None;
+        }
+    }
+    let mut out = Vec::new();
+    for k in RAW_PATH_KEYS {
+        if let Some(v) = obj.get(k) {
+            out.push(cwd.join(v.as_str()?));
+        }
+    }
+    (!out.is_empty()).then_some(out)
+}
+
+/// read／search 的把關：raw_input 的實際路徑必須存在且全在 `cwd` 底下；
+/// `locations` 若有值也必須全在 `cwd` 底下。
+fn access_in_cwd(locs: &[PathBuf], raw: Option<&serde_json::Value>, cwd: &Path) -> bool {
+    let Some(actual) = raw_input_paths(raw, cwd) else {
+        return false;
+    };
+    locations_in_cwd(&actual, cwd) && (locs.is_empty() || locations_in_cwd(locs, cwd))
+}
+
 /// session/new 之後的 mode 判定：Ok(None)＝現值已合規，Ok(Some(m))＝要 set 成 m，
 /// Err＝拒絕啟動（原因）。
 fn decide_mode(
@@ -157,7 +202,7 @@ fn decide_mode(
         }
         Ok((current != target).then_some(target))
     } else {
-        const ALLOWED: [&str; 2] = ["read-only", "workspace-write"];
+        const ALLOWED: [&str; 2] = CODEX_ALLOWED_MODES;
         if ALLOWED.contains(&current) {
             Ok(None)
         } else {
@@ -292,6 +337,8 @@ struct State {
     task: Option<String>,
     text: String,
     cancel: bool,
+    /// 執行中偵測到的非法 mode（一旦設定即 fail-closed 結束，不再復原）。
+    drift: Option<String>,
 }
 
 type Shared = Arc<Mutex<State>>;
@@ -483,6 +530,7 @@ fn run(opts: Opts) -> Result<(), String> {
     let cwd = opts.cwd.clone();
     let cwd_p = opts.cwd.clone();
     let runtime = opts.runtime.clone();
+    let runtime_n = opts.runtime.clone();
 
     let result = async_io::block_on(
         agent_client_protocol::Client
@@ -516,6 +564,13 @@ fn run(opts: Opts) -> Result<(), String> {
                                     .unwrap_or_default()
                             );
                         }
+                        SessionUpdate::CurrentModeUpdate(m) => {
+                            let mode = m.current_mode_id.0.to_string();
+                            if mode_drifted(&runtime_n, &mode) {
+                                eprintln!("ab-host: mode 漂移：{mode}");
+                                lock_state(&sh_n).drift.get_or_insert(mode);
+                            }
+                        }
                         _ => {}
                     }
                     Ok(())
@@ -537,9 +592,9 @@ fn run(opts: Opts) -> Result<(), String> {
                         .iter()
                         .map(|o: &PermissionOption| (o.option_id.clone(), o.kind))
                         .collect();
-                    let (cancelled, task_id) = {
+                    let (cancelled, task_id, drifted) = {
                         let s = lock_state(&sh_p);
-                        (s.cancel, s.task.clone())
+                        (s.cancel, s.task.clone(), s.drift.is_some())
                     };
                     eprintln!(
                         "ab-host: request_permission kind={} title={title}",
@@ -572,8 +627,12 @@ fn run(opts: Opts) -> Result<(), String> {
                         .iter()
                         .map(|l| l.path.clone())
                         .collect();
-                    let in_cwd = locations_in_cwd(&locs, &cwd_p);
-                    let choice = choose_permission(kind, in_cwd, &opts);
+                    // mode 漂移後一律 reject（kind 當作未知）；否則 read／search 以
+                    // raw_input 的實際路徑為準。
+                    let in_cwd = !drifted
+                        && access_in_cwd(&locs, req.tool_call.fields.raw_input.as_ref(), &cwd_p);
+                    let choice =
+                        choose_permission(if drifted { None } else { kind }, in_cwd, &opts);
                     if let Some(id) = &task_id
                         && let Err(e) = task::log_event(
                             &paths_p,
@@ -687,6 +746,9 @@ async fn host_loop(
 
     // ---- mailbox 迴圈
     loop {
+        if let Some(m) = lock_state(&shared).drift.clone() {
+            return Err(format!("mode 漂移：{m}"));
+        }
         let Some(id) = next_queued(&paths, &name) else {
             Timer::after(poll).await;
             continue;
@@ -755,6 +817,15 @@ async fn host_loop(
                 ));
             }
             Timer::after(poll.min(Duration::from_millis(500))).await;
+            let drift = lock_state(&shared).drift.clone();
+            if let Some(m) = drift {
+                if !cancel_sent {
+                    let _ = cx.send_notification(CancelNotification::new(session_id.clone()));
+                }
+                fail_task(&paths, &id, &format!("mode drift: {m}")).map_err(|e| e.to_string())?;
+                lock_state(&shared).task = None;
+                return Err(format!("mode 漂移：{m}"));
+            }
             if !cancel_sent
                 && task::read_status(&dir)
                     .map(|s| s == "cancelled")
@@ -944,6 +1015,69 @@ mod tests {
         // cwd 內 symlink 指向 cwd 外 → false（既存與不存在的子路徑）
         assert!(!locations_in_cwd(&[cwd.join("link/secret")], &cwd));
         assert!(!locations_in_cwd(&[cwd.join("link/missing")], &cwd));
+    }
+
+    #[test]
+    fn mode_drift_judgement() {
+        assert!(!mode_drifted("claude", "default"));
+        assert!(!mode_drifted("codex", "read-only"));
+        assert!(!mode_drifted("codex", "workspace-write"));
+        for m in ["bypassPermissions", "auto", "agent-full-access"] {
+            assert!(mode_drifted("claude", m), "claude {m}");
+            assert!(mode_drifted("codex", m), "codex {m}");
+        }
+    }
+
+    #[test]
+    fn raw_input_gate_scopes_to_cwd() {
+        use serde_json::json;
+        let tmp = tempfile::tempdir().unwrap();
+        let cwd = tmp.path().join("work");
+        let outside = tmp.path().join("outside");
+        std::fs::create_dir_all(&cwd).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        let inside_p = cwd.join("a.txt");
+        let outside_p = outside.join("secret");
+        let raw_in = json!({ "file_path": inside_p });
+        let raw_out = json!({ "file_path": outside_p });
+
+        // 路徑在 cwd 內 → allow（locations 空或同樣在內）
+        assert!(access_in_cwd(&[], Some(&raw_in), &cwd));
+        assert!(access_in_cwd(
+            std::slice::from_ref(&inside_p),
+            Some(&raw_in),
+            &cwd
+        ));
+        // 相對路徑以 cwd 為基準；search 的 path 鍵
+        assert!(access_in_cwd(&[], Some(&json!({"path": "sub"})), &cwd));
+        // 路徑在 cwd 外 → reject
+        assert!(!access_in_cwd(&[], Some(&raw_out), &cwd));
+        assert!(!access_in_cwd(
+            &[],
+            Some(&json!({"path": "../outside"})),
+            &cwd
+        ));
+        // raw_input 缺路徑鍵（或根本沒有）→ reject
+        assert!(!access_in_cwd(
+            std::slice::from_ref(&inside_p),
+            Some(&json!({"pattern": "x"})),
+            &cwd
+        ));
+        assert!(!access_in_cwd(std::slice::from_ref(&inside_p), None, &cwd));
+        // locations 在內但 raw_input 在外 → reject；反之亦然
+        assert!(!access_in_cwd(&[inside_p], Some(&raw_out), &cwd));
+        assert!(!access_in_cwd(&[outside_p], Some(&raw_in), &cwd));
+        // pattern 自帶絕對路徑／`..` → reject
+        assert!(!access_in_cwd(
+            &[],
+            Some(&json!({"path": "sub", "pattern": "/etc/*"})),
+            &cwd
+        ));
+        assert!(!access_in_cwd(
+            &[],
+            Some(&json!({"path": "sub", "pattern": "../*"})),
+            &cwd
+        ));
     }
 
     #[test]
