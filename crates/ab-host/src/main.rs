@@ -6,7 +6,7 @@
 //! 整個 host 迴圈跑在 `connect_with` 的閉包內（該 future 同時驅動 JSON-RPC
 //! dispatch），因此閉包內只用 `async_io::Timer` 睡眠，不可 `thread::sleep`。
 
-use std::path::PathBuf;
+use std::path::{Component, Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -57,16 +57,19 @@ fn first_of<I>(opts: &[(I, PermissionOptionKind)], kinds: [PermissionOptionKind;
         .find_map(|k| opts.iter().find(|(_, ok)| ok == k).map(|(id, _)| id))
 }
 
-/// kind ∈ {read, search, think} → allow_once（無則 allow_always）；其餘
-/// （含缺欄位）→ reject_once（無則 reject_always）。
+/// think → allow_once（無則 allow_always）；read／search 僅在 `in_cwd`
+/// （locations 非空且全在 --cwd 內）時同上；其餘（含缺欄位）→ reject_once
+/// （無則 reject_always）。
 fn choose_permission<'a, I>(
     kind: Option<&ToolKind>,
+    in_cwd: bool,
     opts: &'a [(I, PermissionOptionKind)],
 ) -> Choice<&'a I> {
-    let safe = matches!(
-        kind,
-        Some(ToolKind::Read | ToolKind::Search | ToolKind::Think)
-    );
+    let safe = match kind {
+        Some(ToolKind::Think) => true,
+        Some(ToolKind::Read | ToolKind::Search) => in_cwd,
+        _ => false,
+    };
     if safe {
         match first_of(
             opts,
@@ -88,6 +91,79 @@ fn choose_permission<'a, I>(
         ) {
             Some(id) => Choice::Reject(id),
             None => Choice::NoOption,
+        }
+    }
+}
+
+/// 逐段處理 `.`／`..`（不碰檔案系統）。
+fn lexical_normalize(p: &Path) -> PathBuf {
+    let mut out = PathBuf::new();
+    for c in p.components() {
+        match c {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                out.pop();
+            }
+            other => out.push(other.as_os_str()),
+        }
+    }
+    out
+}
+
+/// 能 canonicalize 就用它（解開 symlink）；否則 absolute＋逐段處理 `..`，
+/// 再把最深的既存祖先 canonicalize，其餘段落接回去。
+fn resolve_path(p: &Path) -> Option<PathBuf> {
+    if let Ok(c) = p.canonicalize() {
+        return Some(c);
+    }
+    let norm = lexical_normalize(&std::path::absolute(p).ok()?);
+    let mut rest = Vec::new();
+    let mut cur = norm.as_path();
+    loop {
+        if let Ok(c) = cur.canonicalize() {
+            let mut out = c;
+            out.extend(rest.iter().rev());
+            return Some(out);
+        }
+        rest.push(cur.file_name()?.to_owned());
+        cur = cur.parent()?;
+    }
+}
+
+/// locations 非空且每個 path 解析後都在 `cwd` 底下才為 true。
+fn locations_in_cwd(paths: &[PathBuf], cwd: &Path) -> bool {
+    if paths.is_empty() {
+        return false;
+    }
+    let Some(root) = resolve_path(cwd) else {
+        return false;
+    };
+    paths
+        .iter()
+        .all(|p| resolve_path(p).is_some_and(|r| r.starts_with(&root)))
+}
+
+/// session/new 之後的 mode 判定：Ok(None)＝現值已合規，Ok(Some(m))＝要 set 成 m，
+/// Err＝拒絕啟動（原因）。
+fn decide_mode(
+    runtime: &str,
+    current: &str,
+    available: &[&str],
+) -> Result<Option<&'static str>, String> {
+    if runtime == "claude" {
+        let target = "default";
+        if !available.contains(&target) {
+            return Err(format!("availableModes 不含 {target}：{available:?}"));
+        }
+        Ok((current != target).then_some(target))
+    } else {
+        const ALLOWED: [&str; 2] = ["read-only", "workspace-write"];
+        if ALLOWED.contains(&current) {
+            Ok(None)
+        } else {
+            Err(format!(
+                "codex 現行 mode 不在允許集合 {ALLOWED:?}：{current}"
+            ))
         }
     }
 }
@@ -345,7 +421,7 @@ fn adapter(runtime: &str) -> AcpAgent {
             "ANTHROPIC_API_KEY",
             "npx",
             "-y",
-            "@agentclientprotocol/claude-agent-acp",
+            "@agentclientprotocol/claude-agent-acp@0.88.0",
         ])
     } else {
         AcpAgentConfig::new("env")
@@ -356,7 +432,7 @@ fn adapter(runtime: &str) -> AcpAgent {
                 "CODEX_API_KEY",
                 "npx",
                 "-y",
-                "@agentclientprotocol/codex-acp",
+                "@agentclientprotocol/codex-acp@2.1.1",
             ])
             .env("INITIAL_AGENT_MODE", "workspace-write")
             .env("NO_BROWSER", "1")
@@ -405,6 +481,8 @@ fn run(opts: Opts) -> Result<(), String> {
     let paths_p = paths.clone();
     let name = opts.name.clone();
     let cwd = opts.cwd.clone();
+    let cwd_p = opts.cwd.clone();
+    let runtime = opts.runtime.clone();
 
     let result = async_io::block_on(
         agent_client_protocol::Client
@@ -485,7 +563,17 @@ fn run(opts: Opts) -> Result<(), String> {
                             RequestPermissionOutcome::Cancelled,
                         ));
                     }
-                    let choice = choose_permission(kind, &opts);
+                    let locs: Vec<PathBuf> = req
+                        .tool_call
+                        .fields
+                        .locations
+                        .as_deref()
+                        .unwrap_or_default()
+                        .iter()
+                        .map(|l| l.path.clone())
+                        .collect();
+                    let in_cwd = locations_in_cwd(&locs, &cwd_p);
+                    let choice = choose_permission(kind, in_cwd, &opts);
                     if let Some(id) = &task_id
                         && let Err(e) = task::log_event(
                             &paths_p,
@@ -515,7 +603,7 @@ fn run(opts: Opts) -> Result<(), String> {
             .connect_with(adapter(&opts.runtime), {
                 let shared = shared.clone();
                 move |cx: ConnectionTo<Agent>| async move {
-                    host_loop(cx, paths, name, cwd, shared, poll, ptimeout)
+                    host_loop(cx, paths, name, cwd, runtime, shared, poll, ptimeout)
                         .await
                         .map_err(agent_client_protocol::util::internal_error)
                 }
@@ -524,11 +612,13 @@ fn run(opts: Opts) -> Result<(), String> {
     result.map_err(|e| e.to_string())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn host_loop(
     cx: ConnectionTo<Agent>,
     paths: Paths,
     name: String,
     cwd: PathBuf,
+    runtime: String,
     shared: Shared,
     poll: Duration,
     ptimeout: Duration,
@@ -563,21 +653,35 @@ async fn host_loop(
         }
     };
     let session_id = sess.session_id;
-    // adapter 預設 mode（如 claude 的 "auto"）會自行放行寫檔而不發 request_permission，
-    // 使 R7 權限策略失效；若 adapter 提供 "default"（逐次詢問）就切過去。
-    if let Some(m) = &sess.modes
-        && m.current_mode_id.0.as_ref() != "default"
-        && m.available_modes
-            .iter()
-            .any(|a| a.id.0.as_ref() == "default")
+    // fail-closed：adapter 預設 mode（如 claude 的 "auto"）會自行放行寫檔而不發
+    // request_permission，使權限策略失效；mode 不合規或無法確認一律拒絕啟動。
+    // set_mode 的 Ok 回應即為 adapter 對切換的確認（回應本身不帶 mode）。
+    let refuse = |why: String| {
+        // 連線層會把錯誤包成 internal error，故在此直接印出約定格式。
+        let msg = format!("拒絕啟動：{why}");
+        eprintln!("ab-host: {msg}");
+        msg
+    };
+    let modes = sess
+        .modes
+        .as_ref()
+        .ok_or_else(|| refuse("session/new 未回報 modes".into()))?;
+    let available: Vec<&str> = modes
+        .available_modes
+        .iter()
+        .map(|a| a.id.0.as_ref())
+        .collect();
+    if let Some(target) =
+        decide_mode(&runtime, modes.current_mode_id.0.as_ref(), &available).map_err(refuse)?
     {
         call(
             &cx,
-            SetSessionModeRequest::new(session_id.clone(), "default"),
+            SetSessionModeRequest::new(session_id.clone(), target),
             ptimeout,
             "session/set_mode",
         )
-        .await?;
+        .await
+        .map_err(|e| refuse(format!("set_mode 失敗：{e}")))?;
     }
     eprintln!("ab-host: ready name={name} session={session_id:?}");
 
@@ -732,9 +836,9 @@ mod tests {
     fn safe_kinds_pick_allow_once_then_allow_always() {
         for k in [ToolKind::Read, ToolKind::Search, ToolKind::Think] {
             let o = opts(&[AllowAlways, RejectOnce, AllowOnce]);
-            assert_eq!(choose_permission(Some(&k), &o), Choice::Allow(&"o2"));
+            assert_eq!(choose_permission(Some(&k), true, &o), Choice::Allow(&"o2"));
             let o = opts(&[RejectOnce, AllowAlways]);
-            assert_eq!(choose_permission(Some(&k), &o), Choice::Allow(&"o1"));
+            assert_eq!(choose_permission(Some(&k), true, &o), Choice::Allow(&"o1"));
         }
     }
 
@@ -748,25 +852,31 @@ mod tests {
             None,
         ] {
             let o = opts(&[AllowOnce, RejectAlways, RejectOnce]);
-            assert_eq!(choose_permission(k.as_ref(), &o), Choice::Reject(&"o2"));
+            assert_eq!(
+                choose_permission(k.as_ref(), true, &o),
+                Choice::Reject(&"o2")
+            );
             let o = opts(&[AllowOnce, RejectAlways]);
-            assert_eq!(choose_permission(k.as_ref(), &o), Choice::Reject(&"o1"));
+            assert_eq!(
+                choose_permission(k.as_ref(), true, &o),
+                Choice::Reject(&"o1")
+            );
         }
     }
 
     #[test]
     fn no_matching_option_is_noption_and_labels_reject() {
         let o = opts(&[RejectOnce]);
-        let c = choose_permission(Some(&ToolKind::Read), &o);
+        let c = choose_permission(Some(&ToolKind::Read), true, &o);
         assert_eq!(c, Choice::NoOption);
         assert_eq!(c.label(), "reject");
         let o = opts(&[AllowOnce]);
         assert_eq!(
-            choose_permission(Some(&ToolKind::Edit), &o),
+            choose_permission(Some(&ToolKind::Edit), true, &o),
             Choice::NoOption
         );
         assert_eq!(
-            choose_permission::<&str>(Some(&ToolKind::Read), &[]),
+            choose_permission::<&str>(Some(&ToolKind::Read), true, &[]),
             Choice::NoOption
         );
         assert_eq!(Choice::Allow(&"x").label(), "allow");
@@ -789,5 +899,67 @@ mod tests {
             map_stop(&StopReason::MaxTurnRequests),
             Terminal::Fail("stopReason=max_turn_requests".into())
         );
+    }
+
+    #[test]
+    fn read_search_need_in_cwd_but_think_does_not() {
+        let o = opts(&[AllowOnce, RejectOnce]);
+        for k in [ToolKind::Read, ToolKind::Search] {
+            assert_eq!(
+                choose_permission(Some(&k), false, &o),
+                Choice::Reject(&"o1")
+            );
+        }
+        assert_eq!(
+            choose_permission(Some(&ToolKind::Think), false, &o),
+            Choice::Allow(&"o0")
+        );
+    }
+
+    #[test]
+    fn locations_scoped_to_cwd() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cwd = tmp.path().join("work");
+        let outside = tmp.path().join("outside");
+        std::fs::create_dir_all(&cwd).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(cwd.join("a.txt"), "a").unwrap();
+        std::fs::write(outside.join("secret"), "s").unwrap();
+        std::os::unix::fs::symlink(&outside, cwd.join("link")).unwrap();
+
+        // cwd 內（既存、不存在）→ true
+        assert!(locations_in_cwd(&[cwd.join("a.txt")], &cwd));
+        assert!(locations_in_cwd(&[cwd.join("new/none.txt")], &cwd));
+        // cwd 外 → false
+        assert!(!locations_in_cwd(&[outside.join("secret")], &cwd));
+        // `..` 跳出（既存與不存在）→ false
+        assert!(!locations_in_cwd(&[cwd.join("../outside/secret")], &cwd));
+        assert!(!locations_in_cwd(&[cwd.join("../nope")], &cwd));
+        // locations 空 → false；任一在外 → false
+        assert!(!locations_in_cwd(&[], &cwd));
+        assert!(!locations_in_cwd(
+            &[cwd.join("a.txt"), outside.join("secret")],
+            &cwd
+        ));
+        // cwd 內 symlink 指向 cwd 外 → false（既存與不存在的子路徑）
+        assert!(!locations_in_cwd(&[cwd.join("link/secret")], &cwd));
+        assert!(!locations_in_cwd(&[cwd.join("link/missing")], &cwd));
+    }
+
+    #[test]
+    fn mode_decision_claude() {
+        let av = ["auto", "default", "plan"];
+        assert_eq!(decide_mode("claude", "default", &av), Ok(None));
+        assert_eq!(decide_mode("claude", "auto", &av), Ok(Some("default")));
+        assert!(decide_mode("claude", "auto", &["auto", "plan"]).is_err());
+    }
+
+    #[test]
+    fn mode_decision_codex() {
+        let av = ["read-only", "workspace-write", "agent", "agent-full-access"];
+        assert_eq!(decide_mode("codex", "read-only", &av), Ok(None));
+        assert_eq!(decide_mode("codex", "workspace-write", &av), Ok(None));
+        assert!(decide_mode("codex", "agent-full-access", &av).is_err());
+        assert!(decide_mode("codex", "agent", &av).is_err());
     }
 }
