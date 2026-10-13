@@ -2,6 +2,19 @@
 
 **tmux 中 AI coding agent 之間的持久化、跨廠牌任務委派。**
 
+> [!WARNING]
+> **已停止開發（2026 年 10 月起）。** 我自己的環境已改用
+> [xvendor](https://github.com/mangow314/xvendor)，它涵蓋了我最常拿
+> agent-bridge 做的事：請 codex 或 agy 做唯讀審查、給第二意見。xvendor 用各家
+> 官方 headless CLI（`codex exec`、`agy -p`）執行，每個 job 都強制唯讀，不再
+> 對互動式 pane 打字、看畫面判斷狀態。
+>
+> 這個 repo 會原樣保留。bug 不再修，codex、Claude Code、agy 的 CLI 改版也不
+> 再跟進，所以 pane 防護和 hooks 在新版上可能失效。xvendor 沒有涵蓋
+> agent-bridge 的全部用途：它的 job 一律不改檔，也沒有 Claude worker。這類需求
+> 請改用 Claude Code 內建的 subagent、agent teams 或跨 session 訊息（比較見
+> 下方「何時該用 agent-bridge……」一節的表格）。
+
 agent-bridge 是架在 tmux 與檔案系統信箱（mailbox）上的薄 CLI。它讓 Claude
 Code、Codex 或 Antigravity 的 session 把一塊自足的任務交給另一個 agent 的
 pane，自己繼續做事，稍後再讀回覆——或一個明確的失敗。每個任務都是磁碟上

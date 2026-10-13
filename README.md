@@ -2,6 +2,22 @@
 
 **Durable, cross-vendor task delegation between AI coding agents in tmux.**
 
+> [!WARNING]
+> **No longer developed (since October 2026).** In my own setup agent-bridge
+> has been replaced by [xvendor](https://github.com/mangow314/xvendor), which
+> covers what I used it for most: asking codex or agy for a read-only review
+> or a second opinion. xvendor runs the vendors' official headless CLIs
+> (`codex exec`, `agy -p`) with read-only enforced on every job, instead of
+> typing into interactive panes and watching their screens.
+>
+> This repo stays up as it is. Bugs will not be fixed, and changes in the
+> codex, Claude Code or agy CLIs will not be followed, so the pane guards and
+> hooks may stop working with newer versions. xvendor does not do everything
+> agent-bridge did: its jobs never edit files and it has no Claude workers.
+> For those, use Claude Code's built-in subagents, agent teams, or
+> cross-session messaging (compared in the table under
+> [Use agent-bridge when…](#use-agent-bridge-when)).
+
 agent-bridge is a thin CLI over tmux plus a filesystem mailbox. It lets a
 Claude Code, Codex, or Antigravity session hand a self-contained task to
 another agent's pane, keep working, and read back the reply — or an explicit
